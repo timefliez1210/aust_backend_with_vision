@@ -1,0 +1,23 @@
+[package]
+name = "aust-offer-generator"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+aust-core = { workspace = true }
+aust-storage = { workspace = true }
+
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+typst = { workspace = true }
+typst-pdf = { workspace = true }
+bytes = { workspace = true }

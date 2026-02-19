@@ -1,0 +1,20 @@
+[package]
+name = "aust-storage"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+aust-core = { workspace = true }
+
+tokio = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+aws-config = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+uuid = { workspace = true }

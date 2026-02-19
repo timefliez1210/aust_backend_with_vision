@@ -1,0 +1,15 @@
+[database]
+url = "postgres://aust:aust_dev_password@localhost/aust_backend"
+
+[storage]
+provider = "s3"
+bucket = "aust-uploads"
+endpoint = "http://localhost:9000"
+region = "us-east-1"
+
+[llm]
+default_provider = "ollama"
+
+[llm.ollama]
+base_url = "http://localhost:11434"
+model = "llama3.2-vision"

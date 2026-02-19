@@ -1,0 +1,44 @@
+[server]
+host = "0.0.0.0"
+port = 8080
+
+[database]
+url = "postgres://aust:aust_dev_password@localhost/aust_backend"
+max_connections = 10
+
+[redis]
+url = "redis://localhost:6379"
+
+[storage]
+provider = "local"
+bucket = "./uploads"
+
+[email]
+imap_host = "imap.example.com"
+imap_port = 993
+smtp_host = "smtp.example.com"
+smtp_port = 587
+username = ""
+password = ""
+poll_interval_secs = 60
+from_address = "umzug@example.com"
+from_name = "AUST Umzüge"
+
+[llm]
+default_provider = "ollama"
+
+[llm.ollama]
+base_url = "http://localhost:11434"
+model = "llama3.2-vision"
+
+[maps]
+provider = "google"
+api_key = ""
+
+[telegram]
+bot_token = ""
+admin_chat_id = 0
+
+[auth]
+jwt_secret = "change_this_in_production_please_use_a_long_random_string"
+jwt_expiry_hours = 24
