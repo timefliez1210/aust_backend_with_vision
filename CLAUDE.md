@@ -6,7 +6,7 @@ A modular Rust backend for automating moving company operations - from initial c
 
 **Purpose**: Automate the quote-to-offer pipeline for a moving company (Austrian market, German language)
 
-**Architecture**: Modular monolith with 8 crates, designed for future microservices extraction
+**Architecture**: Modular monolith with 9 crates + 1 Python sidecar service, designed for future microservices extraction
 
 **Scale**: Single tenant, single region, <1000 requests/day
 
@@ -20,29 +20,41 @@ A modular Rust backend for automating moving company operations - from initial c
 | Cache/Queue | Redis |
 | Object Storage | S3-compatible (MinIO for dev) |
 | LLM | Pluggable: Claude, OpenAI, Ollama |
-| Maps | Google Maps API |
+| Vision ML | Grounding DINO + SAM + Depth Anything V2 + Open3D |
+| Vision Infra | Modal (serverless GPU, T4) |
+| Maps/Routing | OpenRouteService |
 | Email | IMAP/SMTP via lettre + async-imap |
+| Approval UI | Telegram Bot (human-in-the-loop) |
+| PDF | Typst |
 
-## Crate Structure
+## Project Structure
 
 ```
 crates/
-├── core/               # Domain models, config, shared errors
-├── api/                # REST API, routes, middleware
-├── llm-providers/      # LLM abstraction (Claude, OpenAI, Ollama)
-├── storage/            # File storage abstraction (S3, local)
-├── email-agent/        # Email processing (IMAP/SMTP + LLM)
-├── volume-estimator/   # Volume calculation (vision AI, inventory)
-├── distance-calculator/# Geocoding + distance calculation
-└── offer-generator/    # Pricing engine + PDF generation
+├── core/                 # Domain models, config, shared errors
+├── api/                  # REST API, routes, middleware (Axum)
+├── llm-providers/        # LLM abstraction (Claude, OpenAI, Ollama)
+├── storage/              # File storage abstraction (S3, local)
+├── email-agent/          # Email processing + Telegram approval workflow
+├── volume-estimator/     # Volume calculation (LLM vision + external service client)
+├── distance-calculator/  # Geocoding + multi-stop route calculation
+├── offer-generator/      # Pricing engine + PDF generation (Typst)
+└── calendar/             # Booking management + capacity tracking
+
+services/
+└── vision/               # Python ML service (GPU) - 3D volume estimation
+    ├── app/              # FastAPI application
+    └── modal_app.py      # Modal serverless deployment
 ```
 
 ## Key Files
 
-- `src/main.rs` - Application entry point, config loading, server startup
-- `config/*.toml` - Configuration files (default, development, production)
-- `migrations/*.sql` - Database schema
-- `docker/docker-compose.yml` - Local dev infrastructure
+- `src/main.rs` - Application entry point, config loading, service wiring
+- `config/default.toml` - Default configuration
+- `migrations/*.sql` - Database schema (initial + calendar)
+- `docker/docker-compose.yml` - Local dev infrastructure (Postgres, Redis, MinIO, Vision)
+- `docker/docker-compose.gpu.yml` - GPU override for vision service
+- `services/vision/modal_app.py` - Modal deployment for vision service
 
 ## Running Locally
 
@@ -52,13 +64,25 @@ cd docker && docker-compose up -d
 
 # Configure environment
 cp .env.example .env
-# Edit .env with your API keys (LLM, Maps)
+# Edit .env with your API keys (LLM, Maps, Telegram)
 
 # Run migrations and start server
 cargo run
 ```
 
 Server runs on `http://localhost:8080`
+
+### Vision Service (Modal)
+
+```bash
+# Deploy to Modal (serverless GPU)
+modal deploy services/vision/modal_app.py
+
+# Test
+curl https://crfabig--aust-vision-serve.modal.run/health
+curl -X POST https://crfabig--aust-vision-serve.modal.run/estimate/upload \
+  -F "job_id=test" -F "images=@room.jpg"
+```
 
 ## API Endpoints
 
@@ -77,12 +101,21 @@ Server runs on `http://localhost:8080`
 - `PATCH /api/v1/quotes/{id}` - Update quote
 
 ### Volume Estimation
-- `POST /api/v1/estimates/vision` - AI image analysis (base64 JSON)
+- `POST /api/v1/estimates/vision` - LLM image analysis (base64 JSON)
+- `POST /api/v1/estimates/depth-sensor` - 3D ML pipeline (multipart upload, falls back to LLM)
 - `POST /api/v1/estimates/inventory` - Manual inventory form
 - `GET /api/v1/estimates/{id}` - Get estimation
 
+### Calendar
+- `GET /api/v1/calendar/availability?date=YYYY-MM-DD` - Check date + alternatives
+- `GET /api/v1/calendar/schedule?from=...&to=...` - Schedule with capacity (max 90 days)
+- `POST /api/v1/calendar/bookings` - Create booking
+- `GET /api/v1/calendar/bookings/{id}` - Get booking
+- `PATCH /api/v1/calendar/bookings/{id}` - Update status (confirm/cancel)
+- `PUT /api/v1/calendar/capacity/{date}` - Override daily capacity
+
 ### Distance
-- `POST /api/v1/distance/calculate` - Calculate distance between addresses
+- `POST /api/v1/distance/calculate` - Multi-stop route calculation
 
 ### Offers
 - `POST /api/v1/offers/generate` - Generate offer from quote
@@ -96,164 +129,139 @@ Customer Email → Email Agent → Parse Intent (LLM)
                                     ↓
                             Create/Update Quote
                                     ↓
-              ┌─────────────────────┴─────────────────────┐
-              ↓                                           ↓
-    Volume Estimator                            Distance Calculator
-    (Vision AI / Inventory)                     (Geocoding + Routing)
-              ↓                                           ↓
-              └─────────────────────┬─────────────────────┘
+              ┌─────────────────────┼─────────────────────┐
+              ↓                     ↓                     ↓
+    Volume Estimator        Calendar Service      Distance Calculator
+    ┌─────────────────┐     (Availability +       (Geocoding + Routing)
+    │ 3D ML Pipeline  │      Booking)
+    │ (Modal GPU)     │
+    │   ↓ fallback    │
+    │ LLM Vision      │
+    └─────────────────┘
+              ↓                     ↓                     ↓
+              └─────────────────────┼─────────────────────┘
                                     ↓
                             Offer Generator
                             (Pricing + PDF)
                                     ↓
-                            Email Agent sends offer
+                    Telegram → Alex approves → Email sent
 ```
 
 ## Configuration
 
 Environment variables override config files. Format: `AUST__SECTION__KEY`
 
+Key sections in `config/default.toml`:
+- `[server]` - host, port
+- `[database]` - PostgreSQL URL
+- `[redis]` - Redis URL
+- `[storage]` - S3/MinIO settings
+- `[email]` - IMAP/SMTP settings
+- `[llm]` - Provider selection + API keys
+- `[maps]` - OpenRouteService API key
+- `[telegram]` - Bot token + admin chat ID
+- `[calendar]` - Default capacity, alternatives count
+- `[vision_service]` - Enabled flag, base URL, timeout
+
 Examples:
 - `AUST__DATABASE__URL=postgres://...`
 - `AUST__LLM__CLAUDE__API_KEY=sk-...`
-- `AUST__MAPS__API_KEY=...`
-
----
-
-# TODOs
-
-## High Priority (Core Functionality)
-
-### Email Agent - Full Implementation
-- [ ] Implement IMAP polling in `crates/email-agent/src/imap_client.rs`
-- [ ] Implement SMTP sending in `crates/email-agent/src/smtp_client.rs`
-- [ ] Implement email parsing (extract addresses, dates) in `parser.rs`
-- [ ] Implement LLM-powered intent detection in `parser.rs`
-- [ ] Implement LLM-powered response generation in `responder.rs`
-- [ ] Add background task for periodic IMAP polling
-- [ ] Handle email threading (In-Reply-To, References headers)
-
-### Authentication
-- [ ] Implement proper JWT token generation in `crates/api/src/routes/auth.rs`
-- [ ] Implement password hashing with Argon2
-- [ ] Add JWT validation middleware in `crates/api/src/middleware/auth.rs`
-- [ ] Add admin user seeding/creation endpoint
-- [ ] Protect API routes with auth middleware
-
-### PDF Generation
-- [ ] Implement proper PDF generation using Typst in `crates/offer-generator/src/pdf.rs`
-- [ ] Create German offer letter template
-- [ ] Add company logo/branding support
-- [ ] Store generated PDFs in S3
-
-## Medium Priority (Features)
-
-### Volume Estimation Improvements
-- [ ] Add multipart file upload support (currently base64 JSON only)
-- [ ] Implement depth sensor data processing for mobile app
-- [ ] Add item catalog with predefined volumes
-- [ ] Improve vision analysis prompts for better accuracy
-
-### Pricing Engine
-- [ ] Make pricing configurable via database/config
-- [ ] Add seasonal pricing adjustments
-- [ ] Add floor/elevator surcharge configuration
-- [ ] Add weekend/holiday pricing
-- [ ] Support multiple pricing tiers
-
-### Distance Calculator
-- [ ] Add result caching in Redis
-- [ ] Support alternative routing providers (OpenRouteService)
-- [ ] Add travel time estimation
-
-### Customer Management
-- [ ] Add customer CRUD endpoints
-- [ ] Add address CRUD endpoints
-- [ ] Link email threads to customers automatically
-
-## Low Priority (Polish)
-
-### API Improvements
-- [ ] Add request validation with detailed error messages
-- [ ] Add pagination metadata to list endpoints
-- [ ] Add filtering by status in quotes list
-- [ ] Add OpenAPI/Swagger documentation
-- [ ] Add rate limiting middleware
-
-### Observability
-- [ ] Add structured logging with request IDs
-- [ ] Add Prometheus metrics endpoint
-- [ ] Add health check for Redis and S3
-- [ ] Add request/response logging middleware
-
-### Testing
-- [ ] Add unit tests for pricing engine
-- [ ] Add unit tests for volume calculator
-- [ ] Add integration tests with test database
-- [ ] Add API endpoint tests
-
-### DevOps
-- [ ] Add GitHub Actions CI/CD pipeline
-- [ ] Add Kubernetes deployment manifests
-- [ ] Add database backup strategy
-- [ ] Add secrets management (Vault, etc.)
-
-## Technical Debt
-
-- [ ] Remove unused `patch` import in `quotes.rs`
-- [ ] Use `status` field in `ListQuotesQuery` for filtering
-- [ ] Extract duplicate `QuoteRow` struct to shared location
-- [ ] Add proper error handling for LLM API failures (retries, fallbacks)
-- [ ] Add database connection pooling configuration
-- [ ] Consider sqlx offline mode for compile-time query verification
-
-## Future Considerations
-
-### Mobile App Integration
-- [ ] Design API for depth sensor volume estimation
-- [ ] Add push notification support
-- [ ] Add real-time quote status updates (WebSocket?)
-
-### Multi-tenancy (if needed later)
-- [ ] Add tenant ID to all tables
-- [ ] Add tenant isolation middleware
-- [ ] Add tenant configuration management
-
-### Analytics
-- [ ] Track quote conversion rates
-- [ ] Track volume estimation accuracy
-- [ ] Add admin dashboard endpoints
-
----
+- `AUST__VISION_SERVICE__ENABLED=true`
+- `AUST__VISION_SERVICE__BASE_URL=https://crfabig--aust-vision-serve.modal.run`
 
 ## Code Conventions
 
-- **German for user-facing content**: Error messages, email responses, offer letters
+- **German for user-facing content**: Error messages, email responses, offer letters, Telegram messages
 - **English for code**: Variables, functions, comments
 - **UUIDs**: Use v7 (time-ordered) for new records
 - **Dates**: Always UTC in database, convert for display
 - **Money**: Store as cents (i64), currency code separate
 - **Status enums**: Store as lowercase strings in DB
+- **Traits for abstraction**: `LlmProvider`, `StorageProvider` - pluggable implementations
+- **Factory functions**: `create_provider()` for centralized instantiation
+- **Service/Repository pattern**: Business logic in service layer, SQL in repository layer
+
+## Database Schema
+
+See `migrations/` for full schema.
+
+Key tables:
+- `customers` - Contact information
+- `addresses` - Origin/destination with geocoding
+- `quotes` - Quote requests with status tracking
+- `volume_estimations` - Volume calculation results (method: vision/inventory/depth_sensor)
+- `offers` - Generated offers with pricing
+- `email_threads` / `email_messages` - Email conversation tracking
+- `calendar_bookings` - Moving date bookings with status
+- `calendar_capacity_overrides` - Date-specific capacity limits
+- `users` - Admin users
 
 ## LLM Provider Notes
 
-The system supports multiple LLM providers for benchmarking:
+The system supports multiple LLM providers:
 
-- **Claude**: Best for German language, vision capabilities
+- **Claude**: Best for German language, vision capabilities (primary)
 - **OpenAI**: Alternative, good vision support
 - **Ollama**: Local/self-hosted, privacy-focused
 
 Switch providers via `AUST__LLM__DEFAULT_PROVIDER` (claude/openai/ollama)
 
-## Database Schema
+---
 
-See `migrations/20240101000000_initial.sql` for full schema.
+# TODOs
 
-Key tables:
-- `customers` - Contact information
-- `addresses` - Origin/destination addresses with geocoding
-- `quotes` - Quote requests with status tracking
-- `volume_estimations` - Volume calculation results
-- `offers` - Generated offers with pricing
-- `email_threads` / `email_messages` - Email conversation tracking
-- `users` - Admin users
+## High Priority
+
+### Authentication
+- [ ] Implement proper JWT token generation in `crates/api/src/routes/auth.rs`
+- [ ] Implement password hashing with Argon2
+- [ ] Add JWT validation middleware
+- [ ] Protect API routes with auth middleware
+
+### PDF Generation
+- [ ] Finalize Typst offer letter template (German)
+- [ ] Add company logo/branding
+- [ ] Store generated PDFs in S3
+
+## Medium Priority
+
+### Volume Estimation
+- [ ] Fine-tune 3D pipeline with real production photos
+- [ ] Add item catalog volume overrides for high-confidence standard items
+- [ ] Implement ensemble mode (combine LLM + 3D estimates)
+- [ ] Improve cross-image deduplication with better feature extraction
+
+### Pricing Engine
+- [ ] Make pricing configurable via database
+- [ ] Add seasonal/weekend/holiday pricing
+- [ ] Add floor/elevator surcharges
+
+### Distance Calculator
+- [ ] Add result caching in Redis
+- [ ] Add travel time estimation
+
+## Low Priority
+
+### API
+- [ ] Add OpenAPI/Swagger documentation
+- [ ] Add rate limiting middleware
+- [ ] Add pagination metadata
+
+### Observability
+- [ ] Structured logging with request IDs
+- [ ] Prometheus metrics endpoint
+
+### Testing
+- [ ] Unit tests for pricing engine and volume calculator
+- [ ] Integration tests with test database
+- [ ] API endpoint tests
+
+### DevOps
+- [ ] GitHub Actions CI/CD
+- [ ] Database backup strategy
+
+## Technical Debt
+
+- [ ] Remove unused `patch` import in `quotes.rs`
+- [ ] Use `status` field in `ListQuotesQuery` for filtering
+- [ ] Extract duplicate `QuoteRow` to shared location
