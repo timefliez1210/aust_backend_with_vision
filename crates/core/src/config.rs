@@ -79,6 +79,7 @@ pub struct OpenAiConfig {
 pub struct OllamaConfig {
     pub base_url: String,
     pub model: String,
+    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

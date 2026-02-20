@@ -28,8 +28,9 @@ from_name = "AUST Umzüge"
 default_provider = "ollama"
 
 [llm.ollama]
-base_url = "http://localhost:11434"
-model = "llama3.2-vision"
+base_url = "https://ollama.com"
+model = "qwen3.5:397b"
+# api_key = ""  # set via AUST__LLM__OLLAMA__API_KEY env var
 
 [maps]
 provider = "google"

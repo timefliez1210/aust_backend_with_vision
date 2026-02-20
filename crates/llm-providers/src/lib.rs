@@ -41,10 +41,18 @@ pub fn create_provider(config: &LlmConfig) -> Result<Arc<dyn LlmProvider>, LlmEr
                 .ollama
                 .as_ref()
                 .ok_or_else(|| LlmError::Configuration("Ollama config not found".into()))?;
-            Ok(Arc::new(OllamaProvider::new(
-                ollama_config.base_url.clone(),
-                ollama_config.model.clone(),
-            )))
+            let provider = match &ollama_config.api_key {
+                Some(key) if !key.is_empty() => OllamaProvider::with_api_key(
+                    ollama_config.base_url.clone(),
+                    ollama_config.model.clone(),
+                    key.clone(),
+                ),
+                _ => OllamaProvider::new(
+                    ollama_config.base_url.clone(),
+                    ollama_config.model.clone(),
+                ),
+            };
+            Ok(Arc::new(provider))
         }
         provider => Err(LlmError::Configuration(format!(
             "Unknown provider: {provider}"

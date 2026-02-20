@@ -9,6 +9,7 @@ pub struct OllamaProvider {
     client: Client,
     base_url: String,
     model: String,
+    api_key: Option<String>,
 }
 
 impl OllamaProvider {
@@ -17,6 +18,16 @@ impl OllamaProvider {
             client: Client::new(),
             base_url,
             model,
+            api_key: None,
+        }
+    }
+
+    pub fn with_api_key(base_url: String, model: String, api_key: String) -> Self {
+        Self {
+            client: Client::new(),
+            base_url,
+            model,
+            api_key: Some(api_key),
         }
     }
 }
@@ -73,26 +84,7 @@ impl LlmProvider for OllamaProvider {
             stream: false,
         };
 
-        let url = format!("{}/api/chat", self.base_url);
-
-        let response = self
-            .client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .json(&request)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response.text().await.unwrap_or_default();
-            return Err(LlmError::Api(format!(
-                "Ollama API error {status}: {error_text}"
-            )));
-        }
-
-        let ollama_response: OllamaResponse = response.json().await?;
-        Ok(ollama_response.message.content)
+        self.send_request(&request).await
     }
 
     #[instrument(skip(self, image_data))]
@@ -114,15 +106,24 @@ impl LlmProvider for OllamaProvider {
             stream: false,
         };
 
+        self.send_request(&request).await
+    }
+}
+
+impl OllamaProvider {
+    async fn send_request(&self, request: &OllamaRequest) -> Result<String, LlmError> {
         let url = format!("{}/api/chat", self.base_url);
 
-        let response = self
+        let mut req = self
             .client
             .post(&url)
-            .header("Content-Type", "application/json")
-            .json(&request)
-            .send()
-            .await?;
+            .header("Content-Type", "application/json");
+
+        if let Some(key) = &self.api_key {
+            req = req.header("Authorization", format!("Bearer {key}"));
+        }
+
+        let response = req.json(request).send().await?;
 
         if !response.status().is_success() {
             let status = response.status();
