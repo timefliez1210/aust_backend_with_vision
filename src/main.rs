@@ -1,8 +1,10 @@
 use anyhow::Result;
 use aust_api::{create_pool, create_router, AppState};
+use aust_calendar::CalendarService;
 use aust_core::Config;
 use config::{ConfigBuilder, Environment, File};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
@@ -36,8 +38,41 @@ async fn main() -> Result<()> {
     let storage = aust_storage::create_provider(&config.storage).await?;
     tracing::info!("Storage provider initialized");
 
+    // Create calendar service
+    let calendar = Arc::new(CalendarService::new(
+        db.clone(),
+        config.calendar.default_capacity,
+        config.calendar.alternatives_count,
+        config.calendar.search_window_days,
+    ));
+    tracing::info!("Calendar service initialized (default capacity: {})", config.calendar.default_capacity);
+
+    // Create vision service client (if enabled)
+    let vision_service = if config.vision_service.enabled {
+        match aust_volume_estimator::VisionServiceClient::new(
+            &config.vision_service.base_url,
+            config.vision_service.timeout_secs,
+            config.vision_service.max_retries,
+        ) {
+            Ok(client) => {
+                tracing::info!(
+                    "Vision service client initialized: {}",
+                    config.vision_service.base_url
+                );
+                Some(client)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to create vision service client: {e}");
+                None
+            }
+        }
+    } else {
+        tracing::info!("Vision service disabled");
+        None
+    };
+
     // Create app state
-    let state = AppState::new(config.clone(), db, llm, storage);
+    let state = AppState::new(config.clone(), db, llm, storage, calendar, vision_service);
 
     // Create router
     let app = create_router(state);

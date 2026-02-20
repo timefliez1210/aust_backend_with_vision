@@ -40,6 +40,23 @@ pub enum ApprovalDecision {
     EditInstructions(String),
     /// Discard the draft entirely
     Deny,
+    /// Admin approved overbooking via capacity question
+    CapacityApprove(String),
+    /// Admin denied overbooking via capacity question
+    CapacityDeny(String),
+    /// A calendar management command from the admin
+    CalendarCommand(CalendarCommand),
+}
+
+/// Calendar commands from Telegram.
+#[derive(Debug, Clone)]
+pub enum CalendarCommand {
+    /// Show schedule for a month (YYYY-MM) or current month
+    ShowSchedule(Option<String>),
+    /// Show next 7 days
+    ShowUpcoming,
+    /// Set capacity for a date: (date_str, capacity)
+    SetCapacity(String, i32),
 }
 
 /// A callback response from Telegram (inline keyboard press or text reply).
@@ -189,12 +206,16 @@ impl TelegramBot {
                 }
             }
 
-            // Handle text message (edit instructions from admin)
+            // Handle text message (edit instructions or calendar commands from admin)
             if let Some(message) = &update.message {
                 if message.chat.id == self.admin_chat_id {
                     if let Some(text) = &message.text {
-                        // Skip bot commands
-                        if !text.starts_with('/') {
+                        if let Some(cmd) = Self::parse_calendar_command(text) {
+                            responses.push(ApprovalResponse {
+                                draft_id: "calendar_command".to_string(),
+                                decision: ApprovalDecision::CalendarCommand(cmd),
+                            });
+                        } else if !text.starts_with('/') {
                             debug!(
                                 "Received text from admin: {}",
                                 &text[..text.len().min(80)]
@@ -241,11 +262,8 @@ impl TelegramBot {
                 })
             }
             "edit" => {
-                self.send_status_message(
-                    "✏️ Was soll geändert werden? Schreib einfach deine Anweisungen \
-                     (z.B. \"Mach es kürzer\" oder \"Frag auch nach dem Aufzug\").",
-                )
-                .await;
+                // Context-aware edit prompt is sent by the processor,
+                // which knows the customer email and can handle re-queuing.
                 Some(ApprovalResponse {
                     draft_id,
                     decision: ApprovalDecision::AwaitingEditInstructions,
@@ -256,6 +274,24 @@ impl TelegramBot {
                 Some(ApprovalResponse {
                     draft_id,
                     decision: ApprovalDecision::Deny,
+                })
+            }
+            "cap_yes" => {
+                self.send_status_message("✅ Zusätzlicher Umzug wird eingeplant.")
+                    .await;
+                let id = draft_id.clone();
+                Some(ApprovalResponse {
+                    draft_id,
+                    decision: ApprovalDecision::CapacityApprove(id),
+                })
+            }
+            "cap_no" => {
+                self.send_status_message("❌ Anfrage wird mit Alternativterminen beantwortet.")
+                    .await;
+                let id = draft_id.clone();
+                Some(ApprovalResponse {
+                    draft_id,
+                    decision: ApprovalDecision::CapacityDeny(id),
                 })
             }
             _ => {
@@ -320,6 +356,121 @@ impl TelegramBot {
         {
             error!("Failed to send notification: {e}");
         }
+    }
+
+    /// Send a capacity question to the admin when a date is overbooked.
+    /// Shows existing bookings and the incoming request with full details.
+    pub async fn send_capacity_question(
+        &self,
+        request_id: &str,
+        date: &str,
+        existing_bookings: &[String],
+        incoming_summary: &str,
+    ) -> Result<DraftMessage, EmailError> {
+        let mut existing_text = String::new();
+        for line in existing_bookings {
+            existing_text.push_str(&format!("• {line}\n"));
+        }
+
+        let text = format!(
+            "⚠️ *Kapazitätsanfrage für {date}*\n\n\
+             Bereits bestätigt:\n{existing_text}\n\
+             Neue Anfrage:\n\
+             • {incoming_summary}\n\n\
+             Hast du Kapazität für einen weiteren Umzug?"
+        );
+
+        let inline_keyboard = serde_json::json!({
+            "inline_keyboard": [[
+                {
+                    "text": "✅ Ja",
+                    "callback_data": format!("cap_yes:{request_id}")
+                },
+                {
+                    "text": "❌ Nein",
+                    "callback_data": format!("cap_no:{request_id}")
+                }
+            ]]
+        });
+
+        let payload = serde_json::json!({
+            "chat_id": self.admin_chat_id,
+            "text": text,
+            "parse_mode": "Markdown",
+            "reply_markup": inline_keyboard,
+        });
+
+        let response = self
+            .client
+            .post(self.api_url("sendMessage"))
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| EmailError::Telegram(format!("Failed to send capacity question: {e}")))?;
+
+        let result: TelegramResponse<MessageResult> = response
+            .json()
+            .await
+            .map_err(|e| EmailError::Telegram(format!("Failed to parse response: {e}")))?;
+
+        if !result.ok {
+            return Err(EmailError::Telegram(format!(
+                "Telegram API error: {}",
+                result.description.unwrap_or_default()
+            )));
+        }
+
+        let message_id = result.result.map(|r| r.message_id).unwrap_or(0);
+        info!("Sent capacity question for {date} (message_id: {message_id})");
+        Ok(DraftMessage { message_id })
+    }
+
+    /// Send a schedule summary to the admin.
+    pub async fn send_schedule_message(&self, text: &str) {
+        let payload = serde_json::json!({
+            "chat_id": self.admin_chat_id,
+            "text": text,
+            "parse_mode": "Markdown",
+        });
+
+        if let Err(e) = self
+            .client
+            .post(self.api_url("sendMessage"))
+            .json(&payload)
+            .send()
+            .await
+        {
+            error!("Failed to send schedule message: {e}");
+        }
+    }
+
+    /// Parse a Telegram message as a calendar command.
+    /// Returns None if the message is not a recognized command.
+    fn parse_calendar_command(text: &str) -> Option<CalendarCommand> {
+        let text = text.trim();
+
+        if text == "/kalender" {
+            return Some(CalendarCommand::ShowSchedule(None));
+        }
+        if let Some(month) = text.strip_prefix("/kalender ") {
+            let month = month.trim();
+            if !month.is_empty() {
+                return Some(CalendarCommand::ShowSchedule(Some(month.to_string())));
+            }
+        }
+        if text == "/termine" {
+            return Some(CalendarCommand::ShowUpcoming);
+        }
+        if let Some(args) = text.strip_prefix("/kapazitaet ") {
+            let parts: Vec<&str> = args.trim().split_whitespace().collect();
+            if parts.len() == 2 {
+                if let Ok(cap) = parts[1].parse::<i32>() {
+                    return Some(CalendarCommand::SetCapacity(parts[0].to_string(), cap));
+                }
+            }
+        }
+
+        None
     }
 
     /// Notify admin about an incoming email.

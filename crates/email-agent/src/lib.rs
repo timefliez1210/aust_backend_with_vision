@@ -13,4 +13,4 @@ pub use parser::EmailParser;
 pub use processor::EmailProcessor;
 pub use responder::{EmailResponse, EmailResponder};
 pub use smtp_client::SmtpClient;
-pub use telegram::{ApprovalDecision, ApprovalResponse, DraftMessage, TelegramBot};
+pub use telegram::{ApprovalDecision, ApprovalResponse, CalendarCommand, DraftMessage, TelegramBot};

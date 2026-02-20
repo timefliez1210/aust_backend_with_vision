@@ -70,3 +70,27 @@ pub struct DetectedItem {
     pub estimated_volume_m3: f64,
     pub confidence: f64,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DepthSensorResult {
+    pub detected_items: Vec<DepthSensorItem>,
+    pub total_volume_m3: f64,
+    pub confidence_score: f64,
+    pub processing_time_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DepthSensorItem {
+    pub name: String,
+    pub volume_m3: f64,
+    pub dimensions: Option<ItemDimensions>,
+    pub confidence: f64,
+    pub category: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ItemDimensions {
+    pub length_m: f64,
+    pub width_m: f64,
+    pub height_m: f64,
+}

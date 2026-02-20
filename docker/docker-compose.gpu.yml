@@ -1,0 +1,16 @@
+# GPU override for vision service
+# Usage: docker compose -f docker-compose.yml -f docker-compose.gpu.yml up
+services:
+  vision:
+    build:
+      context: ../services/vision
+      dockerfile: Dockerfile
+    environment:
+      VISION_DEVICE: cuda
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

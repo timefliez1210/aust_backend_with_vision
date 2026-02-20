@@ -1,0 +1,147 @@
+use crate::VolumeError;
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
+
+#[derive(Clone)]
+pub struct VisionServiceClient {
+    client: reqwest::Client,
+    base_url: String,
+    max_retries: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct VisionServiceRequest {
+    pub job_id: String,
+    pub s3_keys: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub options: Option<VisionServiceOptions>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct VisionServiceOptions {
+    pub detection_threshold: Option<f64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct VisionServiceResponse {
+    pub job_id: String,
+    pub status: String,
+    pub detected_items: Vec<VisionDetectedItem>,
+    pub total_volume_m3: f64,
+    pub confidence_score: f64,
+    pub processing_time_ms: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct VisionDetectedItem {
+    pub name: String,
+    pub volume_m3: f64,
+    pub dimensions: Option<VisionItemDimensions>,
+    pub confidence: f64,
+    pub seen_in_images: Vec<usize>,
+    pub category: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct VisionItemDimensions {
+    pub length_m: f64,
+    pub width_m: f64,
+    pub height_m: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReadyResponse {
+    status: String,
+}
+
+impl VisionServiceClient {
+    pub fn new(base_url: &str, timeout_secs: u64, max_retries: u32) -> Result<Self, VolumeError> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(timeout_secs))
+            .build()
+            .map_err(|e| VolumeError::ExternalService(format!("Failed to create HTTP client: {e}")))?;
+
+        Ok(Self {
+            client,
+            base_url: base_url.trim_end_matches('/').to_string(),
+            max_retries,
+        })
+    }
+
+    pub async fn check_ready(&self) -> Result<bool, VolumeError> {
+        let url = format!("{}/ready", self.base_url);
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| VolumeError::ExternalService(format!("Vision service unreachable: {e}")))?;
+
+        if resp.status().is_success() {
+            let body: ReadyResponse = resp
+                .json()
+                .await
+                .map_err(|e| VolumeError::ExternalService(format!("Invalid ready response: {e}")))?;
+            Ok(body.status == "ready")
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub async fn estimate_images(
+        &self,
+        request: &VisionServiceRequest,
+    ) -> Result<VisionServiceResponse, VolumeError> {
+        let url = format!("{}/estimate/images", self.base_url);
+        let mut last_err = None;
+
+        for attempt in 0..=self.max_retries {
+            if attempt > 0 {
+                tracing::warn!(
+                    attempt,
+                    max_retries = self.max_retries,
+                    "Retrying vision service request"
+                );
+                tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
+            }
+
+            match self.client.post(&url).json(request).send().await {
+                Ok(resp) => {
+                    if resp.status().is_success() {
+                        return resp.json().await.map_err(|e| {
+                            VolumeError::ExternalService(format!(
+                                "Failed to parse vision service response: {e}"
+                            ))
+                        });
+                    }
+
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+
+                    if status.is_server_error() && attempt < self.max_retries {
+                        last_err = Some(format!("Vision service returned {status}: {body}"));
+                        continue;
+                    }
+
+                    return Err(VolumeError::ExternalService(format!(
+                        "Vision service returned {status}: {body}"
+                    )));
+                }
+                Err(e) => {
+                    if attempt < self.max_retries {
+                        last_err = Some(format!("Vision service request failed: {e}"));
+                        continue;
+                    }
+                    return Err(VolumeError::ExternalService(format!(
+                        "Vision service request failed after {} attempts: {e}",
+                        attempt + 1
+                    )));
+                }
+            }
+        }
+
+        Err(VolumeError::ExternalService(
+            last_err.unwrap_or_else(|| "Vision service request failed".to_string()),
+        ))
+    }
+}

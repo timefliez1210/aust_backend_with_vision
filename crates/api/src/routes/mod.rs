@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod calendar;
 pub mod distance;
 pub mod estimates;
 pub mod health;
@@ -16,4 +17,5 @@ pub fn api_router() -> Router<Arc<AppState>> {
         .nest("/estimates", estimates::router())
         .nest("/distance", distance::router())
         .nest("/offers", offers::router())
+        .nest("/calendar", calendar::router())
 }

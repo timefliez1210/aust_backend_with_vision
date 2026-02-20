@@ -1,0 +1,47 @@
+[project]
+name = "aust-vision"
+version = "0.1.0"
+description = "Vision-based volume estimation service for AUST Backend"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115,<1",
+    "uvicorn[standard]>=0.34,<1",
+    "pydantic>=2.10,<3",
+    "pydantic-settings>=2.7,<3",
+    "boto3>=1.36,<2",
+    "Pillow>=11,<12",
+    "numpy>=1.26,<2",
+    "open3d>=0.18,<1",
+    "torch>=2.5,<3",
+    "torchvision>=0.20,<1",
+    "transformers>=4.48,<5",
+    "groundingdino-py>=0.4,<1",
+    "segment-anything @ git+https://github.com/facebookresearch/segment-anything.git",
+    "scipy>=1.14,<2",
+    "scikit-learn>=1.6,<2",
+    "structlog>=24.4,<26",
+    "httpx>=0.28,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<9",
+    "pytest-asyncio>=0.25,<1",
+    "ruff>=0.9,<1",
+    "mypy>=1.14,<2",
+]
+
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true

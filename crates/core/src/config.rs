@@ -11,6 +11,10 @@ pub struct Config {
     pub maps: MapsConfig,
     pub telegram: TelegramConfig,
     pub auth: AuthConfig,
+    #[serde(default)]
+    pub calendar: CalendarConfig,
+    #[serde(default)]
+    pub vision_service: VisionServiceConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -93,6 +97,42 @@ pub struct TelegramConfig {
 pub struct AuthConfig {
     pub jwt_secret: String,
     pub jwt_expiry_hours: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CalendarConfig {
+    pub default_capacity: i32,
+    pub alternatives_count: usize,
+    pub search_window_days: i64,
+}
+
+impl Default for CalendarConfig {
+    fn default() -> Self {
+        Self {
+            default_capacity: 1,
+            alternatives_count: 3,
+            search_window_days: 14,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct VisionServiceConfig {
+    pub enabled: bool,
+    pub base_url: String,
+    pub timeout_secs: u64,
+    pub max_retries: u32,
+}
+
+impl Default for VisionServiceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: "http://localhost:8090".to_string(),
+            timeout_secs: 120,
+            max_retries: 1,
+        }
+    }
 }
 
 impl Default for ServerConfig {

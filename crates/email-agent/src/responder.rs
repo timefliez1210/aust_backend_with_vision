@@ -1,3 +1,4 @@
+use aust_calendar::AvailabilityResult;
 use crate::EmailError;
 use aust_core::models::{InquirySource, MissingField, MovingInquiry};
 use aust_llm_providers::{LlmMessage, LlmProvider, LlmRole};
@@ -16,10 +17,13 @@ impl EmailResponder {
     /// Generate a response email for a new or ongoing inquiry.
     /// If the inquiry is complete, returns a confirmation.
     /// If data is missing, generates a friendly German email asking for it.
+    /// If availability info is provided and the date is unavailable, the LLM is instructed
+    /// to inform the customer and suggest alternative dates.
     pub async fn generate_response(
         &self,
         inquiry: &MovingInquiry,
         original_body: &str,
+        availability: Option<&AvailabilityResult>,
     ) -> Result<EmailResponse, EmailError> {
         let missing = inquiry.missing_fields();
 
@@ -35,7 +39,7 @@ impl EmailResponder {
         );
 
         let response_body = self
-            .generate_followup_with_llm(inquiry, &missing, original_body)
+            .generate_followup_with_llm(inquiry, &missing, original_body, availability)
             .await?;
 
         let subject = match inquiry.source {
@@ -59,6 +63,7 @@ impl EmailResponder {
         inquiry: &MovingInquiry,
         missing: &[MissingField],
         original_body: &str,
+        availability: Option<&AvailabilityResult>,
     ) -> Result<String, EmailError> {
         let known_data = format_known_data(inquiry);
         let missing_list = missing
@@ -66,6 +71,37 @@ impl EmailResponder {
             .map(|f| format!("- {}", f.german_prompt()))
             .collect::<Vec<_>>()
             .join("\n");
+
+        let availability_context = if let Some(avail) = availability {
+            if !avail.requested_date_available {
+                let alternatives: Vec<String> = avail
+                    .alternatives
+                    .iter()
+                    .map(|a| a.date.format("%d.%m.%Y").to_string())
+                    .collect();
+                let alt_text = if alternatives.is_empty() {
+                    "Es sind leider keine Alternativtermine in den nächsten 14 Tagen verfügbar.".to_string()
+                } else {
+                    format!(
+                        "Alternativtermine: {}",
+                        alternatives.join(", ")
+                    )
+                };
+                format!(
+                    "\n\nWICHTIG - TERMINVERFÜGBARKEIT:\n\
+                     Der Wunschtermin {} ist leider bereits ausgebucht.\n\
+                     {}\n\
+                     Informiere den Kunden höflich, dass der Wunschtermin nicht verfügbar ist, \
+                     und schlage die Alternativtermine vor. Frage, ob einer der Alternativen passt.",
+                    avail.requested_date.format("%d.%m.%Y"),
+                    alt_text
+                )
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
 
         let system_prompt = r#"Du bist der freundliche E-Mail-Assistent von AUST Umzüge, einem Umzugsunternehmen in Hildesheim.
 Deine Aufgabe ist es, fehlende Informationen für ein Umzugsangebot höflich und professionell einzuholen.
@@ -80,12 +116,13 @@ Regeln:
 - Unterschreibe mit "Mit freundlichen Grüßen,\nIhr AUST Umzüge Team"
 - Schreibe NUR den E-Mail-Text, keine Betreffzeile
 - Erwähne, dass Fotos der Räumlichkeiten als Alternative zur Gegenstandsliste akzeptiert werden (nur wenn Volume fehlt)
+- Wenn ein Terminhinweis gegeben wird (Wunschtermin nicht verfügbar), informiere den Kunden darüber und schlage die Alternativen vor
 - Keine Emojis"#;
 
         let user_prompt = format!(
             "Der Kunde hat folgende Anfrage geschickt:\n\n---\n{original_body}\n---\n\n\
              Bereits bekannte Daten:\n{known_data}\n\n\
-             Fehlende Informationen:\n{missing_list}\n\n\
+             Fehlende Informationen:\n{missing_list}{availability_context}\n\n\
              Generiere eine Antwort-E-Mail, die die fehlenden Informationen anfragt."
         );
 

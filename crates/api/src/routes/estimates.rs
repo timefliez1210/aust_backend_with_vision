@@ -1,9 +1,10 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Multipart, Path, State},
     routing::{get, post},
     Json, Router,
 };
 use base64::Engine;
+use bytes::Bytes;
 use serde::Deserialize;
 use sqlx::FromRow;
 use std::sync::Arc;
@@ -11,12 +12,14 @@ use uuid::Uuid;
 
 use crate::{ApiError, AppState};
 use aust_core::models::{EstimationMethod, InventoryForm, VolumeEstimation};
+use aust_volume_estimator::vision_service::{VisionServiceOptions, VisionServiceRequest};
 use aust_volume_estimator::VisionAnalyzer;
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/vision", post(vision_estimate))
         .route("/inventory", post(inventory_estimate))
+        .route("/depth-sensor", post(depth_sensor_estimate))
         .route("/{id}", get(get_estimate))
 }
 
@@ -67,6 +70,30 @@ struct ImageData {
     mime_type: String, // e.g., "image/jpeg"
 }
 
+/// Upload decoded images to S3, returning the list of S3 keys.
+async fn upload_images_to_s3(
+    storage: &dyn aust_storage::StorageProvider,
+    quote_id: Uuid,
+    estimation_id: Uuid,
+    images: &[(Vec<u8>, String)], // (data, mime_type)
+) -> Result<Vec<String>, ApiError> {
+    let mut s3_keys = Vec::with_capacity(images.len());
+    for (idx, (data, mime_type)) in images.iter().enumerate() {
+        let ext = match mime_type.as_str() {
+            "image/png" => "png",
+            "image/webp" => "webp",
+            _ => "jpg",
+        };
+        let key = format!("estimates/{quote_id}/{estimation_id}/{idx}.{ext}");
+        storage
+            .upload(&key, Bytes::from(data.clone()), mime_type)
+            .await
+            .map_err(|e| ApiError::Internal(format!("Failed to upload image to storage: {e}")))?;
+        s3_keys.push(key);
+    }
+    Ok(s3_keys)
+}
+
 async fn vision_estimate(
     State(state): State<Arc<AppState>>,
     Json(request): Json<VisionEstimateRequest>,
@@ -75,26 +102,52 @@ async fn vision_estimate(
         return Err(ApiError::Validation("At least one image is required".into()));
     }
 
+    let id = Uuid::now_v7();
+
+    // Decode all images first
+    let decoded: Vec<(Vec<u8>, String)> = request
+        .images
+        .iter()
+        .map(|img| {
+            let data = base64::engine::general_purpose::STANDARD
+                .decode(&img.data)
+                .map_err(|e| ApiError::Validation(format!("Invalid base64 image data: {e}")))?;
+            Ok((data, img.mime_type.clone()))
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+
+    // Upload images to S3 for future retrieval
+    let s3_keys = upload_images_to_s3(&*state.storage, request.quote_id, id, &decoded).await;
+    let s3_keys = match s3_keys {
+        Ok(keys) => keys,
+        Err(e) => {
+            tracing::warn!("Failed to upload vision images to S3, continuing with LLM analysis: {e}");
+            Vec::new()
+        }
+    };
+
+    // Run LLM analysis
     let analyzer = VisionAnalyzer::new(state.llm.clone());
     let mut total_volume = 0.0;
     let mut results = Vec::new();
 
-    for image in &request.images {
-        let data = base64::engine::general_purpose::STANDARD
-            .decode(&image.data)
-            .map_err(|e| ApiError::Validation(format!("Invalid base64 image data: {e}")))?;
-
+    for (data, mime_type) in &decoded {
         let result = analyzer
-            .analyze_image(&data, &image.mime_type)
+            .analyze_image(data, mime_type)
             .await
             .map_err(|e| ApiError::Internal(e.to_string()))?;
         total_volume += result.total_volume_m3;
         results.push(result);
     }
 
-    let id = Uuid::now_v7();
     let now = chrono::Utc::now();
-    let avg_confidence = results.iter().map(|r| r.confidence_score).sum::<f64>() / results.len() as f64;
+    let avg_confidence =
+        results.iter().map(|r| r.confidence_score).sum::<f64>() / results.len() as f64;
+
+    let source_data = serde_json::json!({
+        "image_count": request.images.len(),
+        "s3_keys": s3_keys,
+    });
 
     let row: VolumeEstimationRow = sqlx::query_as(
         r#"
@@ -106,7 +159,7 @@ async fn vision_estimate(
     .bind(id)
     .bind(request.quote_id)
     .bind(EstimationMethod::Vision.as_str())
-    .bind(serde_json::json!({"image_count": request.images.len()}))
+    .bind(source_data)
     .bind(serde_json::to_value(&results).ok())
     .bind(total_volume)
     .bind(avg_confidence)
@@ -116,7 +169,7 @@ async fn vision_estimate(
 
     // Update quote with estimated volume
     sqlx::query(
-        "UPDATE quotes SET estimated_volume_m3 = $1, status = $2, updated_at = $3 WHERE id = $4"
+        "UPDATE quotes SET estimated_volume_m3 = $1, status = $2, updated_at = $3 WHERE id = $4",
     )
     .bind(total_volume)
     .bind("volume_estimated")
@@ -126,6 +179,164 @@ async fn vision_estimate(
     .await?;
 
     Ok(Json(VolumeEstimation::from(row)))
+}
+
+async fn depth_sensor_estimate(
+    State(state): State<Arc<AppState>>,
+    mut multipart: Multipart,
+) -> Result<Json<VolumeEstimation>, ApiError> {
+    let mut quote_id: Option<Uuid> = None;
+    let mut images: Vec<(Vec<u8>, String)> = Vec::new();
+
+    // Parse multipart form: extract quote_id and image files
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| ApiError::BadRequest(format!("Invalid multipart data: {e}")))?
+    {
+        let name = field.name().unwrap_or("").to_string();
+        match name.as_str() {
+            "quote_id" => {
+                let text = field
+                    .text()
+                    .await
+                    .map_err(|e| ApiError::BadRequest(format!("Failed to read quote_id: {e}")))?;
+                quote_id = Some(
+                    text.parse::<Uuid>()
+                        .map_err(|e| ApiError::Validation(format!("Invalid quote_id: {e}")))?,
+                );
+            }
+            _ => {
+                // Treat any other field as an image file
+                let content_type = field
+                    .content_type()
+                    .unwrap_or("image/jpeg")
+                    .to_string();
+                if !content_type.starts_with("image/") {
+                    continue;
+                }
+                let data = field
+                    .bytes()
+                    .await
+                    .map_err(|e| ApiError::BadRequest(format!("Failed to read image: {e}")))?;
+                images.push((data.to_vec(), content_type));
+            }
+        }
+    }
+
+    let quote_id =
+        quote_id.ok_or_else(|| ApiError::Validation("quote_id field is required".into()))?;
+    if images.is_empty() {
+        return Err(ApiError::Validation(
+            "At least one image file is required".into(),
+        ));
+    }
+
+    let id = Uuid::now_v7();
+
+    // Upload images to S3
+    let s3_keys = upload_images_to_s3(&*state.storage, quote_id, id, &images).await?;
+
+    // Try the vision service first, fall back to LLM analysis
+    let (total_volume, confidence, result_data, method) =
+        match try_vision_service(&state, &s3_keys, id).await {
+            Ok((vol, conf, data)) => (vol, conf, data, EstimationMethod::DepthSensor),
+            Err(e) => {
+                tracing::warn!("Vision service failed, falling back to LLM analysis: {e}");
+                fallback_llm_analysis(&state, &images).await?
+            }
+        };
+
+    let now = chrono::Utc::now();
+    let source_data = serde_json::json!({
+        "image_count": images.len(),
+        "s3_keys": s3_keys,
+    });
+
+    let row: VolumeEstimationRow = sqlx::query_as(
+        r#"
+        INSERT INTO volume_estimations (id, quote_id, method, source_data, result_data, total_volume_m3, confidence_score, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        RETURNING id, quote_id, method, source_data, result_data, total_volume_m3, confidence_score, created_at
+        "#
+    )
+    .bind(id)
+    .bind(quote_id)
+    .bind(method.as_str())
+    .bind(source_data)
+    .bind(result_data)
+    .bind(total_volume)
+    .bind(confidence)
+    .bind(now)
+    .fetch_one(&state.db)
+    .await?;
+
+    // Update quote with estimated volume
+    sqlx::query(
+        "UPDATE quotes SET estimated_volume_m3 = $1, status = $2, updated_at = $3 WHERE id = $4",
+    )
+    .bind(total_volume)
+    .bind("volume_estimated")
+    .bind(now)
+    .bind(quote_id)
+    .execute(&state.db)
+    .await?;
+
+    Ok(Json(VolumeEstimation::from(row)))
+}
+
+/// Try the Python vision service for 3D volume estimation.
+async fn try_vision_service(
+    state: &AppState,
+    s3_keys: &[String],
+    job_id: Uuid,
+) -> Result<(f64, f64, Option<serde_json::Value>), ApiError> {
+    let client = state
+        .vision_service
+        .as_ref()
+        .ok_or_else(|| ApiError::Internal("Vision service not configured".into()))?;
+
+    let request = VisionServiceRequest {
+        job_id: job_id.to_string(),
+        s3_keys: s3_keys.to_vec(),
+        options: Some(VisionServiceOptions {
+            detection_threshold: None,
+        }),
+    };
+
+    let response = client
+        .estimate_images(&request)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    let result_data = serde_json::to_value(&response.detected_items).ok();
+    Ok((response.total_volume_m3, response.confidence_score, result_data))
+}
+
+/// Fallback: run LLM-based vision analysis on the raw image data.
+/// Returns (total_volume, confidence, result_data, method).
+async fn fallback_llm_analysis(
+    state: &AppState,
+    images: &[(Vec<u8>, String)],
+) -> Result<(f64, f64, Option<serde_json::Value>, EstimationMethod), ApiError> {
+    let analyzer = VisionAnalyzer::new(state.llm.clone());
+    let mut total_volume = 0.0;
+    let mut results = Vec::new();
+
+    for (data, mime_type) in images {
+        let result = analyzer
+            .analyze_image(data, mime_type)
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        total_volume += result.total_volume_m3;
+        results.push(result);
+    }
+
+    let avg_confidence =
+        results.iter().map(|r| r.confidence_score).sum::<f64>() / results.len() as f64;
+    let result_data = serde_json::to_value(&results).ok();
+
+    Ok((total_volume, avg_confidence, result_data, EstimationMethod::Vision))
 }
 
 #[derive(Debug, Deserialize)]
@@ -166,7 +377,7 @@ async fn inventory_estimate(
 
     // Update quote with estimated volume
     sqlx::query(
-        "UPDATE quotes SET estimated_volume_m3 = $1, status = $2, updated_at = $3 WHERE id = $4"
+        "UPDATE quotes SET estimated_volume_m3 = $1, status = $2, updated_at = $3 WHERE id = $4",
     )
     .bind(total_volume)
     .bind("volume_estimated")

@@ -61,7 +61,30 @@ services:
       exit 0;
       "
 
+  vision:
+    build:
+      context: ../services/vision
+      dockerfile: Dockerfile.cpu
+    container_name: aust_vision
+    environment:
+      VISION_S3_ENDPOINT: "http://minio:9000"
+      VISION_DEVICE: cpu
+    ports:
+      - "8090:8090"
+    volumes:
+      - vision_weights:/app/weights
+    depends_on:
+      minio-setup:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8090/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 120s
+
 volumes:
   postgres_data:
   redis_data:
   minio_data:
+  vision_weights:

@@ -1,6 +1,8 @@
+use aust_calendar::CalendarService;
 use aust_core::Config;
 use aust_llm_providers::LlmProvider;
 use aust_storage::StorageProvider;
+use aust_volume_estimator::VisionServiceClient;
 use sqlx::PgPool;
 use std::sync::Arc;
 
@@ -10,6 +12,8 @@ pub struct AppState {
     pub db: PgPool,
     pub llm: Arc<dyn LlmProvider>,
     pub storage: Arc<dyn StorageProvider>,
+    pub calendar: Arc<CalendarService>,
+    pub vision_service: Option<VisionServiceClient>,
 }
 
 impl AppState {
@@ -18,12 +22,16 @@ impl AppState {
         db: PgPool,
         llm: Arc<dyn LlmProvider>,
         storage: Arc<dyn StorageProvider>,
+        calendar: Arc<CalendarService>,
+        vision_service: Option<VisionServiceClient>,
     ) -> Self {
         Self {
             config: Arc::new(config),
             db,
             llm,
             storage,
+            calendar,
+            vision_service,
         }
     }
 }

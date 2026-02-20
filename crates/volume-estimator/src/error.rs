@@ -16,4 +16,7 @@ pub enum VolumeError {
 
     #[error("Invalid data: {0}")]
     InvalidData(String),
+
+    #[error("External service error: {0}")]
+    ExternalService(String),
 }

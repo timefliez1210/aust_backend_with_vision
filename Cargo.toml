@@ -17,9 +17,11 @@ license = "MIT"
 
 [dependencies]
 aust-api = { workspace = true }
+aust-calendar = { workspace = true }
 aust-core = { workspace = true }
 aust-llm-providers = { workspace = true }
 aust-storage = { workspace = true }
+aust-volume-estimator = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
 sqlx = { workspace = true }
@@ -111,6 +113,7 @@ aust-volume-estimator = { path = "crates/volume-estimator" }
 aust-distance-calculator = { path = "crates/distance-calculator" }
 aust-offer-generator = { path = "crates/offer-generator" }
 aust-llm-providers = { path = "crates/llm-providers" }
+aust-calendar = { path = "crates/calendar" }
 aust-storage = { path = "crates/storage" }
 
 [profile.release]

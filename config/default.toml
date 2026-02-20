@@ -42,3 +42,14 @@ admin_chat_id = 0
 [auth]
 jwt_secret = "change_this_in_production_please_use_a_long_random_string"
 jwt_expiry_hours = 24
+
+[calendar]
+default_capacity = 1
+alternatives_count = 3
+search_window_days = 14
+
+[vision_service]
+enabled = false
+base_url = "http://localhost:8090"
+timeout_secs = 120
+max_retries = 1

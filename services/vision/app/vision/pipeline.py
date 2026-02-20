@@ -1,0 +1,189 @@
+from __future__ import annotations
+
+import logging
+import time
+
+import numpy as np
+from PIL import Image
+from scipy.spatial.distance import cosine as cosine_distance
+
+from app.config import settings
+from app.models.schemas import (
+    DetectedItem,
+    EstimateResponse,
+    ItemDimensions,
+    VolumeEstimate,
+)
+from app.vision.depth import DepthEstimator
+from app.vision.detector import Detector
+from app.vision.model_loader import ModelRegistry
+from app.vision.segmenter import Segmenter
+from app.vision.volume import VolumeCalculator
+
+logger = logging.getLogger(__name__)
+
+
+class VisionPipeline:
+    """Orchestrates the full vision pipeline: detect -> segment -> depth -> volume.
+
+    Includes cross-image deduplication to merge the same item seen from
+    multiple angles.
+    """
+
+    def __init__(self, registry: ModelRegistry) -> None:
+        self._detector = Detector(registry)
+        self._segmenter = Segmenter(registry)
+        self._depth_estimator = DepthEstimator(registry)
+        self._volume_calculator = VolumeCalculator()
+        self._similarity_threshold = settings.dedup_similarity_threshold
+
+    def run(
+        self,
+        job_id: str,
+        images: list[Image.Image],
+        detection_threshold: float | None = None,
+    ) -> EstimateResponse:
+        """Execute the full pipeline and return the estimate response."""
+        t0 = time.monotonic()
+        threshold = detection_threshold or settings.detection_threshold
+
+        logger.info("Pipeline start: job_id=%s, images=%d, threshold=%.2f",
+                     job_id, len(images), threshold)
+
+        # Stage 1: Detection
+        detections = self._detector.detect(images, threshold=threshold)
+        if not detections:
+            return EstimateResponse(
+                job_id=job_id,
+                status="completed",
+                detected_items=[],
+                total_volume_m3=0.0,
+                confidence_score=0.0,
+                processing_time_ms=int((time.monotonic() - t0) * 1000),
+            )
+
+        # Stage 2: Segmentation
+        masks_by_image = self._segmenter.segment(images, detections)
+
+        # Stage 3: Depth estimation
+        depth_maps = self._depth_estimator.estimate(images)
+
+        # Stage 4: Volume calculation
+        volume_estimates = self._volume_calculator.estimate_volumes(
+            images, detections, masks_by_image, depth_maps
+        )
+
+        # Stage 5: Cross-image deduplication
+        merged_items = self._deduplicate(volume_estimates)
+
+        total_volume = sum(item.volume_m3 for item in merged_items)
+        avg_confidence = (
+            sum(item.confidence for item in merged_items) / len(merged_items)
+            if merged_items
+            else 0.0
+        )
+
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        logger.info(
+            "Pipeline complete: job_id=%s, items=%d, total_volume=%.3f m3, time=%d ms",
+            job_id, len(merged_items), total_volume, elapsed_ms,
+        )
+
+        return EstimateResponse(
+            job_id=job_id,
+            status="completed",
+            detected_items=merged_items,
+            total_volume_m3=round(total_volume, 4),
+            confidence_score=round(avg_confidence, 3),
+            processing_time_ms=elapsed_ms,
+        )
+
+    def _deduplicate(self, estimates: list[VolumeEstimate]) -> list[DetectedItem]:
+        """Merge duplicate items seen across multiple images.
+
+        Uses label matching + feature vector cosine similarity.
+        Items with the same label and similarity above the threshold
+        are considered the same physical object.
+        """
+        if not estimates:
+            return []
+
+        # Group by label
+        label_groups: dict[str, list[VolumeEstimate]] = {}
+        for est in estimates:
+            label_groups.setdefault(est.label.lower(), []).append(est)
+
+        merged_items: list[DetectedItem] = []
+
+        for label, group in label_groups.items():
+            clusters = self._cluster_by_similarity(group)
+            for cluster in clusters:
+                merged = self._merge_cluster(cluster)
+                merged_items.append(merged)
+
+        return merged_items
+
+    def _cluster_by_similarity(
+        self, estimates: list[VolumeEstimate]
+    ) -> list[list[VolumeEstimate]]:
+        """Cluster estimates of the same label by feature vector similarity.
+
+        Simple greedy clustering: for each estimate, either add to an
+        existing cluster if similar enough, or start a new cluster.
+        """
+        clusters: list[list[VolumeEstimate]] = []
+
+        for est in estimates:
+            placed = False
+            if est.feature_vector:
+                for cluster in clusters:
+                    representative = cluster[0]
+                    if representative.feature_vector:
+                        similarity = 1.0 - cosine_distance(
+                            est.feature_vector, representative.feature_vector
+                        )
+                        if similarity >= self._similarity_threshold:
+                            cluster.append(est)
+                            placed = True
+                            break
+
+            if not placed:
+                clusters.append([est])
+
+        return clusters
+
+    @staticmethod
+    def _merge_cluster(cluster: list[VolumeEstimate]) -> DetectedItem:
+        """Merge a cluster of duplicate observations into a single DetectedItem.
+
+        Takes the observation with the highest confidence as the primary,
+        and averages dimensions across all observations.
+        """
+        best = max(cluster, key=lambda e: e.confidence)
+
+        # Average dimensions across observations for stability
+        avg_length = np.mean([e.dimensions.length_m for e in cluster])
+        avg_width = np.mean([e.dimensions.width_m for e in cluster])
+        avg_height = np.mean([e.dimensions.height_m for e in cluster])
+        avg_volume = float(avg_length * avg_width * avg_height)
+
+        # Collect which images this item appeared in
+        seen_in = sorted({e.image_index for e in cluster})
+
+        # Boost confidence when seen in multiple images
+        max_conf = best.confidence
+        multi_image_bonus = min(0.1 * (len(seen_in) - 1), 0.2)
+        boosted_confidence = min(max_conf + multi_image_bonus, 1.0)
+
+        return DetectedItem(
+            name=best.label,
+            volume_m3=round(avg_volume, 4),
+            dimensions=ItemDimensions(
+                length_m=round(float(avg_length), 3),
+                width_m=round(float(avg_width), 3),
+                height_m=round(float(avg_height), 3),
+            ),
+            confidence=round(boosted_confidence, 3),
+            seen_in_images=seen_in,
+            category=best.category,
+        )
