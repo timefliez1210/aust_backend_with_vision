@@ -1,7 +1,41 @@
 use aust_core::models::{InquirySource, MovingInquiry, ParsedEmail};
 use chrono::NaiveDate;
+use serde::Deserialize;
 use tracing::{debug, info};
 use uuid::Uuid;
+
+/// JSON form submission from send-mail.php (attached as .json file).
+#[derive(Debug, Deserialize)]
+struct FormSubmission {
+    #[serde(rename = "form-name")]
+    form_name: Option<String>,
+    name: Option<String>,
+    email: Option<String>,
+    phone: Option<String>,
+    wunschtermin: Option<String>,
+    auszugsadresse: Option<String>,
+    #[serde(rename = "etage-auszug")]
+    etage_auszug: Option<String>,
+    #[serde(rename = "halteverbot-auszug")]
+    halteverbot_auszug: Option<String>,
+    einzugsadresse: Option<String>,
+    #[serde(rename = "etage-einzug")]
+    etage_einzug: Option<String>,
+    #[serde(rename = "halteverbot-einzug")]
+    halteverbot_einzug: Option<String>,
+    #[serde(rename = "zwischenstopp-adresse")]
+    zwischenstopp_adresse: Option<String>,
+    #[serde(rename = "etage-zwischenstopp")]
+    etage_zwischenstopp: Option<String>,
+    #[serde(rename = "halteverbot-zwischenstopp")]
+    halteverbot_zwischenstopp: Option<String>,
+    #[serde(rename = "umzugsvolumen-m3")]
+    umzugsvolumen_m3: Option<String>,
+    #[serde(rename = "gegenstaende-liste")]
+    gegenstaende_liste: Option<String>,
+    zusatzleistungen: Option<String>,
+    nachricht: Option<String>,
+}
 
 pub struct EmailParser;
 
@@ -14,6 +48,11 @@ impl EmailParser {
     /// structured data as possible. Works for both form submissions and
     /// free-text emails.
     pub fn parse_inquiry(&self, email: &ParsedEmail) -> MovingInquiry {
+        // Try JSON attachment first (most reliable for form submissions)
+        if let Some(inquiry) = self.try_parse_json_attachment(email) {
+            return inquiry;
+        }
+
         let body = &email.body_text;
         let source = self.detect_source(body);
 
@@ -51,12 +90,96 @@ impl EmailParser {
         }
     }
 
+    /// Try to parse a JSON attachment from the email (send-mail.php form data).
+    fn try_parse_json_attachment(&self, email: &ParsedEmail) -> Option<MovingInquiry> {
+        let json_attachment = email.attachments.iter().find(|a| {
+            a.content_type.contains("json")
+                || a.filename.ends_with(".json")
+        })?;
+
+        let json_str = std::str::from_utf8(&json_attachment.data).ok()?;
+        let form: FormSubmission = match serde_json::from_str(json_str) {
+            Ok(f) => f,
+            Err(e) => {
+                debug!("JSON attachment parse failed: {e}");
+                return None;
+            }
+        };
+
+        info!(
+            "Parsed JSON form attachment: name={:?}, email={:?}, form={:?}",
+            form.name, form.email, form.form_name
+        );
+
+        let has_photos = email
+            .attachments
+            .iter()
+            .any(|a| a.content_type.starts_with("image/"));
+        let photo_count = email
+            .attachments
+            .iter()
+            .filter(|a| {
+                a.content_type.starts_with("image/") || a.content_type.starts_with("video/")
+            })
+            .count() as u32;
+
+        let preferred_date = form
+            .wunschtermin
+            .as_deref()
+            .and_then(|d| parse_date(d));
+
+        let volume_m3 = form
+            .umzugsvolumen_m3
+            .as_deref()
+            .and_then(|v| v.replace(',', ".").trim().parse::<f64>().ok());
+
+        let services = form.zusatzleistungen.as_deref().unwrap_or("");
+        let services_lower = services.to_lowercase();
+        let without_demontage = services_lower.replace("demontage", "");
+
+        let has_intermediate = form.zwischenstopp_adresse.is_some();
+
+        Some(MovingInquiry {
+            id: Uuid::now_v7(),
+            quote_id: None,
+            source: InquirySource::QuoteForm,
+            name: form.name,
+            email: form.email.unwrap_or_else(|| email.from.clone()),
+            phone: form.phone,
+            preferred_date,
+            departure_address: form.auszugsadresse,
+            departure_floor: form.etage_auszug,
+            departure_parking_ban: Some(form.halteverbot_auszug.as_deref() == Some("on")),
+            has_intermediate_stop: has_intermediate,
+            intermediate_address: form.zwischenstopp_adresse,
+            intermediate_floor: form.etage_zwischenstopp,
+            intermediate_parking_ban: Some(form.halteverbot_zwischenstopp.as_deref() == Some("on")),
+            arrival_address: form.einzugsadresse,
+            arrival_floor: form.etage_einzug,
+            arrival_parking_ban: Some(form.halteverbot_einzug.as_deref() == Some("on")),
+            volume_m3,
+            items_list: form.gegenstaende_liste,
+            has_photos,
+            photo_count,
+            service_packing: services_lower.contains("einpack"),
+            service_assembly: without_demontage.contains("montage"),
+            service_disassembly: services_lower.contains("demontage"),
+            service_storage: services_lower.contains("einlagerung")
+                || services_lower.contains("lagerung"),
+            service_disposal: services_lower.contains("entsorgung"),
+            notes: form.nachricht,
+        })
+    }
+
     /// Detect whether the email body is a structured form submission or free-text.
     fn detect_source(&self, body: &str) -> InquirySource {
         let lower = body.to_lowercase();
 
-        // The website's send-mail.php generates emails with these markers
-        if lower.contains("kostenloses angebot") && lower.contains("auszugsadresse") {
+        // The website's send-mail.php generates emails with these markers.
+        // "Angebotsanfrage" covers both "Neue Angebotsanfrage" and "Kostenloses Angebot" variants.
+        if (lower.contains("kostenloses angebot") || lower.contains("angebotsanfrage"))
+            && lower.contains("auszugsadresse")
+        {
             InquirySource::QuoteForm
         } else if lower.contains("neue kontaktanfrage") || lower.contains("kontaktformular") {
             InquirySource::ContactForm
@@ -66,7 +189,9 @@ impl EmailParser {
     }
 
     /// Parse a "Kostenloses Angebot" form submission email.
-    /// These have a known structure from send-mail.php.
+    /// Handles two formats:
+    /// 1. Flat: "Auszugsadresse: ...", "Etage Auszug: ...", "Halteverbot Auszug: Ja"
+    /// 2. Sectioned: "--- Auszugsadresse ---" followed by "Adresse: ...", "Etage: ...", "Halteverbot: Ja"
     fn parse_quote_form(
         &self,
         email: &ParsedEmail,
@@ -76,25 +201,43 @@ impl EmailParser {
         let body = &email.body_text;
 
         let name = extract_field(body, "Name");
-        let form_email = extract_field(body, "E-Mail");
+        let form_email = extract_field(body, "E-Mail")
+            .or_else(|| extract_field(body, "Email"))
+            .or_else(|| extract_section_field(body, "Kontaktdaten", "E-Mail"))
+            .or_else(|| extract_section_field(body, "Kontaktdaten", "Email"))
+            .or_else(|| extract_email_from_body(body, &email.from));
+
+        debug!("Extracted form_email={:?} (from={})", form_email, email.from);
+
         let phone = extract_field(body, "Telefon");
         let preferred_date = extract_field(body, "Wunschtermin").and_then(|d| parse_date(&d));
 
-        let departure_address = extract_field(body, "Auszugsadresse");
-        let departure_floor = extract_field(body, "Etage Auszug");
-        let departure_parking_ban = extract_bool_field(body, "Halteverbot Auszug");
+        // Try flat format first, fall back to section-based format
+        let departure_address = extract_field(body, "Auszugsadresse")
+            .or_else(|| extract_section_field(body, "Auszugsadresse", "Adresse"));
+        let departure_floor = extract_field(body, "Etage Auszug")
+            .or_else(|| extract_section_field(body, "Auszugsadresse", "Etage"));
+        let departure_parking_ban = extract_bool_field(body, "Halteverbot Auszug")
+            .or_else(|| extract_section_bool(body, "Auszugsadresse", "Halteverbot"));
 
-        let intermediate_address = extract_field(body, "Zwischenstopp");
-        let intermediate_floor = extract_field(body, "Etage Zwischenstopp");
-        let intermediate_parking_ban = extract_bool_field(body, "Halteverbot Zwischenstopp");
+        let intermediate_address = extract_field(body, "Zwischenstopp")
+            .or_else(|| extract_section_field(body, "Zwischenstopp", "Adresse"));
+        let intermediate_floor = extract_field(body, "Etage Zwischenstopp")
+            .or_else(|| extract_section_field(body, "Zwischenstopp", "Etage"));
+        let intermediate_parking_ban = extract_bool_field(body, "Halteverbot Zwischenstopp")
+            .or_else(|| extract_section_bool(body, "Zwischenstopp", "Halteverbot"));
         let has_intermediate_stop = intermediate_address.is_some();
 
-        let arrival_address = extract_field(body, "Einzugsadresse");
-        let arrival_floor = extract_field(body, "Etage Einzug");
-        let arrival_parking_ban = extract_bool_field(body, "Halteverbot Einzug");
+        let arrival_address = extract_field(body, "Einzugsadresse")
+            .or_else(|| extract_section_field(body, "Einzugsadresse", "Adresse"));
+        let arrival_floor = extract_field(body, "Etage Einzug")
+            .or_else(|| extract_section_field(body, "Einzugsadresse", "Etage"));
+        let arrival_parking_ban = extract_bool_field(body, "Halteverbot Einzug")
+            .or_else(|| extract_section_bool(body, "Einzugsadresse", "Halteverbot"));
 
         let volume_m3 = extract_field(body, "Umzugsvolumen")
             .or_else(|| extract_field(body, "Volumen"))
+            .or_else(|| extract_field(body, "Geschätztes Volumen"))
             .and_then(|v| {
                 v.replace("m³", "")
                     .replace("m3", "")
@@ -104,8 +247,9 @@ impl EmailParser {
                     .ok()
             });
 
-        let items_list = extract_field(body, "Gegenstände")
-            .or_else(|| extract_field(body, "Gegenstaende"));
+        // Items can span multiple lines: "Gegenstände: 1x Sofa\n1x Tisch\n..."
+        let items_list = extract_multiline_field(body, "Gegenstände")
+            .or_else(|| extract_multiline_field(body, "Gegenstaende"));
 
         let services_text = extract_field(body, "Zusatzleistungen").unwrap_or_default();
         let services_lower = services_text.to_lowercase();
@@ -114,8 +258,8 @@ impl EmailParser {
             .or_else(|| extract_field(body, "Bemerkung"));
 
         debug!(
-            "Parsed quote form: name={:?}, departure={:?}, arrival={:?}, volume={:?}",
-            name, departure_address, arrival_address, volume_m3
+            "Parsed quote form: name={:?}, departure={:?}, arrival={:?}, volume={:?}, parking_ban_dep={:?}, parking_ban_arr={:?}",
+            name, departure_address, arrival_address, volume_m3, departure_parking_ban, arrival_parking_ban
         );
 
         MovingInquiry {
@@ -141,8 +285,12 @@ impl EmailParser {
             has_photos,
             photo_count,
             service_packing: services_lower.contains("einpack"),
-            service_assembly: services_lower.contains("montage")
-                && !services_lower.contains("demontage"),
+            service_assembly: {
+                // Check for Montage even when Demontage is also present:
+                // remove "demontage" first, then check if "montage" remains
+                let without_demontage = services_lower.replace("demontage", "");
+                without_demontage.contains("montage")
+            },
             service_disassembly: services_lower.contains("demontage"),
             service_storage: services_lower.contains("einlagerung")
                 || services_lower.contains("lagerung"),
@@ -230,6 +378,131 @@ fn extract_bool_field(body: &str, key: &str) -> Option<bool> {
     })
 }
 
+/// Extract a field from within a section delimited by "--- SectionName ---".
+/// Scans lines after the section header until the next section or end of block.
+fn extract_section_field(body: &str, section: &str, key: &str) -> Option<String> {
+    let section_lower = section.to_lowercase();
+    let key_lower = key.to_lowercase();
+    let mut in_section = false;
+
+    for line in body.lines() {
+        let trimmed = line.trim();
+        let lower = trimmed.to_lowercase();
+
+        // Check for section headers: "--- SectionName ---" or "=== SectionName ==="
+        if (lower.contains("---") || lower.contains("==="))
+            && lower.contains(&section_lower)
+        {
+            in_section = true;
+            continue;
+        }
+
+        // Another section starts — stop
+        if in_section && (trimmed.starts_with("---") || trimmed.starts_with("===")) {
+            break;
+        }
+
+        if in_section {
+            if let Some(rest) = lower.strip_prefix(&key_lower) {
+                let rest_trimmed = rest.trim_start_matches(':').trim_start_matches(' ').trim();
+                if !rest_trimmed.is_empty() && rest_trimmed != "-" && rest_trimmed != "keine" {
+                    // Return the original (non-lowered) value
+                    let orig_rest = trimmed[key.len()..].trim_start_matches(':').trim_start_matches(' ').trim();
+                    return Some(orig_rest.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Extract a boolean from within a section.
+fn extract_section_bool(body: &str, section: &str, key: &str) -> Option<bool> {
+    extract_section_field(body, section, key).map(|v| {
+        let lower = v.to_lowercase();
+        lower.contains("ja") || lower.contains("yes") || lower.contains("true")
+    })
+}
+
+/// Extract a multi-line field value. The first line is "Key: value",
+/// continuation lines start with a digit+x pattern (e.g. "1x Sofa...")
+/// or any non-labeled line until the next "Key:" field.
+fn extract_multiline_field(body: &str, key: &str) -> Option<String> {
+    let mut lines_iter = body.lines().peekable();
+    let mut result_lines = Vec::new();
+    let mut found = false;
+
+    while let Some(line) = lines_iter.next() {
+        let trimmed = line.trim();
+
+        if !found {
+            // Look for the key
+            if let Some(rest) = trimmed.strip_prefix(key) {
+                let rest = rest.trim_start_matches(':').trim_start_matches(' ').trim();
+                if !rest.is_empty() && rest != "-" && rest != "Keine" && rest != "keine" {
+                    result_lines.push(rest.to_string());
+                    found = true;
+                }
+            }
+        } else {
+            // Continuation: lines starting with digits (e.g., "1x ...") or non-empty lines
+            // that don't look like a new "Key: Value" field
+            if trimmed.is_empty() {
+                continue; // skip blank lines within items
+            }
+
+            // Stop at section headers or new labeled fields
+            if trimmed.starts_with("---") || trimmed.starts_with("===") {
+                break;
+            }
+
+            // Check if this looks like a new field (contains ":" after a word)
+            if let Some(colon_pos) = trimmed.find(':') {
+                let before_colon = &trimmed[..colon_pos];
+                // If the part before ":" is a label (letters/spaces, no digits at start),
+                // it's a new field — stop collecting
+                if !before_colon.is_empty()
+                    && before_colon.chars().next().map(|c| c.is_alphabetic()).unwrap_or(false)
+                    && !before_colon.contains("m³")
+                    && !before_colon.contains("m3")
+                {
+                    break;
+                }
+            }
+
+            result_lines.push(trimmed.to_string());
+        }
+    }
+
+    if result_lines.is_empty() {
+        None
+    } else {
+        Some(result_lines.join("\n"))
+    }
+}
+
+/// Last-resort email extraction: scan the body for email addresses
+/// and return the first one that isn't the company/sender address.
+fn extract_email_from_body(body: &str, sender: &str) -> Option<String> {
+    let sender_lower = sender.to_lowercase();
+    // Simple email regex: word chars + dots/hyphens @ domain
+    for word in body.split_whitespace() {
+        let word = word.trim_matches(|c: char| c == '<' || c == '>' || c == '(' || c == ')' || c == ',');
+        if word.contains('@') && word.contains('.') {
+            let candidate = word.to_lowercase();
+            // Skip the sender/company address
+            if candidate != sender_lower
+                && !candidate.contains("aust-umzuege")
+                && !candidate.contains("noreply")
+                && !candidate.contains("no-reply")
+            {
+                return Some(word.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Parse a date string in common German formats.
 fn parse_date(s: &str) -> Option<NaiveDate> {
     let s = s.trim();
@@ -298,6 +571,10 @@ mod tests {
         let quote_body = "=== Kostenloses Angebot ===\nAuszugsadresse: Musterstr. 1";
         assert_eq!(parser.detect_source(quote_body), InquirySource::QuoteForm);
 
+        // Also detect "Neue Angebotsanfrage" variant
+        let quote_body2 = "=== Neue Angebotsanfrage ===\n--- Auszugsadresse ---\nAdresse: Str 1";
+        assert_eq!(parser.detect_source(quote_body2), InquirySource::QuoteForm);
+
         let contact_body = "=== Neue Kontaktanfrage ===\nName: Max";
         assert_eq!(
             parser.detect_source(contact_body),
@@ -306,6 +583,167 @@ mod tests {
 
         let direct = "Hallo, ich möchte umziehen...";
         assert_eq!(parser.detect_source(direct), InquirySource::DirectEmail);
+    }
+
+    #[test]
+    fn test_section_field_extraction() {
+        let body = "=== Neue Angebotsanfrage ===\n\
+            --- Auszugsadresse ---\n\
+            Adresse: Steinbergstr. 3, 31139 Hildesheim\n\
+            Etage: 2. Stock\n\
+            Halteverbot: Ja\n\
+            \n\
+            --- Einzugsadresse ---\n\
+            Adresse: Kaiserstr. 32, 31134 Hildesheim\n\
+            Etage: 3. Stock\n\
+            Halteverbot: Ja\n";
+
+        assert_eq!(
+            extract_section_field(body, "Auszugsadresse", "Adresse"),
+            Some("Steinbergstr. 3, 31139 Hildesheim".to_string())
+        );
+        assert_eq!(
+            extract_section_field(body, "Auszugsadresse", "Etage"),
+            Some("2. Stock".to_string())
+        );
+        assert_eq!(
+            extract_section_bool(body, "Auszugsadresse", "Halteverbot"),
+            Some(true)
+        );
+        assert_eq!(
+            extract_section_field(body, "Einzugsadresse", "Adresse"),
+            Some("Kaiserstr. 32, 31134 Hildesheim".to_string())
+        );
+        assert_eq!(
+            extract_section_field(body, "Einzugsadresse", "Etage"),
+            Some("3. Stock".to_string())
+        );
+    }
+
+    #[test]
+    fn test_multiline_field_extraction() {
+        let body = "Gegenstände: 1x Bettumbau (0.30 m³)\n\
+            1x Französisches Bett komplett (1.50 m³)\n\
+            1x Nachttisch (0.20 m³)\n\
+            Zusatzleistungen: Einpackservice\n";
+
+        let items = extract_multiline_field(body, "Gegenstände").unwrap();
+        assert!(items.contains("Bettumbau"));
+        assert!(items.contains("Französisches Bett"));
+        assert!(items.contains("Nachttisch"));
+        // Should NOT include the next field
+        assert!(!items.contains("Zusatzleistungen"));
+    }
+
+    #[test]
+    fn test_json_attachment_parsing() {
+        use aust_core::models::EmailAttachment;
+
+        let parser = EmailParser::new();
+
+        let json = r#"{
+            "form-name": "kostenloses-angebot",
+            "umzugsvolumen-m3": "4.90",
+            "gegenstaende-liste": "1x Schreibtisch über 1,6 m (1.70 m³)\n1x Tisch über 1,2 m (0.80 m³)",
+            "zusatzleistungen": "Möbeldemontage, Einpackservice",
+            "name": "Clemens Fabig",
+            "email": "crfabig@googlemail.com",
+            "phone": "015203080947",
+            "wunschtermin": "2026-02-24",
+            "auszugsadresse": "Steinbergstr. 3, 31139 Hildesheim",
+            "etage-auszug": "1. Stock",
+            "halteverbot-auszug": "on",
+            "einzugsadresse": "Kaiserstr. 32, 31134 Hildsheim",
+            "etage-einzug": "3. Stock",
+            "halteverbot-einzug": "on",
+            "nachricht": "Termin is ein wenig flexibel",
+            "datenschutz-akzeptiert": "on",
+            "_submitted_at": "2026-02-21T10:27:15+01:00"
+        }"#;
+
+        let email = ParsedEmail {
+            from: "umzug@example.com".to_string(),
+            to: "umzug@example.com".to_string(),
+            subject: "Neue Angebotsanfrage".to_string(),
+            body_text: "some text body".to_string(),
+            body_html: None,
+            message_id: "test@test".to_string(),
+            date: chrono::Utc::now(),
+            attachments: vec![EmailAttachment {
+                filename: "form-data.json".to_string(),
+                content_type: "application/json".to_string(),
+                data: json.as_bytes().to_vec(),
+            }],
+        };
+
+        let inquiry = parser.parse_inquiry(&email);
+
+        assert_eq!(inquiry.source, InquirySource::QuoteForm);
+        assert_eq!(inquiry.name, Some("Clemens Fabig".to_string()));
+        assert_eq!(inquiry.email, "crfabig@googlemail.com");
+        assert_eq!(inquiry.phone, Some("015203080947".to_string()));
+        assert_eq!(
+            inquiry.preferred_date,
+            Some(NaiveDate::from_ymd_opt(2026, 2, 24).unwrap())
+        );
+        assert_eq!(
+            inquiry.departure_address,
+            Some("Steinbergstr. 3, 31139 Hildesheim".to_string())
+        );
+        assert_eq!(inquiry.departure_floor, Some("1. Stock".to_string()));
+        assert_eq!(inquiry.departure_parking_ban, Some(true));
+        assert_eq!(inquiry.arrival_floor, Some("3. Stock".to_string()));
+        assert_eq!(inquiry.arrival_parking_ban, Some(true));
+        assert_eq!(inquiry.volume_m3, Some(4.9));
+        assert!(inquiry.items_list.is_some());
+        assert!(inquiry.service_packing);
+        assert!(inquiry.service_disassembly);
+        assert!(!inquiry.service_assembly); // only Demontage, not Montage
+        assert_eq!(
+            inquiry.notes,
+            Some("Termin is ein wenig flexibel".to_string())
+        );
+    }
+
+    #[test]
+    fn test_services_parsing() {
+        let parser = EmailParser::new();
+
+        // Simulate a quote form email with multiple services including both Montage and Demontage
+        let body = "=== Neue Angebotsanfrage ===\n\
+            Name: Max Mustermann\n\
+            E-Mail: max@example.com\n\
+            Telefon: 0176 12345678\n\
+            Wunschtermin: 15.03.2025\n\
+            --- Auszugsadresse ---\n\
+            Adresse: Musterstr. 1, 31139 Hildesheim\n\
+            Etage: 2. Stock\n\
+            Halteverbot: Ja\n\
+            --- Einzugsadresse ---\n\
+            Adresse: Zielstr. 5, 30159 Hannover\n\
+            Etage: EG\n\
+            Halteverbot: Nein\n\
+            Umzugsvolumen: 15 m³\n\
+            Zusatzleistungen: Einpackservice, Möbelmontage, Möbeldemontage, Entsorgung von Sperrmüll\n\
+            Nachricht: Bitte um Angebot\n";
+
+        let email = ParsedEmail {
+            from: "form@aust-umzuege.de".to_string(),
+            to: "umzug@example.com".to_string(),
+            subject: "Neue Angebotsanfrage".to_string(),
+            body_text: body.to_string(),
+            body_html: None,
+            message_id: "test@test".to_string(),
+            date: chrono::Utc::now(),
+            attachments: vec![],
+        };
+
+        let inquiry = parser.parse_inquiry(&email);
+
+        assert!(inquiry.service_packing, "Einpackservice should be detected");
+        assert!(inquiry.service_assembly, "Möbelmontage should be detected even when Demontage is also present");
+        assert!(inquiry.service_disassembly, "Möbeldemontage should be detected");
+        assert!(inquiry.service_disposal, "Entsorgung should be detected");
     }
 
     #[test]

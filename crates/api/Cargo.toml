@@ -33,3 +33,5 @@ argon2 = { workspace = true }
 redis = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
+lettre = { workspace = true }
+reqwest = { workspace = true }

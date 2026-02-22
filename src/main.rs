@@ -1,7 +1,8 @@
 use anyhow::Result;
-use aust_api::{create_pool, create_router, AppState};
+use aust_api::{create_pool, create_router, run_offer_event_handler, AppState};
 use aust_calendar::CalendarService;
 use aust_core::Config;
+use aust_email_agent::EmailProcessor;
 use config::{ConfigBuilder, Environment, File};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -9,11 +10,14 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Load .env file (ignore if missing)
+    let _ = dotenvy::dotenv();
+
     // Initialize tracing
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "aust_backend=debug,aust_api=debug,tower_http=debug".into()),
+                .unwrap_or_else(|_| "aust_backend=debug,aust_api=debug,aust_email_agent=debug,tower_http=debug".into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
@@ -71,13 +75,42 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Create offer event channel (email agent → orchestrator)
+    let (offer_tx, offer_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    // Create email processor (needs LLM + calendar clones before they move into AppState)
+    let llm_for_email = llm.clone();
+    let calendar_for_email = calendar.clone();
+    let email_config = config.email.clone();
+    let telegram_config = config.telegram.clone();
+
     // Create app state
     let state = AppState::new(config.clone(), db, llm, storage, calendar, vision_service);
 
-    // Create router
+    // Start email processor as background task
+    let poll_interval = config.email.poll_interval_secs;
+    tokio::spawn(async move {
+        let mut processor = EmailProcessor::new(
+            email_config,
+            telegram_config,
+            llm_for_email,
+            calendar_for_email,
+        );
+        processor.set_offer_channel(offer_tx);
+        processor.run(poll_interval).await;
+    });
+    tracing::info!("Email processor started");
+
+    // Start offer event handler (receives events from email agent's Telegram poller)
+    let offer_state = Arc::new(state.clone());
+    tokio::spawn(async move {
+        run_offer_event_handler(offer_state, offer_rx).await;
+    });
+    tracing::info!("Offer event handler started");
+
+    // Create router and start server
     let app = create_router(state);
 
-    // Start server
     let addr = SocketAddr::from(([0, 0, 0, 0], config.server.port));
     tracing::info!("Starting server on {}", addr);
 

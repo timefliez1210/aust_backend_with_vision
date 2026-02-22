@@ -1,7 +1,7 @@
 use crate::{StorageError, StorageProvider};
 use async_trait::async_trait;
 use aws_sdk_s3::{
-    config::{Credentials, Region},
+    config::{BehaviorVersion, Credentials, Region},
     presigning::PresigningConfig,
     primitives::ByteStream,
     Client,
@@ -20,7 +20,9 @@ impl S3Storage {
     pub async fn new(config: &StorageConfig) -> Result<Self, StorageError> {
         let region = Region::new(config.region.clone().unwrap_or_else(|| "eu-central-1".to_string()));
 
-        let mut s3_config_builder = aws_sdk_s3::Config::builder().region(region);
+        let mut s3_config_builder = aws_sdk_s3::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(region);
 
         if let Some(endpoint) = &config.endpoint {
             s3_config_builder = s3_config_builder

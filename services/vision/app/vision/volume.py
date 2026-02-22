@@ -12,6 +12,7 @@ from app.models.schemas import (
     ItemDimensions,
     VolumeEstimate,
     classify_item,
+    get_max_volume,
     get_reference_dims,
 )
 
@@ -76,10 +77,33 @@ class VolumeCalculator:
             if abs(scale - 1.0) > 0.01:
                 logger.info("Image %d: applying scale factor %.3f", img_idx, scale)
 
-            # Second pass: apply scale and build final estimates
+            # Second pass: apply scale, filter outliers, and build final estimates
             for raw in raw_estimates:
                 if raw is not None:
                     calibrated = self._apply_scale(raw, scale)
+
+                    # Outlier filtering: reject volumes that exceed category max
+                    max_vol = get_max_volume(calibrated.category)
+                    if calibrated.volume_m3 > max_vol:
+                        logger.warning(
+                            "Outlier filtered: '%s' volume=%.3f m³ exceeds max %.1f m³ for category '%s'",
+                            calibrated.label, calibrated.volume_m3, max_vol, calibrated.category,
+                        )
+                        continue
+
+                    # Reject items with any single dimension > 4m (no household item is that big)
+                    max_dim = max(
+                        calibrated.dimensions.length_m,
+                        calibrated.dimensions.width_m,
+                        calibrated.dimensions.height_m,
+                    )
+                    if max_dim > 4.0:
+                        logger.warning(
+                            "Outlier filtered: '%s' max_dim=%.3f m exceeds 4.0m",
+                            calibrated.label, max_dim,
+                        )
+                        continue
+
                     results.append(calibrated)
 
         logger.info("Volume estimates computed for %d objects", len(results))
@@ -92,11 +116,11 @@ class VolumeCalculator:
     ) -> float:
         """Derive a linear scale factor by comparing estimated vs reference dimensions.
 
-        Uses the highest-confidence detection that has a known reference size.
-        Compares the largest estimated dimension against the largest reference dimension.
+        Uses a confidence-weighted average across ALL detections that have known
+        reference sizes, instead of relying on a single item.
         """
-        best_ratio = None
-        best_confidence = -1.0
+        weighted_sum = 0.0
+        weight_total = 0.0
 
         for det, est in zip(detections, raw_estimates):
             if est is None:
@@ -117,16 +141,20 @@ class VolumeCalculator:
             if est_dims[0] > 0.001:
                 ratio = ref_dims[0] / est_dims[0]
 
-                if det.confidence > best_confidence:
-                    best_confidence = det.confidence
-                    best_ratio = ratio
+                # Skip extreme outliers (likely misdetections)
+                if 0.1 < ratio < 20.0:
+                    weight = det.confidence
+                    weighted_sum += ratio * weight
+                    weight_total += weight
                     logger.info(
                         "Scale ref: '%s' (conf=%.2f) est_max=%.3fm ref_max=%.3fm → ratio=%.3f",
                         det.label, det.confidence, est_dims[0], ref_dims[0], ratio,
                     )
 
-        if best_ratio is not None:
-            return best_ratio
+        if weight_total > 0:
+            avg_ratio = weighted_sum / weight_total
+            logger.info("Weighted average scale factor: %.3f (from %.1f total weight)", avg_ratio, weight_total)
+            return avg_ratio
 
         # Fallback: no known items, return 1.0 (no calibration)
         logger.warning("No known reference items found for scale calibration")

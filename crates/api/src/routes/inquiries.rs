@@ -1,0 +1,550 @@
+//! Inquiry endpoints for photo webapp (Source C) and mobile app (Source D).
+//!
+//! Both endpoints accept multipart form data with customer info, addresses,
+//! service preferences, and image uploads. The mobile endpoint additionally
+//! accepts depth maps and AR metadata.
+//!
+//! Processing flow:
+//! 1. Create/update customer by email
+//! 2. Create origin + destination addresses
+//! 3. Create quote
+//! 4. Upload images to S3
+//! 5. Run volume estimation (vision service → LLM fallback)
+//! 6. Update quote with estimated volume
+//! 7. Auto-generate offer → Telegram approval
+
+use axum::{extract::Multipart, extract::State, routing::post, Json, Router};
+use bytes::Bytes;
+use serde::Serialize;
+use std::sync::Arc;
+use uuid::Uuid;
+
+use crate::{orchestrator, ApiError, AppState};
+use aust_core::models::EstimationMethod;
+use aust_storage::StorageProvider;
+use aust_volume_estimator::VisionAnalyzer;
+
+/// Response returned from both /photo and /mobile endpoints.
+#[derive(Serialize)]
+struct InquiryResponse {
+    quote_id: Uuid,
+    estimation_id: Uuid,
+    customer_id: Uuid,
+    status: String,
+    message: String,
+}
+
+pub fn router() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/photo", post(photo_inquiry))
+        .route("/mobile", post(mobile_inquiry))
+}
+
+/// POST /photo — Photo webapp inquiry (Source C).
+/// Accepts multipart form with customer info, addresses, services, and images.
+async fn photo_inquiry(
+    State(state): State<Arc<AppState>>,
+    multipart: Multipart,
+) -> Result<Json<InquiryResponse>, ApiError> {
+    let parsed = parse_inquiry_form(multipart, false).await?;
+    handle_inquiry(state, parsed).await
+}
+
+/// POST /mobile — Mobile app inquiry (Source D).
+/// Same as /photo, plus depth_maps and ar_metadata fields.
+async fn mobile_inquiry(
+    State(state): State<Arc<AppState>>,
+    multipart: Multipart,
+) -> Result<Json<InquiryResponse>, ApiError> {
+    let parsed = parse_inquiry_form(multipart, true).await?;
+    handle_inquiry(state, parsed).await
+}
+
+/// All parsed fields from the multipart form.
+struct ParsedInquiryForm {
+    name: Option<String>,
+    email: Option<String>,
+    phone: Option<String>,
+    departure_address: Option<String>,
+    departure_floor: Option<String>,
+    departure_parking_ban: Option<bool>,
+    arrival_address: Option<String>,
+    arrival_floor: Option<String>,
+    arrival_parking_ban: Option<bool>,
+    preferred_date: Option<String>,
+    services: Option<String>,
+    message: Option<String>,
+    images: Vec<(Vec<u8>, String)>, // (data, mime_type)
+    depth_maps: Vec<(Vec<u8>, String)>,
+    ar_metadata: Option<String>,
+}
+
+/// Parse the multipart form data into a structured form.
+async fn parse_inquiry_form(
+    mut multipart: Multipart,
+    accept_depth: bool,
+) -> Result<ParsedInquiryForm, ApiError> {
+    let mut form = ParsedInquiryForm {
+        name: None,
+        email: None,
+        phone: None,
+        departure_address: None,
+        departure_floor: None,
+        departure_parking_ban: None,
+        arrival_address: None,
+        arrival_floor: None,
+        arrival_parking_ban: None,
+        preferred_date: None,
+        services: None,
+        message: None,
+        images: Vec::new(),
+        depth_maps: Vec::new(),
+        ar_metadata: None,
+    };
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| ApiError::BadRequest(format!("Ungültige Formulardaten: {e}")))?
+    {
+        let name = field.name().unwrap_or("").to_string();
+        match name.as_str() {
+            "name" => form.name = Some(read_text_field(field).await?),
+            "email" => form.email = Some(read_text_field(field).await?),
+            "phone" => form.phone = Some(read_text_field(field).await?),
+            "departure_address" => form.departure_address = Some(read_text_field(field).await?),
+            "departure_floor" => form.departure_floor = Some(read_text_field(field).await?),
+            "departure_parking_ban" => {
+                let text = read_text_field(field).await?;
+                form.departure_parking_ban = Some(parse_bool_field(&text));
+            }
+            "arrival_address" => form.arrival_address = Some(read_text_field(field).await?),
+            "arrival_floor" => form.arrival_floor = Some(read_text_field(field).await?),
+            "arrival_parking_ban" => {
+                let text = read_text_field(field).await?;
+                form.arrival_parking_ban = Some(parse_bool_field(&text));
+            }
+            "preferred_date" => form.preferred_date = Some(read_text_field(field).await?),
+            "services" => form.services = Some(read_text_field(field).await?),
+            "message" => form.message = Some(read_text_field(field).await?),
+            "images" => {
+                let content_type = field.content_type().unwrap_or("image/jpeg").to_string();
+                if !content_type.starts_with("image/") {
+                    continue;
+                }
+                let data = field
+                    .bytes()
+                    .await
+                    .map_err(|e| ApiError::BadRequest(format!("Bild konnte nicht gelesen werden: {e}")))?;
+                form.images.push((data.to_vec(), content_type));
+            }
+            "depth_maps" if accept_depth => {
+                let content_type = field.content_type().unwrap_or("image/png").to_string();
+                let data = field
+                    .bytes()
+                    .await
+                    .map_err(|e| ApiError::BadRequest(format!("Tiefenkarte konnte nicht gelesen werden: {e}")))?;
+                form.depth_maps.push((data.to_vec(), content_type));
+            }
+            "ar_metadata" if accept_depth => {
+                form.ar_metadata = Some(read_text_field(field).await?);
+            }
+            _ => continue,
+        }
+    }
+
+    Ok(form)
+}
+
+async fn read_text_field(field: axum::extract::multipart::Field<'_>) -> Result<String, ApiError> {
+    field
+        .text()
+        .await
+        .map_err(|e| ApiError::BadRequest(format!("Feld konnte nicht gelesen werden: {e}")))
+}
+
+fn parse_bool_field(value: &str) -> bool {
+    matches!(
+        value.trim().to_lowercase().as_str(),
+        "true" | "1" | "yes" | "ja"
+    )
+}
+
+/// Shared handler for both photo and mobile inquiries.
+async fn handle_inquiry(
+    state: Arc<AppState>,
+    form: ParsedInquiryForm,
+) -> Result<Json<InquiryResponse>, ApiError> {
+    // Validate required fields
+    let name = form
+        .name
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| ApiError::Validation("Name ist erforderlich".into()))?;
+    let email = form
+        .email
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| ApiError::Validation("E-Mail ist erforderlich".into()))?;
+    let departure_address = form
+        .departure_address
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| ApiError::Validation("Auszugsadresse ist erforderlich".into()))?;
+    let arrival_address = form
+        .arrival_address
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| ApiError::Validation("Einzugsadresse ist erforderlich".into()))?;
+
+    if form.images.is_empty() {
+        return Err(ApiError::Validation(
+            "Mindestens ein Bild ist erforderlich".into(),
+        ));
+    }
+
+    let now = chrono::Utc::now();
+
+    // 1. Create or update customer by email
+    let customer_id: Uuid = sqlx::query_as::<_, (Uuid,)>(
+        r#"
+        INSERT INTO customers (id, email, name, phone, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $5)
+        ON CONFLICT (email) DO UPDATE SET
+            name = COALESCE(EXCLUDED.name, customers.name),
+            phone = COALESCE(EXCLUDED.phone, customers.phone),
+            updated_at = $5
+        RETURNING id
+        "#,
+    )
+    .bind(Uuid::now_v7())
+    .bind(&email)
+    .bind(&name)
+    .bind(&form.phone)
+    .bind(now)
+    .fetch_one(&state.db)
+    .await
+    .map(|(id,)| id)
+    .map_err(|e| ApiError::Internal(format!("Kunde konnte nicht erstellt werden: {e}")))?;
+
+    tracing::info!(customer_id = %customer_id, email = %email, "Customer created/updated");
+
+    // 2. Create origin address
+    let (dep_street, dep_city, dep_postal) = parse_address(&departure_address);
+    let origin_id: Uuid = sqlx::query_as::<_, (Uuid,)>(
+        "INSERT INTO addresses (id, street, city, postal_code, floor) VALUES ($1, $2, $3, $4, $5) RETURNING id",
+    )
+    .bind(Uuid::now_v7())
+    .bind(&dep_street)
+    .bind(&dep_city)
+    .bind(&dep_postal)
+    .bind(&form.departure_floor)
+    .fetch_one(&state.db)
+    .await
+    .map(|(id,)| id)
+    .map_err(|e| ApiError::Internal(format!("Auszugsadresse konnte nicht erstellt werden: {e}")))?;
+
+    // 3. Create destination address
+    let (arr_street, arr_city, arr_postal) = parse_address(&arrival_address);
+    let dest_id: Uuid = sqlx::query_as::<_, (Uuid,)>(
+        "INSERT INTO addresses (id, street, city, postal_code, floor) VALUES ($1, $2, $3, $4, $5) RETURNING id",
+    )
+    .bind(Uuid::now_v7())
+    .bind(&arr_street)
+    .bind(&arr_city)
+    .bind(&arr_postal)
+    .bind(&form.arrival_floor)
+    .fetch_one(&state.db)
+    .await
+    .map(|(id,)| id)
+    .map_err(|e| ApiError::Internal(format!("Einzugsadresse konnte nicht erstellt werden: {e}")))?;
+
+    // 4. Parse preferred date
+    let preferred_date_ts = form
+        .preferred_date
+        .as_deref()
+        .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+        .and_then(|d| d.and_hms_opt(10, 0, 0))
+        .map(|dt| chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(dt, chrono::Utc));
+
+    // 5. Build notes from services, parking bans, and message
+    let notes = build_notes(
+        form.services.as_deref(),
+        form.departure_parking_ban,
+        form.arrival_parking_ban,
+        form.message.as_deref(),
+    );
+
+    // 6. Create quote
+    let quote_id = Uuid::now_v7();
+    sqlx::query(
+        r#"
+        INSERT INTO quotes (id, customer_id, origin_address_id, destination_address_id,
+                           status, preferred_date, notes, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
+        "#,
+    )
+    .bind(quote_id)
+    .bind(customer_id)
+    .bind(Some(origin_id))
+    .bind(Some(dest_id))
+    .bind("pending")
+    .bind(preferred_date_ts)
+    .bind(&notes)
+    .bind(now)
+    .execute(&state.db)
+    .await
+    .map_err(|e| ApiError::Internal(format!("Anfrage konnte nicht erstellt werden: {e}")))?;
+
+    tracing::info!(quote_id = %quote_id, "Quote created for inquiry");
+
+    // 7. Upload images to S3
+    let estimation_id = Uuid::now_v7();
+    let s3_keys = upload_images_to_s3(
+        &*state.storage,
+        quote_id,
+        estimation_id,
+        &form.images,
+    )
+    .await?;
+
+    // Upload depth maps if present
+    if !form.depth_maps.is_empty() {
+        if let Err(e) = upload_depth_maps_to_s3(
+            &*state.storage,
+            quote_id,
+            estimation_id,
+            &form.depth_maps,
+        )
+        .await
+        {
+            tracing::warn!("Failed to upload depth maps: {e}");
+        }
+    }
+
+    // 8. Run volume estimation (vision service → LLM fallback)
+    let (total_volume, confidence, result_data, method) =
+        match try_vision_service(&state, &form.images, estimation_id).await {
+            Ok((vol, conf, data)) => {
+                tracing::info!(
+                    estimation_id = %estimation_id,
+                    volume = vol,
+                    "Vision service estimation succeeded"
+                );
+                (vol, conf, data, EstimationMethod::DepthSensor)
+            }
+            Err(e) => {
+                tracing::warn!("Vision service unavailable, falling back to LLM: {e}");
+                fallback_llm_analysis(&state, &form.images).await?
+            }
+        };
+
+    // 9. Build source_data JSON
+    let source_data = serde_json::json!({
+        "source": if form.depth_maps.is_empty() { "photo_webapp" } else { "mobile_app" },
+        "image_count": form.images.len(),
+        "depth_map_count": form.depth_maps.len(),
+        "s3_keys": s3_keys,
+        "ar_metadata": form.ar_metadata.as_deref()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()),
+    });
+
+    // 10. Create volume_estimation record
+    sqlx::query(
+        r#"
+        INSERT INTO volume_estimations (id, quote_id, method, source_data, result_data, total_volume_m3, confidence_score, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        "#,
+    )
+    .bind(estimation_id)
+    .bind(quote_id)
+    .bind(method.as_str())
+    .bind(&source_data)
+    .bind(&result_data)
+    .bind(total_volume)
+    .bind(confidence)
+    .bind(now)
+    .execute(&state.db)
+    .await
+    .map_err(|e| ApiError::Internal(format!("Volumenschätzung konnte nicht gespeichert werden: {e}")))?;
+
+    // 11. Update quote with estimated volume
+    sqlx::query(
+        "UPDATE quotes SET estimated_volume_m3 = $1, status = $2, updated_at = $3 WHERE id = $4",
+    )
+    .bind(total_volume)
+    .bind("volume_estimated")
+    .bind(now)
+    .bind(quote_id)
+    .execute(&state.db)
+    .await?;
+
+    tracing::info!(
+        quote_id = %quote_id,
+        estimation_id = %estimation_id,
+        volume = total_volume,
+        "Volume estimation completed"
+    );
+
+    // 12. Auto-generate offer in background (full pipeline: XLSX → PDF → Telegram)
+    let state_clone = Arc::clone(&state);
+    tokio::spawn(async move {
+        orchestrator::try_auto_generate_offer(state_clone, quote_id).await;
+    });
+
+    Ok(Json(InquiryResponse {
+        quote_id,
+        estimation_id,
+        customer_id,
+        status: "volume_estimated".to_string(),
+        message: "Anfrage erfolgreich erstellt. Angebot wird generiert.".to_string(),
+    }))
+}
+
+/// Upload images to S3 under `estimates/{quote_id}/{estimation_id}/`.
+async fn upload_images_to_s3(
+    storage: &dyn StorageProvider,
+    quote_id: Uuid,
+    estimation_id: Uuid,
+    images: &[(Vec<u8>, String)],
+) -> Result<Vec<String>, ApiError> {
+    let mut s3_keys = Vec::with_capacity(images.len());
+    for (idx, (data, mime_type)) in images.iter().enumerate() {
+        let ext = match mime_type.as_str() {
+            "image/png" => "png",
+            "image/webp" => "webp",
+            _ => "jpg",
+        };
+        let key = format!("estimates/{quote_id}/{estimation_id}/{idx}.{ext}");
+        storage
+            .upload(&key, Bytes::from(data.clone()), mime_type)
+            .await
+            .map_err(|e| ApiError::Internal(format!("Bild-Upload fehlgeschlagen: {e}")))?;
+        s3_keys.push(key);
+    }
+    Ok(s3_keys)
+}
+
+/// Upload depth maps to S3 under `estimates/{quote_id}/{estimation_id}/depth/`.
+async fn upload_depth_maps_to_s3(
+    storage: &dyn StorageProvider,
+    quote_id: Uuid,
+    estimation_id: Uuid,
+    depth_maps: &[(Vec<u8>, String)],
+) -> Result<Vec<String>, ApiError> {
+    let mut s3_keys = Vec::with_capacity(depth_maps.len());
+    for (idx, (data, mime_type)) in depth_maps.iter().enumerate() {
+        let ext = match mime_type.as_str() {
+            "image/png" => "png",
+            _ => "bin",
+        };
+        let key = format!("estimates/{quote_id}/{estimation_id}/depth/{idx}.{ext}");
+        storage
+            .upload(&key, Bytes::from(data.clone()), mime_type)
+            .await
+            .map_err(|e| ApiError::Internal(format!("Tiefenkarten-Upload fehlgeschlagen: {e}")))?;
+        s3_keys.push(key);
+    }
+    Ok(s3_keys)
+}
+
+/// Try the Python vision service for 3D volume estimation.
+/// Sends raw image bytes via multipart upload (Modal doesn't have S3 access).
+async fn try_vision_service(
+    state: &AppState,
+    images: &[(Vec<u8>, String)],
+    job_id: Uuid,
+) -> Result<(f64, f64, Option<serde_json::Value>), ApiError> {
+    let client = state
+        .vision_service
+        .as_ref()
+        .ok_or_else(|| ApiError::Internal("Vision service not configured".into()))?;
+
+    let response = client
+        .estimate_upload(&job_id.to_string(), images)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    let result_data = serde_json::to_value(&response.detected_items).ok();
+    Ok((response.total_volume_m3, response.confidence_score, result_data))
+}
+
+/// Fallback: run LLM-based vision analysis on the raw image data.
+async fn fallback_llm_analysis(
+    state: &AppState,
+    images: &[(Vec<u8>, String)],
+) -> Result<(f64, f64, Option<serde_json::Value>, EstimationMethod), ApiError> {
+    let analyzer = VisionAnalyzer::new(state.llm.clone());
+    let mut total_volume = 0.0;
+    let mut results = Vec::new();
+
+    for (data, mime_type) in images {
+        let result = analyzer
+            .analyze_image(data, mime_type)
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        total_volume += result.total_volume_m3;
+        results.push(result);
+    }
+
+    let avg_confidence =
+        results.iter().map(|r| r.confidence_score).sum::<f64>() / results.len() as f64;
+    let result_data = serde_json::to_value(&results).ok();
+
+    Ok((total_volume, avg_confidence, result_data, EstimationMethod::Vision))
+}
+
+/// Parse a free-form address string into (street, city, postal_code).
+fn parse_address(addr: &str) -> (String, String, String) {
+    let parts: Vec<&str> = addr.splitn(2, ',').collect();
+    if parts.len() == 2 {
+        let street = parts[0].trim().to_string();
+        let city_part = parts[1].trim();
+        let mut postal = String::new();
+        let mut city = city_part.to_string();
+        for word in city_part.split_whitespace() {
+            if word.len() >= 4 && word.len() <= 5 && word.chars().all(|c| c.is_ascii_digit()) {
+                postal = word.to_string();
+                city = city_part.replace(word, "").trim().to_string();
+                break;
+            }
+        }
+        (street, city, postal)
+    } else {
+        (addr.to_string(), String::new(), String::new())
+    }
+}
+
+/// Build notes string from services, parking bans, and optional message.
+fn build_notes(
+    services: Option<&str>,
+    departure_parking_ban: Option<bool>,
+    arrival_parking_ban: Option<bool>,
+    message: Option<&str>,
+) -> String {
+    let mut parts = Vec::new();
+
+    if let Some(services_str) = services {
+        for service in services_str.split(',') {
+            match service.trim().to_lowercase().as_str() {
+                "packing" => parts.push("Verpackungsservice".to_string()),
+                "assembly" => parts.push("Montage".to_string()),
+                "disassembly" => parts.push("Demontage".to_string()),
+                "storage" => parts.push("Einlagerung".to_string()),
+                "disposal" => parts.push("Entsorgung".to_string()),
+                _ => {}
+            }
+        }
+    }
+
+    if departure_parking_ban == Some(true) {
+        parts.push("Halteverbot Auszug".to_string());
+    }
+    if arrival_parking_ban == Some(true) {
+        parts.push("Halteverbot Einzug".to_string());
+    }
+
+    if let Some(msg) = message {
+        if !msg.trim().is_empty() {
+            parts.push(msg.trim().to_string());
+        }
+    }
+
+    parts.join(", ")
+}

@@ -10,9 +10,8 @@ use sqlx::FromRow;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::{ApiError, AppState};
+use crate::{orchestrator, ApiError, AppState};
 use aust_core::models::{EstimationMethod, InventoryForm, VolumeEstimation};
-use aust_volume_estimator::vision_service::{VisionServiceOptions, VisionServiceRequest};
 use aust_volume_estimator::VisionAnalyzer;
 
 pub fn router() -> Router<Arc<AppState>> {
@@ -178,6 +177,11 @@ async fn vision_estimate(
     .execute(&state.db)
     .await?;
 
+    // Auto-generate offer in background
+    let state_clone = state.clone();
+    let qid = request.quote_id;
+    tokio::spawn(async move { orchestrator::try_auto_generate_offer(state_clone, qid).await });
+
     Ok(Json(VolumeEstimation::from(row)))
 }
 
@@ -239,7 +243,7 @@ async fn depth_sensor_estimate(
 
     // Try the vision service first, fall back to LLM analysis
     let (total_volume, confidence, result_data, method) =
-        match try_vision_service(&state, &s3_keys, id).await {
+        match try_vision_service(&state, &images, id).await {
             Ok((vol, conf, data)) => (vol, conf, data, EstimationMethod::DepthSensor),
             Err(e) => {
                 tracing::warn!("Vision service failed, falling back to LLM analysis: {e}");
@@ -282,13 +286,18 @@ async fn depth_sensor_estimate(
     .execute(&state.db)
     .await?;
 
+    // Auto-generate offer in background
+    let state_clone = state.clone();
+    tokio::spawn(async move { orchestrator::try_auto_generate_offer(state_clone, quote_id).await });
+
     Ok(Json(VolumeEstimation::from(row)))
 }
 
 /// Try the Python vision service for 3D volume estimation.
+/// Sends raw image bytes directly via multipart upload.
 async fn try_vision_service(
     state: &AppState,
-    s3_keys: &[String],
+    images: &[(Vec<u8>, String)],
     job_id: Uuid,
 ) -> Result<(f64, f64, Option<serde_json::Value>), ApiError> {
     let client = state
@@ -296,16 +305,8 @@ async fn try_vision_service(
         .as_ref()
         .ok_or_else(|| ApiError::Internal("Vision service not configured".into()))?;
 
-    let request = VisionServiceRequest {
-        job_id: job_id.to_string(),
-        s3_keys: s3_keys.to_vec(),
-        options: Some(VisionServiceOptions {
-            detection_threshold: None,
-        }),
-    };
-
     let response = client
-        .estimate_images(&request)
+        .estimate_upload(&job_id.to_string(), images)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
@@ -385,6 +386,11 @@ async fn inventory_estimate(
     .bind(request.quote_id)
     .execute(&state.db)
     .await?;
+
+    // Auto-generate offer in background
+    let state_clone = state.clone();
+    let qid = request.quote_id;
+    tokio::spawn(async move { orchestrator::try_auto_generate_offer(state_clone, qid).await });
 
     Ok(Json(VolumeEstimation::from(row)))
 }

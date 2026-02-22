@@ -1,0 +1,1129 @@
+//! Offer orchestrator — auto-generates offers when quotes become ready,
+//! sends PDF to Telegram for approval, and emails on approval.
+//! Supports edit loop: Alex can press ✏️, type adjustment instructions,
+//! and get a regenerated offer.
+
+use crate::routes::offers::{build_offer, build_offer_with_overrides, GeneratedOffer, OfferOverrides};
+use crate::AppState;
+use aust_core::config::TelegramConfig;
+use aust_core::models::MovingInquiry;
+use aust_llm_providers::{LlmMessage, LlmProvider};
+use reqwest::{
+    multipart::{Form, Part},
+    Client,
+};
+use sqlx::PgPool;
+use std::sync::Arc;
+use tracing::{error, info, warn};
+use uuid::Uuid;
+
+/// Check if a quote has enough data to auto-generate an offer, and do so.
+/// Called after volume estimation or distance calculation completes.
+pub async fn try_auto_generate_offer(state: Arc<AppState>, quote_id: Uuid) {
+    // Check if an offer already exists for this quote
+    let existing: Option<(Uuid,)> =
+        sqlx::query_as("SELECT id FROM offers WHERE quote_id = $1 LIMIT 1")
+            .bind(quote_id)
+            .fetch_optional(&state.db)
+            .await
+            .unwrap_or(None);
+
+    if existing.is_some() {
+        info!("Offer already exists for quote {quote_id}, skipping auto-generation");
+        return;
+    }
+
+    // Check that the quote has a volume estimate (minimum requirement)
+    let has_volume: Option<(Option<f64>,)> =
+        sqlx::query_as("SELECT estimated_volume_m3 FROM quotes WHERE id = $1")
+            .bind(quote_id)
+            .fetch_optional(&state.db)
+            .await
+            .unwrap_or(None);
+
+    match has_volume {
+        Some((Some(vol),)) if vol > 0.0 => {}
+        _ => {
+            info!("Quote {quote_id} not ready for offer (no volume estimate)");
+            return;
+        }
+    }
+
+    info!("Auto-generating offer for quote {quote_id}");
+
+    match build_offer(&state.db, &*state.storage, quote_id, Some(30)).await {
+        Ok(generated) => {
+            info!(
+                "Offer {} generated for quote {quote_id} (€{:.2})",
+                generated.offer.id,
+                generated.offer.price_cents as f64 / 100.0
+            );
+
+            send_offer_to_telegram(&state.config.telegram, &generated).await;
+        }
+        Err(e) => {
+            error!("Auto-offer generation failed for quote {quote_id}: {e}");
+            notify_telegram_error(
+                &state.config.telegram,
+                &format!("Angebotserstellung fehlgeschlagen für Quote {quote_id}: {e}"),
+            )
+            .await;
+        }
+    }
+}
+
+/// Send the generated offer PDF to Telegram with approve/edit/deny buttons.
+async fn send_offer_to_telegram(config: &TelegramConfig, generated: &GeneratedOffer) {
+    let client = Client::new();
+    let api_url = format!(
+        "https://api.telegram.org/bot{}/sendDocument",
+        config.bot_token
+    );
+
+    let offer = &generated.offer;
+    let price_eur = offer.price_cents as f64 / 100.0;
+
+    let caption = format!(
+        "📋 *Neues Angebot erstellt*\n\n\
+         *Kunde:* {}\n\
+         *E-Mail:* `{}`\n\
+         *Preis:* {:.2} €\n\
+         *Gültig bis:* {}\n\n\
+         Was möchtest du tun?",
+        generated.customer_name,
+        generated.customer_email,
+        price_eur,
+        offer
+            .valid_until
+            .map(|d| d.format("%d.%m.%Y").to_string())
+            .unwrap_or_else(|| "Unbegrenzt".to_string()),
+    );
+
+    let inline_keyboard = serde_json::json!({
+        "inline_keyboard": [[
+            {
+                "text": "✅ Senden",
+                "callback_data": format!("offer_approve:{}", offer.id)
+            },
+            {
+                "text": "✏️ Bearbeiten",
+                "callback_data": format!("offer_edit:{}", offer.id)
+            },
+            {
+                "text": "❌ Verwerfen",
+                "callback_data": format!("offer_deny:{}", offer.id)
+            }
+        ]]
+    });
+
+    let pdf_part = Part::bytes(generated.pdf_bytes.clone())
+        .file_name(format!("Angebot-{}.pdf", offer.id))
+        .mime_str("application/pdf")
+        .unwrap();
+
+    let form = Form::new()
+        .text("chat_id", config.admin_chat_id.to_string())
+        .text("caption", caption)
+        .text("parse_mode", "Markdown")
+        .text("reply_markup", inline_keyboard.to_string())
+        .part("document", pdf_part);
+
+    match client.post(&api_url).multipart(form).send().await {
+        Ok(resp) => {
+            if resp.status().is_success() {
+                info!("Offer {} sent to Telegram for approval", offer.id);
+            } else {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                error!("Telegram sendDocument failed ({status}): {body}");
+            }
+        }
+        Err(e) => {
+            error!("Failed to send offer to Telegram: {e}");
+        }
+    }
+}
+
+/// Send a simple error notification to the admin via Telegram.
+async fn notify_telegram_error(config: &TelegramConfig, message: &str) {
+    let client = Client::new();
+    let api_url = format!(
+        "https://api.telegram.org/bot{}/sendMessage",
+        config.bot_token
+    );
+
+    let payload = serde_json::json!({
+        "chat_id": config.admin_chat_id,
+        "text": format!("⚠️ {message}"),
+    });
+
+    if let Err(e) = client.post(&api_url).json(&payload).send().await {
+        error!("Failed to send Telegram error notification: {e}");
+    }
+}
+
+// --- Offer event handler (receives events from email agent's Telegram poller) ---
+
+use aust_email_agent::ApprovalDecision;
+
+/// State for the offer currently being edited.
+struct EditingOffer {
+    offer_id: Uuid,
+    quote_id: Uuid,
+}
+
+/// Background task that handles offer approval/edit/deny events forwarded from the
+/// email agent's Telegram polling loop via an mpsc channel.
+pub async fn run_offer_event_handler(
+    state: Arc<AppState>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<ApprovalDecision>,
+) {
+    let client = Client::new();
+    let bot_token = &state.config.telegram.bot_token;
+    let chat_id = state.config.telegram.admin_chat_id;
+    let mut editing: Option<EditingOffer> = None;
+
+    info!("Offer event handler started");
+
+    while let Some(event) = rx.recv().await {
+        match event {
+            ApprovalDecision::OfferApprove(id_str) => {
+                if let Ok(offer_id) = Uuid::parse_str(&id_str) {
+                    editing = None;
+                    handle_offer_approval(&state, &client, bot_token, chat_id, offer_id).await;
+                }
+            }
+            ApprovalDecision::OfferEdit(id_str) => {
+                if let Ok(offer_id) = Uuid::parse_str(&id_str) {
+                    let quote_id: Option<(Uuid,)> =
+                        sqlx::query_as("SELECT quote_id FROM offers WHERE id = $1")
+                            .bind(offer_id)
+                            .fetch_optional(&state.db)
+                            .await
+                            .unwrap_or(None);
+
+                    if let Some((qid,)) = quote_id {
+                        editing = Some(EditingOffer {
+                            offer_id,
+                            quote_id: qid,
+                        });
+                        send_telegram_message(
+                            &client,
+                            bot_token,
+                            chat_id,
+                            "✏️ Was soll am Angebot geändert werden?\n\n\
+                             Beispiele:\n\
+                             • \"Preis auf 800 Euro\"\n\
+                             • \"4 Helfer, 6 Stunden\"\n\
+                             • \"Stundensatz 35\"\n\
+                             • \"Abbrechen\"",
+                        )
+                        .await;
+                    }
+                }
+            }
+            ApprovalDecision::OfferDeny(id_str) => {
+                if let Ok(offer_id) = Uuid::parse_str(&id_str) {
+                    editing = None;
+                    handle_offer_denial(&state, &client, bot_token, chat_id, offer_id).await;
+                }
+            }
+            ApprovalDecision::InquiryComplete(inquiry) => {
+                handle_complete_inquiry(&state, &client, bot_token, chat_id, inquiry).await;
+            }
+            ApprovalDecision::OfferEditText(text) => {
+                let Some(edit_state) = editing.take() else {
+                    continue; // not editing an offer, ignore
+                };
+
+                let text_lower = text.trim().to_lowercase();
+                if text_lower == "abbrechen" || text_lower == "cancel" {
+                    send_telegram_message(
+                        &client,
+                        bot_token,
+                        chat_id,
+                        "✏️ Bearbeitung abgebrochen.",
+                    )
+                    .await;
+                    continue;
+                }
+
+                send_telegram_message(
+                    &client,
+                    bot_token,
+                    chat_id,
+                    "⏳ Angebot wird neu erstellt...",
+                )
+                .await;
+
+                handle_offer_edit(
+                    &state,
+                    &client,
+                    bot_token,
+                    chat_id,
+                    edit_state.offer_id,
+                    edit_state.quote_id,
+                    &text,
+                )
+                .await;
+            }
+            _ => {} // ignore non-offer events
+        }
+    }
+}
+
+/// Handle a complete inquiry: create customer + addresses + quote in DB,
+/// set volume estimate, and trigger offer generation → PDF → Telegram.
+async fn handle_complete_inquiry(
+    state: &Arc<AppState>,
+    _client: &Client,
+    _bot_token: &str,
+    _chat_id: i64,
+    inquiry: MovingInquiry,
+) {
+    info!(
+        "Processing complete inquiry {} from {}",
+        inquiry.id, inquiry.email
+    );
+
+    let now = chrono::Utc::now();
+
+    // 1. Create or find customer by email
+    let customer_id: Uuid = match sqlx::query_as::<_, (Uuid,)>(
+        r#"
+        INSERT INTO customers (id, email, name, phone, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $5)
+        ON CONFLICT (email) DO UPDATE SET
+            name = COALESCE(EXCLUDED.name, customers.name),
+            phone = COALESCE(EXCLUDED.phone, customers.phone),
+            updated_at = $5
+        RETURNING id
+        "#,
+    )
+    .bind(Uuid::now_v7())
+    .bind(&inquiry.email)
+    .bind(&inquiry.name)
+    .bind(&inquiry.phone)
+    .bind(now)
+    .fetch_one(&state.db)
+    .await
+    {
+        Ok((id,)) => id,
+        Err(e) => {
+            error!("Failed to create customer: {e}");
+            return;
+        }
+    };
+
+    // 2. Create origin address (if we have departure address)
+    let origin_id = if let Some(ref addr) = inquiry.departure_address {
+        let (street, city, postal) = parse_address(addr);
+        match sqlx::query_as::<_, (Uuid,)>(
+            "INSERT INTO addresses (id, street, city, postal_code, floor) VALUES ($1, $2, $3, $4, $5) RETURNING id",
+        )
+        .bind(Uuid::now_v7())
+        .bind(&street)
+        .bind(&city)
+        .bind(&postal)
+        .bind(&inquiry.departure_floor)
+        .fetch_one(&state.db)
+        .await
+        {
+            Ok((id,)) => Some(id),
+            Err(e) => {
+                warn!("Failed to create origin address: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // 3. Create destination address (if we have arrival address)
+    let dest_id = if let Some(ref addr) = inquiry.arrival_address {
+        let (street, city, postal) = parse_address(addr);
+        match sqlx::query_as::<_, (Uuid,)>(
+            "INSERT INTO addresses (id, street, city, postal_code, floor) VALUES ($1, $2, $3, $4, $5) RETURNING id",
+        )
+        .bind(Uuid::now_v7())
+        .bind(&street)
+        .bind(&city)
+        .bind(&postal)
+        .bind(&inquiry.arrival_floor)
+        .fetch_one(&state.db)
+        .await
+        {
+            Ok((id,)) => Some(id),
+            Err(e) => {
+                warn!("Failed to create destination address: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // 4. Determine volume — use provided volume, or rough estimate from items/description
+    let volume_m3 = inquiry.volume_m3.unwrap_or_else(|| {
+        // Rough estimate: typical apartment sizes
+        if let Some(ref notes) = inquiry.notes {
+            let notes_lower = notes.to_lowercase();
+            if notes_lower.contains("haus") || notes_lower.contains("einfamilienhaus") {
+                50.0
+            } else if notes_lower.contains("4-zimmer") || notes_lower.contains("4 zimmer") {
+                40.0
+            } else if notes_lower.contains("3-zimmer") || notes_lower.contains("3 zimmer") {
+                30.0
+            } else if notes_lower.contains("2-zimmer") || notes_lower.contains("2 zimmer") {
+                20.0
+            } else if notes_lower.contains("1-zimmer") || notes_lower.contains("1 zimmer") || notes_lower.contains("studio") {
+                15.0
+            } else {
+                25.0 // default estimate
+            }
+        } else {
+            25.0
+        }
+    });
+
+    // 5. Create quote
+    let quote_id = Uuid::now_v7();
+    let preferred_date_ts = inquiry
+        .preferred_date
+        .map(|d| d.and_hms_opt(10, 0, 0).unwrap())
+        .map(|dt| chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(dt, chrono::Utc));
+
+    let notes = build_quote_notes(&inquiry);
+
+    if let Err(e) = sqlx::query(
+        r#"
+        INSERT INTO quotes (id, customer_id, origin_address_id, destination_address_id,
+                           status, estimated_volume_m3, preferred_date, notes, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)
+        "#,
+    )
+    .bind(quote_id)
+    .bind(customer_id)
+    .bind(origin_id)
+    .bind(dest_id)
+    .bind("volume_estimated")
+    .bind(volume_m3)
+    .bind(preferred_date_ts)
+    .bind(&notes)
+    .bind(now)
+    .execute(&state.db)
+    .await
+    {
+        error!("Failed to create quote: {e}");
+        return;
+    }
+
+    // 6. Create a volume estimation record (manual, from inquiry data)
+    let estimation_id = Uuid::now_v7();
+    let source_data = serde_json::json!({
+        "source": "email_inquiry",
+        "inquiry_id": inquiry.id.to_string(),
+        "items_list": inquiry.items_list,
+    });
+
+    // Parse items_list text into structured result_data for the "Erfasste Gegenstände" sheet
+    let result_data = inquiry
+        .items_list
+        .as_deref()
+        .map(|text| {
+            let items = parse_items_list_text(text);
+            serde_json::to_value(&items).ok()
+        })
+        .flatten();
+
+    let _ = sqlx::query(
+        r#"
+        INSERT INTO volume_estimations (id, quote_id, method, source_data, result_data, total_volume_m3, confidence_score, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        "#,
+    )
+    .bind(estimation_id)
+    .bind(quote_id)
+    .bind("manual")
+    .bind(source_data)
+    .bind(result_data)
+    .bind(volume_m3)
+    .bind(0.5f64) // lower confidence for rough estimate
+    .bind(now)
+    .execute(&state.db)
+    .await;
+
+    info!(
+        "Created quote {quote_id} for customer {} ({}) — {:.1} m³",
+        inquiry.name.as_deref().unwrap_or("?"),
+        inquiry.email,
+        volume_m3
+    );
+
+    // 7. Generate offer → PDF → Telegram
+    try_auto_generate_offer(Arc::clone(state), quote_id).await;
+}
+
+/// Parsed item from the VolumeCalculator items_list text.
+/// Matches the format: "2x Sofa, Couch, Liege je Sitz (0.80 m³)"
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ParsedInventoryItem {
+    name: String,
+    quantity: u32,
+    volume_m3: f64,
+}
+
+/// Parse VolumeCalculator items_list text into structured items.
+/// Handles both newline-separated and comma-separated formats:
+/// - "1x Bettumbau (0.30 m³)\n1x Nachttisch (0.20 m³)"
+/// - "1x Bettumbau (0.30 m³), 1x Nachttisch (0.20 m³)"
+fn parse_items_list_text(text: &str) -> Vec<ParsedInventoryItem> {
+    let mut items = Vec::new();
+
+    // Normalize: split on newlines first, then within each line split on ", Nx " boundaries
+    // to handle comma-separated items
+    let mut raw_items: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Split on ", Nx " pattern (comma followed by digit+x)
+        // e.g., "1x Bett (0.30 m³), 1x Tisch (0.50 m³)" → ["1x Bett (0.30 m³)", "1x Tisch (0.50 m³)"]
+        let mut remaining = line;
+        loop {
+            // Find ", Nx " boundary — look for ", " followed by digits and "x"
+            let mut split_pos = None;
+            if let Some(comma_pos) = remaining.find(", ") {
+                let after_comma = &remaining[comma_pos + 2..];
+                let digits: String = after_comma.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if !digits.is_empty() {
+                    let after_digits = &after_comma[digits.len()..];
+                    if after_digits.starts_with('x') || after_digits.starts_with(" x") {
+                        split_pos = Some(comma_pos);
+                    }
+                }
+            }
+            if let Some(pos) = split_pos {
+                let item = remaining[..pos].trim();
+                if !item.is_empty() {
+                    raw_items.push(item.to_string());
+                }
+                remaining = remaining[pos + 2..].trim(); // skip ", "
+            } else {
+                if !remaining.is_empty() {
+                    raw_items.push(remaining.to_string());
+                }
+                break;
+            }
+        }
+    }
+
+    for item_str in &raw_items {
+        let mut quantity = 1u32;
+        let mut name = item_str.to_string();
+        let mut volume = 0.0f64;
+
+        // Try to extract quantity: "2x " or "2 x " at the start
+        let digits: String = item_str.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !digits.is_empty() {
+            if let Ok(qty) = digits.parse::<u32>() {
+                let after_digits = &item_str[digits.len()..];
+                if after_digits.starts_with('x') || after_digits.starts_with(" x") {
+                    quantity = qty;
+                    name = after_digits
+                        .strip_prefix('x')
+                        .or_else(|| after_digits.strip_prefix(" x "))
+                        .or_else(|| after_digits.strip_prefix(" x"))
+                        .unwrap_or(after_digits)
+                        .trim()
+                        .to_string();
+                }
+            }
+        }
+
+        // Try to extract volume from parenthesized notation: "(0.80 m³)" or "(0,80 m³)"
+        if let Some(paren_start) = name.rfind('(') {
+            if let Some(paren_end) = name[paren_start..].find(')') {
+                let inside = &name[paren_start + 1..paren_start + paren_end];
+                let vol_str = inside
+                    .replace("m³", "")
+                    .replace("m3", "")
+                    .replace(',', ".")
+                    .trim()
+                    .to_string();
+                if let Ok(v) = vol_str.parse::<f64>() {
+                    volume = v;
+                    name = name[..paren_start].trim().to_string();
+                }
+            }
+        }
+
+        if !name.is_empty() {
+            items.push(ParsedInventoryItem {
+                name,
+                quantity,
+                volume_m3: volume,
+            });
+        }
+    }
+
+    items
+}
+
+/// Parse a free-form address string into (street, city, postal_code).
+/// Best-effort: tries to split "Straße 1, 31157 Sarstedt" into parts.
+fn parse_address(addr: &str) -> (String, String, String) {
+    // Try to find a postal code (5-digit number typical for DE/AT)
+    let parts: Vec<&str> = addr.splitn(2, ',').collect();
+    if parts.len() == 2 {
+        let street = parts[0].trim().to_string();
+        let city_part = parts[1].trim();
+        // Try to extract postal code from city part
+        let mut postal = String::new();
+        let mut city = city_part.to_string();
+        for word in city_part.split_whitespace() {
+            if word.len() >= 4 && word.len() <= 5 && word.chars().all(|c| c.is_ascii_digit()) {
+                postal = word.to_string();
+                city = city_part.replace(word, "").trim().to_string();
+                break;
+            }
+        }
+        (street, city, postal)
+    } else {
+        (addr.to_string(), String::new(), String::new())
+    }
+}
+
+/// Build notes for the quote from inquiry data.
+fn build_quote_notes(inquiry: &MovingInquiry) -> String {
+    let mut parts = Vec::new();
+
+    if let Some(ref floor) = inquiry.departure_floor {
+        parts.push(format!("Auszug: {floor}"));
+    }
+    if let Some(ref floor) = inquiry.arrival_floor {
+        parts.push(format!("Einzug: {floor}"));
+    }
+    if inquiry.departure_parking_ban == Some(true) {
+        parts.push("Halteverbot Auszug".to_string());
+    }
+    if inquiry.arrival_parking_ban == Some(true) {
+        parts.push("Halteverbot Einzug".to_string());
+    }
+    if inquiry.service_packing {
+        parts.push("Verpackungsservice".to_string());
+    }
+    if inquiry.service_assembly {
+        parts.push("Montage".to_string());
+    }
+    if inquiry.service_disassembly {
+        parts.push("Demontage".to_string());
+    }
+    if inquiry.service_storage {
+        parts.push("Einlagerung".to_string());
+    }
+    if inquiry.service_disposal {
+        parts.push("Entsorgung".to_string());
+    }
+    if let Some(ref notes) = inquiry.notes {
+        parts.push(notes.clone());
+    }
+
+    parts.join(", ")
+}
+
+/// Apply edit instructions and regenerate the offer.
+async fn handle_offer_edit(
+    state: &AppState,
+    client: &Client,
+    bot_token: &str,
+    chat_id: i64,
+    old_offer_id: Uuid,
+    quote_id: Uuid,
+    instructions: &str,
+) {
+    // Fetch current offer details for LLM context
+    let current_offer = fetch_current_offer_summary(&state.db, old_offer_id, quote_id).await;
+
+    // Use LLM to parse natural language edit instructions
+    let overrides = match llm_parse_edit_instructions(
+        &*state.llm,
+        instructions,
+        &current_offer,
+    )
+    .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            warn!("LLM edit parsing failed, falling back to regex: {e}");
+            parse_edit_instructions(instructions)
+        }
+    };
+
+    // Apply numeric overrides directly to the quote if needed
+    if let Some(volume) = overrides.volume_m3 {
+        let _ = sqlx::query("UPDATE quotes SET estimated_volume_m3 = $1 WHERE id = $2")
+            .bind(volume)
+            .bind(quote_id)
+            .execute(&state.db)
+            .await;
+    }
+
+    // Delete the old offer so build_offer can create a fresh one
+    let _ = sqlx::query("DELETE FROM offers WHERE id = $1")
+        .bind(old_offer_id)
+        .execute(&state.db)
+        .await;
+
+    // Also reset quote status so offer generation proceeds
+    let _ = sqlx::query("UPDATE quotes SET status = 'volume_estimated' WHERE id = $1")
+        .bind(quote_id)
+        .execute(&state.db)
+        .await;
+
+    // Regenerate with overrides baked into the xlsx/PDF
+    let offer_overrides = OfferOverrides {
+        price_cents: overrides.price_cents,
+        persons: overrides.persons,
+        hours: overrides.hours,
+        rate: overrides.rate,
+    };
+
+    match build_offer_with_overrides(&state.db, &*state.storage, quote_id, Some(30), &offer_overrides).await {
+        Ok(generated) => {
+            info!(
+                "Offer {} regenerated for quote {quote_id} (€{:.2})",
+                generated.offer.id,
+                generated.offer.price_cents as f64 / 100.0
+            );
+
+            send_offer_to_telegram(&state.config.telegram, &generated).await;
+        }
+        Err(e) => {
+            error!("Failed to regenerate offer: {e}");
+            send_telegram_message(
+                client,
+                bot_token,
+                chat_id,
+                &format!("Fehler bei Neuerstellung: {e}"),
+            )
+            .await;
+        }
+    }
+}
+
+/// Summary of the current offer for LLM context.
+struct OfferSummary {
+    price_cents: i64,
+    persons: u32,
+    hours: f64,
+    volume_m3: f64,
+    distance_km: f64,
+}
+
+impl std::fmt::Display for OfferSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let netto = self.price_cents as f64 / 100.0;
+        let brutto = netto * 1.19;
+        write!(
+            f,
+            "Aktuelles Angebot: {:.2}€ netto / {:.2}€ brutto, {} Helfer, {:.1} Stunden, {:.1} m³, {:.0} km",
+            netto, brutto, self.persons, self.hours, self.volume_m3, self.distance_km
+        )
+    }
+}
+
+/// Fetch current offer details for LLM context.
+async fn fetch_current_offer_summary(db: &PgPool, offer_id: Uuid, quote_id: Uuid) -> OfferSummary {
+    // Get offer price
+    let price: Option<(i64,)> = sqlx::query_as("SELECT price_cents FROM offers WHERE id = $1")
+        .bind(offer_id)
+        .fetch_optional(db)
+        .await
+        .unwrap_or(None);
+
+    // Get quote details
+    let quote: Option<(Option<f64>, Option<f64>)> = sqlx::query_as(
+        "SELECT estimated_volume_m3, distance_km FROM quotes WHERE id = $1",
+    )
+    .bind(quote_id)
+    .fetch_optional(db)
+    .await
+    .unwrap_or(None);
+
+    let price_cents = price.map(|(p,)| p).unwrap_or(0);
+    let (volume, distance) = quote.unwrap_or((None, None));
+
+    // Estimate persons/hours from price (reverse of pricing engine)
+    // price_cents = persons * hours * rate_per_person_hour (3000 = €30)
+    let volume_m3 = volume.unwrap_or(25.0);
+    let persons = 2u32.max((volume_m3 / 10.0).ceil() as u32);
+    let throughput = persons as f64 * 2.0; // volume_per_person_hour
+    let hours = (volume_m3 / throughput).ceil().max(1.0);
+
+    OfferSummary {
+        price_cents,
+        persons,
+        hours,
+        volume_m3,
+        distance_km: distance.unwrap_or(0.0),
+    }
+}
+
+/// Use LLM to parse Alex's natural language edit instructions into numeric overrides.
+///
+/// Alex can say things like:
+/// - "mach das Angebot auf 350 Euro" or "350 brutto" or just "350"
+/// - "4 Helfer, 6 Stunden"
+/// - "Stundensatz 35"
+///
+/// Default behavior: a bare price like "350" or "350 Euro" is treated as brutto.
+/// Alex always thinks in brutto prices.
+async fn llm_parse_edit_instructions(
+    llm: &dyn LlmProvider,
+    instructions: &str,
+    current: &OfferSummary,
+) -> Result<EditOverrides, String> {
+    let system_prompt = format!(
+        r#"Du bist ein Assistent, der Anweisungen zur Angebotsänderung versteht.
+
+{current}
+
+Analysiere die Anweisung und extrahiere die gewünschten Änderungen als JSON.
+Wichtige Regeln:
+- Wenn ein Preis OHNE Qualifier genannt wird (z.B. "350", "350 Euro", "mach auf 350"), ist das IMMER brutto (inkl. 19% USt).
+- Nur wenn explizit "netto" gesagt wird, ist es netto.
+- Brutto zu Netto: netto = brutto / 1.19
+- Stundensatz wird aus dem Preis berechnet: stundensatz = netto / (helfer × stunden)
+
+Antworte NUR mit einem JSON-Objekt. Felder die nicht geändert werden: weglassen.
+Mögliche Felder:
+- "price_cents_netto": Nettopreis in Cent (integer)
+- "persons": Anzahl Helfer (integer)
+- "hours": Stunden (float)
+- "rate": Stundensatz pro Helfer (float)
+- "volume_m3": Volumen in m³ (float)
+
+Beispiele:
+- "350 Euro" → {{"price_cents_netto": 29412}}  (350/1.19*100)
+- "350 brutto" → {{"price_cents_netto": 29412}}
+- "350 netto" → {{"price_cents_netto": 35000}}
+- "4 Helfer" → {{"persons": 4}}
+- "mach das Angebot auf 800" → {{"price_cents_netto": 67227}}  (800/1.19*100)
+- "Stundensatz 35" → {{"rate": 35.0}}"#
+    );
+
+    let messages = vec![
+        LlmMessage::system(system_prompt),
+        LlmMessage::user(instructions.to_string()),
+    ];
+
+    let response = llm.complete(&messages).await.map_err(|e| e.to_string())?;
+
+    // Extract JSON from response (may have markdown code fences)
+    let json_str = response
+        .trim()
+        .strip_prefix("```json")
+        .or_else(|| response.trim().strip_prefix("```"))
+        .unwrap_or(response.trim())
+        .strip_suffix("```")
+        .unwrap_or(response.trim())
+        .trim();
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(json_str).map_err(|e| format!("JSON parse error: {e}"))?;
+
+    let mut overrides = EditOverrides::default();
+
+    if let Some(price) = parsed.get("price_cents_netto").and_then(|v| v.as_i64()) {
+        overrides.price_cents = Some(price);
+    }
+    if let Some(persons) = parsed.get("persons").and_then(|v| v.as_u64()) {
+        overrides.persons = Some(persons as u32);
+    }
+    if let Some(hours) = parsed.get("hours").and_then(|v| v.as_f64()) {
+        overrides.hours = Some(hours);
+    }
+    if let Some(rate) = parsed.get("rate").and_then(|v| v.as_f64()) {
+        overrides.rate = Some(rate);
+    }
+    if let Some(vol) = parsed.get("volume_m3").and_then(|v| v.as_f64()) {
+        overrides.volume_m3 = Some(vol);
+    }
+
+    info!(
+        "LLM parsed edit instructions: price={:?}, persons={:?}, hours={:?}, rate={:?}",
+        overrides.price_cents, overrides.persons, overrides.hours, overrides.rate
+    );
+
+    Ok(overrides)
+}
+
+/// Parsed overrides from admin's free-text edit instructions.
+#[derive(Default)]
+struct EditOverrides {
+    price_cents: Option<i64>,
+    persons: Option<u32>,
+    hours: Option<f64>,
+    rate: Option<f64>,
+    volume_m3: Option<f64>,
+}
+
+/// Parse simple German edit instructions into numeric overrides.
+/// Supports patterns like:
+/// - "Preis auf 800 Euro" / "Preis: 800" / "800€"
+/// - "4 Helfer" / "Helfer: 4"
+/// - "6 Stunden" / "Stunden: 6"
+/// - "Stundensatz 35" / "Rate: 35"
+/// - "Volumen 15" / "15 m³"
+fn parse_edit_instructions(text: &str) -> EditOverrides {
+    let mut overrides = EditOverrides::default();
+    let text_lower = text.to_lowercase();
+
+    // Extract all numbers with their surrounding context
+    for segment in text_lower.split([',', '.', ';', '\n']) {
+        let segment = segment.trim();
+
+        // Price: "preis auf 800", "800 euro", "800€", "preis: 800", "350 brutto"
+        if segment.contains("preis") || segment.contains('€') || segment.contains("euro") || segment.contains("brutto") || segment.contains("netto") {
+            if let Some(num) = extract_number(segment) {
+                let cents = if segment.contains("brutto") {
+                    // Convert brutto to netto (remove 19% USt)
+                    ((num / 1.19) * 100.0) as i64
+                } else {
+                    (num * 100.0) as i64
+                };
+                overrides.price_cents = Some(cents);
+            }
+        }
+
+        // Persons: "4 helfer", "helfer: 4", "4 mann"
+        if segment.contains("helfer") || segment.contains("mann") || segment.contains("person") {
+            if let Some(num) = extract_number(segment) {
+                overrides.persons = Some(num as u32);
+            }
+        }
+
+        // Hours: "6 stunden", "stunden: 6"
+        if segment.contains("stunde") {
+            if let Some(num) = extract_number(segment) {
+                if !segment.contains("satz") && !segment.contains("rate") {
+                    overrides.hours = Some(num);
+                }
+            }
+        }
+
+        // Rate: "stundensatz 35", "rate: 35"
+        if segment.contains("stundensatz") || segment.contains("rate") {
+            if let Some(num) = extract_number(segment) {
+                overrides.rate = Some(num);
+            }
+        }
+
+        // Volume: "volumen 15", "15 m³", "15 kubikmeter"
+        if segment.contains("volumen") || segment.contains("m³") || segment.contains("kubik") {
+            if let Some(num) = extract_number(segment) {
+                overrides.volume_m3 = Some(num);
+            }
+        }
+    }
+
+    overrides
+}
+
+/// Extract the first number from a string.
+fn extract_number(s: &str) -> Option<f64> {
+    let mut num_str = String::new();
+    let mut found_digit = false;
+
+    for ch in s.chars() {
+        if ch.is_ascii_digit() {
+            num_str.push(ch);
+            found_digit = true;
+        } else if (ch == '.' || ch == ',') && found_digit {
+            num_str.push('.');
+        } else if found_digit {
+            break;
+        }
+    }
+
+    if num_str.is_empty() {
+        return None;
+    }
+
+    num_str.parse::<f64>().ok()
+}
+
+async fn handle_offer_approval(
+    state: &AppState,
+    client: &Client,
+    bot_token: &str,
+    chat_id: i64,
+    offer_id: Uuid,
+) {
+    info!("Offer {offer_id} approved, sending to customer");
+
+    let row: Option<(String, Option<String>, Uuid)> = sqlx::query_as(
+        r#"
+        SELECT c.email, o.pdf_storage_key, o.quote_id
+        FROM offers o
+        JOIN quotes q ON o.quote_id = q.id
+        JOIN customers c ON q.customer_id = c.id
+        WHERE o.id = $1
+        "#,
+    )
+    .bind(offer_id)
+    .fetch_optional(&state.db)
+    .await
+    .unwrap_or(None);
+
+    let Some((customer_email, Some(storage_key), _quote_id)) = row else {
+        send_telegram_message(
+            client,
+            bot_token,
+            chat_id,
+            "Fehler: Angebot oder PDF nicht gefunden.",
+        )
+        .await;
+        return;
+    };
+
+    let pdf_bytes = match state.storage.download(&storage_key).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            error!("Failed to download offer PDF: {e}");
+            send_telegram_message(
+                client,
+                bot_token,
+                chat_id,
+                &format!("Fehler beim PDF-Download: {e}"),
+            )
+            .await;
+            return;
+        }
+    };
+
+    match send_offer_email(state, &customer_email, &pdf_bytes, offer_id).await {
+        Ok(()) => {
+            let now = chrono::Utc::now();
+            let _ = sqlx::query("UPDATE offers SET status = 'sent', sent_at = $1 WHERE id = $2")
+                .bind(now)
+                .bind(offer_id)
+                .execute(&state.db)
+                .await;
+
+            send_telegram_message(
+                client,
+                bot_token,
+                chat_id,
+                &format!("✅ Angebot an {customer_email} gesendet!"),
+            )
+            .await;
+        }
+        Err(e) => {
+            error!("Failed to send offer email: {e}");
+            send_telegram_message(
+                client,
+                bot_token,
+                chat_id,
+                &format!("Fehler beim E-Mail-Versand: {e}"),
+            )
+            .await;
+        }
+    }
+}
+
+async fn handle_offer_denial(
+    state: &AppState,
+    client: &Client,
+    bot_token: &str,
+    chat_id: i64,
+    offer_id: Uuid,
+) {
+    info!("Offer {offer_id} denied");
+
+    let _ = sqlx::query("UPDATE offers SET status = 'rejected' WHERE id = $1")
+        .bind(offer_id)
+        .execute(&state.db)
+        .await;
+
+    send_telegram_message(client, bot_token, chat_id, "❌ Angebot verworfen.").await;
+}
+
+/// Send an email with the offer PDF attached.
+async fn send_offer_email(
+    state: &AppState,
+    to: &str,
+    pdf_bytes: &[u8],
+    offer_id: Uuid,
+) -> Result<(), String> {
+    use lettre::message::{header::ContentType, Attachment, MultiPart, SinglePart};
+    use lettre::transport::smtp::authentication::Credentials;
+    use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
+
+    let email_config = &state.config.email;
+
+    let from_mailbox: lettre::message::Mailbox = format!(
+        "{} <{}>",
+        email_config.from_name, email_config.from_address
+    )
+    .parse()
+    .map_err(|e| format!("Invalid from address: {e}"))?;
+
+    let to_mailbox: lettre::message::Mailbox =
+        to.parse().map_err(|e| format!("Invalid to address: {e}"))?;
+
+    let pdf_attachment = Attachment::new(format!("Angebot-{offer_id}.pdf")).body(
+        pdf_bytes.to_vec(),
+        ContentType::parse("application/pdf").unwrap(),
+    );
+
+    let body_text = "Sehr geehrte Damen und Herren,\n\n\
+        anbei erhalten Sie unser Angebot für Ihren Umzug.\n\n\
+        Bei Fragen stehen wir Ihnen gerne zur Verfügung.\n\n\
+        Mit freundlichen Grüßen,\n\
+        Ihr Umzugsteam";
+
+    let message = Message::builder()
+        .from(from_mailbox)
+        .to(to_mailbox)
+        .subject("Ihr Umzugsangebot".to_string())
+        .multipart(
+            MultiPart::mixed()
+                .singlepart(SinglePart::plain(body_text.to_string()))
+                .singlepart(pdf_attachment),
+        )
+        .map_err(|e| format!("Failed to build email: {e}"))?;
+
+    let creds = Credentials::new(
+        email_config.username.clone(),
+        email_config.password.clone(),
+    );
+
+    let mailer = AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&email_config.smtp_host)
+        .map_err(|e| format!("SMTP relay setup failed: {e}"))?
+        .port(email_config.smtp_port)
+        .credentials(creds)
+        .build();
+
+    mailer
+        .send(message)
+        .await
+        .map_err(|e| format!("SMTP send failed: {e}"))?;
+
+    info!("Offer email sent to {to}");
+    Ok(())
+}
+
+async fn send_telegram_message(client: &Client, bot_token: &str, chat_id: i64, text: &str) {
+    let api_url = format!("https://api.telegram.org/bot{bot_token}/sendMessage");
+    let payload = serde_json::json!({
+        "chat_id": chat_id,
+        "text": text,
+    });
+
+    if let Err(e) = client.post(&api_url).json(&payload).send().await {
+        error!("Failed to send Telegram message: {e}");
+    }
+}

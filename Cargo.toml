@@ -19,6 +19,7 @@ license = "MIT"
 aust-api = { workspace = true }
 aust-calendar = { workspace = true }
 aust-core = { workspace = true }
+aust-email-agent = { workspace = true }
 aust-llm-providers = { workspace = true }
 aust-storage = { workspace = true }
 aust-volume-estimator = { workspace = true }
@@ -29,6 +30,7 @@ config = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+dotenvy = "0.15"
 
 [workspace.dependencies]
 # Async runtime
@@ -95,6 +97,12 @@ validator = { version = "0.19", features = ["derive"] }
 # PDF generation
 typst = "0.12"
 typst-pdf = "0.12"
+
+# Excel generation
+umya-spreadsheet = "2"
+
+# Temp files
+tempfile = "3"
 
 # Base64
 base64 = "0.22"

@@ -30,7 +30,7 @@ default_provider = "ollama"
 [llm.ollama]
 base_url = "https://ollama.com"
 model = "qwen3.5:397b"
-# api_key = ""  # set via AUST__LLM__OLLAMA__API_KEY env var
+api_key = "REDACTED_OLLAMA_API_KEY"
 
 [maps]
 provider = "google"
@@ -50,7 +50,7 @@ alternatives_count = 3
 search_window_days = 14
 
 [vision_service]
-enabled = false
-base_url = "http://localhost:8090"
-timeout_secs = 120
-max_retries = 1
+enabled = true
+base_url = "https://crfabig--aust-vision-serve.modal.run"
+timeout_secs = 600
+max_retries = 2

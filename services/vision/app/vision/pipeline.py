@@ -13,6 +13,7 @@ from app.models.schemas import (
     EstimateResponse,
     ItemDimensions,
     VolumeEstimate,
+    get_packing_multiplier,
 )
 from app.vision.depth import DepthEstimator
 from app.vision.detector import Detector
@@ -75,6 +76,19 @@ class VisionPipeline:
 
         # Stage 5: Cross-image deduplication
         merged_items = self._deduplicate(volume_estimates)
+
+        # Stage 6: Apply packing multipliers (object volume → truck-loading volume)
+        for i, item in enumerate(merged_items):
+            multiplier = get_packing_multiplier(item.category)
+            if multiplier != 1.0:
+                merged_items[i] = DetectedItem(
+                    name=item.name,
+                    volume_m3=round(item.volume_m3 * multiplier, 4),
+                    dimensions=item.dimensions,  # keep raw dimensions for display
+                    confidence=item.confidence,
+                    seen_in_images=item.seen_in_images,
+                    category=item.category,
+                )
 
         total_volume = sum(item.volume_m3 for item in merged_items)
         avg_confidence = (

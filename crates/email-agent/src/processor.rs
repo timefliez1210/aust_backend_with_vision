@@ -9,6 +9,7 @@ use chrono::NaiveDate;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -51,6 +52,8 @@ pub struct EmailProcessor {
     editing_draft: Option<PendingDraft>,
     /// Pending capacity decisions: request_id → (inquiry snapshot, in_reply_to, email body)
     pending_capacity: HashMap<String, PendingCapacityRequest>,
+    /// Channel to forward offer-related Telegram events to the orchestrator.
+    offer_tx: Option<mpsc::UnboundedSender<ApprovalDecision>>,
 }
 
 impl EmailProcessor {
@@ -78,7 +81,13 @@ impl EmailProcessor {
             pending_drafts: HashMap::new(),
             editing_draft: None,
             pending_capacity: HashMap::new(),
+            offer_tx: None,
         }
+    }
+
+    /// Set the channel for forwarding offer-related Telegram events to the orchestrator.
+    pub fn set_offer_channel(&mut self, tx: mpsc::UnboundedSender<ApprovalDecision>) {
+        self.offer_tx = Some(tx);
     }
 
     /// Run one cycle of the processing loop:
@@ -141,6 +150,12 @@ impl EmailProcessor {
         // Merge extracted data into existing inquiry
         merge_inquiry(inquiry, &updated);
 
+        // For form submissions, the parsed email (from JSON/form data) is the real
+        // customer email, not the IMAP sender address
+        if updated.email != email.from && !updated.email.is_empty() {
+            inquiry.email = updated.email.clone();
+        }
+
         // Try to extract additional data from free-text via LLM
         if matches!(
             updated.source,
@@ -190,6 +205,17 @@ impl EmailProcessor {
                     avail.clone(),
                 )
                 .await;
+            }
+        }
+
+        // If inquiry has enough data, forward to offer pipeline
+        if inquiry_snapshot.is_complete() {
+            info!(
+                "Inquiry {} is complete, forwarding to offer pipeline",
+                inquiry_snapshot.id
+            );
+            if let Some(tx) = &self.offer_tx {
+                let _ = tx.send(ApprovalDecision::InquiryComplete(inquiry_snapshot.clone()));
             }
         }
 
@@ -321,6 +347,19 @@ impl EmailProcessor {
                 continue;
             }
 
+            // Forward offer-related events to the orchestrator via channel
+            match &response.decision {
+                ApprovalDecision::OfferApprove(_)
+                | ApprovalDecision::OfferEdit(_)
+                | ApprovalDecision::OfferDeny(_) => {
+                    if let Some(tx) = &self.offer_tx {
+                        let _ = tx.send(response.decision);
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+
             // Handle edit instructions (free text from admin while a draft is in edit mode)
             if response.draft_id == "edit_instructions" {
                 if let ApprovalDecision::EditInstructions(instructions) = response.decision {
@@ -427,7 +466,11 @@ impl EmailProcessor {
         let draft = match self.editing_draft.take() {
             Some(d) => d,
             None => {
-                // No draft in edit mode — Alex sent a message without pressing "Bearbeiten" first
+                // No email draft in edit mode — try forwarding to offer editor
+                if let Some(tx) = &self.offer_tx {
+                    let _ = tx.send(ApprovalDecision::OfferEditText(instructions.to_string()));
+                    return;
+                }
                 warn!("Received edit instructions but no draft is in edit mode");
                 let tg = self.telegram.lock().await;
                 tg.send_status_message(
@@ -702,9 +745,33 @@ impl EmailProcessor {
             .await;
         drop(tg);
 
+        let telegram_poll_secs = 2; // Telegram needs fast polling for button responses
+        let mut imap_countdown = 0u64; // fetch emails on first iteration
+
         loop {
-            self.process_cycle().await;
-            tokio::time::sleep(std::time::Duration::from_secs(poll_interval_secs)).await;
+            // Check Telegram every 2 seconds for quick button responses
+            self.check_approvals().await;
+
+            // Check IMAP only every poll_interval_secs
+            if imap_countdown == 0 {
+                match self.imap.fetch_unread().await {
+                    Ok(emails) => {
+                        if !emails.is_empty() {
+                            info!("Processing {} new email(s)", emails.len());
+                        }
+                        for email in emails {
+                            self.process_incoming_email(email).await;
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to fetch emails: {e}");
+                    }
+                }
+                imap_countdown = poll_interval_secs;
+            }
+
+            tokio::time::sleep(std::time::Duration::from_secs(telegram_poll_secs)).await;
+            imap_countdown = imap_countdown.saturating_sub(telegram_poll_secs);
         }
     }
 }

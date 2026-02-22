@@ -25,7 +25,7 @@ A modular Rust backend for automating moving company operations - from initial c
 | Maps/Routing | OpenRouteService |
 | Email | IMAP/SMTP via lettre + async-imap |
 | Approval UI | Telegram Bot (human-in-the-loop) |
-| PDF | Typst |
+| PDF | XLSX template (umya-spreadsheet) → LibreOffice PDF conversion |
 
 ## Project Structure
 
@@ -38,7 +38,7 @@ crates/
 ├── email-agent/          # Email processing + Telegram approval workflow
 ├── volume-estimator/     # Volume calculation (LLM vision + external service client)
 ├── distance-calculator/  # Geocoding + multi-stop route calculation
-├── offer-generator/      # Pricing engine + PDF generation (Typst)
+├── offer-generator/      # Pricing engine + XLSX template → PDF generation
 └── calendar/             # Booking management + capacity tracking
 
 services/
@@ -51,7 +51,8 @@ services/
 
 - `src/main.rs` - Application entry point, config loading, service wiring
 - `config/default.toml` - Default configuration
-- `migrations/*.sql` - Database schema (initial + calendar)
+- `migrations/*.sql` - Database schema (initial + calendar + address_floor)
+- `templates/Angebot_Vorlage.xlsx` - XLSX offer template (embedded at compile time)
 - `docker/docker-compose.yml` - Local dev infrastructure (Postgres, Redis, MinIO, Vision)
 - `docker/docker-compose.gpu.yml` - GPU override for vision service
 - `services/vision/modal_app.py` - Modal deployment for vision service
@@ -122,30 +123,89 @@ curl -X POST https://crfabig--aust-vision-serve.modal.run/estimate/upload \
 - `GET /api/v1/offers/{id}` - Get offer
 - `GET /api/v1/offers/{id}/pdf` - Download offer PDF
 
-## Data Flow
+## Data Flow — Quote-to-Offer Pipeline
+
+Four input sources feed into the pipeline:
+
+| Source | Entry Point | Volume Data | Status |
+|--------|------------|-------------|--------|
+| A. Kontakt form | Email → email agent | None (general inquiry) | Working |
+| B. Kostenloses Angebot form | Email → email agent (JSON attachment) | VolumeCalculator items list | Working |
+| C. Photo webapp | Direct API POST | Vision pipeline (ML) | Not yet implemented |
+| D. Mobile app | Direct API POST | Depth sensor + AR | Not yet implemented |
 
 ```
-Customer Email → Email Agent → Parse Intent (LLM)
+                   ┌─── A. Kontakt form (email) ────────┐
+                   ├─── B. Angebot form (email+JSON) ───┤
+Input Sources ─────┤                                    ├─→ MovingInquiry
+                   ├─── C. Photo webapp (API) ──────────┤
+                   └─── D. Mobile app (API) ────────────┘
                                     ↓
-                            Create/Update Quote
+            Email Agent: parse JSON attachment / email text
+            → merge into MovingInquiry
+            → if complete: forward to orchestrator
                                     ↓
-              ┌─────────────────────┼─────────────────────┐
-              ↓                     ↓                     ↓
-    Volume Estimator        Calendar Service      Distance Calculator
-    ┌─────────────────┐     (Availability +       (Geocoding + Routing)
-    │ 3D ML Pipeline  │      Booking)
-    │ (Modal GPU)     │
-    │   ↓ fallback    │
-    │ LLM Vision      │
-    └─────────────────┘
-              ↓                     ↓                     ↓
-              └─────────────────────┼─────────────────────┘
+            Orchestrator (orchestrator.rs):
+            → Create customer (by email, upsert)
+            → Create origin/destination addresses
+            → Create quote with volume + notes
+            → Store volume estimation (parsed items)
+            → Auto-generate offer
                                     ↓
-                            Offer Generator
-                            (Pricing + PDF)
+            Offer Generation (offers.rs):
+            → PricingEngine: persons, hours, rate from volume/distance/floors
+            → build_line_items(): transport, Halteverbot, De/Montage, Einpackservice, Anfahrt
+            → XlsxGenerator: fill template → XLSX
+            → LibreOffice: XLSX → PDF
+            → Upload PDF to S3
+            → Store offer in DB
                                     ↓
-                    Telegram → Alex approves → Email sent
+            Telegram: PDF sent with ✅ Senden / ✏️ Bearbeiten / ❌ Verwerfen
+                                    ↓
+            ┌── ✅ Approve → download PDF from S3 → SMTP email to customer
+            ├── ✏️ Edit → Alex types natural language → LLM parses overrides
+            │        → regenerate offer with overrides → re-send to Telegram
+            └── ❌ Deny → mark offer rejected
 ```
+
+### Telegram Edit Flow
+
+Alex presses ✏️ and types natural language instructions. The LLM parses them into numeric overrides:
+- **Price** (default brutto): `"350 Euro"` / `"mach auf 350"` → netto = 350/1.19 = €294.12
+- **Persons**: `"4 Helfer"` → persons=4
+- **Hours**: `"6 Stunden"` → hours=6
+- **Rate**: `"Stundensatz 35"` → rate=35.0
+- **Volume**: `"15 m³"` → volume=15.0
+
+Rate back-calculation when price is overridden:
+```
+rate = (target_netto - sum_of_non_labor_line_items) / (persons × hours)
+```
+
+### XLSX Template Mapping
+
+The offer uses an XLSX template (`templates/Angebot_Vorlage.xlsx`). Key rows:
+
+| Row | Column D | Column E | Column F | Description |
+|-----|----------|----------|----------|-------------|
+| 31 | De/Montage | quantity | €50/unit | Furniture assembly if requested |
+| 32 | Halteverbotszone | count (1-2) | €100/zone | Parking ban zones |
+| 33 | Umzugsmaterial | quantity | €30/unit | Packing service if requested |
+| 38 | N Umzugshelfer | hours | rate/hr | Labor (G38 = E38 × F38 × J50) |
+| 39 | Transporter | truck count | €60/truck | 1 truck, 2 if >30m³ |
+| 42 | Anfahrt/Abfahrt | quantity | distance-based | €30 + €1.50/km |
+| 44 | | | | **Netto total** (sum of G31:G42) |
+
+The generator clears ALL template preset values (rows 31-42 except 38) before writing, ensuring only explicit line items contribute to the total.
+
+PDF output: columns A-H only (print area set to `$A$1:$H$120`), internal calculation columns I-P excluded.
+
+### Items Sheet ("Erfasste Gegenstände")
+
+For form submissions with a VolumeCalculator items list, a second sheet is added with:
+- Parsed item name, volume (m³), dimensions, confidence
+- Total volume row at bottom
+- Items are parsed from text format: `"2x Sofa, Couch (0.80 m³)"` → name, quantity, volume
 
 ## Configuration
 
@@ -212,16 +272,21 @@ Switch providers via `AUST__LLM__DEFAULT_PROVIDER` (claude/openai/ollama)
 
 ## High Priority
 
+### Direct API Endpoints (Sources C + D)
+- [ ] `POST /api/v1/inquiries/photo` — multipart form + photos for webapp
+- [ ] `POST /api/v1/inquiries/mobile` — multipart form + photos + depth maps for mobile app
+- [ ] Wire both into vision pipeline → offer generation → Telegram approval
+
+### Missing Offer Data
+- [ ] Auto-trigger distance calculation when addresses exist (currently `distance_km: 0.0`)
+- [ ] Add elevator field to addresses table and forms
+- [ ] Salutation detection: currently hardcodes "Herrn", should detect from name or store
+
 ### Authentication
 - [ ] Implement proper JWT token generation in `crates/api/src/routes/auth.rs`
 - [ ] Implement password hashing with Argon2
 - [ ] Add JWT validation middleware
 - [ ] Protect API routes with auth middleware
-
-### PDF Generation
-- [ ] Finalize Typst offer letter template (German)
-- [ ] Add company logo/branding
-- [ ] Store generated PDFs in S3
 
 ## Medium Priority
 
@@ -232,9 +297,9 @@ Switch providers via `AUST__LLM__DEFAULT_PROVIDER` (claude/openai/ollama)
 - [ ] Improve cross-image deduplication with better feature extraction
 
 ### Pricing Engine
-- [ ] Make pricing configurable via database
-- [ ] Add seasonal/weekend/holiday pricing
-- [ ] Add floor/elevator surcharges
+- [ ] Make pricing configurable via database (currently hardcoded rates)
+- [ ] Add seasonal/weekend/holiday pricing (Saturday surcharge exists: +€50)
+- [ ] Store services as JSONB on quotes instead of comma-separated text in `notes`
 
 ### Distance Calculator
 - [ ] Add result caching in Redis
@@ -265,3 +330,4 @@ Switch providers via `AUST__LLM__DEFAULT_PROVIDER` (claude/openai/ollama)
 - [ ] Remove unused `patch` import in `quotes.rs`
 - [ ] Use `status` field in `ListQuotesQuery` for filtering
 - [ ] Extract duplicate `QuoteRow` to shared location
+- [ ] Fix `run_agent.rs` example (missing 4th arg to `EmailProcessor::new()`)

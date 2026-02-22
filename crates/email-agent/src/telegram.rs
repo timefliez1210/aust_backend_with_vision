@@ -46,6 +46,16 @@ pub enum ApprovalDecision {
     CapacityDeny(String),
     /// A calendar management command from the admin
     CalendarCommand(CalendarCommand),
+    /// Admin approved sending an offer to the customer
+    OfferApprove(String),
+    /// Admin wants to edit an offer before sending
+    OfferEdit(String),
+    /// Admin rejected/discarded an offer
+    OfferDeny(String),
+    /// Free-text edit instructions for an offer (routed when no email draft is being edited)
+    OfferEditText(String),
+    /// A complete inquiry is ready to become a quote + offer
+    InquiryComplete(aust_core::models::MovingInquiry),
 }
 
 /// Calendar commands from Telegram.
@@ -163,7 +173,7 @@ impl TelegramBot {
     /// Returns any new approval responses since the last poll.
     pub async fn poll_approvals(&mut self) -> Result<Vec<ApprovalResponse>, EmailError> {
         let mut params = serde_json::json!({
-            "timeout": 1,
+            "timeout": 2,
             "allowed_updates": ["callback_query", "message"],
         });
 
@@ -292,6 +302,29 @@ impl TelegramBot {
                 Some(ApprovalResponse {
                     draft_id,
                     decision: ApprovalDecision::CapacityDeny(id),
+                })
+            }
+            "offer_approve" => {
+                self.send_status_message("✅ Angebot wird versendet...").await;
+                let id = draft_id.clone();
+                Some(ApprovalResponse {
+                    draft_id,
+                    decision: ApprovalDecision::OfferApprove(id),
+                })
+            }
+            "offer_edit" => {
+                let id = draft_id.clone();
+                Some(ApprovalResponse {
+                    draft_id,
+                    decision: ApprovalDecision::OfferEdit(id),
+                })
+            }
+            "offer_deny" => {
+                self.send_status_message("❌ Angebot verworfen.").await;
+                let id = draft_id.clone();
+                Some(ApprovalResponse {
+                    draft_id,
+                    decision: ApprovalDecision::OfferDeny(id),
                 })
             }
             _ => {

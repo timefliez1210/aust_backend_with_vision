@@ -43,12 +43,13 @@ Images → Grounding DINO (detect objects)
 
 ## Scale Calibration
 
-Monocular depth is relative, not metric. To convert to real-world units:
-1. After raw OBB computation, find the highest-confidence detection with a known reference size
-2. Compare estimated largest dimension vs reference largest dimension (e.g., sofa → 2.10m, chair → 0.85m)
+Using Depth Anything V2 Metric Indoor Large, which outputs depth in meters directly.
+Scale calibration refines accuracy using confidence-weighted average across all detected items with known reference sizes:
+1. After raw OBB computation, compare each detection's largest dimension against its reference dimension
+2. Compute confidence-weighted average scale factor across all matched items (skip outlier ratios outside 0.1-20x)
 3. Apply linear scale factor to all items in the image
 
-Reference dimensions for ~30 common items are defined in `app/models/schemas.py:REFERENCE_DIMENSIONS`.
+Reference dimensions for ~65 common items are defined in `app/models/schemas.py:REFERENCE_DIMENSIONS`.
 
 ## Deployment
 
@@ -133,7 +134,6 @@ JSON request with S3 keys:
 | `VISION_WEIGHTS_DIR` | `/app/weights` | Model weights path |
 | `VISION_DETECTION_THRESHOLD` | `0.3` | Grounding DINO confidence threshold |
 | `VISION_DEDUP_SIMILARITY_THRESHOLD` | `0.85` | Cross-image dedup threshold |
-| `VISION_DEPTH_SCALE` | `1.0` | Depth normalization multiplier |
 | `VISION_S3_ENDPOINT` | `http://minio:9000` | MinIO/S3 URL |
 | `VISION_S3_BUCKET` | `aust-uploads` | Image bucket |
 | `VISION_S3_ACCESS_KEY` | `minioadmin` | S3 credentials |
@@ -157,4 +157,4 @@ Accuracy improves significantly with real room photos vs isolated product photos
 |-------|------|---------|
 | Grounding DINO (IDEA-Research/grounding-dino-base) | ~900MB | Object detection |
 | SAM ViT-H (sam_vit_h_4b8939.pth) | ~2.5GB | Segmentation |
-| Depth Anything V2 Small (depth-anything/Depth-Anything-V2-Small-hf) | ~100MB | Depth estimation |
+| Depth Anything V2 Metric Indoor Large (depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf) | ~1.3GB | Metric depth estimation |

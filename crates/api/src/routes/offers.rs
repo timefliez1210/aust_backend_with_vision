@@ -6,13 +6,22 @@ use axum::{
     Json, Router,
 };
 use serde::Deserialize;
-use sqlx::FromRow;
+use sqlx::{FromRow, PgPool};
 use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::{ApiError, AppState};
-use aust_core::models::{Offer, OfferStatus, PricingInput, Quote, QuoteStatus};
-use aust_offer_generator::{PdfGenerator, PricingEngine};
+use aust_core::models::{
+    DepthSensorItem, DepthSensorResult, DetectedItem, Offer, OfferStatus, PricingInput, Quote,
+    QuoteStatus, VisionAnalysisResult,
+};
+use aust_offer_generator::{
+    convert_xlsx_to_pdf, parse_floor, DetectedItemRow, OfferData, OfferLineItem, PricingEngine,
+    XlsxGenerator,
+};
+use aust_storage::StorageProvider;
+
+const TEMPLATE_BYTES: &[u8] = include_bytes!("../../../../templates/offer_template.xlsx");
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -28,18 +37,18 @@ struct GenerateOfferRequest {
 }
 
 #[derive(Debug, FromRow)]
-struct QuoteRow {
-    id: Uuid,
-    customer_id: Uuid,
-    origin_address_id: Option<Uuid>,
-    destination_address_id: Option<Uuid>,
-    status: String,
-    estimated_volume_m3: Option<f64>,
-    distance_km: Option<f64>,
-    preferred_date: Option<chrono::DateTime<chrono::Utc>>,
-    notes: Option<String>,
-    created_at: chrono::DateTime<chrono::Utc>,
-    updated_at: chrono::DateTime<chrono::Utc>,
+pub(crate) struct QuoteRow {
+    pub id: Uuid,
+    pub customer_id: Uuid,
+    pub origin_address_id: Option<Uuid>,
+    pub destination_address_id: Option<Uuid>,
+    pub status: String,
+    pub estimated_volume_m3: Option<f64>,
+    pub distance_km: Option<f64>,
+    pub preferred_date: Option<chrono::DateTime<chrono::Utc>>,
+    pub notes: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl From<QuoteRow> for Quote {
@@ -111,79 +120,524 @@ impl From<OfferRow> for Offer {
     }
 }
 
-async fn generate_offer(
-    State(state): State<Arc<AppState>>,
-    Json(request): Json<GenerateOfferRequest>,
-) -> Result<Json<Offer>, ApiError> {
-    let row: Option<QuoteRow> = sqlx::query_as(
-        r#"
-        SELECT id, customer_id, origin_address_id, destination_address_id, status, estimated_volume_m3, distance_km, preferred_date, notes, created_at, updated_at
-        FROM quotes WHERE id = $1
-        "#
-    )
-    .bind(request.quote_id)
-    .fetch_optional(&state.db)
-    .await?;
+#[derive(Debug, FromRow)]
+pub(crate) struct CustomerRow {
+    #[allow(dead_code)]
+    pub id: Uuid,
+    pub email: String,
+    pub name: Option<String>,
+    pub phone: Option<String>,
+}
 
-    let quote = Quote::from(row.ok_or_else(|| ApiError::NotFound("Quote not found".into()))?);
+#[derive(Debug, FromRow)]
+pub(crate) struct AddressRow {
+    #[allow(dead_code)]
+    pub id: Uuid,
+    pub street: String,
+    pub city: String,
+    pub postal_code: Option<String>,
+    pub floor: Option<String>,
+}
+
+#[derive(Debug, FromRow)]
+pub(crate) struct VolumeEstimationRow {
+    pub result_data: Option<serde_json::Value>,
+    #[allow(dead_code)]
+    pub total_volume_m3: Option<f64>,
+    #[allow(dead_code)]
+    pub method: String,
+}
+
+/// Result of offer generation — the offer record + PDF bytes for immediate use.
+pub struct GeneratedOffer {
+    pub offer: Offer,
+    pub pdf_bytes: Vec<u8>,
+    pub customer_email: String,
+    pub customer_name: String,
+}
+
+/// Optional overrides for the offer (e.g. when admin edits via Telegram).
+#[derive(Default)]
+pub struct OfferOverrides {
+    pub price_cents: Option<i64>,
+    pub persons: Option<u32>,
+    pub hours: Option<f64>,
+    pub rate: Option<f64>,
+}
+
+/// Core offer generation logic. Used by both the API endpoint and the orchestrator.
+pub async fn build_offer(
+    db: &PgPool,
+    storage: &dyn StorageProvider,
+    quote_id: Uuid,
+    valid_days: Option<i64>,
+) -> Result<GeneratedOffer, ApiError> {
+    build_offer_with_overrides(db, storage, quote_id, valid_days, &OfferOverrides::default()).await
+}
+
+/// Core offer generation logic with optional overrides.
+pub async fn build_offer_with_overrides(
+    db: &PgPool,
+    storage: &dyn StorageProvider,
+    quote_id: Uuid,
+    valid_days: Option<i64>,
+    overrides: &OfferOverrides,
+) -> Result<GeneratedOffer, ApiError> {
+    // 1. Fetch quote
+    let quote_row: QuoteRow = sqlx::query_as(
+        r#"
+        SELECT id, customer_id, origin_address_id, destination_address_id, status,
+               estimated_volume_m3, distance_km, preferred_date, notes, created_at, updated_at
+        FROM quotes WHERE id = $1
+        "#,
+    )
+    .bind(quote_id)
+    .fetch_optional(db)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Quote not found".into()))?;
+
+    let quote = Quote::from(quote_row);
 
     let volume = quote
         .estimated_volume_m3
         .ok_or_else(|| ApiError::BadRequest("Quote has no volume estimate".into()))?;
 
-    let distance = quote
-        .distance_km
-        .ok_or_else(|| ApiError::BadRequest("Quote has no distance calculated".into()))?;
+    let distance = quote.distance_km.unwrap_or(0.0);
+
+    // 2. Fetch customer
+    let customer: CustomerRow =
+        sqlx::query_as("SELECT id, email, name, phone FROM customers WHERE id = $1")
+            .bind(quote.customer_id)
+            .fetch_optional(db)
+            .await?
+            .ok_or_else(|| ApiError::NotFound("Customer not found".into()))?;
+
+    // 3. Fetch addresses
+    let origin: Option<AddressRow> = if let Some(addr_id) = quote.origin_address_id {
+        sqlx::query_as("SELECT id, street, city, postal_code, floor FROM addresses WHERE id = $1")
+            .bind(addr_id)
+            .fetch_optional(db)
+            .await?
+    } else {
+        None
+    };
+
+    let destination: Option<AddressRow> = if let Some(addr_id) = quote.destination_address_id {
+        sqlx::query_as("SELECT id, street, city, postal_code, floor FROM addresses WHERE id = $1")
+            .bind(addr_id)
+            .fetch_optional(db)
+            .await?
+    } else {
+        None
+    };
+
+    // 4. Fetch latest volume estimation for detected items
+    let estimation: Option<VolumeEstimationRow> = sqlx::query_as(
+        r#"
+        SELECT result_data, total_volume_m3, method
+        FROM volume_estimations
+        WHERE quote_id = $1
+        ORDER BY created_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(quote_id)
+    .fetch_optional(db)
+    .await?;
+
+    // 5. Parse detected items from result_data
+    let detected_items = parse_detected_items(estimation.as_ref());
+
+    // 6. Calculate pricing
+    let origin_floor = origin
+        .as_ref()
+        .and_then(|a| a.floor.as_deref())
+        .map(parse_floor);
+    let dest_floor = destination
+        .as_ref()
+        .and_then(|a| a.floor.as_deref())
+        .map(parse_floor);
 
     let pricing_input = PricingInput {
         volume_m3: volume,
         distance_km: distance,
         preferred_date: quote.preferred_date,
-        floor_origin: None,
-        floor_destination: None,
-        has_elevator_origin: None,
+        floor_origin: origin_floor,
+        floor_destination: dest_floor,
+        has_elevator_origin: None, // TODO: add elevator field to addresses table
         has_elevator_destination: None,
     };
 
     let pricing_engine = PricingEngine::new();
-    let pricing_result = pricing_engine.calculate(&pricing_input);
+    let mut pricing_result = pricing_engine.calculate(&pricing_input);
 
-    let valid_until = request.valid_days.map(|days| {
-        (chrono::Utc::now() + chrono::Duration::days(days))
-            .date_naive()
-    });
+    // Apply overrides
+    if let Some(p) = overrides.persons {
+        pricing_result.estimated_helpers = p;
+    }
+    if let Some(h) = overrides.hours {
+        pricing_result.estimated_hours = h;
+    }
+    if let Some(price) = overrides.price_cents {
+        pricing_result.total_price_cents = price;
+    }
 
-    let id = Uuid::now_v7();
+    // 7. Build line items from quote notes (services, parking bans) and pricing
+    let line_items = build_line_items(
+        quote.notes.as_deref(),
+        distance,
+        volume,
+    );
+
+    // Determine rate: if price was overridden, back-calculate so xlsx formula matches.
+    // The xlsx netto total (G44) = labor (G38) + sum of other line items.
+    // G38 = hours × rate × persons.
+    // So: rate = (target_netto - other_items_netto) / (persons × hours)
+    let rate_override = if let Some(r) = overrides.rate {
+        r
+    } else if overrides.price_cents.is_some() {
+        let persons = pricing_result.estimated_helpers.max(1) as f64;
+        let hours = pricing_result.estimated_hours.max(1.0);
+        let target_netto = pricing_result.total_price_cents as f64 / 100.0;
+
+        // Sum up non-labor line items that contribute to the XLSX netto total
+        let other_items_netto: f64 = line_items
+            .iter()
+            .filter(|li| li.row != 38) // exclude labor row
+            .map(|li| li.quantity * li.unit_price)
+            .sum();
+
+        let labor_netto = (target_netto - other_items_netto).max(0.0);
+        labor_netto / (persons * hours)
+    } else {
+        30.0
+    };
+
+    // 8. Build OfferData
+    let offer_id = Uuid::now_v7();
     let now = chrono::Utc::now();
+    let today = now.date_naive();
+
+    let customer_name = customer
+        .name
+        .clone()
+        .unwrap_or_else(|| customer.email.clone());
+
+    // Detect salutation (Herr/Frau) and greeting from customer name
+    let (customer_salutation, greeting) = detect_salutation_and_greeting(&customer_name);
+
+    let moving_date = quote
+        .preferred_date
+        .map(|d| d.format("%d.%m.%Y").to_string())
+        .unwrap_or_else(|| "nach Vereinbarung".to_string());
+
+    let origin_street = origin.as_ref().map(|a| a.street.clone()).unwrap_or_default();
+    let origin_city = origin
+        .as_ref()
+        .map(|a| format_city(a))
+        .unwrap_or_default();
+    let origin_floor_info = origin
+        .as_ref()
+        .and_then(|a| a.floor.clone())
+        .unwrap_or_default();
+
+    let dest_street = destination
+        .as_ref()
+        .map(|a| a.street.clone())
+        .unwrap_or_default();
+    let dest_city = destination
+        .as_ref()
+        .map(|a| format_city(a))
+        .unwrap_or_default();
+    let dest_floor_info = destination
+        .as_ref()
+        .and_then(|a| a.floor.clone())
+        .unwrap_or_default();
+
+    let offer_number = format!("{}-{}", today.format("%Y"), &offer_id.to_string()[..4]);
+
+    let offer_data = OfferData {
+        offer_number: offer_number.clone(),
+        date: today,
+        customer_salutation,
+        customer_name: customer_name.clone(),
+        customer_street: origin_street.clone(),
+        customer_city: origin_city.clone(),
+        customer_phone: customer.phone.clone().unwrap_or_default(),
+        customer_email: customer.email.clone(),
+        greeting,
+        moving_date,
+        origin_street,
+        origin_city,
+        origin_floor_info,
+        dest_street,
+        dest_city,
+        dest_floor_info,
+        volume_m3: volume,
+        persons: pricing_result.estimated_helpers,
+        estimated_hours: pricing_result.estimated_hours,
+        rate_per_person_hour: rate_override,
+        line_items,
+        detected_items,
+    };
+
+    // 8. Generate xlsx → PDF
+    let generator = XlsxGenerator::from_template(TEMPLATE_BYTES)
+        .map_err(|e| ApiError::Internal(format!("Template error: {e}")))?;
+    let xlsx_bytes = generator
+        .generate(&offer_data)
+        .map_err(|e| ApiError::Internal(format!("XLSX generation error: {e}")))?;
+
+    // 9. Try PDF conversion (LibreOffice), fall back to xlsx if not available
+    let (s3_key, pdf_bytes) =
+        match convert_xlsx_to_pdf(&xlsx_bytes).await {
+            Ok(pdf_bytes) => {
+                let key = format!("offers/{offer_id}/angebot.pdf");
+                storage
+                    .upload(&key, bytes::Bytes::from(pdf_bytes.clone()), "application/pdf")
+                    .await
+                    .map_err(|e| ApiError::Internal(format!("Failed to upload offer: {e}")))?;
+                (key, pdf_bytes)
+            }
+            Err(e) => {
+                tracing::warn!("PDF conversion unavailable ({e}), uploading xlsx directly");
+                let key = format!("offers/{offer_id}/angebot.xlsx");
+                let bytes = xlsx_bytes.clone();
+                storage
+                    .upload(
+                        &key,
+                        bytes::Bytes::from(bytes.clone()),
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+                    .await
+                    .map_err(|e| ApiError::Internal(format!("Failed to upload offer: {e}")))?;
+                (key, bytes)
+            }
+        };
+
+    // 10. Insert offer record
+    let valid_until =
+        valid_days.map(|days| (now + chrono::Duration::days(days)).date_naive());
 
     let row: OfferRow = sqlx::query_as(
         r#"
-        INSERT INTO offers (id, quote_id, price_cents, currency, valid_until, status, created_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        INSERT INTO offers (id, quote_id, price_cents, currency, valid_until, pdf_storage_key, status, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         RETURNING id, quote_id, price_cents, currency, valid_until, pdf_storage_key, status, created_at, sent_at
-        "#
+        "#,
     )
-    .bind(id)
-    .bind(request.quote_id)
+    .bind(offer_id)
+    .bind(quote_id)
     .bind(pricing_result.total_price_cents)
     .bind("EUR")
     .bind(valid_until)
+    .bind(Some(&s3_key))
     .bind(OfferStatus::Draft.as_str())
     .bind(now)
-    .fetch_one(&state.db)
+    .fetch_one(db)
     .await?;
 
     // Update quote status
-    sqlx::query(
-        "UPDATE quotes SET status = $1, updated_at = $2 WHERE id = $3"
-    )
-    .bind("offer_generated")
-    .bind(now)
-    .bind(request.quote_id)
-    .execute(&state.db)
-    .await?;
+    sqlx::query("UPDATE quotes SET status = $1, updated_at = $2 WHERE id = $3")
+        .bind("offer_generated")
+        .bind(now)
+        .bind(quote_id)
+        .execute(db)
+        .await?;
 
-    Ok(Json(Offer::from(row)))
+    Ok(GeneratedOffer {
+        offer: Offer::from(row),
+        pdf_bytes,
+        customer_email: customer.email,
+        customer_name,
+    })
+}
+
+fn format_city(addr: &AddressRow) -> String {
+    format!(
+        "{}{}",
+        addr.postal_code
+            .as_ref()
+            .map(|p| format!("{p} "))
+            .unwrap_or_default(),
+        addr.city
+    )
+}
+
+/// Detect the appropriate salutation and greeting from the customer name.
+///
+/// Returns (salutation for address block, greeting line).
+/// Uses common German female first names as a heuristic.
+fn detect_salutation_and_greeting(name: &str) -> (String, String) {
+    // If the name contains "Frau" or "Herr" prefix, use that directly
+    let name_trimmed = name.trim();
+    if name_trimmed.starts_with("Frau ") {
+        let after = name_trimmed.strip_prefix("Frau ").unwrap().trim();
+        return (
+            "Frau".to_string(),
+            format!("Sehr geehrte Frau {after},"),
+        );
+    }
+    if name_trimmed.starts_with("Herr ") {
+        let after = name_trimmed.strip_prefix("Herr ").unwrap().trim();
+        return (
+            "Herrn".to_string(),
+            format!("Sehr geehrter Herr {after},"),
+        );
+    }
+
+    // Extract first name (first word)
+    let first_name = name_trimmed
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
+
+    // Extract last name (last word) for greeting
+    let last_name = name_trimmed
+        .split_whitespace()
+        .last()
+        .unwrap_or(name_trimmed);
+
+    // Common German/Austrian female first names
+    const FEMALE_NAMES: &[&str] = &[
+        "anna", "andrea", "angelika", "anita", "barbara", "birgit", "brigitte",
+        "carina", "carmen", "caroline", "charlotte", "christa", "christina", "claudia",
+        "daniela", "diana", "doris", "elisabeth", "elena", "elke", "emma", "erika",
+        "eva", "franziska", "gabriele", "gabi", "gertrud", "gisela", "hannah",
+        "heidi", "helga", "ines", "ingrid", "irene", "jana", "jessica", "johanna",
+        "julia", "karin", "katharina", "katrin", "kristina", "laura", "lena", "lisa",
+        "luisa", "manuela", "maria", "marie", "marina", "marion", "marlene",
+        "martina", "melanie", "michaela", "monika", "nadine", "natalie", "nicole",
+        "nina", "olivia", "patricia", "petra", "renate", "rita", "rosa", "ruth",
+        "sabine", "sandra", "sara", "sarah", "silvia", "simone", "sofia", "sophie",
+        "stefanie", "stephanie", "susanne", "sylvia", "tanja", "teresa", "theresia",
+        "ursula", "ute", "valentina", "vanessa", "vera", "verena", "veronika",
+    ];
+
+    let is_female = FEMALE_NAMES.contains(&first_name.as_str());
+
+    if name_trimmed.contains(' ') {
+        // Have first + last name
+        if is_female {
+            (
+                "Frau".to_string(),
+                format!("Sehr geehrte Frau {last_name},"),
+            )
+        } else {
+            (
+                "Herrn".to_string(),
+                format!("Sehr geehrter Herr {last_name},"),
+            )
+        }
+    } else {
+        // Only one word — can't determine reliably, use generic
+        (
+            String::new(),
+            "Sehr geehrte Damen und Herren,".to_string(),
+        )
+    }
+}
+
+/// Build line items for the XLSX offer from quote notes, distance, and pricing.
+///
+/// Template row mapping:
+///   31: De/Montage            — qty × €50
+///   32: Halteverbotszone      — qty × €100 (per location)
+///   33: Umzugsmaterial        — 1 × €30 (template default, override if Einpackservice)
+///   34: Seidenpapier          — qty × €5 (if packing service)
+///   35: U-Karton              — qty × €2.10 (if packing service)
+///   37: Kleiderboxen          — qty × €10 (if packing service)
+///   38: Personal              — hours × rate × persons (handled separately in xlsx.rs)
+///   39: 3,5t Transporter      — qty × €60 (based on volume)
+///   42: Anfahrt/Abfahrt       — 1 × distance-based price
+fn build_line_items(
+    notes: Option<&str>,
+    distance_km: f64,
+    volume_m3: f64,
+) -> Vec<OfferLineItem> {
+    let notes_lower = notes
+        .map(|n| n.to_lowercase())
+        .unwrap_or_default();
+    let mut items = Vec::new();
+
+    // Row 31: De/Montage — if assembly or disassembly service requested
+    let has_montage = notes_lower.contains("montage") || notes_lower.contains("demontage");
+    if has_montage {
+        items.push(OfferLineItem {
+            row: 31,
+            description: None,
+            quantity: 1.0,
+            unit_price: 50.0, // template preset: €50 per unit
+        });
+    }
+
+    // Row 32: Halteverbotszone — count parking ban locations
+    let mut halteverbot_count = 0.0;
+    if notes_lower.contains("halteverbot auszug") {
+        halteverbot_count += 1.0;
+    }
+    if notes_lower.contains("halteverbot einzug") {
+        halteverbot_count += 1.0;
+    }
+    if halteverbot_count > 0.0 {
+        let desc = if halteverbot_count > 1.0 {
+            Some("Beladestelle + Entladestelle".to_string())
+        } else if notes_lower.contains("halteverbot auszug") {
+            Some("Beladestelle".to_string())
+        } else {
+            None // template default says "Entladestelle"
+        };
+        items.push(OfferLineItem {
+            row: 32,
+            description: desc,
+            quantity: halteverbot_count,
+            unit_price: 100.0,
+        });
+    }
+
+    // Row 33: Umzugsmaterial — if Verpackungsservice/Einpackservice, note it
+    if notes_lower.contains("verpackungsservice") || notes_lower.contains("einpackservice") {
+        items.push(OfferLineItem {
+            row: 33,
+            description: Some("Umzugsmaterial inkl. Einpackservice (nach Aufwand)".to_string()),
+            quantity: 1.0,
+            unit_price: 30.0, // template preset: €30 per unit
+        });
+    }
+
+    // Row 39: Transporter — based on volume (2 trucks for >30m³)
+    let truck_count = if volume_m3 > 30.0 { 2.0 } else { 1.0 };
+    items.push(OfferLineItem {
+        row: 39,
+        description: None,
+        quantity: truck_count,
+        unit_price: 60.0,
+    });
+
+    // Row 42: Anfahrt/Abfahrt — adjust based on distance
+    if distance_km > 0.0 {
+        // Price scales with distance: base €30 + €1.50/km
+        let anfahrt_price = 30.0 + (distance_km * 1.5);
+        items.push(OfferLineItem {
+            row: 42,
+            description: None,
+            quantity: 1.0,
+            unit_price: anfahrt_price,
+        });
+    }
+
+    items
+}
+
+// --- API handlers ---
+
+async fn generate_offer(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<GenerateOfferRequest>,
+) -> Result<Json<Offer>, ApiError> {
+    let result = build_offer(&state.db, &*state.storage, request.quote_id, request.valid_days).await?;
+    Ok(Json(result.offer))
 }
 
 async fn get_offer(
@@ -194,7 +648,7 @@ async fn get_offer(
         r#"
         SELECT id, quote_id, price_cents, currency, valid_until, pdf_storage_key, status, created_at, sent_at
         FROM offers WHERE id = $1
-        "#
+        "#,
     )
     .bind(id)
     .fetch_optional(&state.db)
@@ -212,37 +666,138 @@ async fn get_offer_pdf(
         r#"
         SELECT id, quote_id, price_cents, currency, valid_until, pdf_storage_key, status, created_at, sent_at
         FROM offers WHERE id = $1
-        "#
+        "#,
     )
     .bind(id)
     .fetch_optional(&state.db)
     .await?;
 
-    let offer = Offer::from(row.ok_or_else(|| ApiError::NotFound(format!("Offer {id} not found")))?);
+    let offer =
+        Offer::from(row.ok_or_else(|| ApiError::NotFound(format!("Offer {id} not found")))?);
 
-    let content = format!(
-        "Angebot #{}\nPreis: {:.2} EUR\nGültig bis: {}",
-        offer.id,
-        offer.price_cents as f64 / 100.0,
-        offer
-            .valid_until
-            .map(|d| d.to_string())
-            .unwrap_or_else(|| "Unbegrenzt".to_string())
-    );
+    let storage_key = offer
+        .pdf_storage_key
+        .ok_or_else(|| ApiError::NotFound("Offer has no generated file".into()))?;
 
-    let pdf_generator = PdfGenerator::new();
-    let pdf_bytes = pdf_generator
-        .generate(&content)
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let file_bytes = state
+        .storage
+        .download(&storage_key)
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to download offer: {e}")))?;
+
+    let (content_type, ext) = if storage_key.ends_with(".pdf") {
+        ("application/pdf", "pdf")
+    } else {
+        ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "xlsx")
+    };
+    let filename = format!("Angebot-{}.{ext}", offer.id);
 
     Ok((
         [
-            (header::CONTENT_TYPE, "application/pdf"),
+            (header::CONTENT_TYPE, content_type.to_string()),
             (
                 header::CONTENT_DISPOSITION,
-                "attachment; filename=\"offer.pdf\"",
+                format!("attachment; filename=\"{filename}\""),
             ),
         ],
-        pdf_bytes,
+        file_bytes,
     ))
+}
+
+/// Parsed inventory item from VolumeCalculator items_list text.
+/// Matches the format stored by orchestrator::parse_items_list_text().
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ParsedInventoryItem {
+    name: String,
+    quantity: u32,
+    volume_m3: f64,
+}
+
+/// Parse detected items from volume estimation result_data.
+pub(crate) fn parse_detected_items(estimation: Option<&VolumeEstimationRow>) -> Vec<DetectedItemRow> {
+    let Some(est) = estimation else {
+        return vec![];
+    };
+    let Some(data) = &est.result_data else {
+        return vec![];
+    };
+
+    // Try DepthSensorResult (has detected_items with dimensions)
+    if let Ok(result) = serde_json::from_value::<DepthSensorResult>(data.clone()) {
+        return result
+            .detected_items
+            .into_iter()
+            .map(depth_sensor_to_row)
+            .collect();
+    }
+
+    // Try as Vec<DepthSensorItem> (raw array from vision service)
+    if let Ok(items) = serde_json::from_value::<Vec<DepthSensorItem>>(data.clone()) {
+        return items.into_iter().map(depth_sensor_to_row).collect();
+    }
+
+    // Try VisionAnalysisResult (LLM, array of results)
+    if let Ok(results) = serde_json::from_value::<Vec<VisionAnalysisResult>>(data.clone()) {
+        return results
+            .into_iter()
+            .flat_map(|r| r.detected_items)
+            .map(vision_to_row)
+            .collect();
+    }
+
+    // Try single VisionAnalysisResult
+    if let Ok(result) = serde_json::from_value::<VisionAnalysisResult>(data.clone()) {
+        return result
+            .detected_items
+            .into_iter()
+            .map(vision_to_row)
+            .collect();
+    }
+
+    // Try Vec<DetectedItem>
+    if let Ok(items) = serde_json::from_value::<Vec<DetectedItem>>(data.clone()) {
+        return items.into_iter().map(vision_to_row).collect();
+    }
+
+    // Try parsed inventory items (from VolumeCalculator items_list text)
+    if let Ok(items) = serde_json::from_value::<Vec<ParsedInventoryItem>>(data.clone()) {
+        return items
+            .into_iter()
+            .map(|item| {
+                let name = if item.quantity > 1 {
+                    format!("{}x {}", item.quantity, item.name)
+                } else {
+                    item.name
+                };
+                DetectedItemRow {
+                    name,
+                    volume_m3: item.volume_m3, // already total volume for this line
+                    dimensions: None,
+                    confidence: 0.8, // form-submitted data has decent confidence
+                }
+            })
+            .collect();
+    }
+
+    vec![]
+}
+
+fn depth_sensor_to_row(item: DepthSensorItem) -> DetectedItemRow {
+    DetectedItemRow {
+        name: item.name,
+        volume_m3: item.volume_m3,
+        dimensions: item.dimensions.map(|d| {
+            format!("{:.1} × {:.1} × {:.1} m", d.length_m, d.width_m, d.height_m)
+        }),
+        confidence: item.confidence,
+    }
+}
+
+fn vision_to_row(item: DetectedItem) -> DetectedItemRow {
+    DetectedItemRow {
+        name: item.name,
+        volume_m3: item.estimated_volume_m3,
+        dimensions: None,
+        confidence: item.confidence,
+    }
 }

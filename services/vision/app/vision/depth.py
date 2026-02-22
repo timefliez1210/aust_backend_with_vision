@@ -23,8 +23,8 @@ class DepthEstimator:
     def estimate(self, images: list[Image.Image]) -> list[np.ndarray]:
         """Produce depth maps for a list of images.
 
-        Returns a list of depth arrays (H, W) in metric-like units.
-        Values are relative depth scaled by the configured depth_scale.
+        Returns a list of depth arrays (H, W) in meters.
+        Uses Depth Anything V2 Metric Indoor model which outputs metric depth directly.
         """
         depth_maps: list[np.ndarray] = []
 
@@ -60,17 +60,8 @@ class DepthEstimator:
 
         depth_np = prediction.cpu().numpy()
 
-        # Normalize to approximate metric depth.
-        # Monocular depth is relative, so we scale it to a plausible range.
-        # The depth_scale config lets operators tune this for their setup.
-        depth_min = depth_np.min()
-        depth_max = depth_np.max()
-        if depth_max - depth_min > 1e-6:
-            depth_normalized = (depth_np - depth_min) / (depth_max - depth_min)
-        else:
-            depth_normalized = np.zeros_like(depth_np)
-
-        # Scale to approximate meters (typical room depth ~0.5 to 5m)
-        depth_metric = depth_normalized * 5.0 * settings.depth_scale
+        # The Metric Indoor model outputs depth in meters directly.
+        # Clamp to reasonable indoor range (0.1m to 20m).
+        depth_metric = np.clip(depth_np, 0.1, 20.0)
 
         return depth_metric

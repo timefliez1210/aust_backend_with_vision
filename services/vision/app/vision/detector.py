@@ -13,10 +13,19 @@ logger = logging.getLogger(__name__)
 
 # Prompt for Grounding DINO: common household / moving items
 DETECTION_PROMPT = (
-    "sofa. chair. table. desk. bed. mattress. wardrobe. dresser. shelf. bookshelf. "
-    "cabinet. nightstand. tv. monitor. computer. lamp. speaker. "
-    "refrigerator. washing machine. dryer. dishwasher. oven. microwave. "
-    "box. carton. suitcase. bag. bicycle. piano. guitar. plant. painting. mirror. rug."
+    "sofa. couch. armchair. chair. stool. bench. ottoman. "
+    "table. desk. dining table. coffee table. "
+    "bed. mattress. crib. bunk bed. "
+    "wardrobe. closet. dresser. chest of drawers. shelf. bookshelf. cabinet. cupboard. nightstand. "
+    "tv. monitor. computer. printer. speaker. stereo. "
+    "lamp. floor lamp. chandelier. "
+    "refrigerator. freezer. washing machine. dryer. dishwasher. oven. stove. microwave. "
+    "box. carton. moving box. suitcase. bag. basket. storage container. "
+    "bicycle. treadmill. exercise equipment. "
+    "piano. keyboard. guitar. "
+    "plant. painting. mirror. rug. carpet. curtain. "
+    "shoe rack. coat rack. ironing board. vacuum cleaner. fan. heater. "
+    "kitchen island. bar stool. recliner."
 )
 
 

@@ -1,9 +1,11 @@
 pub mod error;
 pub mod middleware;
+pub mod orchestrator;
 pub mod routes;
 pub mod state;
 
 pub use error::ApiError;
+pub use orchestrator::{run_offer_event_handler, try_auto_generate_offer};
 pub use state::AppState;
 
 use axum::Router;

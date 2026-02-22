@@ -29,8 +29,5 @@ class Settings(BaseSettings):
     # Deduplication
     dedup_similarity_threshold: float = 0.85
 
-    # Depth estimation
-    depth_scale: float = 1.0
-
 
 settings = Settings()

@@ -93,6 +93,52 @@ impl VisionServiceClient {
         request: &VisionServiceRequest,
     ) -> Result<VisionServiceResponse, VolumeError> {
         let url = format!("{}/estimate/images", self.base_url);
+        self.send_with_retry(&url, |client, url| {
+            client.post(url).json(request)
+        }).await
+    }
+
+    /// Upload raw image bytes directly to the vision service as multipart form data.
+    /// Used when the vision service doesn't have access to S3 (e.g. Modal deployment).
+    pub async fn estimate_upload(
+        &self,
+        job_id: &str,
+        images: &[(Vec<u8>, String)], // (data, mime_type)
+    ) -> Result<VisionServiceResponse, VolumeError> {
+        let url = format!("{}/estimate/upload", self.base_url);
+
+        self.send_with_retry(&url, |client, url| {
+            let mut form = reqwest::multipart::Form::new()
+                .text("job_id", job_id.to_string());
+
+            for (idx, (data, mime_type)) in images.iter().enumerate() {
+                let ext = match mime_type.as_str() {
+                    "image/png" => "png",
+                    "image/webp" => "webp",
+                    _ => "jpg",
+                };
+                let part = reqwest::multipart::Part::bytes(data.clone())
+                    .file_name(format!("{idx}.{ext}"))
+                    .mime_str(mime_type)
+                    .unwrap_or_else(|_| {
+                        reqwest::multipart::Part::bytes(data.clone())
+                            .file_name(format!("{idx}.{ext}"))
+                    });
+                form = form.part("images", part);
+            }
+
+            client.post(url).multipart(form)
+        }).await
+    }
+
+    async fn send_with_retry<F>(
+        &self,
+        url: &str,
+        build_request: F,
+    ) -> Result<VisionServiceResponse, VolumeError>
+    where
+        F: Fn(&reqwest::Client, &str) -> reqwest::RequestBuilder,
+    {
         let mut last_err = None;
 
         for attempt in 0..=self.max_retries {
@@ -105,7 +151,7 @@ impl VisionServiceClient {
                 tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
             }
 
-            match self.client.post(&url).json(request).send().await {
+            match build_request(&self.client, url).send().await {
                 Ok(resp) => {
                     if resp.status().is_success() {
                         return resp.json().await.map_err(|e| {

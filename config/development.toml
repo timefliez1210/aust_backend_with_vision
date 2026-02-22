@@ -11,5 +11,17 @@ region = "us-east-1"
 default_provider = "ollama"
 
 [llm.ollama]
-base_url = "http://localhost:11434"
-model = "llama3.2-vision"
+base_url = "https://ollama.com"
+model = "qwen3.5:397b"
+api_key = "REDACTED_OLLAMA_API_KEY"
+
+[email]
+imap_host = "imap.example.com"
+imap_port = 993
+smtp_host = "imap.example.com"
+smtp_port = 587
+username = "umzug@example.com"
+password = "REDACTED_EMAIL_PASSWORD"
+poll_interval_secs = 30
+from_address = "umzug@example.com"
+from_name = "AUST Umzüge"

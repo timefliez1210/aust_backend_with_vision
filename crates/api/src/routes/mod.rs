@@ -3,10 +3,12 @@ pub mod calendar;
 pub mod distance;
 pub mod estimates;
 pub mod health;
+pub mod inquiries;
 pub mod offers;
 pub mod quotes;
 
 use crate::AppState;
+use axum::extract::DefaultBodyLimit;
 use axum::Router;
 use std::sync::Arc;
 
@@ -18,4 +20,6 @@ pub fn api_router() -> Router<Arc<AppState>> {
         .nest("/distance", distance::router())
         .nest("/offers", offers::router())
         .nest("/calendar", calendar::router())
+        .nest("/inquiries", inquiries::router())
+        .layer(DefaultBodyLimit::max(250 * 1024 * 1024)) // 250MB for image uploads
 }

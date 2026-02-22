@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 GROUNDING_DINO_ID = "IDEA-Research/grounding-dino-base"
 SAM_CHECKPOINT = "sam_vit_h_4b8939.pth"
 SAM_MODEL_TYPE = "vit_h"
-DEPTH_ANYTHING_ID = "depth-anything/Depth-Anything-V2-Small-hf"
+DEPTH_ANYTHING_ID = "depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf"
 
 
 def get_device() -> torch.device:
