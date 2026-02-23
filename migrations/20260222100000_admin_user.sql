@@ -1,5 +1,7 @@
 -- Seed admin user for dashboard access
--- Default password: REDACTED_DEFAULT_PASSWORD (CHANGE IMMEDIATELY after first login)
+-- This hash is a placeholder that will NOT verify any password.
+-- After running migrations, generate a real password hash and update:
+--   UPDATE users SET password_hash = '<new_argon2_hash>' WHERE email = 'admin@aust-umzuege.de';
 INSERT INTO users (id, email, password_hash, name, role, created_at, updated_at)
 VALUES (
     gen_random_uuid(),

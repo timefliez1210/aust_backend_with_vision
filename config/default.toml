@@ -30,7 +30,7 @@ default_provider = "ollama"
 [llm.ollama]
 base_url = "https://ollama.com"
 model = "qwen3.5:397b"
-api_key = "REDACTED_OLLAMA_API_KEY"
+api_key = ""
 
 [maps]
 provider = "google"
