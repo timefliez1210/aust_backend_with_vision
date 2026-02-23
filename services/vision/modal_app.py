@@ -50,15 +50,18 @@ vision_image = (
         "python-multipart>=0.0.18,<1",
         "opencv-python-headless>=4.9,<5",
     )
-    # SAM 2 (replaces SAM ViT-H)
-    .pip_install(
-        "sam2 @ git+https://github.com/facebookresearch/sam2.git",
+    # SAM 2.1 (replaces SAM ViT-H) — install from GitHub, package name is "SAM-2"
+    .run_commands(
+        "pip install git+https://github.com/facebookresearch/sam2.git",
     )
-    # MASt3R (includes DUSt3R, needs CUDA compilation)
-    .pip_install(
-        "mast3r @ git+https://github.com/naver/mast3r.git",
+    # MASt3R + DUSt3R (not pip-installable — clone repo, install deps, add to PYTHONPATH)
+    .run_commands(
+        "git clone --recursive https://github.com/naver/mast3r.git /opt/mast3r && "
+        "pip install -r /opt/mast3r/requirements.txt && "
+        "pip install -r /opt/mast3r/dust3r/requirements.txt",
         gpu="L4",
     )
+    .env({"PYTHONPATH": "/opt/mast3r:/opt/mast3r/dust3r"})
     .run_commands(
         # Download and cache model weights into the image
         "python -c \""
@@ -71,17 +74,17 @@ vision_image = (
         "print('HuggingFace weights downloaded.')\""
     )
     .run_commands(
-        # Download SAM 2.1 checkpoint
+        # Download SAM 2.1 checkpoint (download only, don't load to GPU)
         "python -c \""
-        "from sam2.sam2_image_predictor import SAM2ImagePredictor; "
-        "SAM2ImagePredictor.from_pretrained('facebook/sam2.1-hiera-large', cache_dir='/weights/huggingface'); "
+        "from huggingface_hub import snapshot_download; "
+        "snapshot_download('facebook/sam2.1-hiera-large', cache_dir='/weights/huggingface'); "
         "print('SAM 2.1 weights downloaded.')\""
     )
     .run_commands(
-        # Download MASt3R checkpoint
+        # Download MASt3R checkpoint (download only, don't load to GPU)
         "python -c \""
-        "from mast3r.model import AsymmetricMASt3R; "
-        "AsymmetricMASt3R.from_pretrained('naver/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric', cache_dir='/weights/huggingface'); "
+        "from huggingface_hub import snapshot_download; "
+        "snapshot_download('naver/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric', cache_dir='/weights/huggingface'); "
         "print('MASt3R weights downloaded.')\""
     )
     .env({
