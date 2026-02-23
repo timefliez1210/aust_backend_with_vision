@@ -41,6 +41,7 @@ class VideoSegmenter:
         frames: list[Image.Image],
         detections: list[Detection],
         iou_merge_threshold: float = 0.5,
+        cross_label_iou_threshold: float = 0.4,
     ) -> list[TrackedObject]:
         """Segment and track objects across keyframes using SAM 2 video predictor.
 
@@ -49,6 +50,8 @@ class VideoSegmenter:
             detections: DINO detections with image_index referencing frames.
             iou_merge_threshold: IoU threshold for merging duplicate tracks
                 (same label + mask overlap > threshold).
+            cross_label_iou_threshold: IoU threshold for merging tracks at the
+                same physical location regardless of label.
 
         Returns:
             List of tracked objects with masks across frames.
@@ -62,44 +65,53 @@ class VideoSegmenter:
                 path = os.path.join(tmpdir, f"{i:05d}.jpg")
                 frame.save(path, "JPEG", quality=95)
 
-            # Initialize video state
-            inference_state = self._predictor.init_state(video_path=tmpdir)
-
-            # Add each detection as a prompt
-            obj_id_counter = 0
-            obj_id_to_detection: dict[int, Detection] = {}
-
-            for det in detections:
-                box = np.array(det.bbox, dtype=np.float32)
-                frame_idx = det.image_index
-
-                self._predictor.add_new_points_or_box(
-                    inference_state=inference_state,
-                    frame_idx=frame_idx,
-                    obj_id=obj_id_counter,
-                    box=box,
-                )
-                obj_id_to_detection[obj_id_counter] = det
-                obj_id_counter += 1
-
-            logger.info(
-                "Added %d detection prompts to SAM 2 video predictor",
-                obj_id_counter,
+            # Use autocast for consistent dtypes — SAM 2 weights may be
+            # bfloat16 while frame features are float32 after CPU→GPU move.
+            autocast_ctx = (
+                torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+                if self._device.type == "cuda"
+                else torch.autocast(device_type="cpu", dtype=torch.float32)
             )
 
-            # Propagate masks across all frames
-            raw_tracks: dict[int, dict[int, np.ndarray]] = {}
-            for frame_idx, obj_ids, mask_logits in self._predictor.propagate_in_video(
-                inference_state
-            ):
-                for i, oid in enumerate(obj_ids):
-                    oid = int(oid)
-                    mask = (mask_logits[i, 0] > 0.0).cpu().numpy().astype(bool)
-                    # Only keep masks with meaningful area
-                    if mask.sum() > 50:
-                        raw_tracks.setdefault(oid, {})[frame_idx] = mask
+            with autocast_ctx:
+                # Initialize video state
+                inference_state = self._predictor.init_state(video_path=tmpdir)
 
-            self._predictor.reset_state(inference_state)
+                # Add each detection as a prompt
+                obj_id_counter = 0
+                obj_id_to_detection: dict[int, Detection] = {}
+
+                for det in detections:
+                    box = np.array(det.bbox, dtype=np.float32)
+                    frame_idx = det.image_index
+
+                    self._predictor.add_new_points_or_box(
+                        inference_state=inference_state,
+                        frame_idx=frame_idx,
+                        obj_id=obj_id_counter,
+                        box=box,
+                    )
+                    obj_id_to_detection[obj_id_counter] = det
+                    obj_id_counter += 1
+
+                logger.info(
+                    "Added %d detection prompts to SAM 2 video predictor",
+                    obj_id_counter,
+                )
+
+                # Propagate masks across all frames
+                raw_tracks: dict[int, dict[int, np.ndarray]] = {}
+                for frame_idx, obj_ids, mask_logits in self._predictor.propagate_in_video(
+                    inference_state
+                ):
+                    for i, oid in enumerate(obj_ids):
+                        oid = int(oid)
+                        mask = (mask_logits[i, 0] > 0.0).cpu().numpy().astype(bool)
+                        # Only keep masks with meaningful area
+                        if mask.sum() > 50:
+                            raw_tracks.setdefault(oid, {})[frame_idx] = mask
+
+                self._predictor.reset_state(inference_state)
 
         logger.info("SAM 2 propagation: %d tracks across frames", len(raw_tracks))
 
@@ -117,11 +129,18 @@ class VideoSegmenter:
                 confidence=det.confidence,
             ))
 
-        # Merge duplicate tracks: same label + high mask IoU on overlapping frames
+        # Pass 1: Merge duplicate tracks with same label + high mask IoU
         merged = self._merge_duplicate_tracks(tracked, iou_merge_threshold)
         logger.info(
-            "After merging duplicates: %d unique objects (from %d tracks)",
+            "After label merge: %d unique objects (from %d tracks)",
             len(merged), len(tracked),
+        )
+
+        # Pass 2: Merge tracks at the same physical location regardless of label
+        merged = _merge_cross_label_tracks(merged, cross_label_iou_threshold)
+        logger.info(
+            "After cross-label merge: %d unique objects",
+            len(merged),
         )
 
         return merged
@@ -217,6 +236,55 @@ class VideoSegmenter:
                 ))
 
         return merged
+
+
+def _merge_cross_label_tracks(
+    tracks: list[TrackedObject],
+    iou_threshold: float = 0.4,
+) -> list[TrackedObject]:
+    """Second-pass merge: same physical location = same object, regardless of label.
+
+    Handles cases like "armchair chair" + "chair" + "armchair" all referring to
+    the same physical object detected by different prompt groups.
+    """
+    if not tracks:
+        return []
+
+    merged: list[TrackedObject] = []
+    used: set[int] = set()
+
+    for i, track_a in enumerate(tracks):
+        if i in used:
+            continue
+        cluster = [track_a]
+        for j, track_b in enumerate(tracks):
+            if j <= i or j in used:
+                continue
+            iou = _compute_track_iou(track_a.masks_per_frame, track_b.masks_per_frame)
+            if iou > iou_threshold:
+                cluster.append(track_b)
+                used.add(j)
+        used.add(i)
+
+        # Keep highest-confidence detection as representative
+        best = max(cluster, key=lambda t: t.confidence)
+        all_masks: dict[int, np.ndarray] = {}
+        for t in cluster:
+            for fidx, mask in t.masks_per_frame.items():
+                if fidx not in all_masks:
+                    all_masks[fidx] = mask
+                else:
+                    all_masks[fidx] = all_masks[fidx] | mask
+
+        merged.append(TrackedObject(
+            object_id=best.object_id,
+            detection=best.detection,
+            masks_per_frame=all_masks,
+            best_frame_index=best.best_frame_index,
+            confidence=best.confidence,
+        ))
+
+    return merged
 
 
 def _compute_track_iou(

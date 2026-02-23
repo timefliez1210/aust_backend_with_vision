@@ -29,6 +29,18 @@ from app.vision.volume import _crop_bbox_thumbnail
 
 logger = logging.getLogger(__name__)
 
+
+def _select_subset(frames: list, n: int) -> tuple[list, list[int]]:
+    """Select n evenly-spaced frames from a list.
+
+    Returns (selected_frames, indices_into_original_list).
+    """
+    if n >= len(frames):
+        return frames, list(range(len(frames)))
+    indices = np.linspace(0, len(frames) - 1, n, dtype=int).tolist()
+    return [frames[i] for i in indices], indices
+
+
 # Minimum confident points to accept MASt3R reconstruction
 _MIN_RECONSTRUCTION_POINTS = 1000
 
@@ -58,28 +70,65 @@ class VideoPipeline:
         detection_threshold: float | None = None,
         max_keyframes: int | None = None,
     ) -> EstimateResponse:
-        """Execute the full video pipeline and return the estimate response."""
+        """Execute the full video pipeline and return the estimate response.
+
+        Three-tier frame extraction:
+        - Dense keyframes (60): used for SAM 2 temporal tracking
+        - Recon subset (20): uniform for MASt3R parallax
+        - Detection subset (20): pause-aware — seeds with 1 rep per pause, fills uniform
+        """
         t0 = time.monotonic()
         threshold = detection_threshold or settings.detection_threshold
-        max_kf = max_keyframes or settings.video_max_keyframes
+        dense_kf = max_keyframes or settings.video_dense_keyframes
+        recon_kf = settings.video_recon_keyframes
 
         logger.info("Video pipeline start: job_id=%s, threshold=%.2f", job_id, threshold)
 
-        # Phase 0: Keyframe extraction (CPU)
+        # Phase 0: Extract dense keyframes + pause detection (CPU)
         keyframes = extract_keyframes(
             video_bytes,
-            max_frames=max_kf,
+            max_frames=dense_kf,
             min_frames=settings.video_min_keyframes,
             blur_threshold=settings.video_blur_threshold,
         )
         logger.info(
-            "Extracted %d keyframes from %d total frames",
+            "Extracted %d dense keyframes from %d total frames",
             len(keyframes.frames), keyframes.total_frames,
         )
 
-        # Phase 1: 3D Reconstruction (MASt3R on GPU)
+        # Select subsets for reconstruction (uniform for parallax)
+        recon_frames, recon_indices = _select_subset(keyframes.frames, recon_kf)
+
+        # Select detection frames: seed with pause reps, fill with uniform
+        if keyframes.pause_keyframe_indices:
+            detect_indices = list(keyframes.pause_keyframe_indices)
+            # Fill remaining with evenly spaced, avoiding duplicates
+            uniform = np.linspace(0, len(keyframes.frames) - 1, recon_kf, dtype=int).tolist()
+            used = set(detect_indices)
+            for idx in uniform:
+                if idx not in used and len(detect_indices) < recon_kf:
+                    detect_indices.append(idx)
+                    used.add(idx)
+            detect_indices.sort()
+            detect_frames = [keyframes.frames[i] for i in detect_indices]
+            logger.info(
+                "Pause-aware detection: %d frames (%d pause reps + %d uniform fill) "
+                "from %d dense, %d recon frames",
+                len(detect_indices), len(keyframes.pause_keyframe_indices),
+                len(detect_indices) - len(keyframes.pause_keyframe_indices),
+                len(keyframes.frames), len(recon_frames),
+            )
+        else:
+            detect_frames = recon_frames
+            detect_indices = recon_indices
+            logger.info(
+                "Uniform detection: %d recon/detect frames from %d dense",
+                len(recon_frames), len(keyframes.frames),
+            )
+
+        # Phase 1: 3D Reconstruction (MASt3R on recon subset only)
         try:
-            reconstruction = self._run_reconstruction(keyframes)
+            reconstruction = self._run_reconstruction(recon_frames)
             scale_factor = self._validate_and_correct_scale(reconstruction)
             if scale_factor != 1.0:
                 logger.info("Applying scale correction factor: %.3f", scale_factor)
@@ -95,7 +144,16 @@ class VideoPipeline:
         # Phase 2: Detection + Tracking (DINO + SAM 2 on GPU)
         self._registry.ensure_detection_models()
         detector = Detector(self._registry)
-        detections = detector.detect(keyframes.frames, threshold=threshold)
+
+        detections = detector.detect_multi_prompt(
+            detect_frames,
+            threshold=threshold,
+            nms_iou_threshold=settings.detection_nms_threshold,
+        )
+
+        # Remap detection image_index from detect-frame-local to dense-frame-global
+        for det in detections:
+            det.image_index = detect_indices[det.image_index]
 
         if not detections:
             elapsed_ms = int((time.monotonic() - t0) * 1000)
@@ -108,20 +166,55 @@ class VideoPipeline:
                 processing_time_ms=elapsed_ms,
             )
 
+        # SAM 2 tracking on ALL dense frames
         segmenter = VideoSegmenter(self._registry.sam2_video_predictor, self._registry.device)
         tracked_objects = segmenter.segment_and_track(
-            keyframes.frames, detections, iou_merge_threshold=0.5
+            keyframes.frames,
+            detections,
+            iou_merge_threshold=0.5,
+            cross_label_iou_threshold=settings.cross_label_iou_threshold,
         )
 
         logger.info("Tracked %d unique objects across keyframes", len(tracked_objects))
 
+        # Build mapping: dense_frame_index -> recon_frame_index
+        recon_mapping = {
+            dense_idx: recon_idx
+            for recon_idx, dense_idx in enumerate(recon_indices)
+        }
+
         # Phase 3: Volume estimation (CPU + Open3D)
-        # Returns (VolumeEstimate, seen_in_frames) tuples
         volume_results = self._compute_volumes(
-            tracked_objects, reconstruction, keyframes.frames
+            tracked_objects, reconstruction, keyframes.frames, recon_mapping
         )
 
-        # Apply packing multipliers to geometric-sourced items only
+        items = self._process_items(volume_results)
+
+        total_volume = sum(item.volume_m3 for item in items)
+        avg_confidence = (
+            sum(item.confidence for item in items) / len(items) if items else 0.0
+        )
+
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        logger.info(
+            "Video pipeline complete: job_id=%s, items=%d, total_volume=%.3f m3, time=%d ms",
+            job_id, len(items), total_volume, elapsed_ms,
+        )
+
+        return EstimateResponse(
+            job_id=job_id,
+            status="completed",
+            detected_items=items,
+            total_volume_m3=round(total_volume, 4),
+            confidence_score=round(avg_confidence, 3),
+            processing_time_ms=elapsed_ms,
+        )
+
+    def _process_items(
+        self,
+        volume_results: list[tuple[VolumeEstimate, list[int]]],
+    ) -> list[DetectedItem]:
+        """Apply packing multipliers, outlier filtering, and build DetectedItem list."""
         items: list[DetectedItem] = []
         for est, seen_frames in volume_results:
             if est.volume_source == "geometric":
@@ -168,28 +261,10 @@ class VideoPipeline:
                 crop_base64=est.crop_base64,
             ))
 
-        total_volume = sum(item.volume_m3 for item in items)
-        avg_confidence = (
-            sum(item.confidence for item in items) / len(items) if items else 0.0
-        )
+        return items
 
-        elapsed_ms = int((time.monotonic() - t0) * 1000)
-        logger.info(
-            "Video pipeline complete: job_id=%s, items=%d, total_volume=%.3f m3, time=%d ms",
-            job_id, len(items), total_volume, elapsed_ms,
-        )
-
-        return EstimateResponse(
-            job_id=job_id,
-            status="completed",
-            detected_items=items,
-            total_volume_m3=round(total_volume, 4),
-            confidence_score=round(avg_confidence, 3),
-            processing_time_ms=elapsed_ms,
-        )
-
-    def _run_reconstruction(self, keyframes: KeyframeResult) -> ReconstructionResult:
-        """Run MASt3R 3D reconstruction, managing GPU memory."""
+    def _run_reconstruction(self, frames: list[Image.Image]) -> ReconstructionResult:
+        """Run MASt3R 3D reconstruction on a subset of frames, managing GPU memory."""
         # Swap models: unload detection, load MASt3R
         self._registry.unload_detection_models()
         self._registry.load_mast3r()
@@ -197,7 +272,7 @@ class VideoPipeline:
         try:
             reconstructor = Reconstructor(self._registry.mast3r_model, self._registry.device)
             result = reconstructor.reconstruct(
-                keyframes.frames,
+                frames,
                 min_conf=settings.mast3r_min_conf,
                 niter=settings.mast3r_alignment_iters,
             )
@@ -268,8 +343,16 @@ class VideoPipeline:
         tracked_objects: list[TrackedObject],
         reconstruction: ReconstructionResult,
         frames: list[Image.Image],
+        recon_mapping: dict[int, int] | None = None,
     ) -> list[tuple[VolumeEstimate, list[int]]]:
         """Compute volume for each tracked object by projecting masks into the point cloud.
+
+        Args:
+            tracked_objects: Tracked objects with masks indexed by dense frame index.
+            reconstruction: MASt3R result indexed by recon frame index.
+            frames: All dense keyframes.
+            recon_mapping: Maps dense_frame_index -> recon_frame_index. If None,
+                assumes 1:1 mapping (backwards compat).
 
         Returns list of (VolumeEstimate, seen_in_frames) tuples.
         """
@@ -279,7 +362,7 @@ class VideoPipeline:
 
         # Scale correction using RE catalog anchors
         re_scale = self._compute_re_scale_correction(
-            tracked_objects, reconstruction, frames
+            tracked_objects, reconstruction, frames, recon_mapping
         )
         if abs(re_scale - 1.0) > 0.01:
             logger.info("RE catalog scale correction: %.3f", re_scale)
@@ -288,9 +371,9 @@ class VideoPipeline:
             label = obj.detection.label
             category = classify_item(label)
 
-            # Collect 3D points for this object across all frames it appears in
+            # Collect 3D points for this object across frames with 3D data
             object_points = self._extract_object_points(
-                obj, reconstruction
+                obj, reconstruction, recon_mapping
             )
 
             if len(object_points) < 20:
@@ -386,39 +469,64 @@ class VideoPipeline:
         self,
         obj: TrackedObject,
         reconstruction: ReconstructionResult,
+        recon_mapping: dict[int, int] | None = None,
     ) -> np.ndarray:
         """Extract 3D points belonging to an object by projecting SAM 2 masks
         into the MASt3R point cloud.
 
-        For each frame where the object has a mask:
+        For each frame where the object has a mask AND 3D data exists:
         1. Get points originating from that frame (via point_to_image)
         2. Project those points to 2D using camera intrinsics + pose
         3. Keep only points that fall inside the (eroded) SAM 2 mask
+
+        Args:
+            obj: Tracked object with masks indexed by dense frame index.
+            reconstruction: MASt3R result indexed by recon frame index.
+            recon_mapping: Maps dense_frame_index -> recon_frame_index. If None,
+                assumes 1:1 mapping (backwards compat).
         """
         pts_world = reconstruction.point_cloud
         pts_source = reconstruction.point_to_image
         all_object_pts = []
+        logged_resolutions = False
 
         for frame_idx, mask in obj.masks_per_frame.items():
-            if frame_idx >= len(reconstruction.camera_poses):
+            # Map dense frame index to reconstruction frame index
+            if recon_mapping is not None:
+                recon_idx = recon_mapping.get(frame_idx)
+                if recon_idx is None:
+                    continue  # This dense frame has no 3D data
+            else:
+                recon_idx = frame_idx
+
+            if recon_idx >= len(reconstruction.camera_poses):
                 continue
+
+            if not logged_resolutions:
+                mast3r_shape = reconstruction.depth_maps[recon_idx].shape
+                logger.info(
+                    "Projection resolutions for '%s': mask=%s, mast3r=%s, orig=%s",
+                    obj.detection.label, mask.shape, mast3r_shape,
+                    reconstruction.image_sizes[recon_idx],
+                )
+                logged_resolutions = True
 
             # Erode mask by 2px to avoid boundary noise
             eroded_mask = binary_erosion(mask, iterations=2)
             if eroded_mask.sum() < 10:
                 eroded_mask = mask  # use original if erosion removed too much
 
-            # Get points from this frame
-            frame_mask = pts_source == frame_idx
+            # Get points from this recon frame
+            frame_mask = pts_source == recon_idx
             if frame_mask.sum() == 0:
                 continue
 
             frame_pts = pts_world[frame_mask]
 
             # Project to 2D
-            cam2world = reconstruction.camera_poses[frame_idx]
+            cam2world = reconstruction.camera_poses[recon_idx]
             world2cam = np.linalg.inv(cam2world)
-            K = reconstruction.intrinsics[frame_idx]
+            K = reconstruction.intrinsics[recon_idx]
 
             # Transform to camera frame
             pts_cam = (world2cam[:3, :3] @ frame_pts.T + world2cam[:3, 3:]).T
@@ -436,17 +544,13 @@ class VideoPipeline:
             px = (pts_2d[:, 0] / pts_2d[:, 2]).astype(int)
             py = (pts_2d[:, 1] / pts_2d[:, 2]).astype(int)
 
-            # Check which projected points fall inside the mask
-            # The mask may be at a different resolution than the reconstruction
+            # Check which projected points fall inside the mask.
+            # K produces coordinates in MASt3R's processing resolution (e.g. 512x208),
+            # NOT the original image resolution. Scale from MASt3R space to mask space.
             mask_h, mask_w = eroded_mask.shape
-            # Scale projection to mask resolution
-            img_w, img_h = reconstruction.image_sizes[frame_idx]
-            if img_w > 0 and img_h > 0:
-                px_scaled = (px * mask_w / img_w).astype(int)
-                py_scaled = (py * mask_h / img_h).astype(int)
-            else:
-                px_scaled = px
-                py_scaled = py
+            mast3r_h, mast3r_w = reconstruction.depth_maps[recon_idx].shape
+            px_scaled = (px * mask_w / mast3r_w).astype(int)
+            py_scaled = (py * mask_h / mast3r_h).astype(int)
 
             in_bounds = (
                 (px_scaled >= 0) & (px_scaled < mask_w) &
@@ -470,6 +574,7 @@ class VideoPipeline:
         tracked_objects: list[TrackedObject],
         reconstruction: ReconstructionResult,
         frames: list[Image.Image],
+        recon_mapping: dict[int, int] | None = None,
     ) -> float:
         """Use high-confidence RE catalog items as scale anchors.
 
@@ -485,7 +590,7 @@ class VideoPipeline:
                 continue
 
             # Quick OBB measurement for scale reference
-            object_points = self._extract_object_points(obj, reconstruction)
+            object_points = self._extract_object_points(obj, reconstruction, recon_mapping)
             if len(object_points) < 20:
                 continue
 

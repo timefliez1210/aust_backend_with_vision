@@ -121,6 +121,8 @@ impl Default for CalendarConfig {
 pub struct VisionServiceConfig {
     pub enabled: bool,
     pub base_url: String,
+    #[serde(default)]
+    pub video_base_url: Option<String>,
     pub timeout_secs: u64,
     pub max_retries: u32,
 }
@@ -130,6 +132,7 @@ impl Default for VisionServiceConfig {
         Self {
             enabled: false,
             base_url: "http://localhost:8090".to_string(),
+            video_base_url: None,
             timeout_secs: 120,
             max_retries: 1,
         }

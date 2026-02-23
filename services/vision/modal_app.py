@@ -42,8 +42,7 @@ vision_image = (
         "Pillow>=11,<12",
         "numpy>=1.26,<2",
         "open3d>=0.18,<1",
-        "transformers>=4.48,<5",
-        "groundingdino-py>=0.4,<1",
+        "transformers>=4.50,<5",
         "scipy>=1.14,<2",
         "scikit-learn>=1.6,<2",
         "httpx>=0.28,<1",
@@ -66,8 +65,8 @@ vision_image = (
         # Download and cache model weights into the image
         "python -c \""
         "from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor; "
-        "AutoProcessor.from_pretrained('IDEA-Research/grounding-dino-base', cache_dir='/weights/huggingface'); "
-        "AutoModelForZeroShotObjectDetection.from_pretrained('IDEA-Research/grounding-dino-base', cache_dir='/weights/huggingface'); "
+        "AutoProcessor.from_pretrained('openmmlab-community/mm_grounding_dino_large_all', cache_dir='/weights/huggingface'); "
+        "AutoModelForZeroShotObjectDetection.from_pretrained('openmmlab-community/mm_grounding_dino_large_all', cache_dir='/weights/huggingface'); "
         "from transformers import AutoImageProcessor, AutoModelForDepthEstimation; "
         "AutoImageProcessor.from_pretrained('depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf', cache_dir='/weights/huggingface'); "
         "AutoModelForDepthEstimation.from_pretrained('depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf', cache_dir='/weights/huggingface'); "
@@ -250,7 +249,7 @@ def serve_video():
     async def estimate_video(
         job_id: str = Form(default="test"),
         video: UploadFile = File(...),
-        max_keyframes: int = Form(default=20),
+        max_keyframes: int = Form(default=60),
         detection_threshold: float = Form(default=0.3),
     ):
         """Video upload endpoint for 3D volume estimation.

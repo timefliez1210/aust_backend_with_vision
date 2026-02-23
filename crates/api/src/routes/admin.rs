@@ -811,7 +811,7 @@ async fn get_offer_detail(
                 .and_then(|idx| source_s3_keys.get(idx))
                 .map(|k| format!("/api/v1/estimates/images/{k}"));
             OfferDetailItem {
-                name: d.name.clone(),
+                name: d.german_name.clone().unwrap_or_else(|| d.name.clone()),
                 volume_m3: d.volume_m3,
                 quantity: 1,
                 crop_url,

@@ -12,7 +12,7 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 # Model identifiers
-GROUNDING_DINO_ID = "IDEA-Research/grounding-dino-base"
+GROUNDING_DINO_ID = "openmmlab-community/mm_grounding_dino_large_all"
 DEPTH_ANYTHING_ID = "depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf"
 
 # SAM 2.1 (replaces SAM ViT-H)
@@ -234,9 +234,9 @@ class ModelRegistry:
         logger.info("Warming up models ...")
         dummy = Image.fromarray(np.zeros((64, 64, 3), dtype=np.uint8))
 
-        # Warm up Grounding DINO
+        # Warm up Grounding DINO (MM-GDINO uses list-of-lists text format)
         inputs = self.grounding_dino_processor(
-            images=dummy, text="object.", return_tensors="pt"
+            images=dummy, text=[["object"]], return_tensors="pt"
         ).to(self.device)
         with torch.no_grad():
             self.grounding_dino_model(**inputs)

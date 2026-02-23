@@ -50,8 +50,12 @@ class VisionPipeline:
         logger.info("Pipeline start: job_id=%s, images=%d, threshold=%.2f",
                      job_id, len(images), threshold)
 
-        # Stage 1: Detection
-        detections = self._detector.detect(images, threshold=threshold)
+        # Stage 1: Detection (multi-prompt for better recall)
+        detections = self._detector.detect_multi_prompt(
+            images,
+            threshold=threshold,
+            nms_iou_threshold=settings.detection_nms_threshold,
+        )
         if not detections:
             return EstimateResponse(
                 job_id=job_id,

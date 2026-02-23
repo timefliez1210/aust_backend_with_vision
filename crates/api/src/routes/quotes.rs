@@ -296,7 +296,7 @@ async fn get_quote(
                 let dimensions = raw
                     .and_then(|r| r.get("dimensions").cloned());
                 EstimationItem {
-                    name: d.name.clone(),
+                    name: d.german_name.clone().unwrap_or_else(|| d.name.clone()),
                     volume_m3: d.volume_m3,
                     quantity: 1,
                     confidence: d.confidence,

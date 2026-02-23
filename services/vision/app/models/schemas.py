@@ -169,6 +169,8 @@ ITEM_CATEGORIES: dict[str, str] = {
     "package": "boxes",
     "basket": "boxes",
     "storage container": "boxes",
+    # Children
+    "stroller": "misc",
     # Luggage
     "suitcase": "luggage",
     "bag": "luggage",
@@ -491,6 +493,9 @@ RE_CATALOG: dict[str, dict] = {
     "moving box": {"re": 1, "german": "Umzugskarton bis 80 l"},
     "basket": {"re": 1, "german": "Korb"},
     "storage container": {"re": 1.5, "german": "Umzugskarton über 80 l"},
+
+    # ── CHILDREN ──
+    "stroller": {"re": 3, "german": "Kinderwagen"},
 
     # ── LUGGAGE ──
     "suitcase": {"re": 1, "german": "Koffer"},

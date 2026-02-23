@@ -931,7 +931,89 @@ pub fn parse_detected_items(estimation: Option<&VolumeEstimationRow>) -> Vec<Det
     vec![]
 }
 
+/// Map English detection labels to German Umzugsgutliste names.
+/// Mirrors the RE_CATALOG in services/vision/app/models/schemas.py.
+pub fn label_to_german(label: &str) -> Option<&'static str> {
+    match label.to_lowercase().as_str() {
+        // Seating
+        "sofa" | "couch" => Some("Sofa, Couch, Liege"),
+        "armchair" | "recliner" => Some("Sessel mit Armlehnen"),
+        "chair" | "stool" => Some("Stuhl"),
+        "bench" => Some("Eckbank"),
+        "ottoman" => Some("Ottoman"),
+        "bar stool" => Some("Stuhl mit Armlehnen"),
+        "office chair" => Some("Bürostuhl"),
+        // Tables
+        "table" => Some("Tisch"),
+        "desk" => Some("Schreibtisch"),
+        "dining table" => Some("Esstisch"),
+        "coffee table" => Some("Couchtisch"),
+        "kitchen island" => Some("Winkelkombination"),
+        // Beds
+        "bed" => Some("Bett"),
+        "mattress" => Some("Matratze"),
+        "crib" => Some("Kinderbett"),
+        "bunk bed" => Some("Etagenbett"),
+        // Storage
+        "wardrobe" | "closet" => Some("Schrank"),
+        "dresser" | "chest of drawers" | "cabinet" => Some("Kommode"),
+        "shelf" => Some("Regal"),
+        "bookshelf" => Some("Bücherregal"),
+        "cupboard" => Some("Wohnzimmerschrank"),
+        "nightstand" => Some("Nachttisch"),
+        "shoe rack" => Some("Schuhschrank"),
+        "coat rack" => Some("Kleiderablage"),
+        // Electronics
+        "tv" | "television" => Some("Fernseher"),
+        "monitor" => Some("Monitor"),
+        "computer" => Some("Computer"),
+        "laptop" => Some("Laptop"),
+        "printer" => Some("Tischkopierer"),
+        "speaker" | "stereo" => Some("Stereoanlage"),
+        "lamp" => Some("Deckenlampe"),
+        "floor lamp" => Some("Stehlampe"),
+        "chandelier" => Some("Lüster"),
+        // Appliances
+        "refrigerator" | "fridge" => Some("Kühlschrank"),
+        "freezer" => Some("Gefrierschrank"),
+        "washing machine" => Some("Waschmaschine"),
+        "dryer" => Some("Trockner"),
+        "dishwasher" => Some("Geschirrspülmaschine"),
+        "oven" | "stove" => Some("Herd"),
+        "microwave" => Some("Mikrowelle"),
+        "vacuum cleaner" => Some("Staubsauger"),
+        "fan" => Some("Ventilator"),
+        "heater" => Some("Heizgerät"),
+        // Boxes
+        "box" | "carton" | "moving box" => Some("Umzugskarton"),
+        "basket" => Some("Korb"),
+        "storage container" => Some("Umzugskarton groß"),
+        // Children
+        "stroller" => Some("Kinderwagen"),
+        // Luggage
+        "suitcase" => Some("Koffer"),
+        "bag" => Some("Tasche"),
+        // Sports
+        "bicycle" | "bike" => Some("Fahrrad"),
+        "treadmill" => Some("Laufband"),
+        "exercise equipment" => Some("Sportgerät"),
+        // Instruments
+        "piano" => Some("Klavier"),
+        "keyboard" => Some("Keyboard"),
+        "guitar" => Some("Gitarre"),
+        // Misc
+        "plant" => Some("Pflanze"),
+        "painting" => Some("Bild"),
+        "mirror" => Some("Spiegel"),
+        "rug" | "carpet" => Some("Teppich"),
+        "curtain" => Some("Vorhang"),
+        "ironing board" => Some("Bügelbrett"),
+        _ => None,
+    }
+}
+
 fn depth_sensor_to_row(item: DepthSensorItem) -> DetectedItemRow {
+    let german_name = item.german_name.or_else(|| label_to_german(&item.name).map(String::from));
     DetectedItemRow {
         name: item.name,
         volume_m3: item.volume_m3,
@@ -939,7 +1021,7 @@ fn depth_sensor_to_row(item: DepthSensorItem) -> DetectedItemRow {
             format!("{:.1} × {:.1} × {:.1} m", d.length_m, d.width_m, d.height_m)
         }),
         confidence: item.confidence,
-        german_name: item.german_name,
+        german_name,
         re_value: item.re_value,
         volume_source: item.volume_source,
         crop_s3_key: item.crop_s3_key,

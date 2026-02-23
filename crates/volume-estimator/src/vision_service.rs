@@ -6,6 +6,7 @@ use std::time::Duration;
 pub struct VisionServiceClient {
     client: reqwest::Client,
     base_url: String,
+    video_base_url: String,
     max_retries: u32,
 }
 
@@ -46,6 +47,14 @@ pub struct VisionDetectedItem {
     pub bbox_image_index: Option<usize>,
     #[serde(default)]
     pub crop_base64: Option<String>,
+    #[serde(default)]
+    pub german_name: Option<String>,
+    #[serde(default)]
+    pub re_value: Option<f64>,
+    #[serde(default)]
+    pub units: Option<u32>,
+    #[serde(default)]
+    pub volume_source: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -61,15 +70,21 @@ struct ReadyResponse {
 }
 
 impl VisionServiceClient {
-    pub fn new(base_url: &str, timeout_secs: u64, max_retries: u32) -> Result<Self, VolumeError> {
+    pub fn new(base_url: &str, video_base_url: Option<&str>, timeout_secs: u64, max_retries: u32) -> Result<Self, VolumeError> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
             .build()
             .map_err(|e| VolumeError::ExternalService(format!("Failed to create HTTP client: {e}")))?;
 
+        let base = base_url.trim_end_matches('/').to_string();
+        let video = video_base_url
+            .map(|u| u.trim_end_matches('/').to_string())
+            .unwrap_or_else(|| base.clone());
+
         Ok(Self {
             client,
-            base_url: base_url.trim_end_matches('/').to_string(),
+            base_url: base,
+            video_base_url: video,
             max_retries,
         })
     }
@@ -147,7 +162,7 @@ impl VisionServiceClient {
         max_keyframes: Option<u32>,
         detection_threshold: Option<f64>,
     ) -> Result<VisionServiceResponse, VolumeError> {
-        let url = format!("{}/estimate/video", self.base_url);
+        let url = format!("{}/estimate/video", self.video_base_url);
 
         // Build a client with extended timeout for video processing (600s)
         let video_client = reqwest::Client::builder()
@@ -198,7 +213,22 @@ impl VisionServiceClient {
             })?;
 
         if resp.status().is_success() {
-            resp.json().await.map_err(|e| {
+            let body = resp.text().await.map_err(|e| {
+                VolumeError::ExternalService(format!(
+                    "Failed to read vision service video response body: {e}"
+                ))
+            })?;
+            tracing::info!(
+                body_len = body.len(),
+                body_preview = &body[..body.len().min(500)],
+                "Vision service video raw response"
+            );
+            serde_json::from_str(&body).map_err(|e| {
+                tracing::error!(
+                    error = %e,
+                    body_preview = &body[..body.len().min(1000)],
+                    "Failed to deserialize vision service video response"
+                );
                 VolumeError::ExternalService(format!(
                     "Failed to parse vision service video response: {e}"
                 ))

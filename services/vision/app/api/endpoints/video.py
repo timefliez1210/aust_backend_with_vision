@@ -29,7 +29,7 @@ _MAX_SIZE_BYTES = 500 * 1024 * 1024
 async def estimate_video(
     job_id: str = Form(default="test"),
     video: UploadFile = File(...),
-    max_keyframes: int = Form(default=20),
+    max_keyframes: int = Form(default=60),
     detection_threshold: float = Form(default=0.3),
 ) -> EstimateResponse:
     """Estimate moving volume from a room walkthrough video.

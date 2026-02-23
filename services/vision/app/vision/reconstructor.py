@@ -149,7 +149,7 @@ class Reconstructor:
         conf_array = np.concatenate(all_conf, axis=0)
         source_array = np.concatenate(all_source, axis=0)
 
-        total_pts = sum(c.size for c in confs)
+        total_pts = sum(c.numel() for c in confs)
         logger.info(
             "Reconstruction: %d confident points from %d total (%d images)",
             len(point_cloud), total_pts, n,

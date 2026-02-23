@@ -55,6 +55,7 @@ async fn main() -> Result<()> {
     let vision_service = if config.vision_service.enabled {
         match aust_volume_estimator::VisionServiceClient::new(
             &config.vision_service.base_url,
+            config.vision_service.video_base_url.as_deref(),
             config.vision_service.timeout_secs,
             config.vision_service.max_retries,
         ) {
