@@ -80,11 +80,11 @@ def load_sam2(device: torch.device) -> tuple:
     image_predictor.model = image_predictor.model.to(device)
     image_predictor.model.eval()
 
-    # Build video predictor (shares weights but different interface)
+    # Build video predictor (extends SAM2Base directly — it IS the nn.Module)
     from sam2.sam2_video_predictor import SAM2VideoPredictor
     video_predictor = SAM2VideoPredictor.from_pretrained(SAM2_MODEL_ID, cache_dir=cache_dir)
-    video_predictor.model = video_predictor.model.to(device)
-    video_predictor.model.eval()
+    video_predictor = video_predictor.to(device)
+    video_predictor.eval()
 
     logger.info("SAM 2.1 loaded on %s (image + video predictors)", device)
     return image_predictor, video_predictor
@@ -200,7 +200,7 @@ class ModelRegistry:
         if self.sam2_image_predictor is not None:
             self.sam2_image_predictor.model = self.sam2_image_predictor.model.to(cpu)
         if self.sam2_video_predictor is not None:
-            self.sam2_video_predictor.model = self.sam2_video_predictor.model.to(cpu)
+            self.sam2_video_predictor = self.sam2_video_predictor.to(cpu)
         if self.depth_model is not None:
             self.depth_model = self.depth_model.to(cpu)
 
@@ -219,7 +219,7 @@ class ModelRegistry:
         if self.sam2_image_predictor is not None:
             self.sam2_image_predictor.model = self.sam2_image_predictor.model.to(self.device)
         if self.sam2_video_predictor is not None:
-            self.sam2_video_predictor.model = self.sam2_video_predictor.model.to(self.device)
+            self.sam2_video_predictor = self.sam2_video_predictor.to(self.device)
         if self.depth_model is not None:
             self.depth_model = self.depth_model.to(self.device)
 
