@@ -8,24 +8,54 @@ pub use error::ApiError;
 pub use orchestrator::{run_offer_event_handler, try_auto_generate_offer};
 pub use state::AppState;
 
-use axum::Router;
+use axum::{http::HeaderValue, Router};
 use sqlx::PgPool;
 use std::sync::Arc;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 pub fn create_router(state: AppState) -> Router {
+    let shared_state = Arc::new(state);
+
+    let allowed_origins = [
+        "https://www.aust-umzuege.de",
+        "https://aust-umzuege.de",
+        "http://localhost:5173",
+    ]
+    .into_iter()
+    .filter_map(|o| o.parse::<HeaderValue>().ok())
+    .collect::<Vec<_>>();
+
     let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+        .allow_origin(allowed_origins)
+        .allow_methods([
+            axum::http::Method::GET,
+            axum::http::Method::POST,
+            axum::http::Method::PATCH,
+            axum::http::Method::PUT,
+            axum::http::Method::DELETE,
+            axum::http::Method::OPTIONS,
+        ])
+        .allow_headers([
+            axum::http::header::AUTHORIZATION,
+            axum::http::header::CONTENT_TYPE,
+        ])
+        .expose_headers([axum::http::header::CONTENT_DISPOSITION]);
+
+    let admin_routes = Router::new()
+        .nest("/admin", routes::admin::router())
+        .nest("/auth", routes::auth::protected_router())
+        .route_layer(axum::middleware::from_fn_with_state(
+            shared_state.clone(),
+            middleware::require_auth,
+        ));
 
     Router::new()
         .merge(routes::health::router())
-        .nest("/api/v1", routes::api_router())
+        .nest("/api/v1", routes::api_router().merge(admin_routes))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
-        .with_state(Arc::new(state))
+        .with_state(shared_state)
 }
 
 pub async fn create_pool(database_url: &str, max_connections: u32) -> Result<PgPool, sqlx::Error> {

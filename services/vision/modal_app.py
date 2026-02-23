@@ -1,17 +1,21 @@
 """Modal deployment for the AUST Vision Service.
 
-Deploys the vision pipeline (Grounding DINO + SAM + Depth Anything V2 + Open3D)
-as a serverless GPU endpoint on Modal.
+Deploys the vision pipeline as serverless GPU endpoints on Modal:
+- Photo endpoint: Grounding DINO + SAM 2 + Depth Anything V2 (max_inputs=4)
+- Video endpoint: + MASt3R 3D reconstruction (max_inputs=1, long-running)
+
+GPU: L4 (24GB VRAM) for both — MASt3R needs ~12-15GB during reconstruction.
 
 Usage:
     modal deploy services/vision/modal_app.py      # deploy to Modal
     modal serve services/vision/modal_app.py       # dev mode with hot-reload
 
 Test:
-    curl https://<your-modal-app>.modal.run/health
-    curl https://<your-modal-app>.modal.run/ready
-    curl -X POST https://<your-modal-app>.modal.run/estimate/upload \
-        -F "job_id=test-1" -F "images=@room1.jpg" -F "images=@room2.jpg"
+    curl https://<app>.modal.run/health
+    curl -X POST https://<app>.modal.run/estimate/upload \\
+        -F "job_id=test-1" -F "images=@room1.jpg"
+    curl -X POST https://<app>.modal.run/estimate/video \\
+        -F "job_id=test-1" -F "video=@room.mp4"
 """
 from pathlib import Path
 
@@ -23,11 +27,11 @@ LOCAL_APP_DIR = Path(__file__).parent / "app"
 
 vision_image = (
     modal.Image.debian_slim(python_version="3.11")
-    .apt_install("git", "libgl1", "libglib2.0-0")
+    .apt_install("git", "libgl1", "libglib2.0-0", "ffmpeg")
     .pip_install(
         "torch>=2.5,<3",
         "torchvision>=0.20,<1",
-        gpu="T4",
+        gpu="L4",
     )
     .pip_install(
         "fastapi>=0.115,<1",
@@ -40,11 +44,20 @@ vision_image = (
         "open3d>=0.18,<1",
         "transformers>=4.48,<5",
         "groundingdino-py>=0.4,<1",
-        "segment-anything @ git+https://github.com/facebookresearch/segment-anything.git",
         "scipy>=1.14,<2",
         "scikit-learn>=1.6,<2",
         "httpx>=0.28,<1",
         "python-multipart>=0.0.18,<1",
+        "opencv-python-headless>=4.9,<5",
+    )
+    # SAM 2 (replaces SAM ViT-H)
+    .pip_install(
+        "sam2 @ git+https://github.com/facebookresearch/sam2.git",
+    )
+    # MASt3R (includes DUSt3R, needs CUDA compilation)
+    .pip_install(
+        "mast3r @ git+https://github.com/naver/mast3r.git",
+        gpu="L4",
     )
     .run_commands(
         # Download and cache model weights into the image
@@ -55,9 +68,21 @@ vision_image = (
         "from transformers import AutoImageProcessor, AutoModelForDepthEstimation; "
         "AutoImageProcessor.from_pretrained('depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf', cache_dir='/weights/huggingface'); "
         "AutoModelForDepthEstimation.from_pretrained('depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf', cache_dir='/weights/huggingface'); "
-        "import urllib.request; "
-        "urllib.request.urlretrieve('https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth', '/weights/sam_vit_h_4b8939.pth'); "
-        "print('All weights downloaded.')\""
+        "print('HuggingFace weights downloaded.')\""
+    )
+    .run_commands(
+        # Download SAM 2.1 checkpoint
+        "python -c \""
+        "from sam2.sam2_image_predictor import SAM2ImagePredictor; "
+        "SAM2ImagePredictor.from_pretrained('facebook/sam2.1-hiera-large', cache_dir='/weights/huggingface'); "
+        "print('SAM 2.1 weights downloaded.')\""
+    )
+    .run_commands(
+        # Download MASt3R checkpoint
+        "python -c \""
+        "from mast3r.model import AsymmetricMASt3R; "
+        "AsymmetricMASt3R.from_pretrained('naver/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric', cache_dir='/weights/huggingface'); "
+        "print('MASt3R weights downloaded.')\""
     )
     .env({
         "VISION_DEVICE": "cuda",
@@ -74,11 +99,16 @@ vision_image = (
 app = modal.App("aust-vision", image=vision_image)
 
 
-@app.function(gpu="T4", scaledown_window=60, max_containers=1)
+# -- Photo endpoint: fast, concurrent processing ----------------------------
+
+@app.function(gpu="L4", scaledown_window=60, max_containers=1)
 @modal.concurrent(max_inputs=4)
 @modal.asgi_app()
 def serve():
-    """Serve the full FastAPI app on Modal with GPU."""
+    """Serve photo estimation endpoint on Modal with GPU.
+
+    Handles concurrent photo requests (up to 4). Fast ~5s per job.
+    """
     import io
     import logging
     import sys
@@ -89,7 +119,6 @@ def serve():
     )
     logger = logging.getLogger("modal_app")
 
-    # Add /root to sys.path so `app` package is importable
     if "/root" not in sys.path:
         sys.path.insert(0, "/root")
 
@@ -103,10 +132,9 @@ def serve():
     from app.vision.model_loader import registry
     from app.vision.pipeline import VisionPipeline
 
-    # Load models synchronously before serving
-    logger.info("Loading models on GPU ...")
+    logger.info("Loading detection models on GPU ...")
     registry.load_all()
-    logger.info("Models loaded, starting FastAPI app.")
+    logger.info("Models loaded, starting FastAPI app (photo).")
 
     web_app = FastAPI(title="AUST Vision Service (Modal)")
 
@@ -136,7 +164,7 @@ def serve():
         job_id: str = Form(default="test"),
         images: List[UploadFile] = File(...),
     ):
-        """Direct image upload endpoint for testing.
+        """Direct image upload endpoint for photo estimation.
 
         curl -X POST <url>/estimate/upload \\
             -F "job_id=test-1" -F "images=@room1.jpg" -F "images=@room2.jpg"
@@ -152,5 +180,114 @@ def serve():
         pipeline = VisionPipeline(registry)
         result = pipeline.run(job_id=job_id, images=pil_images)
         return result
+
+    return web_app
+
+
+# -- Video endpoint: single-job processing with model swapping --------------
+
+@app.function(gpu="L4", scaledown_window=120, max_containers=1, timeout=900)
+@modal.concurrent(max_inputs=1)
+@modal.asgi_app()
+def serve_video():
+    """Serve video estimation endpoint on Modal with GPU.
+
+    Handles one video job at a time (max_inputs=1) due to GPU model swapping.
+    Processing takes 2-10 minutes per video.
+    """
+    import io
+    import logging
+    import sys
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+    logger = logging.getLogger("modal_app_video")
+
+    if "/root" not in sys.path:
+        sys.path.insert(0, "/root")
+
+    from fastapi import FastAPI, File, Form, UploadFile
+    from fastapi.responses import JSONResponse
+    from PIL import Image as PILImage
+
+    from app.models.schemas import EstimateResponse
+    from app.vision.model_loader import registry
+    from app.vision.video_pipeline import VideoPipeline
+
+    logger.info("Loading detection models on GPU (video endpoint) ...")
+    registry.load_all()
+    logger.info("Models loaded, starting FastAPI app (video).")
+
+    web_app = FastAPI(title="AUST Vision Service - Video (Modal)")
+
+    @web_app.get("/health")
+    def health():
+        return {"status": "ok"}
+
+    @web_app.get("/ready")
+    def ready():
+        if not registry.is_loaded:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "not_ready",
+                    "models_loaded": False,
+                    "gpu_available": registry.gpu_available,
+                },
+            )
+        return {
+            "status": "ready",
+            "models_loaded": True,
+            "gpu_available": registry.gpu_available,
+        }
+
+    @web_app.post("/estimate/video", response_model=EstimateResponse)
+    async def estimate_video(
+        job_id: str = Form(default="test"),
+        video: UploadFile = File(...),
+        max_keyframes: int = Form(default=20),
+        detection_threshold: float = Form(default=0.3),
+    ):
+        """Video upload endpoint for 3D volume estimation.
+
+        curl -X POST <url>/estimate/video \\
+            -F "job_id=test-1" -F "video=@room_walkthrough.mp4"
+        """
+        if not registry.is_loaded:
+            return JSONResponse(status_code=503, content={"detail": "Models not loaded yet."})
+
+        video_bytes = await video.read()
+
+        pipeline = VideoPipeline(registry)
+        result = pipeline.run(
+            job_id=job_id,
+            video_bytes=video_bytes,
+            detection_threshold=detection_threshold,
+            max_keyframes=max_keyframes,
+        )
+        return result
+
+    # Also expose photo upload on the video endpoint for convenience
+    from typing import List
+
+    @web_app.post("/estimate/upload", response_model=EstimateResponse)
+    async def estimate_upload(
+        job_id: str = Form(default="test"),
+        images: List[UploadFile] = File(...),
+    ):
+        """Photo upload endpoint (also available on video function for testing)."""
+        if not registry.is_loaded:
+            return JSONResponse(status_code=503, content={"detail": "Models not loaded yet."})
+
+        from app.vision.pipeline import VisionPipeline
+        pil_images = []
+        for upload in images:
+            data = await upload.read()
+            pil_images.append(PILImage.open(io.BytesIO(data)).convert("RGB"))
+
+        pipeline = VisionPipeline(registry)
+        return pipeline.run(job_id=job_id, images=pil_images)
 
     return web_app

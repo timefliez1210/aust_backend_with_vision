@@ -13,7 +13,8 @@
 //! 6. Update quote with estimated volume
 //! 7. Auto-generate offer → Telegram approval
 
-use axum::{extract::Multipart, extract::State, routing::post, Json, Router};
+use axum::{extract::Multipart, extract::State, http::StatusCode, routing::post, Json, Router};
+use base64::Engine;
 use bytes::Bytes;
 use serde::Serialize;
 use std::sync::Arc;
@@ -25,10 +26,10 @@ use aust_storage::StorageProvider;
 use aust_volume_estimator::VisionAnalyzer;
 
 /// Response returned from both /photo and /mobile endpoints.
+/// Returned immediately as 202 Accepted — processing continues in background.
 #[derive(Serialize)]
 struct InquiryResponse {
     quote_id: Uuid,
-    estimation_id: Uuid,
     customer_id: Uuid,
     status: String,
     message: String,
@@ -42,20 +43,22 @@ pub fn router() -> Router<Arc<AppState>> {
 
 /// POST /photo — Photo webapp inquiry (Source C).
 /// Accepts multipart form with customer info, addresses, services, and images.
+/// Returns 202 Accepted immediately; processing continues in background.
 async fn photo_inquiry(
     State(state): State<Arc<AppState>>,
     multipart: Multipart,
-) -> Result<Json<InquiryResponse>, ApiError> {
+) -> Result<(StatusCode, Json<InquiryResponse>), ApiError> {
     let parsed = parse_inquiry_form(multipart, false).await?;
     handle_inquiry(state, parsed).await
 }
 
 /// POST /mobile — Mobile app inquiry (Source D).
 /// Same as /photo, plus depth_maps and ar_metadata fields.
+/// Returns 202 Accepted immediately; processing continues in background.
 async fn mobile_inquiry(
     State(state): State<Arc<AppState>>,
     multipart: Multipart,
-) -> Result<Json<InquiryResponse>, ApiError> {
+) -> Result<(StatusCode, Json<InquiryResponse>), ApiError> {
     let parsed = parse_inquiry_form(multipart, true).await?;
     handle_inquiry(state, parsed).await
 }
@@ -68,9 +71,11 @@ struct ParsedInquiryForm {
     departure_address: Option<String>,
     departure_floor: Option<String>,
     departure_parking_ban: Option<bool>,
+    departure_elevator: Option<bool>,
     arrival_address: Option<String>,
     arrival_floor: Option<String>,
     arrival_parking_ban: Option<bool>,
+    arrival_elevator: Option<bool>,
     preferred_date: Option<String>,
     services: Option<String>,
     message: Option<String>,
@@ -91,9 +96,11 @@ async fn parse_inquiry_form(
         departure_address: None,
         departure_floor: None,
         departure_parking_ban: None,
+        departure_elevator: None,
         arrival_address: None,
         arrival_floor: None,
         arrival_parking_ban: None,
+        arrival_elevator: None,
         preferred_date: None,
         services: None,
         message: None,
@@ -112,21 +119,41 @@ async fn parse_inquiry_form(
             "name" => form.name = Some(read_text_field(field).await?),
             "email" => form.email = Some(read_text_field(field).await?),
             "phone" => form.phone = Some(read_text_field(field).await?),
-            "departure_address" => form.departure_address = Some(read_text_field(field).await?),
-            "departure_floor" => form.departure_floor = Some(read_text_field(field).await?),
-            "departure_parking_ban" => {
+            "departure_address" | "auszugsadresse" => {
+                form.departure_address = Some(read_text_field(field).await?);
+            }
+            "departure_floor" | "etage_auszug" | "etage-auszug" => {
+                form.departure_floor = Some(read_text_field(field).await?);
+            }
+            "departure_parking_ban" | "halteverbot_auszug" | "halteverbot-auszug" => {
                 let text = read_text_field(field).await?;
                 form.departure_parking_ban = Some(parse_bool_field(&text));
             }
-            "arrival_address" => form.arrival_address = Some(read_text_field(field).await?),
-            "arrival_floor" => form.arrival_floor = Some(read_text_field(field).await?),
-            "arrival_parking_ban" => {
+            "departure_elevator" | "aufzug_auszug" | "aufzug-auszug" => {
+                let text = read_text_field(field).await?;
+                form.departure_elevator = Some(parse_bool_field(&text));
+            }
+            "arrival_address" | "einzugsadresse" => {
+                form.arrival_address = Some(read_text_field(field).await?);
+            }
+            "arrival_floor" | "etage_einzug" | "etage-einzug" => {
+                form.arrival_floor = Some(read_text_field(field).await?);
+            }
+            "arrival_parking_ban" | "halteverbot_einzug" | "halteverbot-einzug" => {
                 let text = read_text_field(field).await?;
                 form.arrival_parking_ban = Some(parse_bool_field(&text));
             }
-            "preferred_date" => form.preferred_date = Some(read_text_field(field).await?),
-            "services" => form.services = Some(read_text_field(field).await?),
-            "message" => form.message = Some(read_text_field(field).await?),
+            "arrival_elevator" | "aufzug_einzug" | "aufzug-einzug" => {
+                let text = read_text_field(field).await?;
+                form.arrival_elevator = Some(parse_bool_field(&text));
+            }
+            "preferred_date" | "wunschtermin" => {
+                form.preferred_date = Some(read_text_field(field).await?);
+            }
+            "services" | "zusatzleistungen" => {
+                form.services = Some(read_text_field(field).await?);
+            }
+            "message" | "nachricht" => form.message = Some(read_text_field(field).await?),
             "images" => {
                 let content_type = field.content_type().unwrap_or("image/jpeg").to_string();
                 if !content_type.starts_with("image/") {
@@ -171,10 +198,13 @@ fn parse_bool_field(value: &str) -> bool {
 }
 
 /// Shared handler for both photo and mobile inquiries.
+/// Creates customer + addresses + quote synchronously, then spawns background
+/// processing for S3 upload, vision estimation, and offer generation.
+/// Returns 202 Accepted immediately so the Cloudflare tunnel / client doesn't time out.
 async fn handle_inquiry(
     state: Arc<AppState>,
     form: ParsedInquiryForm,
-) -> Result<Json<InquiryResponse>, ApiError> {
+) -> Result<(StatusCode, Json<InquiryResponse>), ApiError> {
     // Validate required fields
     let name = form
         .name
@@ -228,13 +258,14 @@ async fn handle_inquiry(
     // 2. Create origin address
     let (dep_street, dep_city, dep_postal) = parse_address(&departure_address);
     let origin_id: Uuid = sqlx::query_as::<_, (Uuid,)>(
-        "INSERT INTO addresses (id, street, city, postal_code, floor) VALUES ($1, $2, $3, $4, $5) RETURNING id",
+        "INSERT INTO addresses (id, street, city, postal_code, floor, elevator) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
     )
     .bind(Uuid::now_v7())
     .bind(&dep_street)
     .bind(&dep_city)
     .bind(&dep_postal)
     .bind(&form.departure_floor)
+    .bind(form.departure_elevator)
     .fetch_one(&state.db)
     .await
     .map(|(id,)| id)
@@ -243,13 +274,14 @@ async fn handle_inquiry(
     // 3. Create destination address
     let (arr_street, arr_city, arr_postal) = parse_address(&arrival_address);
     let dest_id: Uuid = sqlx::query_as::<_, (Uuid,)>(
-        "INSERT INTO addresses (id, street, city, postal_code, floor) VALUES ($1, $2, $3, $4, $5) RETURNING id",
+        "INSERT INTO addresses (id, street, city, postal_code, floor, elevator) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
     )
     .bind(Uuid::now_v7())
     .bind(&arr_street)
     .bind(&arr_city)
     .bind(&arr_postal)
     .bind(&form.arrival_floor)
+    .bind(form.arrival_elevator)
     .fetch_one(&state.db)
     .await
     .map(|(id,)| id)
@@ -294,33 +326,107 @@ async fn handle_inquiry(
 
     tracing::info!(quote_id = %quote_id, "Quote created for inquiry");
 
-    // 7. Upload images to S3
-    let estimation_id = Uuid::now_v7();
-    let s3_keys = upload_images_to_s3(
-        &*state.storage,
-        quote_id,
-        estimation_id,
-        &form.images,
-    )
-    .await?;
-
-    // Upload depth maps if present
-    if !form.depth_maps.is_empty() {
-        if let Err(e) = upload_depth_maps_to_s3(
-            &*state.storage,
+    // 7. Return 202 immediately — spawn background processing
+    let state_bg = Arc::clone(&state);
+    let dep_addr = departure_address.clone();
+    let arr_addr = arrival_address.clone();
+    tokio::spawn(async move {
+        if let Err(e) = process_inquiry_background(
+            state_bg,
             quote_id,
-            estimation_id,
-            &form.depth_maps,
+            form.images,
+            form.depth_maps,
+            form.ar_metadata,
+            dep_addr,
+            arr_addr,
+            now,
         )
         .await
+        {
+            tracing::error!(quote_id = %quote_id, error = %e, "Background inquiry processing failed");
+        }
+    });
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(InquiryResponse {
+            quote_id,
+            customer_id,
+            status: "processing".to_string(),
+            message: "Anfrage erhalten. Bilder werden analysiert und Angebot wird erstellt."
+                .to_string(),
+        }),
+    ))
+}
+
+/// Background processing: distance calc → S3 upload → vision estimation → store results → generate offer.
+/// Runs in a spawned task so the HTTP response is not blocked.
+async fn process_inquiry_background(
+    state: Arc<AppState>,
+    quote_id: Uuid,
+    images: Vec<(Vec<u8>, String)>,
+    depth_maps: Vec<(Vec<u8>, String)>,
+    ar_metadata: Option<String>,
+    departure_address: String,
+    arrival_address: String,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), String> {
+    // 0. Calculate distance between origin and destination
+    let api_key = &state.config.maps.api_key;
+    if !api_key.is_empty() {
+        let calculator = aust_distance_calculator::RouteCalculator::new(api_key.clone());
+        let request = aust_distance_calculator::RouteRequest {
+            addresses: vec![departure_address, arrival_address],
+        };
+        match calculator.calculate(&request).await {
+            Ok(result) => {
+                tracing::info!(
+                    quote_id = %quote_id,
+                    distance_km = result.total_distance_km,
+                    "Distance calculated"
+                );
+                let _ = sqlx::query(
+                    "UPDATE quotes SET distance_km = $1, updated_at = $2 WHERE id = $3",
+                )
+                .bind(result.total_distance_km)
+                .bind(chrono::Utc::now())
+                .bind(quote_id)
+                .execute(&state.db)
+                .await;
+            }
+            Err(e) => {
+                tracing::warn!(quote_id = %quote_id, error = %e, "Distance calculation failed, continuing without");
+            }
+        }
+    } else {
+        tracing::warn!("Maps API key not configured, skipping distance calculation");
+    }
+
+    let estimation_id = Uuid::now_v7();
+
+    // 1. Upload images to S3
+    let s3_keys = upload_images_to_s3(&*state.storage, quote_id, estimation_id, &images)
+        .await
+        .map_err(|e| format!("S3 upload failed: {e}"))?;
+
+    tracing::info!(
+        quote_id = %quote_id,
+        image_count = images.len(),
+        "Images uploaded to S3"
+    );
+
+    // Upload depth maps if present
+    if !depth_maps.is_empty() {
+        if let Err(e) =
+            upload_depth_maps_to_s3(&*state.storage, quote_id, estimation_id, &depth_maps).await
         {
             tracing::warn!("Failed to upload depth maps: {e}");
         }
     }
 
-    // 8. Run volume estimation (vision service → LLM fallback)
+    // 2. Run volume estimation (vision service → LLM fallback)
     let (total_volume, confidence, result_data, method) =
-        match try_vision_service(&state, &form.images, estimation_id).await {
+        match try_vision_service(&state, &images, estimation_id, quote_id, estimation_id).await {
             Ok((vol, conf, data)) => {
                 tracing::info!(
                     estimation_id = %estimation_id,
@@ -331,21 +437,23 @@ async fn handle_inquiry(
             }
             Err(e) => {
                 tracing::warn!("Vision service unavailable, falling back to LLM: {e}");
-                fallback_llm_analysis(&state, &form.images).await?
+                fallback_llm_analysis(&state, &images)
+                    .await
+                    .map_err(|e| format!("LLM fallback failed: {e}"))?
             }
         };
 
-    // 9. Build source_data JSON
+    // 3. Build source_data JSON
     let source_data = serde_json::json!({
-        "source": if form.depth_maps.is_empty() { "photo_webapp" } else { "mobile_app" },
-        "image_count": form.images.len(),
-        "depth_map_count": form.depth_maps.len(),
+        "source": if depth_maps.is_empty() { "photo_webapp" } else { "mobile_app" },
+        "image_count": images.len(),
+        "depth_map_count": depth_maps.len(),
         "s3_keys": s3_keys,
-        "ar_metadata": form.ar_metadata.as_deref()
+        "ar_metadata": ar_metadata.as_deref()
             .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()),
     });
 
-    // 10. Create volume_estimation record
+    // 4. Create volume_estimation record
     sqlx::query(
         r#"
         INSERT INTO volume_estimations (id, quote_id, method, source_data, result_data, total_volume_m3, confidence_score, created_at)
@@ -362,18 +470,19 @@ async fn handle_inquiry(
     .bind(now)
     .execute(&state.db)
     .await
-    .map_err(|e| ApiError::Internal(format!("Volumenschätzung konnte nicht gespeichert werden: {e}")))?;
+    .map_err(|e| format!("Failed to store estimation: {e}"))?;
 
-    // 11. Update quote with estimated volume
+    // 5. Update quote with estimated volume
     sqlx::query(
         "UPDATE quotes SET estimated_volume_m3 = $1, status = $2, updated_at = $3 WHERE id = $4",
     )
     .bind(total_volume)
     .bind("volume_estimated")
-    .bind(now)
+    .bind(chrono::Utc::now())
     .bind(quote_id)
     .execute(&state.db)
-    .await?;
+    .await
+    .map_err(|e| format!("Failed to update quote: {e}"))?;
 
     tracing::info!(
         quote_id = %quote_id,
@@ -382,19 +491,10 @@ async fn handle_inquiry(
         "Volume estimation completed"
     );
 
-    // 12. Auto-generate offer in background (full pipeline: XLSX → PDF → Telegram)
-    let state_clone = Arc::clone(&state);
-    tokio::spawn(async move {
-        orchestrator::try_auto_generate_offer(state_clone, quote_id).await;
-    });
+    // 6. Auto-generate offer (XLSX → PDF → Telegram)
+    orchestrator::try_auto_generate_offer(Arc::clone(&state), quote_id).await;
 
-    Ok(Json(InquiryResponse {
-        quote_id,
-        estimation_id,
-        customer_id,
-        status: "volume_estimated".to_string(),
-        message: "Anfrage erfolgreich erstellt. Angebot wird generiert.".to_string(),
-    }))
+    Ok(())
 }
 
 /// Upload images to S3 under `estimates/{quote_id}/{estimation_id}/`.
@@ -446,10 +546,13 @@ async fn upload_depth_maps_to_s3(
 
 /// Try the Python vision service for 3D volume estimation.
 /// Sends raw image bytes via multipart upload (Modal doesn't have S3 access).
+/// Uploads crop thumbnails to S3 and replaces base64 with S3 keys.
 async fn try_vision_service(
     state: &AppState,
     images: &[(Vec<u8>, String)],
     job_id: Uuid,
+    quote_id: Uuid,
+    estimation_id: Uuid,
 ) -> Result<(f64, f64, Option<serde_json::Value>), ApiError> {
     let client = state
         .vision_service
@@ -461,8 +564,34 @@ async fn try_vision_service(
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    let result_data = serde_json::to_value(&response.detected_items).ok();
-    Ok((response.total_volume_m3, response.confidence_score, result_data))
+    // Upload crop thumbnails to S3 and replace base64 with S3 keys
+    let mut items_value = serde_json::to_value(&response.detected_items)
+        .map_err(|e| ApiError::Internal(format!("Failed to serialize items: {e}")))?;
+
+    if let Some(items_arr) = items_value.as_array_mut() {
+        for (idx, item_val) in items_arr.iter_mut().enumerate() {
+            if let Some(crop_b64) = item_val.get("crop_base64").and_then(|v| v.as_str()) {
+                if !crop_b64.is_empty() {
+                    let name = item_val.get("name").and_then(|v| v.as_str()).unwrap_or("item");
+                    let safe_name = name.replace(' ', "_").to_lowercase();
+                    let key = format!("estimates/{quote_id}/{estimation_id}/crops/{safe_name}_{idx}.jpg");
+                    if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(crop_b64) {
+                        if let Ok(_) = state.storage
+                            .upload(&key, Bytes::from(decoded), "image/jpeg")
+                            .await
+                        {
+                            item_val.as_object_mut().map(|obj| {
+                                obj.remove("crop_base64");
+                                obj.insert("crop_s3_key".to_string(), serde_json::Value::String(key));
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok((response.total_volume_m3, response.confidence_score, Some(items_value)))
 }
 
 /// Fallback: run LLM-based vision analysis on the raw image data.
@@ -522,12 +651,24 @@ fn build_notes(
 
     if let Some(services_str) = services {
         for service in services_str.split(',') {
-            match service.trim().to_lowercase().as_str() {
+            let s = service.trim();
+            let lower = s.to_lowercase();
+            match lower.as_str() {
+                // English names
                 "packing" => parts.push("Verpackungsservice".to_string()),
                 "assembly" => parts.push("Montage".to_string()),
                 "disassembly" => parts.push("Demontage".to_string()),
                 "storage" => parts.push("Einlagerung".to_string()),
                 "disposal" => parts.push("Entsorgung".to_string()),
+                // German names (from web form)
+                _ if lower.contains("demontage") => parts.push("Demontage".to_string()),
+                _ if lower.contains("montage") => parts.push("Montage".to_string()),
+                _ if lower.contains("einpack") || lower.contains("verpackung") => {
+                    parts.push("Verpackungsservice".to_string());
+                }
+                _ if lower.contains("einlagerung") => parts.push("Einlagerung".to_string()),
+                _ if lower.contains("entsorgung") => parts.push("Entsorgung".to_string()),
+                _ if !s.is_empty() => parts.push(s.to_string()),
                 _ => {}
             }
         }

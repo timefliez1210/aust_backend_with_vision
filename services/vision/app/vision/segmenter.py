@@ -13,10 +13,14 @@ logger = logging.getLogger(__name__)
 
 
 class Segmenter:
-    """SAM-based instance segmenter. Takes detections and produces binary masks."""
+    """SAM 2 based instance segmenter. Takes detections and produces binary masks.
+
+    Uses SAM 2's image predictor interface (drop-in replacement for SAM ViT-H).
+    6x faster inference, 4x smaller model, better mask accuracy.
+    """
 
     def __init__(self, registry: ModelRegistry) -> None:
-        self._predictor = registry.sam_predictor
+        self._predictor = registry.sam2_image_predictor
         self._device = registry.device
 
     def segment(
@@ -56,7 +60,7 @@ class Segmenter:
         return masks_by_image
 
     def _segment_box(self, bbox: list[float], image_shape: tuple[int, int]) -> np.ndarray:
-        """Run SAM with a bounding box prompt, returning the best mask."""
+        """Run SAM 2 with a bounding box prompt, returning the best mask."""
         box_np = np.array(bbox, dtype=np.float32)
 
         masks, scores, _ = self._predictor.predict(

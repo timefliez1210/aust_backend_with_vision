@@ -8,6 +8,7 @@ pub enum EstimationMethod {
     Vision,
     Inventory,
     DepthSensor,
+    Video,
     Manual,
 }
 
@@ -17,6 +18,7 @@ impl EstimationMethod {
             Self::Vision => "vision",
             Self::Inventory => "inventory",
             Self::DepthSensor => "depth_sensor",
+            Self::Video => "video",
             Self::Manual => "manual",
         }
     }
@@ -86,6 +88,23 @@ pub struct DepthSensorItem {
     pub dimensions: Option<ItemDimensions>,
     pub confidence: f64,
     pub category: Option<String>,
+    /// German name from RE catalog (e.g. "Kleiderschrank, 2-türig")
+    #[serde(default)]
+    pub german_name: Option<String>,
+    /// RE value from Alltransport catalog (1 RE = 0.1 m³)
+    #[serde(default)]
+    pub re_value: Option<f64>,
+    /// How volume was determined: "re_lookup" or "geometric"
+    #[serde(default)]
+    pub volume_source: Option<String>,
+    #[serde(default)]
+    pub bbox: Option<Vec<f64>>,
+    #[serde(default)]
+    pub bbox_image_index: Option<usize>,
+    #[serde(default)]
+    pub crop_s3_key: Option<String>,
+    #[serde(default)]
+    pub seen_in_images: Option<Vec<usize>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

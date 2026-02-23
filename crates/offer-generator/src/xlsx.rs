@@ -42,6 +42,23 @@ pub struct DetectedItemRow {
     pub volume_m3: f64,
     pub dimensions: Option<String>,
     pub confidence: f64,
+    /// German name from RE catalog
+    #[serde(default)]
+    pub german_name: Option<String>,
+    /// RE value (1 RE = 0.1 m³)
+    #[serde(default)]
+    pub re_value: Option<f64>,
+    /// "re_lookup" or "geometric"
+    #[serde(default)]
+    pub volume_source: Option<String>,
+    #[serde(default)]
+    pub crop_s3_key: Option<String>,
+    #[serde(default)]
+    pub bbox: Option<Vec<f64>>,
+    #[serde(default)]
+    pub bbox_image_index: Option<usize>,
+    #[serde(default)]
+    pub source_image_urls: Option<Vec<String>>,
 }
 
 pub struct XlsxGenerator {
@@ -178,49 +195,119 @@ impl XlsxGenerator {
             .ok_or_else(|| OfferError::Template("Items sheet not found after creation".into()))?;
 
         // Column widths
-        sheet.get_column_dimension_mut("A").set_width(30.0);
-        sheet.get_column_dimension_mut("B").set_width(16.0);
-        sheet.get_column_dimension_mut("C").set_width(22.0);
-        sheet.get_column_dimension_mut("D").set_width(14.0);
+        sheet.get_column_dimension_mut("A").set_width(8.0);   // Nr.
+        sheet.get_column_dimension_mut("B").set_width(32.0);  // Gegenstand
+        sheet.get_column_dimension_mut("C").set_width(28.0);  // Bezeichnung (deutsch)
+        sheet.get_column_dimension_mut("D").set_width(10.0);  // RE
+        sheet.get_column_dimension_mut("E").set_width(14.0);  // Volumen (m³)
+        sheet.get_column_dimension_mut("F").set_width(22.0);  // Maße
+        sheet.get_column_dimension_mut("G").set_width(10.0);  // Quelle
 
-        // Header
-        let headers = ["Gegenstand", "Volumen (m³)", "Maße (L×B×H)", "Konfidenz"];
+        // Header row with bold + bottom border
+        let headers = ["Nr.", "Gegenstand", "Bezeichnung (DE)", "RE", "Volumen (m³)", "Maße (L×B×H)", "Quelle"];
+        let header_cols = ["A", "B", "C", "D", "E", "F", "G"];
         for (col_idx, header) in headers.iter().enumerate() {
-            let col = col_letter(col_idx);
-            let cell = sheet.get_cell_mut(format!("{}1", col));
+            let col = header_cols[col_idx];
+            let cell = sheet.get_cell_mut(format!("{col}1"));
             cell.set_value_string(*header);
-            cell.get_style_mut().get_font_mut().set_bold(true);
+            let style = cell.get_style_mut();
+            style.get_font_mut().set_bold(true);
+            // Bottom border
+            style
+                .get_borders_mut()
+                .get_bottom_mut()
+                .set_border_style(umya_spreadsheet::Border::BORDER_THIN);
         }
+
+        // Light gray for alternating rows
+        let light_gray = "F2F2F2";
 
         // Data rows
         let mut total_volume = 0.0;
         for (i, item) in data.detected_items.iter().enumerate() {
             let row = (i + 2) as u32;
-            set_cell_text(sheet, "A", row, &item.name);
-            set_cell_number(sheet, "B", row, item.volume_m3);
-            if let Some(dims) = &item.dimensions {
-                set_cell_text(sheet, "C", row, dims);
+            let is_even = i % 2 == 0;
+
+            // Nr.
+            set_cell_number(sheet, "A", row, (i + 1) as f64);
+
+            // Gegenstand (detected name)
+            set_cell_text(sheet, "B", row, &item.name);
+
+            // Bezeichnung (German name from RE catalog)
+            if let Some(ref german) = item.german_name {
+                set_cell_text(sheet, "C", row, german);
             }
-            set_cell_text(
-                sheet,
-                "D",
-                row,
-                &format!("{:.0}%", item.confidence * 100.0),
-            );
+
+            // RE value
+            if let Some(re) = item.re_value {
+                set_cell_number(sheet, "D", row, re);
+            }
+
+            // Volumen — formatted to 2 decimal places
+            set_cell_number(sheet, "E", row, item.volume_m3);
+            sheet
+                .get_cell_mut(format!("E{row}"))
+                .get_style_mut()
+                .get_number_format_mut()
+                .set_format_code("0.00");
+
+            // Maße
+            if let Some(dims) = &item.dimensions {
+                set_cell_text(sheet, "F", row, dims);
+            }
+
+            // Quelle
+            if let Some(ref src) = item.volume_source {
+                let label = match src.as_str() {
+                    "re_lookup" => "RE-Katalog",
+                    "geometric" => "3D-Messung",
+                    _ => src.as_str(),
+                };
+                set_cell_text(sheet, "G", row, label);
+            }
+
+            // Alternating row shading
+            if is_even {
+                for col in &header_cols {
+                    sheet
+                        .get_cell_mut(format!("{col}{row}"))
+                        .get_style_mut()
+                        .set_background_color(light_gray);
+                }
+            }
+
             total_volume += item.volume_m3;
         }
 
-        // Total row
-        let total_row = (data.detected_items.len() + 2) as u32;
-        let total_cell = sheet.get_cell_mut(format!("A{total_row}"));
+        // Total row with top border
+        let total_row = (data.detected_items.len() + 3) as u32; // skip a blank row
+        let total_cell = sheet.get_cell_mut(format!("B{total_row}"));
         total_cell.set_value_string("Gesamtvolumen");
         total_cell.get_style_mut().get_font_mut().set_bold(true);
-        set_cell_number(sheet, "B", total_row, total_volume);
-        sheet
-            .get_cell_mut(format!("B{total_row}"))
+        total_cell
             .get_style_mut()
-            .get_font_mut()
-            .set_bold(true);
+            .get_borders_mut()
+            .get_top_mut()
+            .set_border_style(umya_spreadsheet::Border::BORDER_THIN);
+
+        set_cell_number(sheet, "E", total_row, total_volume);
+        let vol_cell = sheet.get_cell_mut(format!("E{total_row}"));
+        vol_cell.get_style_mut().get_font_mut().set_bold(true);
+        vol_cell
+            .get_style_mut()
+            .get_number_format_mut()
+            .set_format_code("0.00");
+        vol_cell
+            .get_style_mut()
+            .get_borders_mut()
+            .get_top_mut()
+            .set_border_style(umya_spreadsheet::Border::BORDER_THIN);
+
+        // Item count
+        let count_row = total_row + 1;
+        set_cell_text(sheet, "B", count_row, "Anzahl Gegenstände");
+        set_cell_number(sheet, "E", count_row, data.detected_items.len() as f64);
 
         Ok(())
     }
@@ -230,16 +317,6 @@ impl XlsxGenerator {
         umya_spreadsheet::writer::xlsx::write_writer(&self.workbook, &mut buf)
             .map_err(|e| OfferError::Template(format!("Failed to write xlsx: {e}")))?;
         Ok(buf.into_inner())
-    }
-}
-
-fn col_letter(idx: usize) -> &'static str {
-    match idx {
-        0 => "A",
-        1 => "B",
-        2 => "C",
-        3 => "D",
-        _ => "A",
     }
 }
 

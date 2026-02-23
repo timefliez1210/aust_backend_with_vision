@@ -1,3 +1,3 @@
 pub mod auth;
 
-pub use auth::AuthLayer;
+pub use auth::require_auth;

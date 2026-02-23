@@ -40,6 +40,12 @@ pub struct VisionDetectedItem {
     pub confidence: f64,
     pub seen_in_images: Vec<usize>,
     pub category: Option<String>,
+    #[serde(default)]
+    pub bbox: Option<Vec<f64>>,
+    #[serde(default)]
+    pub bbox_image_index: Option<usize>,
+    #[serde(default)]
+    pub crop_base64: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -129,6 +135,81 @@ impl VisionServiceClient {
 
             client.post(url).multipart(form)
         }).await
+    }
+
+    /// Upload a video directly to the vision service for 3D volume estimation.
+    /// Video processing takes 2-10 minutes with model swapping on GPU.
+    pub async fn estimate_video(
+        &self,
+        job_id: &str,
+        video_data: &[u8],
+        mime: &str,
+        max_keyframes: Option<u32>,
+        detection_threshold: Option<f64>,
+    ) -> Result<VisionServiceResponse, VolumeError> {
+        let url = format!("{}/estimate/video", self.base_url);
+
+        // Build a client with extended timeout for video processing (600s)
+        let video_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(600))
+            .build()
+            .map_err(|e| {
+                VolumeError::ExternalService(format!(
+                    "Failed to create video HTTP client: {e}"
+                ))
+            })?;
+
+        let ext = match mime {
+            "video/quicktime" => "mov",
+            "video/webm" => "webm",
+            "video/x-matroska" => "mkv",
+            _ => "mp4",
+        };
+
+        let mut form = reqwest::multipart::Form::new()
+            .text("job_id", job_id.to_string());
+
+        if let Some(kf) = max_keyframes {
+            form = form.text("max_keyframes", kf.to_string());
+        }
+        if let Some(dt) = detection_threshold {
+            form = form.text("detection_threshold", dt.to_string());
+        }
+
+        let part = reqwest::multipart::Part::bytes(video_data.to_vec())
+            .file_name(format!("video.{ext}"))
+            .mime_str(mime)
+            .unwrap_or_else(|_| {
+                reqwest::multipart::Part::bytes(video_data.to_vec())
+                    .file_name(format!("video.{ext}"))
+            });
+        form = form.part("video", part);
+
+        // No retry for video — processing is too long to restart
+        let resp = video_client
+            .post(&url)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| {
+                VolumeError::ExternalService(format!(
+                    "Vision service video request failed: {e}"
+                ))
+            })?;
+
+        if resp.status().is_success() {
+            resp.json().await.map_err(|e| {
+                VolumeError::ExternalService(format!(
+                    "Failed to parse vision service video response: {e}"
+                ))
+            })
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            Err(VolumeError::ExternalService(format!(
+                "Vision service video returned {status}: {body}"
+            )))
+        }
     }
 
     async fn send_with_retry<F>(

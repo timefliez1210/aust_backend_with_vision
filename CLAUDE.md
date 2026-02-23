@@ -20,8 +20,8 @@ A modular Rust backend for automating moving company operations - from initial c
 | Cache/Queue | Redis |
 | Object Storage | S3-compatible (MinIO for dev) |
 | LLM | Pluggable: Claude, OpenAI, Ollama |
-| Vision ML | Grounding DINO + SAM + Depth Anything V2 + Open3D |
-| Vision Infra | Modal (serverless GPU, T4) |
+| Vision ML | Grounding DINO + SAM 2 + Depth Anything V2 + MASt3R + Open3D |
+| Vision Infra | Modal (serverless GPU, L4) |
 | Maps/Routing | OpenRouteService |
 | Email | IMAP/SMTP via lettre + async-imap |
 | Approval UI | Telegram Bot (human-in-the-loop) |
@@ -104,6 +104,7 @@ curl -X POST https://crfabig--aust-vision-serve.modal.run/estimate/upload \
 ### Volume Estimation
 - `POST /api/v1/estimates/vision` - LLM image analysis (base64 JSON)
 - `POST /api/v1/estimates/depth-sensor` - 3D ML pipeline (multipart upload, falls back to LLM)
+- `POST /api/v1/estimates/video` - Video 3D reconstruction pipeline (multipart upload, 600s timeout)
 - `POST /api/v1/estimates/inventory` - Manual inventory form
 - `GET /api/v1/estimates/{id}` - Get estimation
 
@@ -133,6 +134,7 @@ Four input sources feed into the pipeline:
 | B. Kostenloses Angebot form | Email → email agent (JSON attachment) | VolumeCalculator items list | Working |
 | C. Photo webapp | Direct API POST | Vision pipeline (ML) | Not yet implemented |
 | D. Mobile app | Direct API POST | Depth sensor + AR | Not yet implemented |
+| E. Video upload | Admin dashboard → API | Video 3D reconstruction (MASt3R + SAM 2) | Implemented |
 
 ```
                    ┌─── A. Kontakt form (email) ────────┐

@@ -184,6 +184,19 @@ pub async fn upsert_capacity_override(
     Ok(row)
 }
 
+/// Delete a booking by ID.
+pub async fn delete_booking(
+    pool: &PgPool,
+    id: Uuid,
+) -> Result<bool, CalendarError> {
+    let result = sqlx::query("DELETE FROM calendar_bookings WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+
+    Ok(result.rows_affected() > 0)
+}
+
 /// Get a single booking by ID.
 pub async fn get_booking_by_id(
     pool: &PgPool,

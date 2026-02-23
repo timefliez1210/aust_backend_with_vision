@@ -43,6 +43,16 @@ pub struct Offer {
     pub status: OfferStatus,
     pub created_at: DateTime<Utc>,
     pub sent_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offer_number: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persons: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hours_estimated: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_per_hour_cents: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line_items_json: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

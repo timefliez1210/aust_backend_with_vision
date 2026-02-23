@@ -27,8 +27,7 @@ logger = logging.getLogger(__name__)
 class VisionPipeline:
     """Orchestrates the full vision pipeline: detect -> segment -> depth -> volume.
 
-    Includes cross-image deduplication to merge the same item seen from
-    multiple angles.
+    Includes within-image deduplication to merge overlapping detections.
     """
 
     def __init__(self, registry: ModelRegistry) -> None:
@@ -77,17 +76,27 @@ class VisionPipeline:
         # Stage 5: Cross-image deduplication
         merged_items = self._deduplicate(volume_estimates)
 
-        # Stage 6: Apply packing multipliers (object volume → truck-loading volume)
+        # Stage 6: Apply packing multipliers to geometric-sourced items only.
+        # RE-sourced volumes already include handling/packing space.
         for i, item in enumerate(merged_items):
+            if item.volume_source == "re":
+                continue  # RE volumes already include packing space
             multiplier = get_packing_multiplier(item.category)
             if multiplier != 1.0:
                 merged_items[i] = DetectedItem(
                     name=item.name,
                     volume_m3=round(item.volume_m3 * multiplier, 4),
-                    dimensions=item.dimensions,  # keep raw dimensions for display
+                    dimensions=item.dimensions,
                     confidence=item.confidence,
                     seen_in_images=item.seen_in_images,
                     category=item.category,
+                    german_name=item.german_name,
+                    re_value=item.re_value,
+                    units=item.units,
+                    volume_source=item.volume_source,
+                    bbox=item.bbox,
+                    bbox_image_index=item.bbox_image_index,
+                    crop_base64=item.crop_base64,
                 )
 
         total_volume = sum(item.volume_m3 for item in merged_items)
@@ -113,11 +122,11 @@ class VisionPipeline:
         )
 
     def _deduplicate(self, estimates: list[VolumeEstimate]) -> list[DetectedItem]:
-        """Merge duplicate items seen across multiple images.
+        """Merge duplicate detections within each image.
 
         Uses label matching + feature vector cosine similarity.
-        Items with the same label and similarity above the threshold
-        are considered the same physical object.
+        Only deduplicates within the same image (cross-image dedup
+        is disabled due to unreliable feature vectors).
         """
         if not estimates:
             return []
@@ -142,8 +151,10 @@ class VisionPipeline:
     ) -> list[list[VolumeEstimate]]:
         """Cluster estimates of the same label by feature vector similarity.
 
-        Simple greedy clustering: for each estimate, either add to an
-        existing cluster if similar enough, or start a new cluster.
+        Only deduplicates within the same image — cross-image dedup is
+        unreliable with the current low-dimensional feature vectors
+        (mean color + centroid + OBB dims) because centroids are in
+        per-image coordinate frames and not comparable across images.
         """
         clusters: list[list[VolumeEstimate]] = []
 
@@ -152,6 +163,9 @@ class VisionPipeline:
             if est.feature_vector:
                 for cluster in clusters:
                     representative = cluster[0]
+                    # Only merge items from the same image
+                    if representative.image_index != est.image_index:
+                        continue
                     if representative.feature_vector:
                         similarity = 1.0 - cosine_distance(
                             est.feature_vector, representative.feature_vector
@@ -172,6 +186,9 @@ class VisionPipeline:
 
         Takes the observation with the highest confidence as the primary,
         and averages dimensions across all observations.
+
+        For RE-sourced items, uses the RE volume directly (not averaged
+        geometric volume), since RE is the authoritative source.
         """
         best = max(cluster, key=lambda e: e.confidence)
 
@@ -179,19 +196,22 @@ class VisionPipeline:
         avg_length = np.mean([e.dimensions.length_m for e in cluster])
         avg_width = np.mean([e.dimensions.width_m for e in cluster])
         avg_height = np.mean([e.dimensions.height_m for e in cluster])
-        avg_volume = float(avg_length * avg_width * avg_height)
+
+        # For RE-sourced items, use the RE volume from the best observation.
+        # For geometric items, use averaged dimensions to compute volume.
+        if best.volume_source == "re":
+            volume = best.volume_m3
+        else:
+            volume = float(avg_length * avg_width * avg_height)
 
         # Collect which images this item appeared in
         seen_in = sorted({e.image_index for e in cluster})
 
-        # Boost confidence when seen in multiple images
-        max_conf = best.confidence
-        multi_image_bonus = min(0.1 * (len(seen_in) - 1), 0.2)
-        boosted_confidence = min(max_conf + multi_image_bonus, 1.0)
+        boosted_confidence = best.confidence
 
         return DetectedItem(
             name=best.label,
-            volume_m3=round(avg_volume, 4),
+            volume_m3=round(volume, 4),
             dimensions=ItemDimensions(
                 length_m=round(float(avg_length), 3),
                 width_m=round(float(avg_width), 3),
@@ -200,4 +220,11 @@ class VisionPipeline:
             confidence=round(boosted_confidence, 3),
             seen_in_images=seen_in,
             category=best.category,
+            german_name=best.german_name,
+            re_value=best.re_value,
+            units=best.units,
+            volume_source=best.volume_source,
+            bbox=best.bbox,
+            bbox_image_index=best.image_index,
+            crop_base64=best.crop_base64,
         )

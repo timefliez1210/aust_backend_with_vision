@@ -16,6 +16,22 @@ impl Default for UserRole {
     }
 }
 
+impl UserRole {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Admin => "admin",
+            Self::Operator => "operator",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "admin" => Self::Admin,
+            _ => Self::Operator,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
     pub id: Uuid,
@@ -47,6 +63,7 @@ pub struct LoginRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthToken {
     pub access_token: String,
+    pub refresh_token: String,
     pub token_type: String,
     pub expires_in: u64,
 }

@@ -83,6 +83,7 @@ async fn main() -> Result<()> {
     let calendar_for_email = calendar.clone();
     let email_config = config.email.clone();
     let telegram_config = config.telegram.clone();
+    let db_for_email = db.clone();
 
     // Create app state
     let state = AppState::new(config.clone(), db, llm, storage, calendar, vision_service);
@@ -95,6 +96,7 @@ async fn main() -> Result<()> {
             telegram_config,
             llm_for_email,
             calendar_for_email,
+            db_for_email,
         );
         processor.set_offer_channel(offer_tx);
         processor.run(poll_interval).await;

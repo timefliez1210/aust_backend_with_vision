@@ -34,6 +34,14 @@ pub fn router() -> Router<Arc<AppState>> {
 struct GenerateOfferRequest {
     quote_id: Uuid,
     valid_days: Option<i64>,
+    #[serde(default)]
+    price_cents_netto: Option<i64>,
+    #[serde(default)]
+    persons: Option<u32>,
+    #[serde(default)]
+    hours: Option<f64>,
+    #[serde(default)]
+    rate: Option<f64>,
 }
 
 #[derive(Debug, FromRow)]
@@ -62,6 +70,7 @@ impl From<QuoteRow> for Quote {
             "accepted" => QuoteStatus::Accepted,
             "rejected" => QuoteStatus::Rejected,
             "expired" => QuoteStatus::Expired,
+            "cancelled" => QuoteStatus::Cancelled,
             _ => QuoteStatus::Pending,
         };
 
@@ -92,6 +101,11 @@ struct OfferRow {
     status: String,
     created_at: chrono::DateTime<chrono::Utc>,
     sent_at: Option<chrono::DateTime<chrono::Utc>>,
+    offer_number: Option<String>,
+    persons: Option<i32>,
+    hours_estimated: Option<f64>,
+    rate_per_hour_cents: Option<i64>,
+    line_items_json: Option<serde_json::Value>,
 }
 
 impl From<OfferRow> for Offer {
@@ -116,6 +130,11 @@ impl From<OfferRow> for Offer {
             status,
             created_at: row.created_at,
             sent_at: row.sent_at,
+            offer_number: row.offer_number,
+            persons: row.persons,
+            hours_estimated: row.hours_estimated,
+            rate_per_hour_cents: row.rate_per_hour_cents,
+            line_items_json: row.line_items_json,
         }
     }
 }
@@ -137,15 +156,38 @@ pub(crate) struct AddressRow {
     pub city: String,
     pub postal_code: Option<String>,
     pub floor: Option<String>,
+    pub elevator: Option<bool>,
 }
 
 #[derive(Debug, FromRow)]
-pub(crate) struct VolumeEstimationRow {
+pub struct VolumeEstimationRow {
     pub result_data: Option<serde_json::Value>,
+    pub source_data: Option<serde_json::Value>,
     #[allow(dead_code)]
     pub total_volume_m3: Option<f64>,
     #[allow(dead_code)]
     pub method: String,
+}
+
+/// Summary data for the Telegram caption — populated during offer generation.
+pub struct TelegramSummary {
+    pub customer_phone: String,
+    pub origin_address: String,
+    pub origin_floor: String,
+    pub origin_elevator: Option<bool>,
+    pub dest_address: String,
+    pub dest_floor: String,
+    pub dest_elevator: Option<bool>,
+    pub preferred_date: String,
+    pub volume_m3: f64,
+    pub items_count: usize,
+    pub distance_km: f64,
+    pub services: String,
+    pub persons: u32,
+    pub hours: f64,
+    pub rate: f64,
+    pub netto_cents: i64,
+    pub customer_message: String,
 }
 
 /// Result of offer generation — the offer record + PDF bytes for immediate use.
@@ -154,6 +196,7 @@ pub struct GeneratedOffer {
     pub pdf_bytes: Vec<u8>,
     pub customer_email: String,
     pub customer_name: String,
+    pub summary: TelegramSummary,
 }
 
 /// Optional overrides for the offer (e.g. when admin edits via Telegram).
@@ -214,7 +257,7 @@ pub async fn build_offer_with_overrides(
 
     // 3. Fetch addresses
     let origin: Option<AddressRow> = if let Some(addr_id) = quote.origin_address_id {
-        sqlx::query_as("SELECT id, street, city, postal_code, floor FROM addresses WHERE id = $1")
+        sqlx::query_as("SELECT id, street, city, postal_code, floor, elevator FROM addresses WHERE id = $1")
             .bind(addr_id)
             .fetch_optional(db)
             .await?
@@ -223,7 +266,7 @@ pub async fn build_offer_with_overrides(
     };
 
     let destination: Option<AddressRow> = if let Some(addr_id) = quote.destination_address_id {
-        sqlx::query_as("SELECT id, street, city, postal_code, floor FROM addresses WHERE id = $1")
+        sqlx::query_as("SELECT id, street, city, postal_code, floor, elevator FROM addresses WHERE id = $1")
             .bind(addr_id)
             .fetch_optional(db)
             .await?
@@ -234,7 +277,7 @@ pub async fn build_offer_with_overrides(
     // 4. Fetch latest volume estimation for detected items
     let estimation: Option<VolumeEstimationRow> = sqlx::query_as(
         r#"
-        SELECT result_data, total_volume_m3, method
+        SELECT result_data, source_data, total_volume_m3, method
         FROM volume_estimations
         WHERE quote_id = $1
         ORDER BY created_at DESC
@@ -264,8 +307,8 @@ pub async fn build_offer_with_overrides(
         preferred_date: quote.preferred_date,
         floor_origin: origin_floor,
         floor_destination: dest_floor,
-        has_elevator_origin: None, // TODO: add elevator field to addresses table
-        has_elevator_destination: None,
+        has_elevator_origin: origin.as_ref().and_then(|a| a.elevator),
+        has_elevator_destination: destination.as_ref().and_then(|a| a.elevator),
     };
 
     let pricing_engine = PricingEngine::new();
@@ -354,7 +397,13 @@ pub async fn build_offer_with_overrides(
         .and_then(|a| a.floor.clone())
         .unwrap_or_default();
 
-    let offer_number = format!("{}-{}", today.format("%Y"), &offer_id.to_string()[..4]);
+    let (seq_val,): (i64,) = sqlx::query_as("SELECT nextval('offer_number_seq')")
+        .fetch_one(db)
+        .await?;
+    let offer_number = format!("{}-{:04}", today.format("%Y"), seq_val);
+
+    // Extract services and customer message from notes
+    let (services_str, customer_message) = extract_services_and_message(quote.notes.as_deref());
 
     let offer_data = OfferData {
         offer_number: offer_number.clone(),
@@ -366,19 +415,19 @@ pub async fn build_offer_with_overrides(
         customer_phone: customer.phone.clone().unwrap_or_default(),
         customer_email: customer.email.clone(),
         greeting,
-        moving_date,
-        origin_street,
-        origin_city,
-        origin_floor_info,
-        dest_street,
-        dest_city,
-        dest_floor_info,
+        moving_date: moving_date.clone(),
+        origin_street: origin_street.clone(),
+        origin_city: origin_city.clone(),
+        origin_floor_info: origin_floor_info.clone(),
+        dest_street: dest_street.clone(),
+        dest_city: dest_city.clone(),
+        dest_floor_info: dest_floor_info.clone(),
         volume_m3: volume,
         persons: pricing_result.estimated_helpers,
         estimated_hours: pricing_result.estimated_hours,
         rate_per_person_hour: rate_override,
         line_items,
-        detected_items,
+        detected_items: detected_items.clone(),
     };
 
     // 8. Generate xlsx → PDF
@@ -419,11 +468,17 @@ pub async fn build_offer_with_overrides(
     let valid_until =
         valid_days.map(|days| (now + chrono::Duration::days(days)).date_naive());
 
+    // Serialize line items for storage
+    let line_items_json = serde_json::to_value(&offer_data.line_items).ok();
+    let rate_cents = (rate_override * 100.0).round() as i64;
+
     let row: OfferRow = sqlx::query_as(
         r#"
-        INSERT INTO offers (id, quote_id, price_cents, currency, valid_until, pdf_storage_key, status, created_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        RETURNING id, quote_id, price_cents, currency, valid_until, pdf_storage_key, status, created_at, sent_at
+        INSERT INTO offers (id, quote_id, price_cents, currency, valid_until, pdf_storage_key, status, created_at,
+                            offer_number, persons, hours_estimated, rate_per_hour_cents, line_items_json)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+        RETURNING id, quote_id, price_cents, currency, valid_until, pdf_storage_key, status, created_at, sent_at,
+                  offer_number, persons, hours_estimated, rate_per_hour_cents, line_items_json
         "#,
     )
     .bind(offer_id)
@@ -434,6 +489,11 @@ pub async fn build_offer_with_overrides(
     .bind(Some(&s3_key))
     .bind(OfferStatus::Draft.as_str())
     .bind(now)
+    .bind(&offer_number)
+    .bind(pricing_result.estimated_helpers as i32)
+    .bind(pricing_result.estimated_hours)
+    .bind(rate_cents)
+    .bind(&line_items_json)
     .fetch_one(db)
     .await?;
 
@@ -445,12 +505,84 @@ pub async fn build_offer_with_overrides(
         .execute(db)
         .await?;
 
+    // Build full address strings for Telegram summary
+    let origin_full = if origin_street.is_empty() {
+        String::new()
+    } else {
+        format!("{}, {}", origin_street, origin_city)
+    };
+    let dest_full = if dest_street.is_empty() {
+        String::new()
+    } else {
+        format!("{}, {}", dest_street, dest_city)
+    };
+
+    let summary = TelegramSummary {
+        customer_phone: customer.phone.clone().unwrap_or_default(),
+        origin_address: origin_full,
+        origin_floor: origin_floor_info,
+        origin_elevator: origin.as_ref().and_then(|a| a.elevator),
+        dest_address: dest_full,
+        dest_floor: dest_floor_info,
+        dest_elevator: destination.as_ref().and_then(|a| a.elevator),
+        preferred_date: moving_date,
+        volume_m3: volume,
+        items_count: detected_items.len(),
+        distance_km: distance,
+        services: services_str,
+        persons: pricing_result.estimated_helpers,
+        hours: pricing_result.estimated_hours,
+        rate: rate_override,
+        netto_cents: pricing_result.total_price_cents,
+        customer_message,
+    };
+
     Ok(GeneratedOffer {
         offer: Offer::from(row),
         pdf_bytes,
         customer_email: customer.email,
         customer_name,
+        summary,
     })
+}
+
+/// Extract recognized services and any remaining free-text customer message from quote notes.
+///
+/// Notes format: "Halteverbot Auszug, Verpackungsservice, Montage, Bitte vorsichtig mit dem Klavier"
+/// Known service keywords are extracted; everything else is the customer message.
+fn extract_services_and_message(notes: Option<&str>) -> (String, String) {
+    let Some(notes) = notes else {
+        return (String::new(), String::new());
+    };
+
+    let known_services = [
+        "halteverbot auszug",
+        "halteverbot einzug",
+        "verpackungsservice",
+        "einpackservice",
+        "montage",
+        "demontage",
+        "einlagerung",
+        "entsorgung",
+    ];
+
+    let known_prefixes = ["auszug:", "einzug:"];
+
+    let mut services = Vec::new();
+    let mut message_parts = Vec::new();
+
+    for part in notes.split(", ") {
+        let lower = part.trim().to_lowercase();
+        let is_service = known_services.iter().any(|s| lower == *s)
+            || known_prefixes.iter().any(|p| lower.starts_with(p));
+        if is_service {
+            services.push(part.trim().to_string());
+        } else if !part.trim().is_empty() {
+            message_parts.push(part.trim().to_string());
+        }
+    }
+
+    (services.join(", "), message_parts.join(", "))
 }
 
 fn format_city(addr: &AddressRow) -> String {
@@ -636,7 +768,15 @@ async fn generate_offer(
     State(state): State<Arc<AppState>>,
     Json(request): Json<GenerateOfferRequest>,
 ) -> Result<Json<Offer>, ApiError> {
-    let result = build_offer(&state.db, &*state.storage, request.quote_id, request.valid_days).await?;
+    let overrides = OfferOverrides {
+        price_cents: request.price_cents_netto,
+        persons: request.persons,
+        hours: request.hours,
+        rate: request.rate,
+    };
+    let result = build_offer_with_overrides(
+        &state.db, &*state.storage, request.quote_id, request.valid_days, &overrides
+    ).await?;
     Ok(Json(result.offer))
 }
 
@@ -646,7 +786,8 @@ async fn get_offer(
 ) -> Result<Json<Offer>, ApiError> {
     let row: Option<OfferRow> = sqlx::query_as(
         r#"
-        SELECT id, quote_id, price_cents, currency, valid_until, pdf_storage_key, status, created_at, sent_at
+        SELECT id, quote_id, price_cents, currency, valid_until, pdf_storage_key, status, created_at, sent_at,
+               offer_number, persons, hours_estimated, rate_per_hour_cents, line_items_json
         FROM offers WHERE id = $1
         "#,
     )
@@ -664,7 +805,8 @@ async fn get_offer_pdf(
 ) -> Result<impl IntoResponse, ApiError> {
     let row: Option<OfferRow> = sqlx::query_as(
         r#"
-        SELECT id, quote_id, price_cents, currency, valid_until, pdf_storage_key, status, created_at, sent_at
+        SELECT id, quote_id, price_cents, currency, valid_until, pdf_storage_key, status, created_at, sent_at,
+               offer_number, persons, hours_estimated, rate_per_hour_cents, line_items_json
         FROM offers WHERE id = $1
         "#,
     )
@@ -714,7 +856,7 @@ struct ParsedInventoryItem {
 }
 
 /// Parse detected items from volume estimation result_data.
-pub(crate) fn parse_detected_items(estimation: Option<&VolumeEstimationRow>) -> Vec<DetectedItemRow> {
+pub fn parse_detected_items(estimation: Option<&VolumeEstimationRow>) -> Vec<DetectedItemRow> {
     let Some(est) = estimation else {
         return vec![];
     };
@@ -774,6 +916,13 @@ pub(crate) fn parse_detected_items(estimation: Option<&VolumeEstimationRow>) -> 
                     volume_m3: item.volume_m3, // already total volume for this line
                     dimensions: None,
                     confidence: 0.8, // form-submitted data has decent confidence
+                    german_name: None,
+                    re_value: None,
+                    volume_source: None,
+                    crop_s3_key: None,
+                    bbox: None,
+                    bbox_image_index: None,
+                    source_image_urls: None,
                 }
             })
             .collect();
@@ -790,6 +939,13 @@ fn depth_sensor_to_row(item: DepthSensorItem) -> DetectedItemRow {
             format!("{:.1} × {:.1} × {:.1} m", d.length_m, d.width_m, d.height_m)
         }),
         confidence: item.confidence,
+        german_name: item.german_name,
+        re_value: item.re_value,
+        volume_source: item.volume_source,
+        crop_s3_key: item.crop_s3_key,
+        bbox: item.bbox,
+        bbox_image_index: item.bbox_image_index,
+        source_image_urls: None,
     }
 }
 
@@ -799,5 +955,12 @@ fn vision_to_row(item: DetectedItem) -> DetectedItemRow {
         volume_m3: item.estimated_volume_m3,
         dimensions: None,
         confidence: item.confidence,
+        german_name: None,
+        re_value: None,
+        volume_source: None,
+        crop_s3_key: None,
+        bbox: None,
+        bbox_image_index: None,
+        source_image_urls: None,
     }
 }

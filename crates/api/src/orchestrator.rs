@@ -17,6 +17,25 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+/// Format an address with floor and elevator info for Telegram display.
+/// e.g. "Musterstr. 1, 31135 Hildesheim (3. OG, kein Aufzug)"
+fn format_address_line(address: &str, floor: &str, elevator: Option<bool>) -> String {
+    let mut parts = Vec::new();
+    if !floor.is_empty() {
+        parts.push(floor.to_string());
+    }
+    match elevator {
+        Some(true) => parts.push("Aufzug".to_string()),
+        Some(false) => parts.push("kein Aufzug".to_string()),
+        None => {}
+    }
+    if parts.is_empty() {
+        address.to_string()
+    } else {
+        format!("{} ({})", address, parts.join(", "))
+    }
+}
+
 /// Check if a quote has enough data to auto-generate an offer, and do so.
 /// Called after volume estimation or distance calculation completes.
 pub async fn try_auto_generate_offer(state: Arc<AppState>, quote_id: Uuid) {
@@ -81,23 +100,65 @@ async fn send_offer_to_telegram(config: &TelegramConfig, generated: &GeneratedOf
     );
 
     let offer = &generated.offer;
-    let price_eur = offer.price_cents as f64 / 100.0;
+    let s = &generated.summary;
+    let netto = s.netto_cents as f64 / 100.0;
+    let brutto = netto * 1.19;
 
-    let caption = format!(
+    // Build address lines with floor + elevator info
+    let origin_line = format_address_line(&s.origin_address, &s.origin_floor, s.origin_elevator);
+    let dest_line = format_address_line(&s.dest_address, &s.dest_floor, s.dest_elevator);
+
+    let mut caption = format!(
         "📋 *Neues Angebot erstellt*\n\n\
          *Kunde:* {}\n\
-         *E-Mail:* `{}`\n\
-         *Preis:* {:.2} €\n\
-         *Gültig bis:* {}\n\n\
-         Was möchtest du tun?",
+         *E-Mail:* `{}`",
         generated.customer_name,
         generated.customer_email,
-        price_eur,
+    );
+    if !s.customer_phone.is_empty() {
+        caption.push_str(&format!("\n*Tel:* {}", s.customer_phone));
+    }
+
+    if !s.origin_address.is_empty() {
+        caption.push_str(&format!("\n\n*Auszug:* {origin_line}"));
+    }
+    if !s.dest_address.is_empty() {
+        caption.push_str(&format!("\n*Einzug:* {dest_line}"));
+    }
+    caption.push_str(&format!("\n*Wunschtermin:* {}", s.preferred_date));
+
+    caption.push_str(&format!("\n\n*Volumen:* {:.1} m³", s.volume_m3));
+    if s.items_count > 0 {
+        caption.push_str(&format!(" ({} Gegenstände)", s.items_count));
+    }
+    if s.distance_km > 0.0 {
+        caption.push_str(&format!("\n*Entfernung:* {:.0} km", s.distance_km));
+    }
+
+    if !s.services.is_empty() {
+        caption.push_str(&format!("\n\n*Leistungen:* {}", s.services));
+    }
+
+    caption.push_str(&format!(
+        "\n\n*Preis:* {:.2} € brutto ({:.2} € netto)",
+        brutto, netto
+    ));
+    caption.push_str(&format!(
+        "\n{} Helfer × {:.0} Std × {:.2} €/Std",
+        s.persons, s.hours, s.rate
+    ));
+
+    if !s.customer_message.is_empty() {
+        caption.push_str(&format!("\n\n_Kundennachricht:_\n\"{}\"", s.customer_message));
+    }
+
+    caption.push_str(&format!(
+        "\n\n*Gültig bis:* {}",
         offer
             .valid_until
             .map(|d| d.format("%d.%m.%Y").to_string())
             .unwrap_or_else(|| "Unbegrenzt".to_string()),
-    );
+    ));
 
     let inline_keyboard = serde_json::json!({
         "inline_keyboard": [[
@@ -319,13 +380,14 @@ async fn handle_complete_inquiry(
     let origin_id = if let Some(ref addr) = inquiry.departure_address {
         let (street, city, postal) = parse_address(addr);
         match sqlx::query_as::<_, (Uuid,)>(
-            "INSERT INTO addresses (id, street, city, postal_code, floor) VALUES ($1, $2, $3, $4, $5) RETURNING id",
+            "INSERT INTO addresses (id, street, city, postal_code, floor, elevator) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
         )
         .bind(Uuid::now_v7())
         .bind(&street)
         .bind(&city)
         .bind(&postal)
         .bind(&inquiry.departure_floor)
+        .bind(None::<bool>) // email inquiries don't capture elevator yet
         .fetch_one(&state.db)
         .await
         {
@@ -343,13 +405,14 @@ async fn handle_complete_inquiry(
     let dest_id = if let Some(ref addr) = inquiry.arrival_address {
         let (street, city, postal) = parse_address(addr);
         match sqlx::query_as::<_, (Uuid,)>(
-            "INSERT INTO addresses (id, street, city, postal_code, floor) VALUES ($1, $2, $3, $4, $5) RETURNING id",
+            "INSERT INTO addresses (id, street, city, postal_code, floor, elevator) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
         )
         .bind(Uuid::now_v7())
         .bind(&street)
         .bind(&city)
         .bind(&postal)
         .bind(&inquiry.arrival_floor)
+        .bind(None::<bool>) // email inquiries don't capture elevator yet
         .fetch_one(&state.db)
         .await
         {
@@ -460,6 +523,22 @@ async fn handle_complete_inquiry(
         volume_m3
     );
 
+    // Link email thread to quote (if thread exists for this customer)
+    let _ = sqlx::query(
+        r#"
+        UPDATE email_threads SET quote_id = $1
+        WHERE id = (
+            SELECT id FROM email_threads
+            WHERE customer_id = $2 AND quote_id IS NULL
+            ORDER BY created_at DESC LIMIT 1
+        )
+        "#,
+    )
+    .bind(quote_id)
+    .bind(customer_id)
+    .execute(&state.db)
+    .await;
+
     // 7. Generate offer → PDF → Telegram
     try_auto_generate_offer(Arc::clone(state), quote_id).await;
 }
@@ -467,17 +546,17 @@ async fn handle_complete_inquiry(
 /// Parsed item from the VolumeCalculator items_list text.
 /// Matches the format: "2x Sofa, Couch, Liege je Sitz (0.80 m³)"
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct ParsedInventoryItem {
-    name: String,
-    quantity: u32,
-    volume_m3: f64,
+pub struct ParsedInventoryItem {
+    pub name: String,
+    pub quantity: u32,
+    pub volume_m3: f64,
 }
 
 /// Parse VolumeCalculator items_list text into structured items.
 /// Handles both newline-separated and comma-separated formats:
 /// - "1x Bettumbau (0.30 m³)\n1x Nachttisch (0.20 m³)"
 /// - "1x Bettumbau (0.30 m³), 1x Nachttisch (0.20 m³)"
-fn parse_items_list_text(text: &str) -> Vec<ParsedInventoryItem> {
+pub fn parse_items_list_text(text: &str) -> Vec<ParsedInventoryItem> {
     let mut items = Vec::new();
 
     // Normalize: split on newlines first, then within each line split on ", Nx " boundaries
@@ -978,7 +1057,7 @@ async fn handle_offer_approval(
     .await
     .unwrap_or(None);
 
-    let Some((customer_email, Some(storage_key), _quote_id)) = row else {
+    let Some((customer_email, Some(storage_key), quote_id)) = row else {
         send_telegram_message(
             client,
             bot_token,
@@ -1012,6 +1091,42 @@ async fn handle_offer_approval(
                 .bind(offer_id)
                 .execute(&state.db)
                 .await;
+
+            // Store offer email in thread (if a thread exists for this quote's customer)
+            let thread_row: Option<(Uuid,)> = sqlx::query_as(
+                r#"
+                SELECT et.id FROM email_threads et
+                JOIN quotes q ON et.customer_id = q.customer_id
+                WHERE q.id = $1
+                ORDER BY et.created_at DESC LIMIT 1
+                "#,
+            )
+            .bind(quote_id)
+            .fetch_optional(&state.db)
+            .await
+            .unwrap_or(None);
+
+            if let Some((thread_id,)) = thread_row {
+                let body = "Sehr geehrte Damen und Herren,\n\n\
+                    anbei erhalten Sie unser Angebot für Ihren Umzug.\n\n\
+                    Bei Fragen stehen wir Ihnen gerne zur Verfügung.\n\n\
+                    Mit freundlichen Grüßen,\nIhr Umzugsteam";
+
+                let _ = sqlx::query(
+                    r#"
+                    INSERT INTO email_messages (id, thread_id, direction, from_address, to_address, subject, body_text, llm_generated, created_at)
+                    VALUES ($1, $2, 'outbound', $3, $4, $5, $6, false, NOW())
+                    "#,
+                )
+                .bind(Uuid::now_v7())
+                .bind(thread_id)
+                .bind("umzug@example.com")
+                .bind(&customer_email)
+                .bind("Ihr Umzugsangebot")
+                .bind(body)
+                .execute(&state.db)
+                .await;
+            }
 
             send_telegram_message(
                 client,
@@ -1052,7 +1167,7 @@ async fn handle_offer_denial(
 }
 
 /// Send an email with the offer PDF attached.
-async fn send_offer_email(
+pub async fn send_offer_email(
     state: &AppState,
     to: &str,
     pdf_bytes: &[u8],

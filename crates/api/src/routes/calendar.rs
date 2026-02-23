@@ -18,7 +18,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/availability", get(check_availability))
         .route("/schedule", get(get_schedule))
         .route("/bookings", post(create_booking))
-        .route("/bookings/{id}", get(get_booking).patch(update_booking))
+        .route("/bookings/{id}", get(get_booking).patch(update_booking).delete(delete_booking_handler))
         .route("/capacity/{date}", put(set_capacity))
 }
 
@@ -131,6 +131,22 @@ async fn update_booking(
     })?;
 
     Ok(Json(booking))
+}
+
+async fn delete_booking_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state
+        .calendar
+        .delete_booking(id)
+        .await
+        .map_err(|e| match &e {
+            aust_calendar::CalendarError::NotFound(_) => ApiError::NotFound(e.to_string()),
+            _ => ApiError::Internal(e.to_string()),
+        })?;
+
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 async fn set_capacity(

@@ -266,6 +266,16 @@ impl CalendarService {
         Ok(entries)
     }
 
+    /// Delete a booking by ID.
+    pub async fn delete_booking(&self, id: Uuid) -> Result<(), CalendarError> {
+        let deleted = repository::delete_booking(&self.pool, id).await?;
+        if !deleted {
+            return Err(CalendarError::NotFound(format!("Booking {id} not found")));
+        }
+        info!("Deleted booking {}", id);
+        Ok(())
+    }
+
     /// Get a single booking by ID.
     pub async fn get_booking(&self, id: Uuid) -> Result<Booking, CalendarError> {
         repository::get_booking_by_id(&self.pool, id)

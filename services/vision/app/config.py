@@ -29,5 +29,16 @@ class Settings(BaseSettings):
     # Deduplication
     dedup_similarity_threshold: float = 0.85
 
+    # Video pipeline
+    video_max_keyframes: int = 20
+    video_min_keyframes: int = 10
+    video_blur_threshold: float = 100.0
+    video_max_size_mb: int = 500
+
+    # MASt3R reconstruction
+    mast3r_min_conf: float = 1.5
+    mast3r_batch_size: int = 1
+    mast3r_alignment_iters: int = 300
+
 
 settings = Settings()

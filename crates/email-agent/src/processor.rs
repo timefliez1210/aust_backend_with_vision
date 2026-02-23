@@ -6,6 +6,7 @@ use chrono::Datelike;
 use aust_core::models::{MovingInquiry, ParsedEmail};
 use aust_llm_providers::LlmProvider;
 use chrono::NaiveDate;
+use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -22,6 +23,9 @@ struct PendingDraft {
     pub body: String,
     pub in_reply_to: Option<String>,
     pub inquiry: MovingInquiry,
+    pub thread_id: Option<Uuid>,
+    /// DB message ID for the stored draft (so we can update status on approve/deny).
+    pub db_message_id: Option<Uuid>,
 }
 
 /// Pending capacity override request waiting for Alex's decision.
@@ -37,6 +41,7 @@ struct PendingCapacityRequest {
 /// The main email processing loop.
 /// Orchestrates: IMAP polling → parsing → LLM draft → Telegram approval → SMTP send.
 pub struct EmailProcessor {
+    db: PgPool,
     imap: ImapClient,
     smtp: SmtpClient,
     telegram: Arc<Mutex<TelegramBot>>,
@@ -62,6 +67,7 @@ impl EmailProcessor {
         telegram_config: TelegramConfig,
         llm: Arc<dyn LlmProvider>,
         calendar: Arc<CalendarService>,
+        db: PgPool,
     ) -> Self {
         let imap = ImapClient::new(email_config.clone());
         let smtp = SmtpClient::new(email_config);
@@ -71,6 +77,7 @@ impl EmailProcessor {
         );
 
         Self {
+            db,
             imap,
             smtp,
             telegram: Arc::new(Mutex::new(telegram)),
@@ -88,6 +95,149 @@ impl EmailProcessor {
     /// Set the channel for forwarding offer-related Telegram events to the orchestrator.
     pub fn set_offer_channel(&mut self, tx: mpsc::UnboundedSender<ApprovalDecision>) {
         self.offer_tx = Some(tx);
+    }
+
+    /// Find or create an email thread for a customer.
+    /// Reuses an existing thread if one was created within the last 30 days.
+    async fn find_or_create_thread(
+        &self,
+        customer_email: &str,
+        subject: &str,
+    ) -> Option<Uuid> {
+        // Upsert customer by email → get customer_id
+        let _ = sqlx::query(
+            r#"
+            INSERT INTO customers (id, email, created_at, updated_at)
+            VALUES ($1, $2, NOW(), NOW())
+            ON CONFLICT (email) DO NOTHING
+            "#,
+        )
+        .bind(Uuid::now_v7())
+        .bind(customer_email)
+        .execute(&self.db)
+        .await
+        .map_err(|e| warn!("Failed to upsert customer for email tracking: {e}"));
+
+        let customer_id: Uuid = match sqlx::query_as::<_, (Uuid,)>(
+            "SELECT id FROM customers WHERE email = $1",
+        )
+        .bind(customer_email)
+        .fetch_optional(&self.db)
+        .await
+        {
+            Ok(Some((id,))) => id,
+            Ok(None) => {
+                warn!("Customer not found after upsert for {customer_email}");
+                return None;
+            }
+            Err(e) => {
+                warn!("Failed to find customer for email tracking: {e}");
+                return None;
+            }
+        };
+
+        // Find existing thread within 30 days
+        let existing_thread: Option<(Uuid,)> = sqlx::query_as(
+            r#"
+            SELECT id FROM email_threads
+            WHERE customer_id = $1 AND created_at > NOW() - INTERVAL '30 days'
+            ORDER BY created_at DESC LIMIT 1
+            "#,
+        )
+        .bind(customer_id)
+        .fetch_optional(&self.db)
+        .await
+        .unwrap_or(None);
+
+        if let Some((thread_id,)) = existing_thread {
+            return Some(thread_id);
+        }
+
+        // Create new thread
+        let thread_id = Uuid::now_v7();
+        match sqlx::query(
+            "INSERT INTO email_threads (id, customer_id, subject, created_at, updated_at) VALUES ($1, $2, $3, NOW(), NOW())",
+        )
+        .bind(thread_id)
+        .bind(customer_id)
+        .bind(subject)
+        .execute(&self.db)
+        .await
+        {
+            Ok(_) => Some(thread_id),
+            Err(e) => {
+                warn!("Failed to create email thread: {e}");
+                None
+            }
+        }
+    }
+
+    /// Store an inbound email message in the database.
+    async fn store_inbound_email(
+        &self,
+        thread_id: Uuid,
+        from_address: &str,
+        to_address: &str,
+        subject: &str,
+        body_text: &str,
+        body_html: Option<&str>,
+        message_id: &str,
+    ) {
+        let msg_id = if message_id.is_empty() {
+            None
+        } else {
+            Some(message_id)
+        };
+
+        if let Err(e) = sqlx::query(
+            r#"
+            INSERT INTO email_messages (id, thread_id, direction, from_address, to_address, subject, body_text, body_html, message_id, llm_generated, created_at)
+            VALUES ($1, $2, 'inbound', $3, $4, $5, $6, $7, $8, false, NOW())
+            "#,
+        )
+        .bind(Uuid::now_v7())
+        .bind(thread_id)
+        .bind(from_address)
+        .bind(to_address)
+        .bind(subject)
+        .bind(body_text)
+        .bind(body_html)
+        .bind(msg_id)
+        .execute(&self.db)
+        .await
+        {
+            warn!("Failed to store inbound email: {e}");
+        }
+    }
+
+    /// Store an outbound email message in the database.
+    async fn store_outbound_email(
+        &self,
+        thread_id: Uuid,
+        from_address: &str,
+        to_address: &str,
+        subject: &str,
+        body_text: &str,
+        llm_generated: bool,
+    ) {
+        if let Err(e) = sqlx::query(
+            r#"
+            INSERT INTO email_messages (id, thread_id, direction, from_address, to_address, subject, body_text, llm_generated, created_at)
+            VALUES ($1, $2, 'outbound', $3, $4, $5, $6, $7, NOW())
+            "#,
+        )
+        .bind(Uuid::now_v7())
+        .bind(thread_id)
+        .bind(from_address)
+        .bind(to_address)
+        .bind(subject)
+        .bind(body_text)
+        .bind(llm_generated)
+        .execute(&self.db)
+        .await
+        {
+            warn!("Failed to store outbound email: {e}");
+        }
     }
 
     /// Run one cycle of the processing loop:
@@ -156,6 +306,9 @@ impl EmailProcessor {
             inquiry.email = updated.email.clone();
         }
 
+        // Snapshot values we need for DB storage (before releasing the borrow on self.inquiries)
+        let customer_email_final = inquiry.email.clone();
+
         // Try to extract additional data from free-text via LLM
         if matches!(
             updated.source,
@@ -191,6 +344,24 @@ impl EmailProcessor {
 
         // If date is fully booked, send capacity question to Alex via Telegram
         let inquiry_snapshot = inquiry.clone();
+
+        // Store inbound email in database (after inquiry borrow is released)
+        let thread_id = self
+            .find_or_create_thread(&customer_email_final, &email.subject)
+            .await;
+        if let Some(tid) = thread_id {
+            self.store_inbound_email(
+                tid,
+                &customer_email_final,
+                &email.to,
+                &email.subject,
+                &email.body_text,
+                email.body_html.as_deref(),
+                &email.message_id,
+            )
+            .await;
+        }
+
         if let Some(ref avail) = availability {
             if !avail.requested_date_available {
                 info!(
@@ -231,6 +402,7 @@ impl EmailProcessor {
                     response,
                     email.message_id.clone(),
                     inquiry_snapshot,
+                    thread_id,
                 )
                 .await;
             }
@@ -259,8 +431,37 @@ impl EmailProcessor {
         response: EmailResponse,
         in_reply_to: String,
         inquiry: MovingInquiry,
+        thread_id: Option<Uuid>,
     ) {
         let draft_id = Uuid::now_v7().to_string();
+
+        // Store draft in DB so it's visible in the admin dashboard
+        let db_message_id = if let Some(tid) = thread_id {
+            let msg_id = Uuid::now_v7();
+            match sqlx::query(
+                r#"
+                INSERT INTO email_messages (id, thread_id, direction, from_address, to_address, subject, body_text, llm_generated, status, created_at)
+                VALUES ($1, $2, 'outbound', $3, $4, $5, $6, true, 'draft', NOW())
+                "#,
+            )
+            .bind(msg_id)
+            .bind(tid)
+            .bind("umzug@example.com")
+            .bind(customer_email)
+            .bind(&response.subject)
+            .bind(&response.body)
+            .execute(&self.db)
+            .await
+            {
+                Ok(_) => Some(msg_id),
+                Err(e) => {
+                    warn!("Failed to store draft in DB: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         let draft = PendingDraft {
             draft_id: draft_id.clone(),
@@ -273,6 +474,8 @@ impl EmailProcessor {
                 Some(in_reply_to)
             },
             inquiry,
+            thread_id,
+            db_message_id,
         };
 
         let tg = self.telegram.lock().await;
@@ -299,6 +502,18 @@ impl EmailProcessor {
     /// Re-send a revised draft to Telegram (after edit loop iteration).
     async fn resubmit_draft(&mut self, draft: PendingDraft) {
         let new_draft_id = Uuid::now_v7().to_string();
+
+        // Update the draft body in DB if we have a stored message
+        if let Some(msg_id) = draft.db_message_id {
+            let _ = sqlx::query(
+                "UPDATE email_messages SET subject = $1, body_text = $2 WHERE id = $3",
+            )
+            .bind(&draft.subject)
+            .bind(&draft.body)
+            .bind(msg_id)
+            .execute(&self.db)
+            .await;
+        }
 
         let tg = self.telegram.lock().await;
         match tg
@@ -448,6 +663,14 @@ impl EmailProcessor {
                     }
                     ApprovalDecision::Deny => {
                         info!("Draft {} denied, discarding", draft.draft_id);
+                        if let Some(msg_id) = draft.db_message_id {
+                            let _ = sqlx::query(
+                                "UPDATE email_messages SET status = 'discarded' WHERE id = $1",
+                            )
+                            .bind(msg_id)
+                            .execute(&self.db)
+                            .await;
+                        }
                     }
                     _ => {}
                 }
@@ -721,6 +944,27 @@ impl EmailProcessor {
         {
             Ok(status) => {
                 info!("Email sent to {}: {status}", draft.customer_email);
+
+                // Update draft status to 'sent' in DB (or insert if no draft was stored)
+                if let Some(msg_id) = draft.db_message_id {
+                    let _ = sqlx::query(
+                        "UPDATE email_messages SET status = 'sent' WHERE id = $1",
+                    )
+                    .bind(msg_id)
+                    .execute(&self.db)
+                    .await;
+                } else if let Some(thread_id) = draft.thread_id {
+                    self.store_outbound_email(
+                        thread_id,
+                        "umzug@example.com",
+                        &draft.customer_email,
+                        &draft.subject,
+                        &draft.body,
+                        true,
+                    )
+                    .await;
+                }
+
                 let tg = self.telegram.lock().await;
                 tg.notify_sent(&draft.customer_email, &draft.subject).await;
             }
