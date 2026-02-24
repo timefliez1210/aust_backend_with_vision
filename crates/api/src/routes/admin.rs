@@ -38,6 +38,9 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/users/{id}/delete", post(delete_user))
         .route("/offers/{id}/delete", post(delete_offer))
         .route("/quotes/{id}/delete", post(delete_quote))
+        .route("/quotes/{id}/accept", post(accept_quote))
+        .route("/quotes/{id}/done", post(mark_quote_done))
+        .route("/quotes/{id}/paid", post(mark_quote_paid))
         .route("/customers/{id}/delete", post(delete_customer))
 }
 
@@ -50,6 +53,14 @@ struct DashboardResponse {
     todays_bookings: i64,
     total_customers: i64,
     recent_activity: Vec<ActivityItem>,
+    conflict_dates: Vec<ConflictDate>,
+}
+
+#[derive(Debug, Serialize)]
+struct ConflictDate {
+    date: NaiveDate,
+    booked: i64,
+    capacity: i32,
 }
 
 #[derive(Debug, Serialize, FromRow)]
@@ -77,7 +88,7 @@ async fn dashboard(
 
     let today = Utc::now().date_naive();
     let (todays_bookings,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM calendar_bookings WHERE moving_date = $1 AND status != 'cancelled'",
+        "SELECT COUNT(*) FROM calendar_bookings WHERE booking_date = $1 AND status != 'cancelled'",
     )
     .bind(today)
     .fetch_optional(&state.db)
@@ -107,12 +118,63 @@ async fn dashboard(
     .await
     .unwrap_or_default();
 
+    // Find dates in the next 30 days where bookings >= capacity
+    let from_date = today;
+    let to_date = today + chrono::Days::new(30);
+    let default_capacity = state.config.calendar.default_capacity;
+
+    #[derive(FromRow)]
+    struct ConflictRow {
+        booking_date: NaiveDate,
+        booking_count: i64,
+    }
+
+    let conflict_rows: Vec<ConflictRow> = sqlx::query_as(
+        r#"
+        SELECT booking_date, COUNT(*) AS booking_count
+        FROM calendar_bookings
+        WHERE booking_date BETWEEN $1 AND $2
+          AND status != 'cancelled'
+        GROUP BY booking_date
+        HAVING COUNT(*) >= COALESCE(
+            (SELECT capacity FROM calendar_capacity_overrides WHERE override_date = booking_date),
+            $3
+        )
+        ORDER BY booking_date
+        "#,
+    )
+    .bind(from_date)
+    .bind(to_date)
+    .bind(default_capacity)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    let mut conflict_dates = Vec::new();
+    for row in conflict_rows {
+        // Fetch actual capacity for this date
+        let cap: Option<(i32,)> = sqlx::query_as(
+            "SELECT capacity FROM calendar_capacity_overrides WHERE override_date = $1",
+        )
+        .bind(row.booking_date)
+        .fetch_optional(&state.db)
+        .await
+        .unwrap_or(None);
+
+        conflict_dates.push(ConflictDate {
+            date: row.booking_date,
+            booked: row.booking_count,
+            capacity: cap.map(|c| c.0).unwrap_or(default_capacity),
+        });
+    }
+
     Ok(Json(DashboardResponse {
         open_quotes,
         pending_offers,
         todays_bookings,
         total_customers,
         recent_activity: recent_offers,
+        conflict_dates,
     }))
 }
 
@@ -999,7 +1061,7 @@ async fn send_offer(
     .fetch_optional(&state.db)
     .await?;
 
-    let (customer_email, storage_key, _quote_id) =
+    let (customer_email, storage_key, quote_id) =
         row.ok_or_else(|| ApiError::NotFound(format!("Angebot {id} nicht gefunden")))?;
 
     let storage_key = storage_key
@@ -1022,6 +1084,13 @@ async fn send_offer(
         .execute(&state.db)
         .await?;
 
+    // Also update quote status to offer_sent
+    sqlx::query("UPDATE quotes SET status = 'offer_sent', updated_at = $1 WHERE id = $2")
+        .bind(now)
+        .bind(quote_id)
+        .execute(&state.db)
+        .await?;
+
     Ok(Json(serde_json::json!({
         "message": format!("Angebot an {customer_email} gesendet"),
         "sent_at": now,
@@ -1033,6 +1102,13 @@ async fn reject_offer(
     Extension(_claims): Extension<TokenClaims>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // Fetch quote_id before updating
+    let quote_row: Option<(Uuid,)> =
+        sqlx::query_as("SELECT quote_id FROM offers WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await?;
+
     let result = sqlx::query("UPDATE offers SET status = 'rejected' WHERE id = $1")
         .bind(id)
         .execute(&state.db)
@@ -1042,9 +1118,143 @@ async fn reject_offer(
         return Err(ApiError::NotFound(format!("Angebot {id} nicht gefunden")));
     }
 
+    // Also update quote status to rejected
+    if let Some((quote_id,)) = quote_row {
+        let now = Utc::now();
+        let _ = sqlx::query("UPDATE quotes SET status = 'rejected', updated_at = $1 WHERE id = $2")
+            .bind(now)
+            .bind(quote_id)
+            .execute(&state.db)
+            .await;
+    }
+
     Ok(Json(serde_json::json!({
         "message": "Angebot verworfen",
         "id": id,
+    })))
+}
+
+// --- Lifecycle Transitions ---
+
+async fn accept_quote(
+    State(state): State<Arc<AppState>>,
+    Extension(_claims): Extension<TokenClaims>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // Validate current status
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT status FROM quotes WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await?;
+
+    let (current_status,) =
+        row.ok_or_else(|| ApiError::NotFound(format!("Anfrage {id} nicht gefunden")))?;
+
+    if current_status != "offer_sent" && current_status != "offer_generated" {
+        return Err(ApiError::BadRequest(format!(
+            "Anfrage kann nur aus Status 'offer_sent' oder 'offer_generated' akzeptiert werden (aktuell: '{current_status}')"
+        )));
+    }
+
+    let now = Utc::now();
+
+    // Update quote status to accepted
+    sqlx::query("UPDATE quotes SET status = 'accepted', updated_at = $1 WHERE id = $2")
+        .bind(now)
+        .bind(id)
+        .execute(&state.db)
+        .await?;
+
+    // Update linked offer to accepted
+    sqlx::query(
+        "UPDATE offers SET status = 'accepted' WHERE quote_id = $1 AND status IN ('draft', 'sent')",
+    )
+    .bind(id)
+    .execute(&state.db)
+    .await?;
+
+    // Confirm linked tentative booking
+    let booking_row: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM calendar_bookings WHERE quote_id = $1 AND status = 'tentative' LIMIT 1",
+    )
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await?;
+
+    if let Some((booking_id,)) = booking_row {
+        let _ = state.calendar.confirm_booking(booking_id).await;
+    }
+
+    Ok(Json(serde_json::json!({
+        "message": "Anfrage akzeptiert",
+        "status": "accepted",
+    })))
+}
+
+async fn mark_quote_done(
+    State(state): State<Arc<AppState>>,
+    Extension(_claims): Extension<TokenClaims>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT status FROM quotes WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await?;
+
+    let (current_status,) =
+        row.ok_or_else(|| ApiError::NotFound(format!("Anfrage {id} nicht gefunden")))?;
+
+    if current_status != "accepted" {
+        return Err(ApiError::BadRequest(format!(
+            "Anfrage kann nur aus Status 'accepted' als erledigt markiert werden (aktuell: '{current_status}')"
+        )));
+    }
+
+    let now = Utc::now();
+    sqlx::query("UPDATE quotes SET status = 'done', updated_at = $1 WHERE id = $2")
+        .bind(now)
+        .bind(id)
+        .execute(&state.db)
+        .await?;
+
+    Ok(Json(serde_json::json!({
+        "message": "Anfrage als erledigt markiert",
+        "status": "done",
+    })))
+}
+
+async fn mark_quote_paid(
+    State(state): State<Arc<AppState>>,
+    Extension(_claims): Extension<TokenClaims>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT status FROM quotes WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await?;
+
+    let (current_status,) =
+        row.ok_or_else(|| ApiError::NotFound(format!("Anfrage {id} nicht gefunden")))?;
+
+    if current_status != "done" {
+        return Err(ApiError::BadRequest(format!(
+            "Anfrage kann nur aus Status 'done' als bezahlt markiert werden (aktuell: '{current_status}')"
+        )));
+    }
+
+    let now = Utc::now();
+    sqlx::query("UPDATE quotes SET status = 'paid', updated_at = $1 WHERE id = $2")
+        .bind(now)
+        .bind(id)
+        .execute(&state.db)
+        .await?;
+
+    Ok(Json(serde_json::json!({
+        "message": "Anfrage als bezahlt markiert",
+        "status": "paid",
     })))
 }
 

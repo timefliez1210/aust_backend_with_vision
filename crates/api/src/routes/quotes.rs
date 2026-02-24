@@ -61,6 +61,9 @@ impl From<QuoteRow> for Quote {
             "accepted" => QuoteStatus::Accepted,
             "rejected" => QuoteStatus::Rejected,
             "expired" => QuoteStatus::Expired,
+            "cancelled" => QuoteStatus::Cancelled,
+            "done" => QuoteStatus::Done,
+            "paid" => QuoteStatus::Paid,
             _ => QuoteStatus::Pending,
         };
 

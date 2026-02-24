@@ -14,6 +14,8 @@ pub enum QuoteStatus {
     Rejected,
     Expired,
     Cancelled,
+    Done,
+    Paid,
 }
 
 impl Default for QuoteStatus {
@@ -34,6 +36,8 @@ impl QuoteStatus {
             Self::Rejected => "rejected",
             Self::Expired => "expired",
             Self::Cancelled => "cancelled",
+            Self::Done => "done",
+            Self::Paid => "paid",
         }
     }
 }

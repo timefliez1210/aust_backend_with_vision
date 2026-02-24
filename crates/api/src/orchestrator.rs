@@ -13,6 +13,7 @@ use reqwest::{
     multipart::{Form, Part},
     Client,
 };
+use aust_calendar::NewBooking;
 use sqlx::PgPool;
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -80,6 +81,9 @@ pub async fn try_auto_generate_offer(state: Arc<AppState>, quote_id: Uuid) {
             );
 
             send_offer_to_telegram(&state.config.telegram, &generated).await;
+
+            // Auto-create tentative booking if quote has a preferred_date
+            auto_create_booking(&state, quote_id).await;
         }
         Err(e) => {
             error!("Auto-offer generation failed for quote {quote_id}: {e}");
@@ -88,6 +92,99 @@ pub async fn try_auto_generate_offer(state: Arc<AppState>, quote_id: Uuid) {
                 &format!("Angebotserstellung fehlgeschlagen für Quote {quote_id}: {e}"),
             )
             .await;
+        }
+    }
+}
+
+/// Auto-create a tentative booking when an offer is generated, if the quote has a preferred_date.
+/// Uses force_create_booking (bypasses capacity) — conflicts are intentional and shown in the dashboard.
+/// Failures are logged but never block offer generation.
+async fn auto_create_booking(state: &AppState, quote_id: Uuid) {
+    // Fetch preferred_date from quote
+    let row: Option<(Option<chrono::DateTime<chrono::Utc>>,)> =
+        sqlx::query_as("SELECT preferred_date FROM quotes WHERE id = $1")
+            .bind(quote_id)
+            .fetch_optional(&state.db)
+            .await
+            .unwrap_or(None);
+
+    let booking_date = match row {
+        Some((Some(dt),)) => dt.date_naive(),
+        _ => {
+            info!("Quote {quote_id} has no preferred_date, skipping auto-booking");
+            return;
+        }
+    };
+
+    // Check if an active booking already exists for this quote (the unique index would catch this too)
+    let existing: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM calendar_bookings WHERE quote_id = $1 AND status != 'cancelled' LIMIT 1",
+    )
+    .bind(quote_id)
+    .fetch_optional(&state.db)
+    .await
+    .unwrap_or(None);
+
+    if existing.is_some() {
+        info!("Active booking already exists for quote {quote_id}, skipping");
+        return;
+    }
+
+    // Fetch customer and address info for the booking
+    let info_row: Option<(Option<String>, Option<String>, Option<f64>, Option<f64>)> = sqlx::query_as(
+        r#"
+        SELECT c.name, c.email, q.estimated_volume_m3, q.distance_km
+        FROM quotes q
+        JOIN customers c ON q.customer_id = c.id
+        WHERE q.id = $1
+        "#,
+    )
+    .bind(quote_id)
+    .fetch_optional(&state.db)
+    .await
+    .unwrap_or(None);
+
+    let (customer_name, customer_email, volume_m3, distance_km) =
+        info_row.unwrap_or((None, None, None, None));
+
+    // Fetch addresses
+    let addr_row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+        r#"
+        SELECT
+            (SELECT street || ', ' || city FROM addresses WHERE id = q.origin_address_id),
+            (SELECT street || ', ' || city FROM addresses WHERE id = q.destination_address_id)
+        FROM quotes q WHERE q.id = $1
+        "#,
+    )
+    .bind(quote_id)
+    .fetch_optional(&state.db)
+    .await
+    .unwrap_or(None);
+
+    let (departure, arrival) = addr_row.unwrap_or((None, None));
+
+    let new_booking = NewBooking {
+        booking_date,
+        quote_id: Some(quote_id),
+        customer_name,
+        customer_email,
+        departure_address: departure,
+        arrival_address: arrival,
+        volume_m3,
+        distance_km,
+        description: None,
+        status: "tentative".to_string(),
+    };
+
+    match state.calendar.force_create_booking(new_booking).await {
+        Ok(booking) => {
+            info!(
+                "Auto-created tentative booking {} for quote {quote_id} on {}",
+                booking.id, booking_date
+            );
+        }
+        Err(e) => {
+            warn!("Failed to auto-create booking for quote {quote_id}: {e}");
         }
     }
 }
@@ -1121,6 +1218,13 @@ async fn handle_offer_approval(
                 .execute(&state.db)
                 .await;
 
+            // Also update quote status to offer_sent
+            let _ = sqlx::query("UPDATE quotes SET status = 'offer_sent', updated_at = $1 WHERE id = $2")
+                .bind(now)
+                .bind(quote_id)
+                .execute(&state.db)
+                .await;
+
             // Store offer email in thread (if a thread exists for this quote's customer)
             let thread_row: Option<(Uuid,)> = sqlx::query_as(
                 r#"
@@ -1187,10 +1291,28 @@ async fn handle_offer_denial(
 ) {
     info!("Offer {offer_id} denied");
 
+    // Fetch quote_id before updating
+    let quote_row: Option<(Uuid,)> =
+        sqlx::query_as("SELECT quote_id FROM offers WHERE id = $1")
+            .bind(offer_id)
+            .fetch_optional(&state.db)
+            .await
+            .unwrap_or(None);
+
     let _ = sqlx::query("UPDATE offers SET status = 'rejected' WHERE id = $1")
         .bind(offer_id)
         .execute(&state.db)
         .await;
+
+    // Also update quote status to rejected
+    if let Some((quote_id,)) = quote_row {
+        let now = chrono::Utc::now();
+        let _ = sqlx::query("UPDATE quotes SET status = 'rejected', updated_at = $1 WHERE id = $2")
+            .bind(now)
+            .bind(quote_id)
+            .execute(&state.db)
+            .await;
+    }
 
     send_telegram_message(client, bot_token, chat_id, "❌ Angebot verworfen.").await;
 }
