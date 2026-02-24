@@ -38,9 +38,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/users/{id}/delete", post(delete_user))
         .route("/offers/{id}/delete", post(delete_offer))
         .route("/quotes/{id}/delete", post(delete_quote))
-        .route("/quotes/{id}/accept", post(accept_quote))
-        .route("/quotes/{id}/done", post(mark_quote_done))
-        .route("/quotes/{id}/paid", post(mark_quote_paid))
+        .route("/quotes/{id}/status", post(set_quote_status))
         .route("/customers/{id}/delete", post(delete_customer))
         .route("/orders", get(list_orders))
 }
@@ -1137,125 +1135,83 @@ async fn reject_offer(
 
 // --- Lifecycle Transitions ---
 
-async fn accept_quote(
-    State(state): State<Arc<AppState>>,
-    Extension(_claims): Extension<TokenClaims>,
-    Path(id): Path<Uuid>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    // Validate current status
-    let row: Option<(String,)> =
-        sqlx::query_as("SELECT status FROM quotes WHERE id = $1")
-            .bind(id)
-            .fetch_optional(&state.db)
-            .await?;
-
-    let (current_status,) =
-        row.ok_or_else(|| ApiError::NotFound(format!("Anfrage {id} nicht gefunden")))?;
-
-    if current_status != "offer_sent" && current_status != "offer_generated" {
-        return Err(ApiError::BadRequest(format!(
-            "Anfrage kann nur aus Status 'offer_sent' oder 'offer_generated' akzeptiert werden (aktuell: '{current_status}')"
-        )));
-    }
-
-    let now = Utc::now();
-
-    // Update quote status to accepted
-    sqlx::query("UPDATE quotes SET status = 'accepted', updated_at = $1 WHERE id = $2")
-        .bind(now)
-        .bind(id)
-        .execute(&state.db)
-        .await?;
-
-    // Update linked offer to accepted
-    sqlx::query(
-        "UPDATE offers SET status = 'accepted' WHERE quote_id = $1 AND status IN ('draft', 'sent')",
-    )
-    .bind(id)
-    .execute(&state.db)
-    .await?;
-
-    // Confirm linked tentative booking
-    let booking_row: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT id FROM calendar_bookings WHERE quote_id = $1 AND status = 'tentative' LIMIT 1",
-    )
-    .bind(id)
-    .fetch_optional(&state.db)
-    .await?;
-
-    if let Some((booking_id,)) = booking_row {
-        let _ = state.calendar.confirm_booking(booking_id).await;
-    }
-
-    Ok(Json(serde_json::json!({
-        "message": "Anfrage akzeptiert",
-        "status": "accepted",
-    })))
+#[derive(Debug, Deserialize)]
+struct SetQuoteStatusRequest {
+    status: String,
 }
 
-async fn mark_quote_done(
+async fn set_quote_status(
     State(state): State<Arc<AppState>>,
     Extension(_claims): Extension<TokenClaims>,
     Path(id): Path<Uuid>,
+    Json(body): Json<SetQuoteStatusRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let valid_statuses = [
+        "pending",
+        "info_requested",
+        "volume_estimated",
+        "offer_generated",
+        "offer_sent",
+        "accepted",
+        "rejected",
+        "done",
+        "paid",
+        "cancelled",
+    ];
+
+    if !valid_statuses.contains(&body.status.as_str()) {
+        return Err(ApiError::BadRequest(format!(
+            "Ungueltiger Status: '{}'. Erlaubt: {}",
+            body.status,
+            valid_statuses.join(", ")
+        )));
+    }
+
+    // Verify quote exists
     let row: Option<(String,)> =
         sqlx::query_as("SELECT status FROM quotes WHERE id = $1")
             .bind(id)
             .fetch_optional(&state.db)
             .await?;
 
-    let (current_status,) =
+    let (_current_status,) =
         row.ok_or_else(|| ApiError::NotFound(format!("Anfrage {id} nicht gefunden")))?;
 
-    if current_status != "accepted" {
-        return Err(ApiError::BadRequest(format!(
-            "Anfrage kann nur aus Status 'accepted' als erledigt markiert werden (aktuell: '{current_status}')"
-        )));
-    }
-
     let now = Utc::now();
-    sqlx::query("UPDATE quotes SET status = 'done', updated_at = $1 WHERE id = $2")
+
+    sqlx::query("UPDATE quotes SET status = $1, updated_at = $2 WHERE id = $3")
+        .bind(&body.status)
         .bind(now)
         .bind(id)
         .execute(&state.db)
         .await?;
 
-    Ok(Json(serde_json::json!({
-        "message": "Anfrage als erledigt markiert",
-        "status": "done",
-    })))
-}
-
-async fn mark_quote_paid(
-    State(state): State<Arc<AppState>>,
-    Extension(_claims): Extension<TokenClaims>,
-    Path(id): Path<Uuid>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let row: Option<(String,)> =
-        sqlx::query_as("SELECT status FROM quotes WHERE id = $1")
-            .bind(id)
-            .fetch_optional(&state.db)
-            .await?;
-
-    let (current_status,) =
-        row.ok_or_else(|| ApiError::NotFound(format!("Anfrage {id} nicht gefunden")))?;
-
-    if current_status != "done" {
-        return Err(ApiError::BadRequest(format!(
-            "Anfrage kann nur aus Status 'done' als bezahlt markiert werden (aktuell: '{current_status}')"
-        )));
-    }
-
-    let now = Utc::now();
-    sqlx::query("UPDATE quotes SET status = 'paid', updated_at = $1 WHERE id = $2")
-        .bind(now)
+    // Side effects for specific transitions
+    if body.status == "accepted" {
+        // Update linked offer to accepted
+        sqlx::query(
+            "UPDATE offers SET status = 'accepted' WHERE quote_id = $1 AND status IN ('draft', 'sent')",
+        )
         .bind(id)
         .execute(&state.db)
         .await?;
 
+        // Confirm linked tentative booking
+        let booking_row: Option<(Uuid,)> = sqlx::query_as(
+            "SELECT id FROM calendar_bookings WHERE quote_id = $1 AND status = 'tentative' LIMIT 1",
+        )
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await?;
+
+        if let Some((booking_id,)) = booking_row {
+            let _ = state.calendar.confirm_booking(booking_id).await;
+        }
+    }
+
     Ok(Json(serde_json::json!({
-        "message": "Anfrage als bezahlt markiert",
-        "status": "paid",
+        "message": format!("Status auf '{}' gesetzt", body.status),
+        "status": body.status,
     })))
 }
 
