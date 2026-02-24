@@ -35,3 +35,5 @@ base64 = { workspace = true }
 bytes = { workspace = true }
 lettre = { workspace = true }
 reqwest = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }

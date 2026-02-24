@@ -78,9 +78,12 @@ async def estimate_video(
         job_id, len(video_bytes) / 1024 / 1024, content_type,
     )
 
+    import asyncio
+
     pipeline = VideoPipeline(registry)
     try:
-        result = pipeline.run(
+        result = await asyncio.to_thread(
+            pipeline.run,
             job_id=job_id,
             video_bytes=video_bytes,
             detection_threshold=detection_threshold,

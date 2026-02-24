@@ -171,6 +171,8 @@ def serve():
         curl -X POST <url>/estimate/upload \\
             -F "job_id=test-1" -F "images=@room1.jpg" -F "images=@room2.jpg"
         """
+        import asyncio
+
         if not registry.is_loaded:
             return JSONResponse(status_code=503, content={"detail": "Models not loaded yet."})
 
@@ -180,7 +182,7 @@ def serve():
             pil_images.append(PILImage.open(io.BytesIO(data)).convert("RGB"))
 
         pipeline = VisionPipeline(registry)
-        result = pipeline.run(job_id=job_id, images=pil_images)
+        result = await asyncio.to_thread(pipeline.run, job_id=job_id, images=pil_images)
         return result
 
     return web_app
@@ -257,17 +259,27 @@ def serve_video():
         curl -X POST <url>/estimate/video \\
             -F "job_id=test-1" -F "video=@room_walkthrough.mp4"
         """
+        import asyncio
+
         if not registry.is_loaded:
             return JSONResponse(status_code=503, content={"detail": "Models not loaded yet."})
 
         video_bytes = await video.read()
 
         pipeline = VideoPipeline(registry)
-        result = pipeline.run(
+        # Run blocking pipeline in thread pool to keep event loop responsive.
+        # Without this, the 2-10 min sync call blocks uvicorn's event loop,
+        # causing Modal's proxy to drop the connection before response is sent.
+        result = await asyncio.to_thread(
+            pipeline.run,
             job_id=job_id,
             video_bytes=video_bytes,
             detection_threshold=detection_threshold,
             max_keyframes=max_keyframes,
+        )
+        logger.info(
+            "Returning response: job_id=%s, items=%d, volume=%.3f m3",
+            result.job_id, len(result.detected_items), result.total_volume_m3,
         )
         return result
 
@@ -280,6 +292,8 @@ def serve_video():
         images: List[UploadFile] = File(...),
     ):
         """Photo upload endpoint (also available on video function for testing)."""
+        import asyncio
+
         if not registry.is_loaded:
             return JSONResponse(status_code=503, content={"detail": "Models not loaded yet."})
 
@@ -290,6 +304,6 @@ def serve_video():
             pil_images.append(PILImage.open(io.BytesIO(data)).convert("RGB"))
 
         pipeline = VisionPipeline(registry)
-        return pipeline.run(job_id=job_id, images=pil_images)
+        return await asyncio.to_thread(pipeline.run, job_id=job_id, images=pil_images)
 
     return web_app

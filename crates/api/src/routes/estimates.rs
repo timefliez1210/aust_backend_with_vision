@@ -382,6 +382,12 @@ async fn video_estimate(
         .as_ref()
         .ok_or_else(|| ApiError::Internal("Vision service not configured".into()))?;
 
+    tracing::info!(
+        %quote_id,
+        video_size_mb = video_bytes.len() / (1024 * 1024),
+        "Calling vision service video endpoint..."
+    );
+
     let response = client
         .estimate_video(
             &id.to_string(),
@@ -391,7 +397,18 @@ async fn video_estimate(
             detection_threshold,
         )
         .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+        .map_err(|e| {
+            tracing::error!(%quote_id, error = %e, "Vision service video call failed");
+            ApiError::Internal(e.to_string())
+        })?;
+
+    tracing::info!(
+        %quote_id,
+        items = response.detected_items.len(),
+        total_volume = response.total_volume_m3,
+        processing_ms = response.processing_time_ms,
+        "Vision service video response received"
+    );
 
     // Upload crop thumbnails to S3 and replace base64 with S3 keys
     let mut items_value = serde_json::to_value(&response.detected_items)

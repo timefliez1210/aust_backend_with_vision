@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod auth;
 pub mod calendar;
+pub mod customer;
 pub mod distance;
 pub mod estimates;
 pub mod health;
@@ -22,5 +23,6 @@ pub fn api_router() -> Router<Arc<AppState>> {
         .nest("/offers", offers::router())
         .nest("/calendar", calendar::router())
         .nest("/inquiries", inquiries::router())
+        .nest("/customer", customer::auth_router())
         .layer(DefaultBodyLimit::max(250 * 1024 * 1024)) // 250MB for image uploads
 }
