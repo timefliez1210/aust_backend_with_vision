@@ -1,0 +1,13 @@
+[Unit]
+Description=AUST Backend database backup
+Wants=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+User=timefliez
+WorkingDirectory=/media/timefliez/FileSystem/projects/aust_backend
+ExecStart=/media/timefliez/FileSystem/projects/aust_backend/scripts/backup-db.sh
+
+[Install]
+WantedBy=multi-user.target

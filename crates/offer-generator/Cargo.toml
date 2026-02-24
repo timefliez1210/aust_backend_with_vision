@@ -18,6 +18,6 @@ async-trait = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
-umya-spreadsheet = { workspace = true }
+zip = { workspace = true }
 tempfile = { workspace = true }
 bytes = { workspace = true }

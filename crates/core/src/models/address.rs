@@ -63,6 +63,10 @@ pub struct RouteLeg {
     pub to_location: GeoLocation,
     pub distance_km: f64,
     pub duration_minutes: u32,
+    /// GeoJSON LineString coordinates [[lng, lat], ...] for the driving route.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
+    pub geometry: Vec<[f64; 2]>,
 }
 
 /// Full multi-stop route calculation result.
@@ -83,4 +87,8 @@ pub struct DistanceResult {
     pub duration_minutes: Option<u32>,
     pub origin: GeoLocation,
     pub destination: GeoLocation,
+    /// GeoJSON LineString coordinates [[lng, lat], ...] for the driving route.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
+    pub geometry: Vec<[f64; 2]>,
 }

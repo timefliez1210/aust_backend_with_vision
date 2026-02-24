@@ -85,6 +85,64 @@ curl -X POST https://crfabig--aust-vision-serve.modal.run/estimate/upload \
   -F "job_id=test" -F "images=@room.jpg"
 ```
 
+## Deployment (Production)
+
+The backend runs as a systemd service (`aust-backend.service`) with a release binary.
+
+### Deploy Workflow
+
+```bash
+# Full deploy: backup DB → git pull → cargo build --release → restart service → health check
+./scripts/deploy.sh
+```
+
+The deploy script:
+1. Checks Docker, PostgreSQL, and cargo are available
+2. Aborts if there are uncommitted local changes
+3. Backs up the database (gzipped pg_dump)
+4. Pulls latest changes (`git pull --ff-only`)
+5. Builds release binary
+6. Restarts `aust-backend` systemd service
+7. Verifies health endpoint (3 retries)
+
+### Database Backups
+
+**Pre-deploy backup**: Every deploy automatically backs up the DB first.
+
+**Daily backup**: systemd timer runs at 03:00 daily.
+
+```bash
+# Manual backup
+./scripts/backup-db.sh
+
+# Install daily backup timer
+sudo cp scripts/aust-backup.service scripts/aust-backup.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now aust-backup.timer
+
+# Verify timer is scheduled
+systemctl list-timers aust-backup
+```
+
+Backups are stored in `backups/db/` as `aust_backend_YYYYMMDD_HHMMSS.sql.gz`. The last 30 backups are kept, older ones are rotated.
+
+### Useful Commands
+
+```bash
+# Service status and logs
+sudo systemctl status aust-backend
+journalctl -u aust-backend -f              # follow logs
+journalctl -u aust-backend -n 100          # last 100 lines
+journalctl -u aust-backend --since today   # today's logs
+
+# Manual restart (without full deploy)
+sudo systemctl restart aust-backend
+
+# Check health
+curl http://localhost:8080/health
+curl http://localhost:8080/ready
+```
+
 ## API Endpoints
 
 ### Health
@@ -325,7 +383,8 @@ Switch providers via `AUST__LLM__DEFAULT_PROVIDER` (claude/openai/ollama)
 
 ### DevOps
 - [ ] GitHub Actions CI/CD
-- [ ] Database backup strategy
+- [x] Database backup strategy
+- [x] Deploy script with pre-deploy backup
 
 ## Technical Debt
 

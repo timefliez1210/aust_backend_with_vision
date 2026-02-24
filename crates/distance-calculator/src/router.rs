@@ -62,6 +62,19 @@ impl DistanceRouter {
             let distance_km = summary.distance / 1000.0;
             let duration_minutes = (summary.duration / 60.0) as u32;
 
+            let geometry = feature
+                .geometry
+                .coordinates
+                .iter()
+                .filter_map(|c| {
+                    if c.len() >= 2 {
+                        Some([c[0], c[1]])
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
             debug!("Distance: {distance_km:.1} km, Duration: {duration_minutes} min");
 
             return Ok(DistanceResult {
@@ -69,6 +82,7 @@ impl DistanceRouter {
                 duration_minutes: Some(duration_minutes),
                 origin: origin.clone(),
                 destination: destination.clone(),
+                geometry,
             });
         }
 
@@ -85,7 +99,13 @@ struct OrsDirectionsResponse {
 
 #[derive(Debug, Deserialize)]
 struct OrsDirectionsFeature {
+    geometry: OrsDirectionsGeometry,
     properties: OrsDirectionsProperties,
+}
+
+#[derive(Debug, Deserialize)]
+struct OrsDirectionsGeometry {
+    coordinates: Vec<Vec<f64>>,
 }
 
 /// ORS returns segments + summary. We only need summary.

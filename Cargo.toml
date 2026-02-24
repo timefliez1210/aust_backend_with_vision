@@ -98,8 +98,9 @@ validator = { version = "0.19", features = ["derive"] }
 typst = "0.12"
 typst-pdf = "0.12"
 
-# Excel generation
-umya-spreadsheet = "2"
+
+# ZIP archive manipulation
+zip = "2"
 
 # Temp files
 tempfile = "3"

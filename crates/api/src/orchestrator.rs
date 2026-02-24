@@ -7,6 +7,7 @@ use crate::routes::offers::{build_offer, build_offer_with_overrides, GeneratedOf
 use crate::AppState;
 use aust_core::config::TelegramConfig;
 use aust_core::models::MovingInquiry;
+use aust_distance_calculator::{RouteCalculator, RouteRequest};
 use aust_llm_providers::{LlmMessage, LlmProvider};
 use reqwest::{
     multipart::{Form, Part},
@@ -426,6 +427,33 @@ async fn handle_complete_inquiry(
         None
     };
 
+    // 3b. Calculate distance if both addresses exist
+    let distance_km = if let (Some(ref dep), Some(ref arr)) =
+        (&inquiry.departure_address, &inquiry.arrival_address)
+    {
+        let calculator = RouteCalculator::new(state.config.maps.api_key.clone());
+        match calculator
+            .calculate(&RouteRequest {
+                addresses: vec![dep.clone(), arr.clone()],
+            })
+            .await
+        {
+            Ok(result) => {
+                info!(
+                    "Distance calculated: {:.1} km between {} and {}",
+                    result.total_distance_km, dep, arr
+                );
+                Some(result.total_distance_km)
+            }
+            Err(e) => {
+                warn!("Distance calculation failed (will generate offer without distance): {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // 4. Determine volume — use provided volume, or rough estimate from items/description
     let volume_m3 = inquiry.volume_m3.unwrap_or_else(|| {
         // Rough estimate: typical apartment sizes
@@ -461,8 +489,8 @@ async fn handle_complete_inquiry(
     if let Err(e) = sqlx::query(
         r#"
         INSERT INTO quotes (id, customer_id, origin_address_id, destination_address_id,
-                           status, estimated_volume_m3, preferred_date, notes, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)
+                           status, estimated_volume_m3, distance_km, preferred_date, notes, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)
         "#,
     )
     .bind(quote_id)
@@ -471,6 +499,7 @@ async fn handle_complete_inquiry(
     .bind(dest_id)
     .bind("volume_estimated")
     .bind(volume_m3)
+    .bind(distance_km)
     .bind(preferred_date_ts)
     .bind(&notes)
     .bind(now)

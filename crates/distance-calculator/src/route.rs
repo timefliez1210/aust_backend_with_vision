@@ -70,6 +70,7 @@ impl RouteCalculator {
                 to_location: locations[i + 1].clone(),
                 distance_km: result.distance_km,
                 duration_minutes: duration,
+                geometry: result.geometry,
             });
         }
 

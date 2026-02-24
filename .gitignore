@@ -32,3 +32,6 @@ coverage/
 
 # Test artifacts
 test_output/
+
+# Backups
+backups/

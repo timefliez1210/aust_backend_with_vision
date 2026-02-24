@@ -16,12 +16,10 @@ use aust_core::models::{
     QuoteStatus, VisionAnalysisResult,
 };
 use aust_offer_generator::{
-    convert_xlsx_to_pdf, parse_floor, DetectedItemRow, OfferData, OfferLineItem, PricingEngine,
-    XlsxGenerator,
+    convert_xlsx_to_pdf, generate_offer_xlsx, parse_floor, DetectedItemRow, OfferData,
+    OfferLineItem, PricingEngine,
 };
 use aust_storage::StorageProvider;
-
-const TEMPLATE_BYTES: &[u8] = include_bytes!("../../../../templates/offer_template.xlsx");
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -405,9 +403,13 @@ pub async fn build_offer_with_overrides(
     // Extract services and customer message from notes
     let (services_str, customer_message) = extract_services_and_message(quote.notes.as_deref());
 
+    let valid_until_date =
+        valid_days.map(|days| (now + chrono::Duration::days(days)).date_naive());
+
     let offer_data = OfferData {
         offer_number: offer_number.clone(),
         date: today,
+        valid_until: valid_until_date,
         customer_salutation,
         customer_name: customer_name.clone(),
         customer_street: origin_street.clone(),
@@ -430,11 +432,8 @@ pub async fn build_offer_with_overrides(
         detected_items: detected_items.clone(),
     };
 
-    // 8. Generate xlsx → PDF
-    let generator = XlsxGenerator::from_template(TEMPLATE_BYTES)
-        .map_err(|e| ApiError::Internal(format!("Template error: {e}")))?;
-    let xlsx_bytes = generator
-        .generate(&offer_data)
+    // 8. Generate XLSX (direct XML manipulation of template)
+    let xlsx_bytes = generate_offer_xlsx(&offer_data)
         .map_err(|e| ApiError::Internal(format!("XLSX generation error: {e}")))?;
 
     // 9. Try PDF conversion (LibreOffice), fall back to xlsx if not available
