@@ -11,6 +11,7 @@ use uuid::Uuid;
 use aust_calendar::{
     AvailabilityResult, Booking, CapacityOverride, NewBooking, ScheduleEntry,
 };
+use chrono::Utc;
 use crate::{ApiError, AppState};
 
 pub fn router() -> Router<Arc<AppState>> {
@@ -129,6 +130,37 @@ async fn update_booking(
         aust_calendar::CalendarError::NotFound(_) => ApiError::NotFound(e.to_string()),
         _ => ApiError::Internal(e.to_string()),
     })?;
+
+    // Sync linked quote status when booking has a quote_id
+    if let Some(quote_id) = booking.quote_id {
+        let now = Utc::now();
+        match booking.status.as_str() {
+            "confirmed" => {
+                // Booking confirmed → quote accepted, offer accepted
+                sqlx::query("UPDATE quotes SET status = 'accepted', updated_at = $1 WHERE id = $2 AND status IN ('offer_generated', 'offer_sent')")
+                    .bind(now)
+                    .bind(quote_id)
+                    .execute(&state.db)
+                    .await
+                    .ok();
+                sqlx::query("UPDATE offers SET status = 'accepted' WHERE quote_id = $1 AND status IN ('draft', 'sent')")
+                    .bind(quote_id)
+                    .execute(&state.db)
+                    .await
+                    .ok();
+            }
+            "cancelled" => {
+                // Booking cancelled → quote rejected
+                sqlx::query("UPDATE quotes SET status = 'rejected', updated_at = $1 WHERE id = $2 AND status IN ('offer_generated', 'offer_sent', 'accepted')")
+                    .bind(now)
+                    .bind(quote_id)
+                    .execute(&state.db)
+                    .await
+                    .ok();
+            }
+            _ => {}
+        }
+    }
 
     Ok(Json(booking))
 }
