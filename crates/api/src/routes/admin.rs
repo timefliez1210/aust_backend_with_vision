@@ -42,6 +42,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/quotes/{id}/done", post(mark_quote_done))
         .route("/quotes/{id}/paid", post(mark_quote_paid))
         .route("/customers/{id}/delete", post(delete_customer))
+        .route("/orders", get(list_orders))
 }
 
 // --- Dashboard ---
@@ -1256,6 +1257,155 @@ async fn mark_quote_paid(
         "message": "Anfrage als bezahlt markiert",
         "status": "paid",
     })))
+}
+
+// --- Orders (Auftraege) ---
+
+#[derive(Debug, Deserialize)]
+struct ListOrdersQuery {
+    status: Option<String>,
+    search: Option<String>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+#[derive(Debug, Serialize, FromRow)]
+struct OrderListItem {
+    id: Uuid,
+    customer_name: Option<String>,
+    customer_email: String,
+    origin_city: Option<String>,
+    destination_city: Option<String>,
+    #[serde(rename = "volume_m3")]
+    estimated_volume_m3: Option<f64>,
+    status: String,
+    preferred_date: Option<DateTime<Utc>>,
+    offer_price_brutto: Option<i64>,
+    booking_date: Option<NaiveDate>,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+struct OrdersListResponse {
+    orders: Vec<OrderListItem>,
+    total: i64,
+}
+
+async fn list_orders(
+    State(state): State<Arc<AppState>>,
+    Extension(_claims): Extension<TokenClaims>,
+    Query(query): Query<ListOrdersQuery>,
+) -> Result<Json<OrdersListResponse>, ApiError> {
+    let limit = query.limit.unwrap_or(50).min(100);
+    let offset = query.offset.unwrap_or(0);
+    let search = query
+        .search
+        .map(|s| format!("%{s}%"))
+        .unwrap_or_else(|| "%".to_string());
+
+    // Filter by specific sub-status within orders, or show all order statuses
+    let status_filter = query.status.as_deref();
+    let statuses: &[&str] = match status_filter {
+        Some(s) if s == "accepted" || s == "done" || s == "paid" => &[],
+        _ => &["accepted", "done", "paid"],
+    };
+
+    let orders: Vec<OrderListItem> = if statuses.is_empty() {
+        // Single status filter
+        sqlx::query_as(
+            r#"
+            SELECT q.id,
+                   c.name AS customer_name,
+                   c.email AS customer_email,
+                   oa.city AS origin_city,
+                   da.city AS destination_city,
+                   q.estimated_volume_m3,
+                   q.status,
+                   q.preferred_date,
+                   (SELECT ROUND(o.price_cents * 1.19)::bigint FROM offers o WHERE o.quote_id = q.id ORDER BY o.created_at DESC LIMIT 1) AS offer_price_brutto,
+                   (SELECT cb.booking_date FROM calendar_bookings cb WHERE cb.quote_id = q.id AND cb.status <> 'cancelled' LIMIT 1) AS booking_date,
+                   q.created_at
+            FROM quotes q
+            JOIN customers c ON q.customer_id = c.id
+            LEFT JOIN addresses oa ON q.origin_address_id = oa.id
+            LEFT JOIN addresses da ON q.destination_address_id = da.id
+            WHERE q.status = $1
+              AND (c.name ILIKE $2 OR c.email ILIKE $2)
+            ORDER BY COALESCE(q.preferred_date, q.created_at) ASC
+            LIMIT $3 OFFSET $4
+            "#,
+        )
+        .bind(status_filter.unwrap())
+        .bind(&search)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&state.db)
+        .await?
+    } else {
+        // All order statuses
+        sqlx::query_as(
+            r#"
+            SELECT q.id,
+                   c.name AS customer_name,
+                   c.email AS customer_email,
+                   oa.city AS origin_city,
+                   da.city AS destination_city,
+                   q.estimated_volume_m3,
+                   q.status,
+                   q.preferred_date,
+                   (SELECT ROUND(o.price_cents * 1.19)::bigint FROM offers o WHERE o.quote_id = q.id ORDER BY o.created_at DESC LIMIT 1) AS offer_price_brutto,
+                   (SELECT cb.booking_date FROM calendar_bookings cb WHERE cb.quote_id = q.id AND cb.status <> 'cancelled' LIMIT 1) AS booking_date,
+                   q.created_at
+            FROM quotes q
+            JOIN customers c ON q.customer_id = c.id
+            LEFT JOIN addresses oa ON q.origin_address_id = oa.id
+            LEFT JOIN addresses da ON q.destination_address_id = da.id
+            WHERE q.status IN ('accepted', 'done', 'paid')
+              AND (c.name ILIKE $1 OR c.email ILIKE $1)
+            ORDER BY COALESCE(q.preferred_date, q.created_at) ASC
+            LIMIT $2 OFFSET $3
+            "#,
+        )
+        .bind(&search)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&state.db)
+        .await?
+    };
+
+    let total: (i64,) = if statuses.is_empty() {
+        sqlx::query_as(
+            r#"
+            SELECT COUNT(*)
+            FROM quotes q
+            JOIN customers c ON q.customer_id = c.id
+            WHERE q.status = $1
+              AND (c.name ILIKE $2 OR c.email ILIKE $2)
+            "#,
+        )
+        .bind(status_filter.unwrap())
+        .bind(&search)
+        .fetch_one(&state.db)
+        .await?
+    } else {
+        sqlx::query_as(
+            r#"
+            SELECT COUNT(*)
+            FROM quotes q
+            JOIN customers c ON q.customer_id = c.id
+            WHERE q.status IN ('accepted', 'done', 'paid')
+              AND (c.name ILIKE $1 OR c.email ILIKE $1)
+            "#,
+        )
+        .bind(&search)
+        .fetch_one(&state.db)
+        .await?
+    };
+
+    Ok(Json(OrdersListResponse {
+        orders,
+        total: total.0,
+    }))
 }
 
 // --- Addresses ---
