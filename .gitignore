@@ -32,6 +32,13 @@ coverage/
 
 # Test artifacts
 test_output/
+test_telegram_edits.py
+
+# Debug files
+debug_*.xlsx
+
+# Python cache
+__pycache__/
 
 # Backups
 backups/
