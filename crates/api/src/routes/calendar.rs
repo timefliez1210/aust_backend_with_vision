@@ -4,12 +4,13 @@ use axum::{
     Json, Router,
 };
 use chrono::NaiveDate;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
 use aust_calendar::{
-    AvailabilityResult, Booking, CapacityOverride, NewBooking, ScheduleEntry,
+    AvailabilityResult, Booking, CapacityOverride, NewBooking,
 };
 use chrono::Utc;
 use crate::{ApiError, AppState};
@@ -47,10 +48,25 @@ struct ScheduleQuery {
     to: NaiveDate,
 }
 
+/// Enriched booking with offer price for frontend display.
+#[derive(Debug, Serialize)]
+struct EnrichedBooking {
+    #[serde(flatten)]
+    booking: Booking,
+    offer_price_cents: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct EnrichedScheduleEntry {
+    date: NaiveDate,
+    availability: aust_calendar::DateAvailability,
+    bookings: Vec<EnrichedBooking>,
+}
+
 async fn get_schedule(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ScheduleQuery>,
-) -> Result<Json<Vec<ScheduleEntry>>, ApiError> {
+) -> Result<Json<Vec<EnrichedScheduleEntry>>, ApiError> {
     if query.from > query.to {
         return Err(ApiError::BadRequest(
             "'from' must be before or equal to 'to'".to_string(),
@@ -70,7 +86,48 @@ async fn get_schedule(
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    Ok(Json(schedule))
+    // Collect all quote_ids from bookings to fetch offer prices in one query
+    let quote_ids: Vec<Uuid> = schedule
+        .iter()
+        .flat_map(|entry| &entry.bookings)
+        .filter_map(|b| b.quote_id)
+        .collect();
+
+    let mut price_map: HashMap<Uuid, i64> = HashMap::new();
+    if !quote_ids.is_empty() {
+        let rows: Vec<(Uuid, i64)> = sqlx::query_as(
+            "SELECT quote_id, price_cents FROM offers WHERE quote_id = ANY($1) AND status != 'rejected' ORDER BY created_at DESC",
+        )
+        .bind(&quote_ids)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
+
+        for (qid, price) in rows {
+            price_map.entry(qid).or_insert(price);
+        }
+    }
+
+    let enriched: Vec<EnrichedScheduleEntry> = schedule
+        .into_iter()
+        .map(|entry| EnrichedScheduleEntry {
+            date: entry.date,
+            availability: entry.availability,
+            bookings: entry
+                .bookings
+                .into_iter()
+                .map(|b| {
+                    let price = b.quote_id.and_then(|qid| price_map.get(&qid).copied());
+                    EnrichedBooking {
+                        booking: b,
+                        offer_price_cents: price,
+                    }
+                })
+                .collect(),
+        })
+        .collect();
+
+    Ok(Json(enriched))
 }
 
 async fn create_booking(

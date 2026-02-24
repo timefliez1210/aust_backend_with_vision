@@ -135,7 +135,7 @@ async fn dashboard(
         WHERE booking_date BETWEEN $1 AND $2
           AND status != 'cancelled'
         GROUP BY booking_date
-        HAVING COUNT(*) >= COALESCE(
+        HAVING COUNT(*) > COALESCE(
             (SELECT capacity FROM calendar_capacity_overrides WHERE override_date = booking_date),
             $3
         )
@@ -1186,27 +1186,60 @@ async fn set_quote_status(
         .execute(&state.db)
         .await?;
 
-    // Side effects for specific transitions
-    if body.status == "accepted" {
-        // Update linked offer to accepted
-        sqlx::query(
-            "UPDATE offers SET status = 'accepted' WHERE quote_id = $1 AND status IN ('draft', 'sent')",
-        )
-        .bind(id)
-        .execute(&state.db)
-        .await?;
+    // Sync linked booking and offer status
+    match body.status.as_str() {
+        "accepted" => {
+            // Quote accepted → offer accepted, booking confirmed
+            sqlx::query(
+                "UPDATE offers SET status = 'accepted' WHERE quote_id = $1 AND status IN ('draft', 'sent')",
+            )
+            .bind(id)
+            .execute(&state.db)
+            .await?;
 
-        // Confirm linked tentative booking
-        let booking_row: Option<(Uuid,)> = sqlx::query_as(
-            "SELECT id FROM calendar_bookings WHERE quote_id = $1 AND status = 'tentative' LIMIT 1",
-        )
-        .bind(id)
-        .fetch_optional(&state.db)
-        .await?;
+            let booking_row: Option<(Uuid,)> = sqlx::query_as(
+                "SELECT id FROM calendar_bookings WHERE quote_id = $1 AND status != 'cancelled' LIMIT 1",
+            )
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await?;
 
-        if let Some((booking_id,)) = booking_row {
-            let _ = state.calendar.confirm_booking(booking_id).await;
+            if let Some((booking_id,)) = booking_row {
+                let _ = state.calendar.confirm_booking(booking_id).await;
+            }
         }
+        "rejected" | "cancelled" => {
+            // Quote rejected/cancelled → booking cancelled
+            let booking_row: Option<(Uuid,)> = sqlx::query_as(
+                "SELECT id FROM calendar_bookings WHERE quote_id = $1 AND status != 'cancelled' LIMIT 1",
+            )
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await?;
+
+            if let Some((booking_id,)) = booking_row {
+                let _ = state.calendar.cancel_booking(booking_id).await;
+            }
+        }
+        "offer_generated" | "offer_sent" | "pending" | "volume_estimated" => {
+            // Downgraded back to pre-acceptance → booking back to tentative
+            sqlx::query(
+                "UPDATE calendar_bookings SET status = 'tentative', updated_at = $1 WHERE quote_id = $2 AND status != 'cancelled'",
+            )
+            .bind(now)
+            .bind(id)
+            .execute(&state.db)
+            .await?;
+
+            // Also reset offer status back to draft/sent
+            sqlx::query(
+                "UPDATE offers SET status = 'draft' WHERE quote_id = $1 AND status = 'accepted'",
+            )
+            .bind(id)
+            .execute(&state.db)
+            .await?;
+        }
+        _ => {}
     }
 
     Ok(Json(serde_json::json!({
