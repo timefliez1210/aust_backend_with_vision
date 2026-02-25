@@ -587,6 +587,11 @@ fn format_city(addr: &AddressRow) -> String {
 ///
 /// Returns (salutation for address block, greeting line).
 /// Uses common German female first names as a heuristic.
+/// Returns just the greeting line for a customer name (e.g. "Sehr geehrter Herr Müller,").
+pub fn greeting_for_name(name: &str) -> String {
+    detect_salutation_and_greeting(name).1
+}
+
 fn detect_salutation_and_greeting(name: &str) -> (String, String) {
     // If the name contains "Frau" or "Herr" prefix, use that directly
     let name_trimmed = name.trim();

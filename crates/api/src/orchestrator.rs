@@ -1337,6 +1337,44 @@ pub async fn send_offer_email(
     Ok(())
 }
 
+pub async fn send_offer_email_custom(
+    state: &AppState,
+    to: &str,
+    pdf_bytes: &[u8],
+    offer_id: Uuid,
+    subject: &str,
+    body: &str,
+) -> Result<(), String> {
+    use crate::services::email::{build_email_with_attachment, send_email};
+
+    let email_config = &state.config.email;
+
+    let message = build_email_with_attachment(
+        &email_config.from_address,
+        &email_config.from_name,
+        to,
+        subject,
+        body,
+        pdf_bytes,
+        &format!("Angebot-{offer_id}.pdf"),
+        "application/pdf",
+    )
+    .map_err(|e| format!("Failed to build email: {e}"))?;
+
+    send_email(
+        &email_config.smtp_host,
+        email_config.smtp_port,
+        &email_config.username,
+        &email_config.password,
+        message,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    info!("Offer email sent to {to} (custom)");
+    Ok(())
+}
+
 async fn send_telegram_message(client: &Client, bot_token: &str, chat_id: i64, text: &str) {
     let api_url = format!("https://api.telegram.org/bot{bot_token}/sendMessage");
     let payload = serde_json::json!({

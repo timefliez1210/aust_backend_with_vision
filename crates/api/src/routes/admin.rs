@@ -974,6 +974,8 @@ struct OfferDetailResponse {
     pdf_url: Option<String>,
     created_at: DateTime<Utc>,
     items: Vec<OfferDetailItem>,
+    email_subject: String,
+    email_body: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1146,11 +1148,16 @@ async fn get_offer_detail(
         .as_ref()
         .map(|_| format!("/api/v1/offers/{}/pdf", row.id));
 
+    // Build email draft
+    let customer_name_str = row.customer_name.clone().unwrap_or_default();
+    let email_subject = "Ihr Umzugsangebot".to_string();
+    let email_body = build_email_draft(&customer_name_str);
+
     Ok(Json(OfferDetailResponse {
         id: row.id,
         offer_number: row.offer_number,
         quote_id: row.quote_id,
-        customer_name: row.customer_name.unwrap_or_default(),
+        customer_name: customer_name_str,
         customer_email: row.customer_email,
         origin_address: origin_addr,
         destination_address: dest_addr,
@@ -1167,6 +1174,8 @@ async fn get_offer_detail(
         pdf_url,
         created_at: row.created_at,
         items,
+        email_subject,
+        email_body,
     }))
 }
 
@@ -1178,6 +1187,18 @@ fn format_address(street: Option<&str>, postal: Option<&str>, city: Option<&str>
         }
         _ => String::new(),
     }
+}
+
+fn build_email_draft(customer_name: &str) -> String {
+    let greeting = crate::routes::offers::greeting_for_name(customer_name);
+    format!(
+        "{greeting}\n\n\
+        anbei erhalten Sie unser Angebot für Ihren Umzug.\n\n\
+        Bei Fragen stehen wir Ihnen gerne zur Verfügung.\n\n\
+        Mit freundlichen Grüßen,\n\
+        Ihr Umzugsteam\n\
+        AUST Umzüge"
+    )
 }
 
 // --- Update Offer ---
@@ -1308,14 +1329,23 @@ async fn regenerate_offer(
 
 // --- Send / Reject ---
 
+#[derive(Debug, Deserialize, Default)]
+struct SendOfferRequest {
+    #[serde(default)]
+    email_subject: Option<String>,
+    #[serde(default)]
+    email_body: Option<String>,
+}
+
 async fn send_offer(
     State(state): State<Arc<AppState>>,
     Extension(_claims): Extension<TokenClaims>,
     Path(id): Path<Uuid>,
+    Json(request): Json<SendOfferRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let row: Option<(String, Option<String>, Uuid)> = sqlx::query_as(
+    let row: Option<(String, Option<String>, Uuid, Option<String>)> = sqlx::query_as(
         r#"
-        SELECT c.email, o.pdf_storage_key, o.quote_id
+        SELECT c.email, o.pdf_storage_key, o.quote_id, COALESCE(c.name, c.email)
         FROM offers o
         JOIN quotes q ON o.quote_id = q.id
         JOIN customers c ON q.customer_id = c.id
@@ -1326,7 +1356,7 @@ async fn send_offer(
     .fetch_optional(&state.db)
     .await?;
 
-    let (customer_email, storage_key, quote_id) =
+    let (customer_email, storage_key, quote_id, customer_name) =
         row.ok_or_else(|| ApiError::NotFound(format!("Angebot {id} nicht gefunden")))?;
 
     let storage_key = storage_key
@@ -1338,7 +1368,10 @@ async fn send_offer(
         .await
         .map_err(|e| ApiError::Internal(format!("PDF-Download fehlgeschlagen: {e}")))?;
 
-    crate::orchestrator::send_offer_email(&state, &customer_email, &pdf_bytes, id)
+    let subject = request.email_subject.unwrap_or_else(|| "Ihr Umzugsangebot".to_string());
+    let body = request.email_body.unwrap_or_else(|| build_email_draft(&customer_name.unwrap_or_default()));
+
+    crate::orchestrator::send_offer_email_custom(&state, &customer_email, &pdf_bytes, id, &subject, &body)
         .await
         .map_err(|e| ApiError::Internal(format!("E-Mail-Versand fehlgeschlagen: {e}")))?;
 
