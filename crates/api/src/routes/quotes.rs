@@ -239,15 +239,28 @@ async fn get_quote(
     .fetch_all(&state.db)
     .await?;
 
-    let estimation = if est_rows.is_empty() {
+    // Fetch original video URLs from ALL estimations (including processing/failed)
+    let all_video_rows: Vec<(Option<serde_json::Value>,)> = sqlx::query_as(
+        "SELECT source_data FROM volume_estimations WHERE quote_id = $1 AND method = 'video' ORDER BY created_at",
+    )
+    .bind(id)
+    .fetch_all(&state.db)
+    .await?;
+    let mut all_source_videos: Vec<String> = Vec::new();
+    for (sd,) in &all_video_rows {
+        if let Some(key) = sd.as_ref().and_then(|sd| sd.get("video_s3_key")?.as_str()) {
+            all_source_videos.push(format!("/api/v1/estimates/images/{key}"));
+        }
+    }
+
+    let estimation = if est_rows.is_empty() && all_source_videos.is_empty() {
         None
     } else {
         let mut all_items: Vec<EstimationItem> = Vec::new();
         let mut all_source_images: Vec<String> = Vec::new();
-        let mut all_source_videos: Vec<String> = Vec::new();
         let mut total_volume = 0.0;
-        let first_id = est_rows[0].id;
-        let first_method = est_rows[0].method.clone();
+        let first_id = est_rows.first().map(|r| r.id).unwrap_or_default();
+        let first_method = est_rows.first().map(|r| r.method.clone()).unwrap_or_else(|| "video".to_string());
 
         for est in &est_rows {
             let vol_est = VolumeEstimationRow {
@@ -273,10 +286,7 @@ async fn get_quote(
                 all_source_images.push(format!("/api/v1/estimates/images/{k}"));
             }
 
-            // Collect source videos
-            if let Some(video_key) = est.source_data.as_ref().and_then(|sd| sd.get("video_s3_key")?.as_str()) {
-                all_source_videos.push(format!("/api/v1/estimates/images/{video_key}"));
-            }
+            // source_videos already collected above (all statuses)
 
             total_volume += est.total_volume_m3.unwrap_or(0.0);
 
