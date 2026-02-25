@@ -300,7 +300,7 @@ pub async fn build_offer_with_overrides(
         // Sum up non-labor line items that contribute to the XLSX netto total
         let other_items_netto: f64 = line_items
             .iter()
-            .filter(|li| li.row != 38) // exclude labor row
+            .filter(|li| !li.is_labor)
             .map(|li| li.quantity * li.unit_price)
             .sum();
 
@@ -362,6 +362,16 @@ pub async fn build_offer_with_overrides(
     let valid_until_date =
         valid_days.map(|days| (now + chrono::Duration::days(days)).date_naive());
 
+    // Labor is always the first line item
+    let mut all_items = vec![OfferLineItem {
+        description: format!("{} Umzugshelfer", pricing_result.estimated_helpers),
+        quantity: pricing_result.estimated_hours,
+        unit_price: rate_override,
+        is_labor: true,
+        ..Default::default()
+    }];
+    all_items.extend(line_items);
+
     let offer_data = OfferData {
         offer_number: offer_number.clone(),
         date: today,
@@ -384,7 +394,7 @@ pub async fn build_offer_with_overrides(
         persons: pricing_result.estimated_helpers,
         estimated_hours: pricing_result.estimated_hours,
         rate_per_person_hour: rate_override,
-        line_items,
+        line_items: all_items,
         detected_items: detected_items.clone(),
     };
 
@@ -623,18 +633,10 @@ fn detect_salutation_and_greeting(name: &str) -> (String, String) {
     }
 }
 
-/// Build line items for the XLSX offer from quote notes, distance, and pricing.
+/// Build non-labor line items for the XLSX offer from quote notes, distance, and pricing.
 ///
-/// Template row mapping:
-///   31: De/Montage            — qty × €50
-///   32: Halteverbotszone      — qty × €100 (per location)
-///   33: Umzugsmaterial        — 1 × €30 (template default, override if Einpackservice)
-///   34: Seidenpapier          — qty × €5 (if packing service)
-///   35: U-Karton              — qty × €2.10 (if packing service)
-///   37: Kleiderboxen          — qty × €10 (if packing service)
-///   38: Personal              — hours × rate × persons (handled separately in xlsx.rs)
-///   39: 3,5t Transporter      — qty × €60 (based on volume)
-///   42: Anfahrt/Abfahrt       — 1 × distance-based price
+/// Items are written dynamically into rows 31-42 (no fixed row assignments).
+/// Labor is prepended separately in `build_offer_with_overrides()`.
 fn build_line_items(
     notes: Option<&str>,
     distance_km: f64,
@@ -645,18 +647,18 @@ fn build_line_items(
         .unwrap_or_default();
     let mut items = Vec::new();
 
-    // Row 31: De/Montage — if assembly or disassembly service requested
+    // De/Montage — if assembly or disassembly service requested
     let has_montage = notes_lower.contains("montage") || notes_lower.contains("demontage");
     if has_montage {
         items.push(OfferLineItem {
-            row: 31,
-            description: None,
+            description: "De/Montage".to_string(),
             quantity: 1.0,
-            unit_price: 50.0, // template preset: €50 per unit
+            unit_price: 50.0,
+            ..Default::default()
         });
     }
 
-    // Row 32: Halteverbotszone — count parking ban locations
+    // Halteverbotszone — count parking ban locations
     let mut halteverbot_count = 0.0;
     if notes_lower.contains("halteverbot auszug") {
         halteverbot_count += 1.0;
@@ -665,49 +667,51 @@ fn build_line_items(
         halteverbot_count += 1.0;
     }
     if halteverbot_count > 0.0 {
-        let desc = if halteverbot_count > 1.0 {
+        let remark = if halteverbot_count > 1.0 {
             Some("Beladestelle + Entladestelle".to_string())
         } else if notes_lower.contains("halteverbot auszug") {
             Some("Beladestelle".to_string())
         } else {
-            None // template default says "Entladestelle"
+            Some("Entladestelle".to_string())
         };
         items.push(OfferLineItem {
-            row: 32,
-            description: desc,
+            description: "Halteverbotszone".to_string(),
             quantity: halteverbot_count,
             unit_price: 100.0,
+            remark,
+            ..Default::default()
         });
     }
 
-    // Row 33: Umzugsmaterial — if Verpackungsservice/Einpackservice, note it
+    // Umzugsmaterial — if Verpackungsservice/Einpackservice
     if notes_lower.contains("verpackungsservice") || notes_lower.contains("einpackservice") {
         items.push(OfferLineItem {
-            row: 33,
-            description: Some("Umzugsmaterial inkl. Einpackservice (nach Aufwand)".to_string()),
+            description: "Umzugsmaterial".to_string(),
             quantity: 1.0,
-            unit_price: 30.0, // template preset: €30 per unit
+            unit_price: 30.0,
+            remark: Some("inkl. Einpackservice".to_string()),
+            ..Default::default()
         });
     }
 
-    // Row 39: Transporter — based on volume (2 trucks for >30m³)
+    // Transporter — based on volume (2 trucks for >30m³)
     let truck_count = if volume_m3 > 30.0 { 2.0 } else { 1.0 };
     items.push(OfferLineItem {
-        row: 39,
-        description: None,
+        description: "3,5t Transporter".to_string(),
         quantity: truck_count,
         unit_price: 60.0,
+        remark: Some("m. Koffer".to_string()),
+        ..Default::default()
     });
 
-    // Row 42: Anfahrt/Abfahrt — adjust based on distance
+    // Anfahrt/Abfahrt — adjust based on distance
     if distance_km > 0.0 {
-        // Price scales with distance: base €30 + €1.50/km
         let anfahrt_price = 30.0 + (distance_km * 1.5);
         items.push(OfferLineItem {
-            row: 42,
-            description: None,
+            description: "Anfahrt/Abfahrt".to_string(),
             quantity: 1.0,
             unit_price: anfahrt_price,
+            ..Default::default()
         });
     }
 
@@ -1100,47 +1104,47 @@ mod tests {
     #[test]
     fn line_items_no_services() {
         let items = build_line_items(None, 0.0, 20.0);
-        // Should only have truck (row 39), no anfahrt (distance=0)
+        // Should only have truck, no anfahrt (distance=0)
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].row, 39);
+        assert!(items[0].description.contains("Transporter"));
         assert_eq!(items[0].quantity, 1.0);
+        assert!(!items[0].is_labor);
     }
 
     #[test]
     fn line_items_montage() {
         let items = build_line_items(Some("montage"), 0.0, 20.0);
-        let montage = items.iter().find(|i| i.row == 31).expect("should have montage");
+        let montage = items.iter().find(|i| i.description.contains("Montage")).expect("should have montage");
         assert_eq!(montage.quantity, 1.0);
         assert_eq!(montage.unit_price, 50.0);
     }
 
     #[test]
     fn line_items_demontage() {
-        // "Demontage" also triggers row 31 because notes_lower.contains("montage") matches "demontage"
         let items = build_line_items(Some("Demontage"), 0.0, 20.0);
-        assert!(items.iter().any(|i| i.row == 31));
+        assert!(items.iter().any(|i| i.description.contains("Montage")));
     }
 
     #[test]
     fn line_items_halteverbot_auszug_only() {
         let items = build_line_items(Some("Halteverbot Auszug"), 0.0, 20.0);
-        let hv = items.iter().find(|i| i.row == 32).expect("should have halteverbot");
+        let hv = items.iter().find(|i| i.description.contains("Halteverbot")).expect("should have halteverbot");
         assert_eq!(hv.quantity, 1.0);
-        assert_eq!(hv.description.as_deref(), Some("Beladestelle"));
+        assert_eq!(hv.description, "Halteverbotszone");
     }
 
     #[test]
     fn line_items_halteverbot_both() {
         let items = build_line_items(Some("Halteverbot Auszug, Halteverbot Einzug"), 0.0, 20.0);
-        let hv = items.iter().find(|i| i.row == 32).expect("should have halteverbot");
+        let hv = items.iter().find(|i| i.description.contains("Halteverbot")).expect("should have halteverbot");
         assert_eq!(hv.quantity, 2.0);
-        assert_eq!(hv.description.as_deref(), Some("Beladestelle + Entladestelle"));
+        assert_eq!(hv.description, "Halteverbotszone");
     }
 
     #[test]
     fn line_items_einpackservice() {
         let items = build_line_items(Some("einpackservice"), 0.0, 20.0);
-        let ep = items.iter().find(|i| i.row == 33).expect("should have einpackservice");
+        let ep = items.iter().find(|i| i.description.contains("Umzugsmaterial")).expect("should have umzugsmaterial");
         assert_eq!(ep.quantity, 1.0);
         assert_eq!(ep.unit_price, 30.0);
     }
@@ -1148,27 +1152,27 @@ mod tests {
     #[test]
     fn line_items_verpackungsservice() {
         let items = build_line_items(Some("Verpackungsservice"), 0.0, 20.0);
-        assert!(items.iter().any(|i| i.row == 33));
+        assert!(items.iter().any(|i| i.description.contains("Umzugsmaterial")));
     }
 
     #[test]
     fn line_items_truck_count_small() {
         let items = build_line_items(None, 0.0, 30.0);
-        let truck = items.iter().find(|i| i.row == 39).unwrap();
+        let truck = items.iter().find(|i| i.description.contains("Transporter")).unwrap();
         assert_eq!(truck.quantity, 1.0);
     }
 
     #[test]
     fn line_items_truck_count_large() {
         let items = build_line_items(None, 0.0, 31.0);
-        let truck = items.iter().find(|i| i.row == 39).unwrap();
+        let truck = items.iter().find(|i| i.description.contains("Transporter")).unwrap();
         assert_eq!(truck.quantity, 2.0);
     }
 
     #[test]
     fn line_items_anfahrt_distance() {
         let items = build_line_items(None, 50.0, 20.0);
-        let anfahrt = items.iter().find(|i| i.row == 42).expect("should have anfahrt");
+        let anfahrt = items.iter().find(|i| i.description.contains("Anfahrt")).expect("should have anfahrt");
         assert_eq!(anfahrt.quantity, 1.0);
         assert!((anfahrt.unit_price - 105.0).abs() < 0.01, "30 + 50*1.5 = 105");
     }
@@ -1180,19 +1184,19 @@ mod tests {
             100.0,
             35.0,
         );
-        assert!(items.iter().any(|i| i.row == 31), "montage");
-        assert!(items.iter().any(|i| i.row == 32), "halteverbot");
-        assert!(items.iter().any(|i| i.row == 33), "einpackservice");
-        let truck = items.iter().find(|i| i.row == 39).unwrap();
+        assert!(items.iter().any(|i| i.description.contains("Montage")), "montage");
+        assert!(items.iter().any(|i| i.description.contains("Halteverbot")), "halteverbot");
+        assert!(items.iter().any(|i| i.description.contains("Umzugsmaterial")), "umzugsmaterial");
+        let truck = items.iter().find(|i| i.description.contains("Transporter")).unwrap();
         assert_eq!(truck.quantity, 2.0, "volume > 30 → 2 trucks");
-        let anfahrt = items.iter().find(|i| i.row == 42).unwrap();
+        let anfahrt = items.iter().find(|i| i.description.contains("Anfahrt")).unwrap();
         assert!((anfahrt.unit_price - 180.0).abs() < 0.01, "30 + 100*1.5 = 180");
     }
 
     #[test]
     fn line_items_zero_distance_no_anfahrt() {
         let items = build_line_items(None, 0.0, 20.0);
-        assert!(!items.iter().any(|i| i.row == 42), "no anfahrt for zero distance");
+        assert!(!items.iter().any(|i| i.description.contains("Anfahrt")), "no anfahrt for zero distance");
     }
 
     // --- extract_services_and_message tests ---

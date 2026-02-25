@@ -45,12 +45,15 @@ pub struct OfferData {
     pub detected_items: Vec<DetectedItemRow>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OfferLineItem {
-    pub row: u32,
-    pub description: Option<String>,
+    pub description: String,
     pub quantity: f64,
     pub unit_price: f64,
+    #[serde(default)]
+    pub is_labor: bool,
+    #[serde(default)]
+    pub remark: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,9 +84,15 @@ pub struct DetectedItemRow {
 
 enum CellValue {
     Text(String),
+    /// Text with an explicit style index (overrides the template cell's style).
+    StyledText(String, &'static str),
     Number(f64),
     /// Number with an explicit style index (used when inserting into a new cell).
     StyledNumber(f64, &'static str),
+    /// Formula — writes `<f>...</f>` into the cell (keeps original style).
+    Formula(String),
+    /// Formula with an explicit style index.
+    StyledFormula(String, &'static str),
 }
 
 // ---------------------------------------------------------------------------
@@ -96,14 +105,14 @@ pub fn generate_offer_xlsx(data: &OfferData) -> Result<Vec<u8>, OfferError> {
         .map_err(|e| OfferError::Template(format!("Failed to read template ZIP: {e}")))?;
 
     // Build modifications
-    let cell_mods = build_cell_modifications(data);
-    let hidden_rows = compute_hidden_rows(data);
+    let (cell_mods, hidden_rows, unhidden_rows) = build_cell_modifications(data);
 
     // Read and modify sheet1.xml
     let sheet1_xml = read_zip_entry(&mut template_zip, "xl/worksheets/sheet1.xml")?;
     let sheet1_str = String::from_utf8(sheet1_xml)
         .map_err(|e| OfferError::Template(format!("sheet1.xml is not valid UTF-8: {e}")))?;
-    let mut modified_sheet1 = apply_modifications(&sheet1_str, &cell_mods, &hidden_rows);
+    let mut modified_sheet1 =
+        apply_modifications(&sheet1_str, &cell_mods, &hidden_rows, &unhidden_rows);
 
     // Remove hyperlinks section — we want plain text, not clickable links
     modified_sheet1 = strip_hyperlinks(&modified_sheet1);
@@ -175,7 +184,9 @@ pub fn generate_offer_xlsx(data: &OfferData) -> Result<Vec<u8>, OfferError> {
 // Build cell modifications from OfferData
 // ---------------------------------------------------------------------------
 
-fn build_cell_modifications(data: &OfferData) -> Vec<(String, CellValue)> {
+fn build_cell_modifications(
+    data: &OfferData,
+) -> (Vec<(String, CellValue)>, Vec<u32>, Vec<u32>) {
     let mut mods = Vec::new();
 
     // Customer address block
@@ -183,11 +194,13 @@ fn build_cell_modifications(data: &OfferData) -> Vec<(String, CellValue)> {
     mods.push(("A9".into(), CellValue::Text(data.customer_name.clone())));
     mods.push(("A10".into(), CellValue::Text(data.customer_street.clone())));
     mods.push(("A11".into(), CellValue::Text(data.customer_city.clone())));
+    mods.push(("A12".into(), CellValue::StyledText(data.customer_email.clone(), "0")));
 
-    // Clear the old TODAY() formula in G14 (overlaps with company info text box).
+    // Clear the old TODAY() formula in G14-G15 (overlaps with company info text box).
     mods.push(("G14".into(), CellValue::Text(String::new())));
-    // Date in G15 — below the text box. Style 10 = dd.mm.yyyy date format.
-    mods.push(("G15".into(), CellValue::StyledNumber(date_to_excel_serial(data.date), "10")));
+    mods.push(("G15".into(), CellValue::Text(String::new())));
+    // Date in G16 — same row as title. Style 10 = dd.mm.yyyy date format.
+    mods.push(("G16".into(), CellValue::StyledNumber(date_to_excel_serial(data.date), "10")));
 
     // Title
     mods.push((
@@ -201,7 +214,9 @@ fn build_cell_modifications(data: &OfferData) -> Vec<(String, CellValue)> {
     // Moving date & contact
     mods.push(("B17".into(), CellValue::Text(data.moving_date.clone())));
     mods.push(("B18".into(), CellValue::Text(data.customer_phone.clone())));
-    mods.push(("F18".into(), CellValue::Text(data.customer_email.clone())));
+    // Clear the template's email cells (moved to A12 in the address block).
+    mods.push(("E18".into(), CellValue::StyledText(String::new(), "0")));
+    mods.push(("F18".into(), CellValue::StyledText(String::new(), "0")));
 
     // Greeting
     mods.push(("A20".into(), CellValue::Text(data.greeting.clone())));
@@ -222,65 +237,102 @@ fn build_cell_modifications(data: &OfferData) -> Vec<(String, CellValue)> {
         CellValue::Text(format!("Umzugspauschale {:.1} m³", data.volume_m3)),
     ));
 
-    // Clear all line item quantities and prices (rows 31-42, except 38=labor)
-    for row in 31..=42 {
-        if row == 38 {
-            continue;
-        }
+    // --- Line items: dynamic row assignment with alternating styles ---
+    //
+    // Template column layout for rows 31-42:
+    //   A-B (merged): Beschreibung (main description)
+    //   C:            Bemerkung (remark)
+    //   D:            (mostly empty)
+    //   E:            Menge (quantity)
+    //   F:            Einzelpreis (unit price)
+    //   G:            Gesamt Netto (formula)
+    //
+    // Style pairs indexed by [color]: 0 = white (fill 4), 1 = blue (fill 3)
+    const STYLES_AB: [&str; 2] = ["58", "53"]; // columns A, B
+    const STYLES_C: [&str; 2] = ["59", "54"];  // column C
+    const STYLES_DE: [&str; 2] = ["60", "55"]; // columns D, E
+    const STYLES_FG: [&str; 2] = ["61", "56"]; // columns F, G
+
+    // 1. Hide ALL template rows 31-42 and clear their content
+    let mut hidden_rows: Vec<u32> = (31..=42).collect();
+    let mut unhidden_rows: Vec<u32> = Vec::new();
+
+    for row in 31..=42u32 {
         mods.push((format!("E{row}"), CellValue::Number(0.0)));
         mods.push((format!("F{row}"), CellValue::Number(0.0)));
     }
 
-    // Fill in actual line items
-    for item in &data.line_items {
-        mods.push((format!("E{}", item.row), CellValue::Number(item.quantity)));
-        mods.push((format!("F{}", item.row), CellValue::Number(item.unit_price)));
-        if let Some(desc) = &item.description {
-            mods.push((format!("D{}", item.row), CellValue::Text(desc.clone())));
+    // 2. Write items sequentially starting at row 31
+    let max_items = 12.min(data.line_items.len()); // template has 12 slots (31-42)
+    for (i, item) in data.line_items.iter().take(max_items).enumerate() {
+        let row = 31 + i as u32;
+        let color = i % 2; // 0 = white (first row), 1 = blue
+
+        // Un-hide this row
+        unhidden_rows.push(row);
+
+        // Write description to column A (merged with B = "Beschreibung")
+        mods.push((
+            format!("A{row}"),
+            CellValue::StyledText(item.description.clone(), STYLES_AB[color]),
+        ));
+        // Style column B (merge partner, content ignored but style visible)
+        mods.push((
+            format!("B{row}"),
+            CellValue::StyledText(String::new(), STYLES_AB[color]),
+        ));
+        // Column C: Bemerkung (remark)
+        let remark = item.remark.as_deref().unwrap_or("");
+        mods.push((
+            format!("C{row}"),
+            CellValue::StyledText(remark.to_string(), STYLES_C[color]),
+        ));
+        // Clear column D (mostly empty, but some rows have preset text)
+        mods.push((
+            format!("D{row}"),
+            CellValue::StyledText(String::new(), STYLES_DE[color]),
+        ));
+        // Write quantity and unit price
+        mods.push((
+            format!("E{row}"),
+            CellValue::StyledNumber(item.quantity, STYLES_DE[color]),
+        ));
+        mods.push((
+            format!("F{row}"),
+            CellValue::StyledNumber(item.unit_price, STYLES_FG[color]),
+        ));
+
+        // Write formula to G with correct alternating style
+        if item.is_labor {
+            mods.push(("J50".into(), CellValue::Number(data.persons as f64)));
+            let formula = format!("IF(E{row}=\"\", 0, F{row}*E{row}*J50)");
+            mods.push((format!("G{row}"), CellValue::StyledFormula(formula, STYLES_FG[color])));
+        } else {
+            let formula = format!("IF(E{row}=\"\", 0, F{row}*E{row})");
+            mods.push((format!("G{row}"), CellValue::StyledFormula(formula, STYLES_FG[color])));
         }
     }
 
-    // Labor line (row 38)
-    mods.push((
-        "D38".into(),
-        CellValue::Text(format!("{} Umzugshelfer", data.persons)),
-    ));
-    mods.push(("E38".into(), CellValue::Number(data.estimated_hours)));
-    mods.push(("F38".into(), CellValue::Number(data.rate_per_person_hour)));
+    // Remove unhidden rows from hidden list
+    hidden_rows.retain(|r| !unhidden_rows.contains(r));
 
-    // Persons count in J50 (used by G38 formula: =E38*F38*J50)
-    mods.push(("J50".into(), CellValue::Number(data.persons as f64)));
+    // Rewrite G44 formula: SUM instead of individual row references
+    mods.push(("G44".into(), CellValue::Formula("SUM(G31:G42)".into())));
 
-    mods
-}
-
-/// Determine which line-item rows (31-42) should be hidden.
-/// A row is hidden if its quantity is zero after applying modifications.
-fn compute_hidden_rows(data: &OfferData) -> Vec<u32> {
-    let active_rows: Vec<u32> = data.line_items.iter().map(|li| li.row).collect();
-    let mut hidden = Vec::new();
-    for row in 31..=42 {
-        if row == 38 {
-            // Labor row: always visible (has hours/rate)
-            continue;
-        }
-        if !active_rows.contains(&row) {
-            hidden.push(row);
-        }
-    }
-    hidden
+    (mods, hidden_rows, unhidden_rows)
 }
 
 // ---------------------------------------------------------------------------
 // XML modification engine
 // ---------------------------------------------------------------------------
 
-/// Apply cell modifications and row hiding to the sheet1 XML.
+/// Apply cell modifications, row hiding, and row un-hiding to the sheet1 XML.
 /// Uses targeted string surgery — the template XML has a known, predictable structure.
 fn apply_modifications(
     xml: &str,
     cell_mods: &[(String, CellValue)],
     hidden_rows: &[u32],
+    unhidden_rows: &[u32],
 ) -> String {
     let mut result = xml.to_string();
 
@@ -294,7 +346,12 @@ fn apply_modifications(
         result = hide_row(&result, row_num);
     }
 
-    // 3. Strip cached values from formula cells so LibreOffice must recalculate.
+    // 3. Un-hide rows (ensure visible rows are not hidden)
+    for &row_num in unhidden_rows {
+        result = unhide_row(&result, row_num);
+    }
+
+    // 4. Strip cached values from formula cells so LibreOffice must recalculate.
     //    Template has stale <v> values that won't match our new inputs.
     result = strip_formula_cached_values(&result);
 
@@ -390,6 +447,13 @@ fn build_cell_xml(cell_ref: &str, style: Option<&str>, value: &CellValue) -> Str
                 cell_ref, s_attr, escaped
             )
         }
+        CellValue::StyledText(text, forced_style) => {
+            let escaped = xml_escape(text);
+            format!(
+                r#"<c r="{}" s="{}" t="inlineStr"><is><t>{}</t></is></c>"#,
+                cell_ref, forced_style, escaped
+            )
+        }
         CellValue::Number(n) => {
             // Format: avoid scientific notation, trim trailing zeros
             let formatted = format_number(*n);
@@ -401,6 +465,20 @@ fn build_cell_xml(cell_ref: &str, style: Option<&str>, value: &CellValue) -> Str
             format!(
                 r#"<c r="{}" s="{}" t="n"><v>{}</v></c>"#,
                 cell_ref, forced_style, formatted
+            )
+        }
+        CellValue::Formula(formula) => {
+            let escaped = xml_escape(formula);
+            format!(
+                r#"<c r="{}"{} t="n"><f>{}</f></c>"#,
+                cell_ref, s_attr, escaped
+            )
+        }
+        CellValue::StyledFormula(formula, forced_style) => {
+            let escaped = xml_escape(formula);
+            format!(
+                r#"<c r="{}" s="{}" t="n"><f>{}</f></c>"#,
+                cell_ref, forced_style, escaped
             )
         }
     }
@@ -480,6 +558,29 @@ fn hide_row(xml: &str, row_num: u32) -> String {
                 result.push_str(&xml[..gt_pos]);
                 result.push_str(r#" hidden="true""#);
                 result.push_str(&xml[gt_pos..]);
+                return result;
+            }
+        }
+    }
+    xml.to_string()
+}
+
+/// Remove hidden="true" attribute from a <row> element (make it visible).
+fn unhide_row(xml: &str, row_num: u32) -> String {
+    let row_r = format!(r#"<row r="{}""#, row_num);
+    if let Some(pos) = xml.find(&row_r) {
+        let after = &xml[pos..];
+        if let Some(gt_offset) = after.find('>') {
+            let gt_pos = pos + gt_offset;
+            let tag_content = &xml[pos..gt_pos];
+
+            // Replace hidden="true" with hidden="false"
+            if let Some(h_pos) = tag_content.find(r#"hidden="true""#) {
+                let abs_h = pos + h_pos;
+                let mut result = String::with_capacity(xml.len());
+                result.push_str(&xml[..abs_h]);
+                result.push_str(r#"hidden="false""#);
+                result.push_str(&xml[abs_h + r#"hidden="true""#.len()..]);
                 return result;
             }
         }
@@ -652,67 +753,78 @@ fn build_items_sheet_xml(items: &[DetectedItemRow]) -> String {
     xml.push_str(r#"<sheetFormatPr defaultRowHeight="15"/>"#);
     xml.push_str(r#"<sheetData>"#);
 
-    // Header row
+    // Header row (orange background, bold white text)
     xml.push_str(r#"<row r="1" ht="18">"#);
-    for (col, header) in [("A", "Nr."), ("B", "Gegenstand"), ("C", "Bezeichnung (DE)"), ("D", "Volumen (m³)")] {
+    for (col, header, s) in [("A", "Nr.", "80"), ("B", "Gegenstand", "79"), ("C", "Anzahl", "80"), ("D", "Volumen (m³)", "80")] {
         xml.push_str(&format!(
-            r#"<c r="{}1" s="47" t="inlineStr"><is><t>{}</t></is></c>"#,
-            col, xml_escape(header)
+            r#"<c r="{}1" s="{}" t="inlineStr"><is><t>{}</t></is></c>"#,
+            col, s, xml_escape(header)
         ));
     }
     xml.push_str(r#"</row>"#);
 
     // Data rows
     let mut total_volume = 0.0;
+    let mut total_quantity: u32 = 0;
     for (i, item) in items.iter().enumerate() {
         let row = i + 2;
         let is_odd = i % 2 == 1;
-        let s_text = if is_odd { "21" } else { "17" };
-        let s_num = if is_odd { "22" } else { "18" };
+        let s_center = if is_odd { "82" } else { "81" };
+
+        // Parse quantity prefix from name (e.g. "2x Sideboard groß" → 2, strip prefix)
+        let (qty, display_name): (u32, &str) = item
+            .name
+            .find('x')
+            .and_then(|pos| {
+                let prefix = item.name[..pos].trim();
+                let q: u32 = prefix.parse().ok()?;
+                Some((q, item.name[pos + 1..].trim()))
+            })
+            .unwrap_or((1, &item.name));
+        total_quantity += qty;
 
         xml.push_str(&format!(r#"<row r="{}">"#, row));
 
         xml.push_str(&format!(
             r#"<c r="A{}" s="{}" t="n"><v>{}</v></c>"#,
-            row, s_num, i + 1
+            row, s_center, i + 1
         ));
         xml.push_str(&format!(
             r#"<c r="B{}" s="{}" t="inlineStr"><is><t>{}</t></is></c>"#,
-            row, s_text, xml_escape(&item.name)
+            row, s_center, xml_escape(display_name)
         ));
 
-        let german = item.german_name.as_deref().unwrap_or("");
         xml.push_str(&format!(
-            r#"<c r="C{}" s="{}" t="inlineStr"><is><t>{}</t></is></c>"#,
-            row, s_text, xml_escape(german)
+            r#"<c r="C{}" s="{}" t="n"><v>{}</v></c>"#,
+            row, s_center, qty
         ));
 
         xml.push_str(&format!(
             r#"<c r="D{}" s="{}" t="inlineStr"><is><t>{:.2} m³</t></is></c>"#,
-            row, s_num, item.volume_m3
+            row, s_center, item.volume_m3
         ));
 
         xml.push_str(r#"</row>"#);
         total_volume += item.volume_m3;
     }
 
-    // Total row
+    // Total row (orange background, bold white text)
     let total_row = items.len() + 2;
     xml.push_str(&format!(r#"<row r="{}" ht="18">"#, total_row));
     xml.push_str(&format!(
-        r#"<c r="A{}" s="47" t="inlineStr"><is><t></t></is></c>"#,
+        r#"<c r="A{}" s="80" t="inlineStr"><is><t></t></is></c>"#,
         total_row
     ));
     xml.push_str(&format!(
-        r#"<c r="B{}" s="47" t="inlineStr"><is><t>Gesamt</t></is></c>"#,
+        r#"<c r="B{}" s="79" t="inlineStr"><is><t>Gesamt</t></is></c>"#,
         total_row
     ));
     xml.push_str(&format!(
-        r#"<c r="C{}" s="47" t="inlineStr"><is><t>{} Gegenstände</t></is></c>"#,
-        total_row, items.len()
+        r#"<c r="C{}" s="80" t="n"><v>{}</v></c>"#,
+        total_row, total_quantity
     ));
     xml.push_str(&format!(
-        r#"<c r="D{}" s="47" t="inlineStr"><is><t>{:.2} m³</t></is></c>"#,
+        r#"<c r="D{}" s="80" t="inlineStr"><is><t>{:.2} m³</t></is></c>"#,
         total_row, total_volume
     ));
     xml.push_str(r#"</row>"#);

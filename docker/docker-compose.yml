@@ -2,6 +2,7 @@ services:
   postgres:
     image: postgres:16-alpine
     container_name: aust_postgres
+    restart: always
     environment:
       POSTGRES_USER: aust
       POSTGRES_PASSWORD: aust_dev_password
@@ -19,6 +20,7 @@ services:
   redis:
     image: redis:7-alpine
     container_name: aust_redis
+    restart: always
     ports:
       - "6379:6379"
     volumes:
@@ -32,6 +34,7 @@ services:
   minio:
     image: minio/minio:latest
     container_name: aust_minio
+    restart: always
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: minioadmin
