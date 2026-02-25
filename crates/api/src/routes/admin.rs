@@ -802,7 +802,7 @@ async fn get_quote_detail(
                         } else {
                             (quantity * unit_price * 100.0).round() as i64
                         };
-                        OfferDetailLineItem { label, quantity, unit_price_cents, total_cents }
+                        OfferDetailLineItem { label, quantity, unit_price_cents, total_cents, is_labor }
                     })
                     .collect()
             })
@@ -981,6 +981,7 @@ struct OfferDetailLineItem {
     quantity: f64,
     unit_price_cents: i64,
     total_cents: i64,
+    is_labor: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1080,6 +1081,7 @@ async fn get_offer_detail(
                         quantity,
                         unit_price_cents,
                         total_cents,
+                        is_labor,
                     }
                 })
                 .collect()
