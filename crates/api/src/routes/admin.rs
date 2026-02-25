@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use aust_core::models::TokenClaims;
 
+use aust_offer_generator::OfferLineItem;
 use crate::orchestrator::parse_items_list_text;
 use crate::routes::offers::{build_offer_with_overrides, parse_detected_items, OfferOverrides, VolumeEstimationRow};
 use crate::services::db::insert_estimation_no_return;
@@ -1237,6 +1238,16 @@ struct RegenerateRequest {
     persons: Option<u32>,
     hours: Option<f64>,
     rate: Option<f64>,
+    /// Custom non-labor line items (description, quantity, unit_price in EUR).
+    #[serde(default)]
+    line_items: Option<Vec<RegenerateLineItem>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegenerateLineItem {
+    description: String,
+    quantity: f64,
+    unit_price: f64,
 }
 
 async fn regenerate_offer(
@@ -1269,6 +1280,17 @@ async fn regenerate_offer(
         persons: request.persons,
         hours: request.hours,
         rate: request.rate,
+        line_items: request.line_items.map(|items| {
+            items
+                .into_iter()
+                .map(|li| OfferLineItem {
+                    description: li.description,
+                    quantity: li.quantity,
+                    unit_price: li.unit_price,
+                    ..Default::default()
+                })
+                .collect()
+        }),
     };
 
     let generated =

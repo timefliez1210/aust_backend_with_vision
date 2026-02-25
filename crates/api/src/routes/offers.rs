@@ -160,6 +160,8 @@ pub struct OfferOverrides {
     pub persons: Option<u32>,
     pub hours: Option<f64>,
     pub rate: Option<f64>,
+    /// Custom non-labor line items. When set, replaces `build_line_items()` output.
+    pub line_items: Option<Vec<OfferLineItem>>,
 }
 
 /// Core offer generation logic. Used by both the API endpoint and the orchestrator.
@@ -279,12 +281,16 @@ pub async fn build_offer_with_overrides(
         pricing_result.total_price_cents = price;
     }
 
-    // 7. Build line items from quote notes (services, parking bans) and pricing
-    let line_items = build_line_items(
-        quote.notes.as_deref(),
-        distance,
-        volume,
-    );
+    // 7. Build line items: use overrides if provided, else derive from quote notes
+    let line_items = if let Some(ref items) = overrides.line_items {
+        items.clone()
+    } else {
+        build_line_items(
+            quote.notes.as_deref(),
+            distance,
+            volume,
+        )
+    };
 
     // Determine rate: if price was overridden, back-calculate so xlsx formula matches.
     // The xlsx netto total (G44) = labor (G38) + sum of other line items.
@@ -739,6 +745,7 @@ async fn generate_offer(
         persons: request.persons,
         hours: request.hours,
         rate: request.rate,
+        line_items: None,
     };
     let result = build_offer_with_overrides(
         &state.db, &*state.storage, request.quote_id, request.valid_days, &overrides

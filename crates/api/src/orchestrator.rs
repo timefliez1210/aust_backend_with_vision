@@ -869,6 +869,7 @@ async fn handle_offer_edit(
         persons: overrides.persons,
         hours: overrides.hours,
         rate: overrides.rate,
+        line_items: None,
     };
 
     match build_offer_with_overrides(&state.db, &*state.storage, quote_id, Some(30), &offer_overrides).await {
