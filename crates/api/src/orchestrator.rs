@@ -1229,7 +1229,7 @@ async fn handle_offer_approval(
                 )
                 .bind(Uuid::now_v7())
                 .bind(thread_id)
-                .bind("umzug@example.com")
+                .bind(&state.config.email.from_address)
                 .bind(&customer_email)
                 .bind("Ihr Umzugsangebot")
                 .bind(body)

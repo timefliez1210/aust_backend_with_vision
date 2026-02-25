@@ -498,14 +498,14 @@ async fn update_estimation_items(
     Json(request): Json<UpdateEstimationItemsRequest>,
 ) -> Result<Json<EstimationInfo>, ApiError> {
     // Get latest estimation for this quote
-    let est: Option<(Uuid, Option<serde_json::Value>)> = sqlx::query_as(
-        "SELECT id, source_data FROM volume_estimations WHERE quote_id = $1 ORDER BY created_at DESC LIMIT 1",
+    let est: Option<(Uuid, String, Option<serde_json::Value>)> = sqlx::query_as(
+        "SELECT id, method, source_data FROM volume_estimations WHERE quote_id = $1 ORDER BY created_at DESC LIMIT 1",
     )
     .bind(quote_id)
     .fetch_optional(&state.db)
     .await?;
 
-    let (estimation_id, est_source_data) =
+    let (estimation_id, estimation_method, est_source_data) =
         est.ok_or_else(|| ApiError::NotFound("Keine Schaetzung fuer diese Anfrage".into()))?;
 
     // Calculate new total volume
@@ -576,7 +576,7 @@ async fn update_estimation_items(
 
     Ok(Json(EstimationInfo {
         id: estimation_id,
-        method: "depth_sensor".to_string(),
+        method: estimation_method,
         total_volume_m3: total_volume,
         items,
         source_images,

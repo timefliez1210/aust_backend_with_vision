@@ -420,9 +420,6 @@ pub async fn build_offer_with_overrides(
         };
 
     // 10. Insert offer record
-    let valid_until =
-        valid_days.map(|days| (now + chrono::Duration::days(days)).date_naive());
-
     // Serialize line items for storage
     let line_items_json = serde_json::to_value(&offer_data.line_items).ok();
     let rate_cents = (rate_override * 100.0).round() as i64;
@@ -440,7 +437,7 @@ pub async fn build_offer_with_overrides(
     .bind(quote_id)
     .bind(pricing_result.total_price_cents)
     .bind("EUR")
-    .bind(valid_until)
+    .bind(valid_until_date)
     .bind(Some(&s3_key))
     .bind(OfferStatus::Draft.as_str())
     .bind(now)

@@ -59,6 +59,8 @@ pub struct EmailProcessor {
     pending_capacity: HashMap<String, PendingCapacityRequest>,
     /// Channel to forward offer-related Telegram events to the orchestrator.
     offer_tx: Option<mpsc::UnboundedSender<ApprovalDecision>>,
+    /// The configured from address for outbound emails.
+    from_address: String,
 }
 
 impl EmailProcessor {
@@ -69,6 +71,7 @@ impl EmailProcessor {
         calendar: Arc<CalendarService>,
         db: PgPool,
     ) -> Self {
+        let from_address = email_config.from_address.clone();
         let imap = ImapClient::new(email_config.clone());
         let smtp = SmtpClient::new(email_config);
         let telegram = TelegramBot::new(
@@ -89,6 +92,7 @@ impl EmailProcessor {
             editing_draft: None,
             pending_capacity: HashMap::new(),
             offer_tx: None,
+            from_address,
         }
     }
 
@@ -446,7 +450,7 @@ impl EmailProcessor {
             )
             .bind(msg_id)
             .bind(tid)
-            .bind("umzug@example.com")
+            .bind(&self.from_address)
             .bind(customer_email)
             .bind(&response.subject)
             .bind(&response.body)
@@ -956,7 +960,7 @@ impl EmailProcessor {
                 } else if let Some(thread_id) = draft.thread_id {
                     self.store_outbound_email(
                         thread_id,
-                        "umzug@example.com",
+                        &self.from_address,
                         &draft.customer_email,
                         &draft.subject,
                         &draft.body,
