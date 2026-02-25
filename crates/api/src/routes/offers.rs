@@ -1094,4 +1094,328 @@ mod tests {
         let items = parse_detected_items(Some(&est));
         assert_eq!(items[0].german_name.as_deref(), Some("Sofa, Couch, Liege"));
     }
+
+    // --- build_line_items tests ---
+
+    #[test]
+    fn line_items_no_services() {
+        let items = build_line_items(None, 0.0, 20.0);
+        // Should only have truck (row 39), no anfahrt (distance=0)
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].row, 39);
+        assert_eq!(items[0].quantity, 1.0);
+    }
+
+    #[test]
+    fn line_items_montage() {
+        let items = build_line_items(Some("montage"), 0.0, 20.0);
+        let montage = items.iter().find(|i| i.row == 31).expect("should have montage");
+        assert_eq!(montage.quantity, 1.0);
+        assert_eq!(montage.unit_price, 50.0);
+    }
+
+    #[test]
+    fn line_items_demontage() {
+        // "Demontage" also triggers row 31 because notes_lower.contains("montage") matches "demontage"
+        let items = build_line_items(Some("Demontage"), 0.0, 20.0);
+        assert!(items.iter().any(|i| i.row == 31));
+    }
+
+    #[test]
+    fn line_items_halteverbot_auszug_only() {
+        let items = build_line_items(Some("Halteverbot Auszug"), 0.0, 20.0);
+        let hv = items.iter().find(|i| i.row == 32).expect("should have halteverbot");
+        assert_eq!(hv.quantity, 1.0);
+        assert_eq!(hv.description.as_deref(), Some("Beladestelle"));
+    }
+
+    #[test]
+    fn line_items_halteverbot_both() {
+        let items = build_line_items(Some("Halteverbot Auszug, Halteverbot Einzug"), 0.0, 20.0);
+        let hv = items.iter().find(|i| i.row == 32).expect("should have halteverbot");
+        assert_eq!(hv.quantity, 2.0);
+        assert_eq!(hv.description.as_deref(), Some("Beladestelle + Entladestelle"));
+    }
+
+    #[test]
+    fn line_items_einpackservice() {
+        let items = build_line_items(Some("einpackservice"), 0.0, 20.0);
+        let ep = items.iter().find(|i| i.row == 33).expect("should have einpackservice");
+        assert_eq!(ep.quantity, 1.0);
+        assert_eq!(ep.unit_price, 30.0);
+    }
+
+    #[test]
+    fn line_items_verpackungsservice() {
+        let items = build_line_items(Some("Verpackungsservice"), 0.0, 20.0);
+        assert!(items.iter().any(|i| i.row == 33));
+    }
+
+    #[test]
+    fn line_items_truck_count_small() {
+        let items = build_line_items(None, 0.0, 30.0);
+        let truck = items.iter().find(|i| i.row == 39).unwrap();
+        assert_eq!(truck.quantity, 1.0);
+    }
+
+    #[test]
+    fn line_items_truck_count_large() {
+        let items = build_line_items(None, 0.0, 31.0);
+        let truck = items.iter().find(|i| i.row == 39).unwrap();
+        assert_eq!(truck.quantity, 2.0);
+    }
+
+    #[test]
+    fn line_items_anfahrt_distance() {
+        let items = build_line_items(None, 50.0, 20.0);
+        let anfahrt = items.iter().find(|i| i.row == 42).expect("should have anfahrt");
+        assert_eq!(anfahrt.quantity, 1.0);
+        assert!((anfahrt.unit_price - 105.0).abs() < 0.01, "30 + 50*1.5 = 105");
+    }
+
+    #[test]
+    fn line_items_all_services_combined() {
+        let items = build_line_items(
+            Some("Montage, Halteverbot Auszug, Halteverbot Einzug, Verpackungsservice"),
+            100.0,
+            35.0,
+        );
+        assert!(items.iter().any(|i| i.row == 31), "montage");
+        assert!(items.iter().any(|i| i.row == 32), "halteverbot");
+        assert!(items.iter().any(|i| i.row == 33), "einpackservice");
+        let truck = items.iter().find(|i| i.row == 39).unwrap();
+        assert_eq!(truck.quantity, 2.0, "volume > 30 → 2 trucks");
+        let anfahrt = items.iter().find(|i| i.row == 42).unwrap();
+        assert!((anfahrt.unit_price - 180.0).abs() < 0.01, "30 + 100*1.5 = 180");
+    }
+
+    #[test]
+    fn line_items_zero_distance_no_anfahrt() {
+        let items = build_line_items(None, 0.0, 20.0);
+        assert!(!items.iter().any(|i| i.row == 42), "no anfahrt for zero distance");
+    }
+
+    // --- extract_services_and_message tests ---
+
+    #[test]
+    fn extract_services_none() {
+        let (services, msg) = extract_services_and_message(None);
+        assert!(services.is_empty());
+        assert!(msg.is_empty());
+    }
+
+    #[test]
+    fn extract_only_services() {
+        let (services, msg) = extract_services_and_message(Some("Halteverbot Auszug, Montage"));
+        assert!(services.contains("Halteverbot Auszug"));
+        assert!(services.contains("Montage"));
+        assert!(msg.is_empty());
+    }
+
+    #[test]
+    fn extract_only_message() {
+        let (services, msg) = extract_services_and_message(Some("Bitte vorsichtig mit dem Klavier"));
+        assert!(services.is_empty());
+        assert_eq!(msg, "Bitte vorsichtig mit dem Klavier");
+    }
+
+    #[test]
+    fn extract_mixed() {
+        let (services, msg) = extract_services_and_message(
+            Some("Montage, Bitte vorsichtig, Halteverbot Auszug")
+        );
+        assert!(services.contains("Montage"));
+        assert!(services.contains("Halteverbot Auszug"));
+        assert_eq!(msg, "Bitte vorsichtig");
+    }
+
+    #[test]
+    fn extract_floor_prefixes() {
+        let (services, msg) = extract_services_and_message(
+            Some("Auszug: 3. Stock, Einzug: 1. Stock")
+        );
+        assert!(services.contains("Auszug: 3. Stock"));
+        assert!(services.contains("Einzug: 1. Stock"));
+        assert!(msg.is_empty());
+    }
+
+    #[test]
+    fn extract_case_insensitive() {
+        // Note: the function converts to lowercase for matching
+        let (services, _msg) = extract_services_and_message(Some("MONTAGE"));
+        // "MONTAGE" trimmed lowercase = "montage" which matches
+        assert!(!services.is_empty());
+    }
+
+    // --- detect_salutation_and_greeting tests ---
+
+    #[test]
+    fn salutation_explicit_herr() {
+        let (sal, greet) = detect_salutation_and_greeting("Herr Müller");
+        assert_eq!(sal, "Herrn");
+        assert_eq!(greet, "Sehr geehrter Herr Müller,");
+    }
+
+    #[test]
+    fn salutation_explicit_frau() {
+        let (sal, greet) = detect_salutation_and_greeting("Frau Schmidt");
+        assert_eq!(sal, "Frau");
+        assert_eq!(greet, "Sehr geehrte Frau Schmidt,");
+    }
+
+    #[test]
+    fn salutation_female_first_name() {
+        let (sal, greet) = detect_salutation_and_greeting("Anna Müller");
+        assert_eq!(sal, "Frau");
+        assert_eq!(greet, "Sehr geehrte Frau Müller,");
+    }
+
+    #[test]
+    fn salutation_male_first_name() {
+        let (sal, greet) = detect_salutation_and_greeting("Thomas Müller");
+        assert_eq!(sal, "Herrn");
+        assert_eq!(greet, "Sehr geehrter Herr Müller,");
+    }
+
+    #[test]
+    fn salutation_single_name() {
+        let (sal, greet) = detect_salutation_and_greeting("Müller");
+        assert_eq!(sal, "");
+        assert_eq!(greet, "Sehr geehrte Damen und Herren,");
+    }
+
+    #[test]
+    fn salutation_unknown_first_name() {
+        let (sal, greet) = detect_salutation_and_greeting("Xandr Müller");
+        assert_eq!(sal, "Herrn");
+        assert_eq!(greet, "Sehr geehrter Herr Müller,");
+    }
+
+    #[test]
+    fn salutation_whitespace_handling() {
+        let (sal, greet) = detect_salutation_and_greeting("  Frau Schmidt  ");
+        assert_eq!(sal, "Frau");
+        assert_eq!(greet, "Sehr geehrte Frau Schmidt,");
+    }
+
+    // --- label_to_german tests ---
+
+    #[test]
+    fn german_label_sofa() {
+        assert_eq!(label_to_german("sofa"), Some("Sofa, Couch, Liege"));
+    }
+
+    #[test]
+    fn german_label_case_insensitive() {
+        assert_eq!(label_to_german("SOFA"), Some("Sofa, Couch, Liege"));
+    }
+
+    #[test]
+    fn german_label_unknown() {
+        assert_eq!(label_to_german("xyzabc"), None);
+    }
+
+    #[test]
+    fn german_label_all_categories() {
+        // One from each major category
+        assert!(label_to_german("chair").is_some(), "seating");
+        assert!(label_to_german("desk").is_some(), "tables");
+        assert!(label_to_german("bed").is_some(), "beds");
+        assert!(label_to_german("wardrobe").is_some(), "storage");
+        assert!(label_to_german("tv").is_some(), "electronics");
+        assert!(label_to_german("fridge").is_some(), "appliances");
+        assert!(label_to_german("box").is_some(), "boxes");
+        assert!(label_to_german("piano").is_some(), "instruments");
+        assert!(label_to_german("plant").is_some(), "misc");
+    }
+
+    #[test]
+    fn german_label_aliases() {
+        // "couch" and "sofa" map to same
+        assert_eq!(label_to_german("couch"), label_to_german("sofa"));
+    }
+
+    // --- format_city tests ---
+
+    #[test]
+    fn format_city_with_postal() {
+        let addr = AddressRow {
+            id: Uuid::nil(),
+            street: "Musterstr. 1".to_string(),
+            city: "Hildesheim".to_string(),
+            postal_code: Some("31134".to_string()),
+            floor: None,
+            elevator: None,
+        };
+        assert_eq!(format_city(&addr), "31134 Hildesheim");
+    }
+
+    #[test]
+    fn format_city_without_postal() {
+        let addr = AddressRow {
+            id: Uuid::nil(),
+            street: "Musterstr. 1".to_string(),
+            city: "Hildesheim".to_string(),
+            postal_code: None,
+            floor: None,
+            elevator: None,
+        };
+        assert_eq!(format_city(&addr), "Hildesheim");
+    }
+
+    #[test]
+    fn format_city_empty_postal() {
+        let addr = AddressRow {
+            id: Uuid::nil(),
+            street: "Musterstr. 1".to_string(),
+            city: "Hildesheim".to_string(),
+            postal_code: Some("".to_string()),
+            floor: None,
+            elevator: None,
+        };
+        assert_eq!(format_city(&addr), " Hildesheim");
+    }
+
+    // --- proptests ---
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn build_line_items_never_panics(
+            s in ".*",
+            dist in 0.0..1000.0f64,
+            vol in 0.0..200.0f64,
+        ) {
+            let _ = build_line_items(Some(&s), dist, vol);
+        }
+
+        #[test]
+        fn extract_services_never_panics(s in ".*") {
+            let _ = extract_services_and_message(Some(&s));
+        }
+
+        #[test]
+        fn detect_salutation_never_panics(s in ".*") {
+            let _ = detect_salutation_and_greeting(&s);
+        }
+
+        #[test]
+        fn label_to_german_never_panics(s in ".*") {
+            let _ = label_to_german(&s);
+        }
+
+        #[test]
+        fn parse_detected_items_never_panics(val in proptest::arbitrary::any::<String>()) {
+            // Create arbitrary JSON from the string (will usually fail to deserialize, but shouldn't panic)
+            let json_val = serde_json::Value::String(val);
+            let est = VolumeEstimationRow {
+                result_data: Some(json_val),
+                source_data: None,
+                total_volume_m3: None,
+                method: "test".to_string(),
+            };
+            let _ = parse_detected_items(Some(&est));
+        }
+    }
 }

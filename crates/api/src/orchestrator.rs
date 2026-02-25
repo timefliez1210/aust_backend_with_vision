@@ -1347,3 +1347,98 @@ async fn send_telegram_message(client: &Client, bot_token: &str, chat_id: i64, t
         error!("Failed to send Telegram message: {e}");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_single_item_with_volume() {
+        let items = parse_items_list_text("1x Sofa (0.80 m³)");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "Sofa");
+        assert_eq!(items[0].quantity, 1);
+        assert!((items[0].volume_m3 - 0.80).abs() < 0.001);
+    }
+
+    #[test]
+    fn parse_multiple_items_newline() {
+        let items = parse_items_list_text("1x Sofa (0.80 m³)\n1x Tisch (0.50 m³)");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].name, "Sofa");
+        assert_eq!(items[1].name, "Tisch");
+    }
+
+    #[test]
+    fn parse_comma_separated() {
+        let items = parse_items_list_text("1x Bett (0.30 m³), 1x Tisch (0.50 m³)");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].name, "Bett");
+        assert_eq!(items[1].name, "Tisch");
+    }
+
+    #[test]
+    fn parse_quantity_greater_than_one() {
+        let items = parse_items_list_text("3x Stuhl (0.20 m³)");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].quantity, 3);
+        assert_eq!(items[0].name, "Stuhl");
+    }
+
+    #[test]
+    fn parse_comma_decimal() {
+        let items = parse_items_list_text("1x Sofa (0,80 m³)");
+        assert_eq!(items.len(), 1);
+        assert!((items[0].volume_m3 - 0.80).abs() < 0.001, "German comma decimal");
+    }
+
+    #[test]
+    fn parse_m3_variants() {
+        let items1 = parse_items_list_text("1x Sofa (0.80 m³)");
+        let items2 = parse_items_list_text("1x Sofa (0.80 m3)");
+        assert!((items1[0].volume_m3 - items2[0].volume_m3).abs() < 0.001);
+    }
+
+    #[test]
+    fn parse_no_volume() {
+        let items = parse_items_list_text("1x Sofa");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "Sofa");
+        assert!((items[0].volume_m3 - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn parse_empty_input() {
+        let items = parse_items_list_text("");
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn parse_mixed_format() {
+        let items = parse_items_list_text("1x Sofa (0.80 m³)\n2x Stuhl (0.20 m³), 1x Tisch (0.50 m³)");
+        assert_eq!(items.len(), 3);
+    }
+
+    #[test]
+    fn parse_space_x_separator() {
+        let items = parse_items_list_text("2 x Sofa (0.80 m³)");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].quantity, 2);
+    }
+
+    // Proptests
+    use proptest::prelude::*;
+    proptest! {
+        #[test]
+        fn parse_items_never_panics(s in ".*") {
+            let _ = parse_items_list_text(&s);
+        }
+
+        #[test]
+        fn parse_items_structured_fuzz(
+            s in "[0-9]{0,3}x? ?[a-zA-Z ]{0,30}( ?\\(?[0-9.,]+ ?m[³3]?\\)?)?"
+        ) {
+            let _ = parse_items_list_text(&s);
+        }
+    }
+}

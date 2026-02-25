@@ -76,3 +76,43 @@ pub struct UpdateQuote {
     pub preferred_date: Option<DateTime<Utc>>,
     pub notes: Option<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quote_status_as_str_roundtrip() {
+        let variants = [
+            (QuoteStatus::Pending, "pending"),
+            (QuoteStatus::InfoRequested, "info_requested"),
+            (QuoteStatus::VolumeEstimated, "volume_estimated"),
+            (QuoteStatus::OfferGenerated, "offer_generated"),
+            (QuoteStatus::OfferSent, "offer_sent"),
+            (QuoteStatus::Accepted, "accepted"),
+            (QuoteStatus::Rejected, "rejected"),
+            (QuoteStatus::Expired, "expired"),
+            (QuoteStatus::Cancelled, "cancelled"),
+            (QuoteStatus::Done, "done"),
+            (QuoteStatus::Paid, "paid"),
+        ];
+        for (status, expected_str) in variants {
+            assert_eq!(status.as_str(), expected_str, "as_str for {:?}", status);
+            // Roundtrip via serde
+            let json = serde_json::to_string(&status).unwrap();
+            let deserialized: QuoteStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(deserialized, status, "roundtrip for {:?}", status);
+        }
+    }
+
+    #[test]
+    fn quote_status_default() {
+        assert_eq!(QuoteStatus::default(), QuoteStatus::Pending);
+    }
+
+    #[test]
+    fn quote_status_serde_snake_case() {
+        let status: QuoteStatus = serde_json::from_str("\"offer_generated\"").unwrap();
+        assert_eq!(status, QuoteStatus::OfferGenerated);
+    }
+}

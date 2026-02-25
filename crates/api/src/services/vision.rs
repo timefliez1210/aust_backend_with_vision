@@ -139,3 +139,56 @@ pub fn parse_address(addr: &str) -> (String, String, String) {
         (addr.to_string(), String::new(), String::new())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_full_address() {
+        let (street, city, postal) = parse_address("Musterstr. 1, 31157 Sarstedt");
+        assert_eq!(street, "Musterstr. 1");
+        assert_eq!(city, "Sarstedt");
+        assert_eq!(postal, "31157");
+    }
+
+    #[test]
+    fn parse_no_postal_code() {
+        let (street, city, postal) = parse_address("Musterstr. 1, Sarstedt");
+        assert_eq!(street, "Musterstr. 1");
+        assert_eq!(city, "Sarstedt");
+        assert_eq!(postal, "");
+    }
+
+    #[test]
+    fn parse_no_comma() {
+        let (street, city, postal) = parse_address("Musterstr 1 Sarstedt");
+        assert_eq!(street, "Musterstr 1 Sarstedt");
+        assert_eq!(city, "");
+        assert_eq!(postal, "");
+    }
+
+    #[test]
+    fn parse_five_digit_postal() {
+        let (street, city, postal) = parse_address("Straße 1, 10115 Berlin");
+        assert_eq!(street, "Straße 1");
+        assert_eq!(postal, "10115");
+        assert_eq!(city, "Berlin");
+    }
+
+    #[test]
+    fn parse_four_digit_postal() {
+        let (street, city, postal) = parse_address("Straße 1, 1010 Wien");
+        assert_eq!(street, "Straße 1");
+        assert_eq!(postal, "1010");
+        assert_eq!(city, "Wien");
+    }
+
+    use proptest::prelude::*;
+    proptest! {
+        #[test]
+        fn parse_address_never_panics(s in ".*") {
+            let _ = parse_address(&s);
+        }
+    }
+}
