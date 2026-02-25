@@ -11,9 +11,10 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::{ApiError, AppState};
+use crate::routes::shared::QuoteRow;
 use aust_core::models::{
-    DepthSensorItem, DepthSensorResult, DetectedItem, Offer, OfferStatus, PricingInput, Quote,
-    QuoteStatus, VisionAnalysisResult,
+    DepthSensorResult, DetectedItem, Offer, OfferStatus, PricingInput, Quote,
+    VisionAnalysisResult,
 };
 use aust_offer_generator::{
     convert_xlsx_to_pdf, generate_offer_xlsx, parse_floor, DetectedItemRow, OfferData,
@@ -42,53 +43,6 @@ struct GenerateOfferRequest {
     rate: Option<f64>,
 }
 
-#[derive(Debug, FromRow)]
-pub(crate) struct QuoteRow {
-    pub id: Uuid,
-    pub customer_id: Uuid,
-    pub origin_address_id: Option<Uuid>,
-    pub destination_address_id: Option<Uuid>,
-    pub status: String,
-    pub estimated_volume_m3: Option<f64>,
-    pub distance_km: Option<f64>,
-    pub preferred_date: Option<chrono::DateTime<chrono::Utc>>,
-    pub notes: Option<String>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub updated_at: chrono::DateTime<chrono::Utc>,
-}
-
-impl From<QuoteRow> for Quote {
-    fn from(row: QuoteRow) -> Self {
-        let status = match row.status.as_str() {
-            "pending" => QuoteStatus::Pending,
-            "info_requested" => QuoteStatus::InfoRequested,
-            "volume_estimated" => QuoteStatus::VolumeEstimated,
-            "offer_generated" => QuoteStatus::OfferGenerated,
-            "offer_sent" => QuoteStatus::OfferSent,
-            "accepted" => QuoteStatus::Accepted,
-            "rejected" => QuoteStatus::Rejected,
-            "expired" => QuoteStatus::Expired,
-            "cancelled" => QuoteStatus::Cancelled,
-            "done" => QuoteStatus::Done,
-            "paid" => QuoteStatus::Paid,
-            _ => QuoteStatus::Pending,
-        };
-
-        Quote {
-            id: row.id,
-            customer_id: row.customer_id,
-            origin_address_id: row.origin_address_id,
-            destination_address_id: row.destination_address_id,
-            status,
-            estimated_volume_m3: row.estimated_volume_m3,
-            distance_km: row.distance_km,
-            preferred_date: row.preferred_date,
-            notes: row.notes,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
-        }
-    }
-}
 
 #[derive(Debug, FromRow)]
 struct OfferRow {
@@ -870,13 +824,8 @@ pub fn parse_detected_items(estimation: Option<&VolumeEstimationRow>) -> Vec<Det
         return result
             .detected_items
             .into_iter()
-            .map(depth_sensor_to_row)
+            .map(detected_item_to_row)
             .collect();
-    }
-
-    // Try as Vec<DepthSensorItem> (raw array from vision service)
-    if let Ok(items) = serde_json::from_value::<Vec<DepthSensorItem>>(data.clone()) {
-        return items.into_iter().map(depth_sensor_to_row).collect();
     }
 
     // Try VisionAnalysisResult (LLM, array of results)
@@ -884,7 +833,7 @@ pub fn parse_detected_items(estimation: Option<&VolumeEstimationRow>) -> Vec<Det
         return results
             .into_iter()
             .flat_map(|r| r.detected_items)
-            .map(vision_to_row)
+            .map(detected_item_to_row)
             .collect();
     }
 
@@ -893,13 +842,13 @@ pub fn parse_detected_items(estimation: Option<&VolumeEstimationRow>) -> Vec<Det
         return result
             .detected_items
             .into_iter()
-            .map(vision_to_row)
+            .map(detected_item_to_row)
             .collect();
     }
 
-    // Try Vec<DetectedItem>
+    // Try raw Vec<DetectedItem> (handles both old vision and depth_sensor arrays)
     if let Ok(items) = serde_json::from_value::<Vec<DetectedItem>>(data.clone()) {
-        return items.into_iter().map(vision_to_row).collect();
+        return items.into_iter().map(detected_item_to_row).collect();
     }
 
     // Try parsed inventory items (from VolumeCalculator items_list text)
@@ -1013,7 +962,7 @@ pub fn label_to_german(label: &str) -> Option<&'static str> {
     }
 }
 
-fn depth_sensor_to_row(item: DepthSensorItem) -> DetectedItemRow {
+fn detected_item_to_row(item: DetectedItem) -> DetectedItemRow {
     let german_name = item.german_name.or_else(|| label_to_german(&item.name).map(String::from));
     DetectedItemRow {
         name: item.name,
@@ -1032,18 +981,120 @@ fn depth_sensor_to_row(item: DepthSensorItem) -> DetectedItemRow {
     }
 }
 
-fn vision_to_row(item: DetectedItem) -> DetectedItemRow {
-    DetectedItemRow {
-        name: item.name,
-        volume_m3: item.estimated_volume_m3,
-        dimensions: None,
-        confidence: item.confidence,
-        german_name: None,
-        re_value: None,
-        volume_source: None,
-        crop_s3_key: None,
-        bbox: None,
-        bbox_image_index: None,
-        source_image_urls: None,
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_vol_est(result_data: serde_json::Value) -> VolumeEstimationRow {
+        VolumeEstimationRow {
+            result_data: Some(result_data),
+            source_data: None,
+            total_volume_m3: Some(10.0),
+            method: "depth_sensor".to_string(),
+        }
+    }
+
+    #[test]
+    fn parse_depth_sensor_result_data() {
+        let json = serde_json::json!({
+            "detected_items": [
+                {
+                    "name": "Sofa",
+                    "volume_m3": 1.2,
+                    "confidence": 0.85,
+                    "dimensions": {"length_m": 2.0, "width_m": 0.9, "height_m": 0.8},
+                    "category": "seating"
+                }
+            ],
+            "total_volume_m3": 1.2,
+            "confidence_score": 0.85,
+            "processing_time_ms": 5000
+        });
+        let est = make_vol_est(json);
+        let items = parse_detected_items(Some(&est));
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "Sofa");
+        assert!((items[0].volume_m3 - 1.2).abs() < 0.001);
+        assert!((items[0].confidence - 0.85).abs() < 0.001);
+        assert!(items[0].dimensions.is_some());
+    }
+
+    #[test]
+    fn parse_vision_llm_result_data() {
+        let json = serde_json::json!({
+            "detected_items": [
+                {"name": "Tisch", "estimated_volume_m3": 0.5, "confidence": 0.7}
+            ],
+            "total_volume_m3": 0.5,
+            "confidence_score": 0.7,
+            "room_type": "living_room"
+        });
+        let est = make_vol_est(json);
+        let items = parse_detected_items(Some(&est));
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "Tisch");
+        assert!((items[0].volume_m3 - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn parse_vision_llm_array_result_data() {
+        let json = serde_json::json!([
+            {
+                "detected_items": [
+                    {"name": "Schrank", "estimated_volume_m3": 2.0, "confidence": 0.9}
+                ],
+                "total_volume_m3": 2.0,
+                "confidence_score": 0.9
+            }
+        ]);
+        let est = make_vol_est(json);
+        let items = parse_detected_items(Some(&est));
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "Schrank");
+    }
+
+    #[test]
+    fn parse_empty_result_data() {
+        let est = VolumeEstimationRow {
+            result_data: None,
+            source_data: None,
+            total_volume_m3: None,
+            method: "vision".to_string(),
+        };
+        let items = parse_detected_items(Some(&est));
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn parse_no_estimation() {
+        let items = parse_detected_items(None);
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn parse_inventory_items() {
+        let json = serde_json::json!([
+            {"name": "Sofa", "quantity": 2, "volume_m3": 1.6}
+        ]);
+        let est = make_vol_est(json);
+        let items = parse_detected_items(Some(&est));
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "2x Sofa");
+        assert!((items[0].volume_m3 - 1.6).abs() < 0.001);
+    }
+
+    #[test]
+    fn depth_sensor_item_german_name_lookup() {
+        let json = serde_json::json!({
+            "detected_items": [
+                {"name": "sofa", "volume_m3": 1.0, "confidence": 0.9}
+            ],
+            "total_volume_m3": 1.0,
+            "confidence_score": 0.9,
+            "processing_time_ms": 3000
+        });
+        let est = make_vol_est(json);
+        let items = parse_detected_items(Some(&est));
+        assert_eq!(items[0].german_name.as_deref(), Some("Sofa, Couch, Liege"));
     }
 }

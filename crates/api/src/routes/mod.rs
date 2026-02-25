@@ -8,6 +8,7 @@ pub mod health;
 pub mod inquiries;
 pub mod offers;
 pub mod quotes;
+pub(crate) mod shared;
 
 use crate::AppState;
 use axum::extract::DefaultBodyLimit;
