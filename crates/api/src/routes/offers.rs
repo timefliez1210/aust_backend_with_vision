@@ -41,6 +41,15 @@ struct GenerateOfferRequest {
     hours: Option<f64>,
     #[serde(default)]
     rate: Option<f64>,
+    #[serde(default)]
+    line_items: Option<Vec<GenerateLineItem>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GenerateLineItem {
+    description: String,
+    quantity: f64,
+    unit_price: f64,
 }
 
 
@@ -745,7 +754,17 @@ async fn generate_offer(
         persons: request.persons,
         hours: request.hours,
         rate: request.rate,
-        line_items: None,
+        line_items: request.line_items.map(|items| {
+            items
+                .into_iter()
+                .map(|li| OfferLineItem {
+                    description: li.description,
+                    quantity: li.quantity,
+                    unit_price: li.unit_price,
+                    ..Default::default()
+                })
+                .collect()
+        }),
     };
     let result = build_offer_with_overrides(
         &state.db, &*state.storage, request.quote_id, request.valid_days, &overrides
