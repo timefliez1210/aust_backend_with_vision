@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use crate::{ApiError, AppState};
 use crate::routes::offers::{parse_detected_items, VolumeEstimationRow};
+use crate::routes::shared::QuoteRow;
 use aust_core::models::{CreateQuote, Quote, QuoteStatus, UpdateQuote};
 
 pub fn router() -> Router<Arc<AppState>> {
@@ -35,53 +36,6 @@ struct QuoteListResponse {
     offset: i64,
 }
 
-#[derive(Debug, FromRow)]
-struct QuoteRow {
-    id: Uuid,
-    customer_id: Uuid,
-    origin_address_id: Option<Uuid>,
-    destination_address_id: Option<Uuid>,
-    status: String,
-    estimated_volume_m3: Option<f64>,
-    distance_km: Option<f64>,
-    preferred_date: Option<chrono::DateTime<chrono::Utc>>,
-    notes: Option<String>,
-    created_at: chrono::DateTime<chrono::Utc>,
-    updated_at: chrono::DateTime<chrono::Utc>,
-}
-
-impl From<QuoteRow> for Quote {
-    fn from(row: QuoteRow) -> Self {
-        let status = match row.status.as_str() {
-            "pending" => QuoteStatus::Pending,
-            "info_requested" => QuoteStatus::InfoRequested,
-            "volume_estimated" => QuoteStatus::VolumeEstimated,
-            "offer_generated" => QuoteStatus::OfferGenerated,
-            "offer_sent" => QuoteStatus::OfferSent,
-            "accepted" => QuoteStatus::Accepted,
-            "rejected" => QuoteStatus::Rejected,
-            "expired" => QuoteStatus::Expired,
-            "cancelled" => QuoteStatus::Cancelled,
-            "done" => QuoteStatus::Done,
-            "paid" => QuoteStatus::Paid,
-            _ => QuoteStatus::Pending,
-        };
-
-        Quote {
-            id: row.id,
-            customer_id: row.customer_id,
-            origin_address_id: row.origin_address_id,
-            destination_address_id: row.destination_address_id,
-            status,
-            estimated_volume_m3: row.estimated_volume_m3,
-            distance_km: row.distance_km,
-            preferred_date: row.preferred_date,
-            notes: row.notes,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
-        }
-    }
-}
 
 async fn create_quote(
     State(state): State<Arc<AppState>>,

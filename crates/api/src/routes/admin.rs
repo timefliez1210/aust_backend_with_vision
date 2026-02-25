@@ -1932,41 +1932,24 @@ async fn send_plain_email(
     subject: &str,
     body: &str,
 ) -> Result<(), String> {
-    use lettre::transport::smtp::authentication::Credentials;
-    use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
+    use crate::services::email::{build_plain_email, send_email};
 
-    let from_mailbox: lettre::message::Mailbox = format!(
-        "{} <{}>",
-        email_config.from_name, email_config.from_address
+    let message = build_plain_email(
+        &email_config.from_address,
+        &email_config.from_name,
+        to,
+        subject,
+        body,
     )
-    .parse()
-    .map_err(|e| format!("Invalid from address: {e}"))?;
+    .map_err(|e| format!("Failed to build email: {e}"))?;
 
-    let to_mailbox: lettre::message::Mailbox =
-        to.parse().map_err(|e| format!("Invalid to address: {e}"))?;
-
-    let message = Message::builder()
-        .from(from_mailbox)
-        .to(to_mailbox)
-        .subject(subject)
-        .body(body.to_string())
-        .map_err(|e| format!("Failed to build email: {e}"))?;
-
-    let creds = Credentials::new(
-        email_config.username.clone(),
-        email_config.password.clone(),
-    );
-
-    let mailer = AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&email_config.smtp_host)
-        .map_err(|e| format!("SMTP relay setup failed: {e}"))?
-        .port(email_config.smtp_port)
-        .credentials(creds)
-        .build();
-
-    mailer
-        .send(message)
-        .await
-        .map_err(|e| format!("SMTP send failed: {e}"))?;
-
-    Ok(())
+    send_email(
+        &email_config.smtp_host,
+        email_config.smtp_port,
+        &email_config.username,
+        &email_config.password,
+        message,
+    )
+    .await
+    .map_err(|e| e.to_string())
 }

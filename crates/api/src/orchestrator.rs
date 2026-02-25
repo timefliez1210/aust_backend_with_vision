@@ -1324,26 +1324,9 @@ pub async fn send_offer_email(
     pdf_bytes: &[u8],
     offer_id: Uuid,
 ) -> Result<(), String> {
-    use lettre::message::{header::ContentType, Attachment, MultiPart, SinglePart};
-    use lettre::transport::smtp::authentication::Credentials;
-    use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
+    use crate::services::email::{build_email_with_attachment, send_email};
 
     let email_config = &state.config.email;
-
-    let from_mailbox: lettre::message::Mailbox = format!(
-        "{} <{}>",
-        email_config.from_name, email_config.from_address
-    )
-    .parse()
-    .map_err(|e| format!("Invalid from address: {e}"))?;
-
-    let to_mailbox: lettre::message::Mailbox =
-        to.parse().map_err(|e| format!("Invalid to address: {e}"))?;
-
-    let pdf_attachment = Attachment::new(format!("Angebot-{offer_id}.pdf")).body(
-        pdf_bytes.to_vec(),
-        ContentType::parse("application/pdf").unwrap(),
-    );
 
     let body_text = "Sehr geehrte Damen und Herren,\n\n\
         anbei erhalten Sie unser Angebot für Ihren Umzug.\n\n\
@@ -1351,32 +1334,27 @@ pub async fn send_offer_email(
         Mit freundlichen Grüßen,\n\
         Ihr Umzugsteam";
 
-    let message = Message::builder()
-        .from(from_mailbox)
-        .to(to_mailbox)
-        .subject("Ihr Umzugsangebot".to_string())
-        .multipart(
-            MultiPart::mixed()
-                .singlepart(SinglePart::plain(body_text.to_string()))
-                .singlepart(pdf_attachment),
-        )
-        .map_err(|e| format!("Failed to build email: {e}"))?;
+    let message = build_email_with_attachment(
+        &email_config.from_address,
+        &email_config.from_name,
+        to,
+        "Ihr Umzugsangebot",
+        body_text,
+        pdf_bytes,
+        &format!("Angebot-{offer_id}.pdf"),
+        "application/pdf",
+    )
+    .map_err(|e| format!("Failed to build email: {e}"))?;
 
-    let creds = Credentials::new(
-        email_config.username.clone(),
-        email_config.password.clone(),
-    );
-
-    let mailer = AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&email_config.smtp_host)
-        .map_err(|e| format!("SMTP relay setup failed: {e}"))?
-        .port(email_config.smtp_port)
-        .credentials(creds)
-        .build();
-
-    mailer
-        .send(message)
-        .await
-        .map_err(|e| format!("SMTP send failed: {e}"))?;
+    send_email(
+        &email_config.smtp_host,
+        email_config.smtp_port,
+        &email_config.username,
+        &email_config.password,
+        message,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
 
     info!("Offer email sent to {to}");
     Ok(())

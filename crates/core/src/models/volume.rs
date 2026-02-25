@@ -67,35 +67,25 @@ pub struct VisionAnalysisResult {
     pub analysis_notes: Option<String>,
 }
 
+/// Unified detected item type for all estimation methods.
+///
+/// Previously split between `DetectedItem` (LLM vision) and `DepthSensorItem` (3D pipeline).
+/// Accepts both `volume_m3` and `estimated_volume_m3` via serde alias for backward compatibility
+/// with existing JSON in the database.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectedItem {
     pub name: String,
-    pub estimated_volume_m3: f64,
-    pub confidence: f64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DepthSensorResult {
-    pub detected_items: Vec<DepthSensorItem>,
-    pub total_volume_m3: f64,
-    pub confidence_score: f64,
-    pub processing_time_ms: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DepthSensorItem {
-    pub name: String,
+    #[serde(alias = "estimated_volume_m3")]
     pub volume_m3: f64,
-    pub dimensions: Option<ItemDimensions>,
     pub confidence: f64,
+    #[serde(default)]
+    pub dimensions: Option<ItemDimensions>,
+    #[serde(default)]
     pub category: Option<String>,
-    /// German name from RE catalog (e.g. "Kleiderschrank, 2-türig")
     #[serde(default)]
     pub german_name: Option<String>,
-    /// RE value from Alltransport catalog (1 RE = 0.1 m³)
     #[serde(default)]
     pub re_value: Option<f64>,
-    /// How volume was determined: "re_lookup" or "geometric"
     #[serde(default)]
     pub volume_source: Option<String>,
     #[serde(default)]
@@ -106,6 +96,17 @@ pub struct DepthSensorItem {
     pub crop_s3_key: Option<String>,
     #[serde(default)]
     pub seen_in_images: Option<Vec<usize>>,
+}
+
+/// Type alias for backward compatibility — `DepthSensorItem` was merged into `DetectedItem`.
+pub type DepthSensorItem = DetectedItem;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DepthSensorResult {
+    pub detected_items: Vec<DetectedItem>,
+    pub total_volume_m3: f64,
+    pub confidence_score: f64,
+    pub processing_time_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
