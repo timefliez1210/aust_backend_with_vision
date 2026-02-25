@@ -52,7 +52,6 @@ impl EmailResponder {
         Ok(EmailResponse {
             subject,
             body: response_body,
-            is_final: false,
         })
     }
 
@@ -191,7 +190,6 @@ Regeln:
         EmailResponse {
             subject: "Ihr Umzugsangebot wird erstellt – AUST Umzüge".to_string(),
             body,
-            is_final: true,
         }
     }
 
@@ -244,7 +242,6 @@ Regeln:
         Ok(EmailResponse {
             subject: subject.to_string(),
             body: response,
-            is_final: false,
         })
     }
 
@@ -432,8 +429,6 @@ fn format_services(inquiry: &MovingInquiry) -> String {
 pub struct EmailResponse {
     pub subject: String,
     pub body: String,
-    /// Whether this is the final response (inquiry complete, offer being generated).
-    pub is_final: bool,
 }
 
 use chrono::NaiveDate;

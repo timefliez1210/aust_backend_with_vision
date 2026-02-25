@@ -9,15 +9,6 @@ pub enum EmailDirection {
     Outbound,
 }
 
-impl EmailDirection {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Inbound => "inbound",
-            Self::Outbound => "outbound",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmailThread {
     pub id: Uuid,
@@ -75,15 +66,3 @@ pub struct EmailAttachment {
     pub data: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EmailIntent {
-    NewInquiry,
-    ProvideInfo,
-    RequestQuote,
-    AcceptOffer,
-    RejectOffer,
-    Question,
-    Complaint,
-    Other,
-}

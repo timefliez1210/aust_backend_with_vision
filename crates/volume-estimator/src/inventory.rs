@@ -1,5 +1,5 @@
 use crate::VolumeError;
-use aust_core::models::{InventoryForm, InventoryItem};
+use aust_core::models::InventoryForm;
 
 pub struct InventoryProcessor;
 
@@ -16,31 +16,6 @@ impl InventoryProcessor {
             .sum();
 
         Ok(total)
-    }
-
-    pub fn parse_csv(&self, csv_data: &str) -> Result<Vec<InventoryItem>, VolumeError> {
-        let mut items = Vec::new();
-
-        for line in csv_data.lines().skip(1) {
-            let parts: Vec<&str> = line.split(',').collect();
-            if parts.len() >= 3 {
-                let item = InventoryItem {
-                    name: parts[0].trim().to_string(),
-                    quantity: parts[1]
-                        .trim()
-                        .parse()
-                        .map_err(|_| VolumeError::InvalidData("Invalid quantity".into()))?,
-                    volume_m3: parts[2]
-                        .trim()
-                        .parse()
-                        .map_err(|_| VolumeError::InvalidData("Invalid volume".into()))?,
-                    category: parts.get(3).map(|s| s.trim().to_string()),
-                };
-                items.push(item);
-            }
-        }
-
-        Ok(items)
     }
 }
 

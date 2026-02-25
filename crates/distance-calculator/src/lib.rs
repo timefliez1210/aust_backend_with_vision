@@ -7,4 +7,3 @@ mod router;
 pub use error::DistanceError;
 pub use geocoder::Geocoder;
 pub use route::{RouteCalculator, RouteRequest};
-pub use router::DistanceRouter;

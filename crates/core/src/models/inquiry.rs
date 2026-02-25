@@ -65,17 +65,6 @@ pub enum InquirySource {
     MediaEmail,
 }
 
-impl InquirySource {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::QuoteForm => "quote_form",
-            Self::ContactForm => "contact_form",
-            Self::DirectEmail => "direct_email",
-            Self::MediaEmail => "media_email",
-        }
-    }
-}
-
 impl MovingInquiry {
     /// Returns a list of fields that are still missing for a complete quote.
     pub fn missing_fields(&self) -> Vec<MissingField> {

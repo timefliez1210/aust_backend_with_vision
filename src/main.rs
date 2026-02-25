@@ -36,7 +36,7 @@ async fn main() -> Result<()> {
 
     // Create LLM provider
     let llm = aust_llm_providers::create_provider(&config.llm)?;
-    tracing::info!("LLM provider initialized: {}", llm.name());
+    tracing::info!("LLM provider initialized");
 
     // Create storage provider
     let storage = aust_storage::create_provider(&config.storage).await?;

@@ -59,10 +59,6 @@ struct OllamaResponseMessage {
 
 #[async_trait]
 impl LlmProvider for OllamaProvider {
-    fn name(&self) -> &str {
-        "ollama"
-    }
-
     #[instrument(skip(self, messages))]
     async fn complete(&self, messages: &[LlmMessage]) -> Result<String, LlmError> {
         let ollama_messages: Vec<OllamaMessage> = messages

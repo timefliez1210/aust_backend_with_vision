@@ -65,9 +65,6 @@ tokio-native-tls = "0.3"
 tokio-util = { version = "0.7", features = ["compat"] }
 mail-parser = "0.9"
 
-# Redis
-redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
-
 # S3
 aws-sdk-s3 = "1"
 aws-config = "1"

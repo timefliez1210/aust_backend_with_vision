@@ -10,19 +10,6 @@ pub struct VisionServiceClient {
     max_retries: u32,
 }
 
-#[derive(Debug, Serialize)]
-pub struct VisionServiceRequest {
-    pub job_id: String,
-    pub s3_keys: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub options: Option<VisionServiceOptions>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct VisionServiceOptions {
-    pub detection_threshold: Option<f64>,
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 pub struct VisionServiceResponse {
     pub job_id: String,
@@ -64,11 +51,6 @@ pub struct VisionItemDimensions {
     pub height_m: f64,
 }
 
-#[derive(Debug, Deserialize)]
-struct ReadyResponse {
-    status: String,
-}
-
 impl VisionServiceClient {
     pub fn new(base_url: &str, video_base_url: Option<&str>, timeout_secs: u64, max_retries: u32) -> Result<Self, VolumeError> {
         let client = reqwest::Client::builder()
@@ -87,36 +69,6 @@ impl VisionServiceClient {
             video_base_url: video,
             max_retries,
         })
-    }
-
-    pub async fn check_ready(&self) -> Result<bool, VolumeError> {
-        let url = format!("{}/ready", self.base_url);
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| VolumeError::ExternalService(format!("Vision service unreachable: {e}")))?;
-
-        if resp.status().is_success() {
-            let body: ReadyResponse = resp
-                .json()
-                .await
-                .map_err(|e| VolumeError::ExternalService(format!("Invalid ready response: {e}")))?;
-            Ok(body.status == "ready")
-        } else {
-            Ok(false)
-        }
-    }
-
-    pub async fn estimate_images(
-        &self,
-        request: &VisionServiceRequest,
-    ) -> Result<VisionServiceResponse, VolumeError> {
-        let url = format!("{}/estimate/images", self.base_url);
-        self.send_with_retry(&url, |client, url| {
-            client.post(url).json(request)
-        }).await
     }
 
     /// Upload raw image bytes directly to the vision service as multipart form data.

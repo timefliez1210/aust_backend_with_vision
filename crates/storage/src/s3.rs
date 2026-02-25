@@ -2,13 +2,11 @@ use crate::{StorageError, StorageProvider};
 use async_trait::async_trait;
 use aws_sdk_s3::{
     config::{BehaviorVersion, Credentials, Region},
-    presigning::PresigningConfig,
     primitives::ByteStream,
     Client,
 };
 use aust_core::config::StorageConfig;
 use bytes::Bytes;
-use std::time::Duration;
 use tracing::instrument;
 
 pub struct S3Storage {
@@ -84,50 +82,4 @@ impl StorageProvider for S3Storage {
         Ok(data.into_bytes())
     }
 
-    #[instrument(skip(self))]
-    async fn delete(&self, key: &str) -> Result<(), StorageError> {
-        self.client
-            .delete_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-            .map_err(|e| StorageError::S3(e.to_string()))?;
-
-        Ok(())
-    }
-
-    #[instrument(skip(self))]
-    async fn exists(&self, key: &str) -> Result<bool, StorageError> {
-        match self
-            .client
-            .head_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-        {
-            Ok(_) => Ok(true),
-            Err(_) => Ok(false),
-        }
-    }
-
-    #[instrument(skip(self))]
-    async fn get_presigned_url(&self, key: &str, expires_in_secs: u64) -> Result<String, StorageError> {
-        let presigning_config = PresigningConfig::builder()
-            .expires_in(Duration::from_secs(expires_in_secs))
-            .build()
-            .map_err(|e| StorageError::S3(e.to_string()))?;
-
-        let presigned = self
-            .client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .presigned(presigning_config)
-            .await
-            .map_err(|e| StorageError::S3(e.to_string()))?;
-
-        Ok(presigned.uri().to_string())
-    }
 }

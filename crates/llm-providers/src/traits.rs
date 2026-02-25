@@ -41,8 +41,6 @@ impl LlmMessage {
 
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
-    fn name(&self) -> &str;
-
     async fn complete(&self, messages: &[LlmMessage]) -> Result<String, LlmError>;
 
     async fn analyze_image(

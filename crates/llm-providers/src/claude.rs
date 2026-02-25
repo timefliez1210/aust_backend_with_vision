@@ -50,10 +50,6 @@ struct ClaudeContent {
 
 #[async_trait]
 impl LlmProvider for ClaudeProvider {
-    fn name(&self) -> &str {
-        "claude"
-    }
-
     #[instrument(skip(self, messages))]
     async fn complete(&self, messages: &[LlmMessage]) -> Result<String, LlmError> {
         let (system, messages) = extract_system_message(messages);
