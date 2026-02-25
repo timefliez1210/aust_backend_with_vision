@@ -1,4 +1,5 @@
 pub mod error;
+pub mod mock;
 pub mod traits;
 
 mod claude;
@@ -7,6 +8,7 @@ mod openai;
 
 pub use claude::ClaudeProvider;
 pub use error::LlmError;
+pub use mock::MockLlmProvider;
 pub use ollama::OllamaProvider;
 pub use openai::OpenAiProvider;
 pub use traits::{LlmMessage, LlmProvider, LlmRole};

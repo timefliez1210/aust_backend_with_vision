@@ -4,6 +4,9 @@ pub mod orchestrator;
 pub mod routes;
 pub mod state;
 
+#[cfg(test)]
+pub(crate) mod test_helpers;
+
 pub use error::ApiError;
 pub use orchestrator::{run_offer_event_handler, try_auto_generate_offer};
 pub use state::AppState;

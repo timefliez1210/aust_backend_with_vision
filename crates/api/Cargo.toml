@@ -30,10 +30,16 @@ anyhow = { workspace = true }
 validator = { workspace = true }
 jsonwebtoken = { workspace = true }
 argon2 = { workspace = true }
-redis = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
 lettre = { workspace = true }
 reqwest = { workspace = true }
 rand = { workspace = true }
 hex = { workspace = true }
+
+[dev-dependencies]
+wiremock = "0.6"
+tower = { workspace = true, features = ["util"] }
+hyper = "1"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tempfile = { workspace = true }
