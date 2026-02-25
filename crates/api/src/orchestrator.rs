@@ -4,7 +4,7 @@
 //! and get a regenerated offer.
 
 use crate::routes::offers::{build_offer, build_offer_with_overrides, GeneratedOffer, OfferOverrides};
-use crate::AppState;
+use crate::{services, AppState};
 use aust_core::config::TelegramConfig;
 use aust_core::models::MovingInquiry;
 use aust_distance_calculator::{RouteCalculator, RouteRequest};
@@ -476,7 +476,7 @@ async fn handle_complete_inquiry(
 
     // 2. Create origin address (if we have departure address)
     let origin_id = if let Some(ref addr) = inquiry.departure_address {
-        let (street, city, postal) = parse_address(addr);
+        let (street, city, postal) = services::vision::parse_address(addr);
         match sqlx::query_as::<_, (Uuid,)>(
             "INSERT INTO addresses (id, street, city, postal_code, floor, elevator) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
         )
@@ -501,7 +501,7 @@ async fn handle_complete_inquiry(
 
     // 3. Create destination address (if we have arrival address)
     let dest_id = if let Some(ref addr) = inquiry.arrival_address {
-        let (street, city, postal) = parse_address(addr);
+        let (street, city, postal) = services::vision::parse_address(addr);
         match sqlx::query_as::<_, (Uuid,)>(
             "INSERT INTO addresses (id, street, city, postal_code, floor, elevator) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
         )
@@ -774,30 +774,6 @@ pub fn parse_items_list_text(text: &str) -> Vec<ParsedInventoryItem> {
     }
 
     items
-}
-
-/// Parse a free-form address string into (street, city, postal_code).
-/// Best-effort: tries to split "Straße 1, 31157 Sarstedt" into parts.
-fn parse_address(addr: &str) -> (String, String, String) {
-    // Try to find a postal code (5-digit number typical for DE/AT)
-    let parts: Vec<&str> = addr.splitn(2, ',').collect();
-    if parts.len() == 2 {
-        let street = parts[0].trim().to_string();
-        let city_part = parts[1].trim();
-        // Try to extract postal code from city part
-        let mut postal = String::new();
-        let mut city = city_part.to_string();
-        for word in city_part.split_whitespace() {
-            if word.len() >= 4 && word.len() <= 5 && word.chars().all(|c| c.is_ascii_digit()) {
-                postal = word.to_string();
-                city = city_part.replace(word, "").trim().to_string();
-                break;
-            }
-        }
-        (street, city, postal)
-    } else {
-        (addr.to_string(), String::new(), String::new())
-    }
 }
 
 /// Build notes for the quote from inquiry data.
@@ -1253,7 +1229,7 @@ async fn handle_offer_approval(
                 )
                 .bind(Uuid::now_v7())
                 .bind(thread_id)
-                .bind("umzug@example.com")
+                .bind(&state.config.email.from_address)
                 .bind(&customer_email)
                 .bind("Ihr Umzugsangebot")
                 .bind(body)
@@ -1324,26 +1300,9 @@ pub async fn send_offer_email(
     pdf_bytes: &[u8],
     offer_id: Uuid,
 ) -> Result<(), String> {
-    use lettre::message::{header::ContentType, Attachment, MultiPart, SinglePart};
-    use lettre::transport::smtp::authentication::Credentials;
-    use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
+    use crate::services::email::{build_email_with_attachment, send_email};
 
     let email_config = &state.config.email;
-
-    let from_mailbox: lettre::message::Mailbox = format!(
-        "{} <{}>",
-        email_config.from_name, email_config.from_address
-    )
-    .parse()
-    .map_err(|e| format!("Invalid from address: {e}"))?;
-
-    let to_mailbox: lettre::message::Mailbox =
-        to.parse().map_err(|e| format!("Invalid to address: {e}"))?;
-
-    let pdf_attachment = Attachment::new(format!("Angebot-{offer_id}.pdf")).body(
-        pdf_bytes.to_vec(),
-        ContentType::parse("application/pdf").unwrap(),
-    );
 
     let body_text = "Sehr geehrte Damen und Herren,\n\n\
         anbei erhalten Sie unser Angebot für Ihren Umzug.\n\n\
@@ -1351,32 +1310,27 @@ pub async fn send_offer_email(
         Mit freundlichen Grüßen,\n\
         Ihr Umzugsteam";
 
-    let message = Message::builder()
-        .from(from_mailbox)
-        .to(to_mailbox)
-        .subject("Ihr Umzugsangebot".to_string())
-        .multipart(
-            MultiPart::mixed()
-                .singlepart(SinglePart::plain(body_text.to_string()))
-                .singlepart(pdf_attachment),
-        )
-        .map_err(|e| format!("Failed to build email: {e}"))?;
+    let message = build_email_with_attachment(
+        &email_config.from_address,
+        &email_config.from_name,
+        to,
+        "Ihr Umzugsangebot",
+        body_text,
+        pdf_bytes,
+        &format!("Angebot-{offer_id}.pdf"),
+        "application/pdf",
+    )
+    .map_err(|e| format!("Failed to build email: {e}"))?;
 
-    let creds = Credentials::new(
-        email_config.username.clone(),
-        email_config.password.clone(),
-    );
-
-    let mailer = AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&email_config.smtp_host)
-        .map_err(|e| format!("SMTP relay setup failed: {e}"))?
-        .port(email_config.smtp_port)
-        .credentials(creds)
-        .build();
-
-    mailer
-        .send(message)
-        .await
-        .map_err(|e| format!("SMTP send failed: {e}"))?;
+    send_email(
+        &email_config.smtp_host,
+        email_config.smtp_port,
+        &email_config.username,
+        &email_config.password,
+        message,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
 
     info!("Offer email sent to {to}");
     Ok(())
@@ -1391,5 +1345,100 @@ async fn send_telegram_message(client: &Client, bot_token: &str, chat_id: i64, t
 
     if let Err(e) = client.post(&api_url).json(&payload).send().await {
         error!("Failed to send Telegram message: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_single_item_with_volume() {
+        let items = parse_items_list_text("1x Sofa (0.80 m³)");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "Sofa");
+        assert_eq!(items[0].quantity, 1);
+        assert!((items[0].volume_m3 - 0.80).abs() < 0.001);
+    }
+
+    #[test]
+    fn parse_multiple_items_newline() {
+        let items = parse_items_list_text("1x Sofa (0.80 m³)\n1x Tisch (0.50 m³)");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].name, "Sofa");
+        assert_eq!(items[1].name, "Tisch");
+    }
+
+    #[test]
+    fn parse_comma_separated() {
+        let items = parse_items_list_text("1x Bett (0.30 m³), 1x Tisch (0.50 m³)");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].name, "Bett");
+        assert_eq!(items[1].name, "Tisch");
+    }
+
+    #[test]
+    fn parse_quantity_greater_than_one() {
+        let items = parse_items_list_text("3x Stuhl (0.20 m³)");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].quantity, 3);
+        assert_eq!(items[0].name, "Stuhl");
+    }
+
+    #[test]
+    fn parse_comma_decimal() {
+        let items = parse_items_list_text("1x Sofa (0,80 m³)");
+        assert_eq!(items.len(), 1);
+        assert!((items[0].volume_m3 - 0.80).abs() < 0.001, "German comma decimal");
+    }
+
+    #[test]
+    fn parse_m3_variants() {
+        let items1 = parse_items_list_text("1x Sofa (0.80 m³)");
+        let items2 = parse_items_list_text("1x Sofa (0.80 m3)");
+        assert!((items1[0].volume_m3 - items2[0].volume_m3).abs() < 0.001);
+    }
+
+    #[test]
+    fn parse_no_volume() {
+        let items = parse_items_list_text("1x Sofa");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "Sofa");
+        assert!((items[0].volume_m3 - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn parse_empty_input() {
+        let items = parse_items_list_text("");
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn parse_mixed_format() {
+        let items = parse_items_list_text("1x Sofa (0.80 m³)\n2x Stuhl (0.20 m³), 1x Tisch (0.50 m³)");
+        assert_eq!(items.len(), 3);
+    }
+
+    #[test]
+    fn parse_space_x_separator() {
+        let items = parse_items_list_text("2 x Sofa (0.80 m³)");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].quantity, 2);
+    }
+
+    // Proptests
+    use proptest::prelude::*;
+    proptest! {
+        #[test]
+        fn parse_items_never_panics(s in ".*") {
+            let _ = parse_items_list_text(&s);
+        }
+
+        #[test]
+        fn parse_items_structured_fuzz(
+            s in "[0-9]{0,3}x? ?[a-zA-Z ]{0,30}( ?\\(?[0-9.,]+ ?m[³3]?\\)?)?"
+        ) {
+            let _ = parse_items_list_text(&s);
+        }
     }
 }

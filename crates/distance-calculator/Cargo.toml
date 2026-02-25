@@ -16,7 +16,6 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
-redis = { workspace = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

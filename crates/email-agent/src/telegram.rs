@@ -79,7 +79,10 @@ pub struct ApprovalResponse {
 impl TelegramBot {
     pub fn new(bot_token: String, admin_chat_id: i64) -> Self {
         Self {
-            client: Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("Failed to create HTTP client"),
             bot_token,
             admin_chat_id,
             last_update_id: None,

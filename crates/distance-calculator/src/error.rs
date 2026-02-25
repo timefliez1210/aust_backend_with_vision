@@ -11,9 +11,6 @@ pub enum DistanceError {
     #[error("API error: {0}")]
     Api(String),
 
-    #[error("Cache error: {0}")]
-    Cache(String),
-
     #[error("Network error: {0}")]
     Network(#[from] reqwest::Error),
 }

@@ -15,7 +15,10 @@ pub struct OllamaProvider {
 impl OllamaProvider {
     pub fn new(base_url: String, model: String) -> Self {
         Self {
-            client: Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build()
+                .expect("Failed to create HTTP client"),
             base_url,
             model,
             api_key: None,
@@ -24,7 +27,10 @@ impl OllamaProvider {
 
     pub fn with_api_key(base_url: String, model: String, api_key: String) -> Self {
         Self {
-            client: Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build()
+                .expect("Failed to create HTTP client"),
             base_url,
             model,
             api_key: Some(api_key),
@@ -59,10 +65,6 @@ struct OllamaResponseMessage {
 
 #[async_trait]
 impl LlmProvider for OllamaProvider {
-    fn name(&self) -> &str {
-        "ollama"
-    }
-
     #[instrument(skip(self, messages))]
     async fn complete(&self, messages: &[LlmMessage]) -> Result<String, LlmError> {
         let ollama_messages: Vec<OllamaMessage> = messages

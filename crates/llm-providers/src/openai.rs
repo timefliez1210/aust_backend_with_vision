@@ -16,7 +16,10 @@ pub struct OpenAiProvider {
 impl OpenAiProvider {
     pub fn new(api_key: String, model: String) -> Self {
         Self {
-            client: Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build()
+                .expect("Failed to create HTTP client"),
             api_key,
             model,
         }
@@ -53,10 +56,6 @@ struct OpenAiResponseMessage {
 
 #[async_trait]
 impl LlmProvider for OpenAiProvider {
-    fn name(&self) -> &str {
-        "openai"
-    }
-
     #[instrument(skip(self, messages))]
     async fn complete(&self, messages: &[LlmMessage]) -> Result<String, LlmError> {
         let openai_messages: Vec<OpenAiMessage> = messages

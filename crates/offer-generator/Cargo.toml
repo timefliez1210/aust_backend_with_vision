@@ -21,3 +21,6 @@ chrono = { workspace = true }
 zip = { workspace = true }
 tempfile = { workspace = true }
 bytes = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"

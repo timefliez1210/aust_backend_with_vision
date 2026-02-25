@@ -49,25 +49,4 @@ impl StorageProvider for LocalStorage {
         Ok(Bytes::from(data))
     }
 
-    #[instrument(skip(self))]
-    async fn delete(&self, key: &str) -> Result<(), StorageError> {
-        let path = self.get_full_path(key);
-
-        if path.exists() {
-            fs::remove_file(&path).await?;
-        }
-
-        Ok(())
-    }
-
-    #[instrument(skip(self))]
-    async fn exists(&self, key: &str) -> Result<bool, StorageError> {
-        let path = self.get_full_path(key);
-        Ok(path.exists())
-    }
-
-    #[instrument(skip(self))]
-    async fn get_presigned_url(&self, key: &str, _expires_in_secs: u64) -> Result<String, StorageError> {
-        Ok(format!("file://{}", self.get_full_path(key).display()))
-    }
 }

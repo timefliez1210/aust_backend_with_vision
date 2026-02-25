@@ -44,9 +44,12 @@ fn preview_offer_pdf() {
         estimated_hours: 2.0,
         rate_per_person_hour: 30.0,
         line_items: vec![
-            OfferLineItem { row: 33, description: None, quantity: 1.0, unit_price: 30.0 },
-            OfferLineItem { row: 39, description: None, quantity: 1.0, unit_price: 60.0 },
-            OfferLineItem { row: 42, description: None, quantity: 1.0, unit_price: 51.29 },
+            OfferLineItem { description: "4 Umzugshelfer".to_string(), quantity: 4.0, unit_price: 30.0, is_labor: true, remark: None },
+            OfferLineItem { description: "De/Montage".to_string(), quantity: 1.0, unit_price: 50.0, is_labor: false, remark: None },
+            OfferLineItem { description: "Halteverbotszone".to_string(), quantity: 2.0, unit_price: 100.0, is_labor: false, remark: Some("Beladestelle + Entladestelle".to_string()) },
+            OfferLineItem { description: "Umzugsmaterial".to_string(), quantity: 1.0, unit_price: 30.0, is_labor: false, remark: Some("inkl. Einpackservice".to_string()) },
+            OfferLineItem { description: "3,5t Transporter".to_string(), quantity: 1.0, unit_price: 60.0, is_labor: false, remark: Some("m. Koffer".to_string()) },
+            OfferLineItem { description: "Anfahrt/Abfahrt".to_string(), quantity: 1.0, unit_price: 51.29, is_labor: false, remark: None },
         ],
         detected_items: vec![
             make_item("Schreibtisch bis 1,6 m", "Schreibtisch", 12.0, 1.20, None),

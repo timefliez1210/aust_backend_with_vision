@@ -35,19 +35,6 @@ fn default_country() -> String {
     "Österreich".to_string()
 }
 
-/// Valid floor options matching the website form.
-pub const FLOOR_OPTIONS: &[&str] = &[
-    "Erdgeschoss",
-    "Hochparterre",
-    "1. Stock",
-    "2. Stock",
-    "3. Stock",
-    "4. Stock",
-    "5. Stock",
-    "6. Stock",
-    "Höher als 6. Stock",
-];
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeoLocation {
     pub latitude: f64,

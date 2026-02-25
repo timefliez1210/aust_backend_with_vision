@@ -11,9 +11,10 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::{ApiError, AppState};
+use crate::routes::shared::QuoteRow;
 use aust_core::models::{
-    DepthSensorItem, DepthSensorResult, DetectedItem, Offer, OfferStatus, PricingInput, Quote,
-    QuoteStatus, VisionAnalysisResult,
+    DepthSensorResult, DetectedItem, Offer, OfferStatus, PricingInput, Quote,
+    VisionAnalysisResult,
 };
 use aust_offer_generator::{
     convert_xlsx_to_pdf, generate_offer_xlsx, parse_floor, DetectedItemRow, OfferData,
@@ -42,53 +43,6 @@ struct GenerateOfferRequest {
     rate: Option<f64>,
 }
 
-#[derive(Debug, FromRow)]
-pub(crate) struct QuoteRow {
-    pub id: Uuid,
-    pub customer_id: Uuid,
-    pub origin_address_id: Option<Uuid>,
-    pub destination_address_id: Option<Uuid>,
-    pub status: String,
-    pub estimated_volume_m3: Option<f64>,
-    pub distance_km: Option<f64>,
-    pub preferred_date: Option<chrono::DateTime<chrono::Utc>>,
-    pub notes: Option<String>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub updated_at: chrono::DateTime<chrono::Utc>,
-}
-
-impl From<QuoteRow> for Quote {
-    fn from(row: QuoteRow) -> Self {
-        let status = match row.status.as_str() {
-            "pending" => QuoteStatus::Pending,
-            "info_requested" => QuoteStatus::InfoRequested,
-            "volume_estimated" => QuoteStatus::VolumeEstimated,
-            "offer_generated" => QuoteStatus::OfferGenerated,
-            "offer_sent" => QuoteStatus::OfferSent,
-            "accepted" => QuoteStatus::Accepted,
-            "rejected" => QuoteStatus::Rejected,
-            "expired" => QuoteStatus::Expired,
-            "cancelled" => QuoteStatus::Cancelled,
-            "done" => QuoteStatus::Done,
-            "paid" => QuoteStatus::Paid,
-            _ => QuoteStatus::Pending,
-        };
-
-        Quote {
-            id: row.id,
-            customer_id: row.customer_id,
-            origin_address_id: row.origin_address_id,
-            destination_address_id: row.destination_address_id,
-            status,
-            estimated_volume_m3: row.estimated_volume_m3,
-            distance_km: row.distance_km,
-            preferred_date: row.preferred_date,
-            notes: row.notes,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
-        }
-    }
-}
 
 #[derive(Debug, FromRow)]
 struct OfferRow {
@@ -346,7 +300,7 @@ pub async fn build_offer_with_overrides(
         // Sum up non-labor line items that contribute to the XLSX netto total
         let other_items_netto: f64 = line_items
             .iter()
-            .filter(|li| li.row != 38) // exclude labor row
+            .filter(|li| !li.is_labor)
             .map(|li| li.quantity * li.unit_price)
             .sum();
 
@@ -408,6 +362,16 @@ pub async fn build_offer_with_overrides(
     let valid_until_date =
         valid_days.map(|days| (now + chrono::Duration::days(days)).date_naive());
 
+    // Labor is always the first line item
+    let mut all_items = vec![OfferLineItem {
+        description: format!("{} Umzugshelfer", pricing_result.estimated_helpers),
+        quantity: pricing_result.estimated_hours,
+        unit_price: rate_override,
+        is_labor: true,
+        ..Default::default()
+    }];
+    all_items.extend(line_items);
+
     let offer_data = OfferData {
         offer_number: offer_number.clone(),
         date: today,
@@ -430,7 +394,7 @@ pub async fn build_offer_with_overrides(
         persons: pricing_result.estimated_helpers,
         estimated_hours: pricing_result.estimated_hours,
         rate_per_person_hour: rate_override,
-        line_items,
+        line_items: all_items,
         detected_items: detected_items.clone(),
     };
 
@@ -466,12 +430,19 @@ pub async fn build_offer_with_overrides(
         };
 
     // 10. Insert offer record
-    let valid_until =
-        valid_days.map(|days| (now + chrono::Duration::days(days)).date_naive());
-
     // Serialize line items for storage
     let line_items_json = serde_json::to_value(&offer_data.line_items).ok();
     let rate_cents = (rate_override * 100.0).round() as i64;
+
+    // Compute actual netto from line items (must match XLSX SUM(G31:G42))
+    let actual_netto: f64 = offer_data.line_items.iter().map(|item| {
+        if item.is_labor {
+            item.quantity * item.unit_price * pricing_result.estimated_helpers as f64
+        } else {
+            item.quantity * item.unit_price
+        }
+    }).sum();
+    let actual_netto_cents = (actual_netto * 100.0).round() as i64;
 
     let row: OfferRow = sqlx::query_as(
         r#"
@@ -484,9 +455,9 @@ pub async fn build_offer_with_overrides(
     )
     .bind(offer_id)
     .bind(quote_id)
-    .bind(pricing_result.total_price_cents)
+    .bind(actual_netto_cents)
     .bind("EUR")
-    .bind(valid_until)
+    .bind(valid_until_date)
     .bind(Some(&s3_key))
     .bind(OfferStatus::Draft.as_str())
     .bind(now)
@@ -534,7 +505,7 @@ pub async fn build_offer_with_overrides(
         persons: pricing_result.estimated_helpers,
         hours: pricing_result.estimated_hours,
         rate: rate_override,
-        netto_cents: pricing_result.total_price_cents,
+        netto_cents: actual_netto_cents,
         customer_message,
     };
 
@@ -672,18 +643,10 @@ fn detect_salutation_and_greeting(name: &str) -> (String, String) {
     }
 }
 
-/// Build line items for the XLSX offer from quote notes, distance, and pricing.
+/// Build non-labor line items for the XLSX offer from quote notes, distance, and pricing.
 ///
-/// Template row mapping:
-///   31: De/Montage            — qty × €50
-///   32: Halteverbotszone      — qty × €100 (per location)
-///   33: Umzugsmaterial        — 1 × €30 (template default, override if Einpackservice)
-///   34: Seidenpapier          — qty × €5 (if packing service)
-///   35: U-Karton              — qty × €2.10 (if packing service)
-///   37: Kleiderboxen          — qty × €10 (if packing service)
-///   38: Personal              — hours × rate × persons (handled separately in xlsx.rs)
-///   39: 3,5t Transporter      — qty × €60 (based on volume)
-///   42: Anfahrt/Abfahrt       — 1 × distance-based price
+/// Items are written dynamically into rows 31-42 (no fixed row assignments).
+/// Labor is prepended separately in `build_offer_with_overrides()`.
 fn build_line_items(
     notes: Option<&str>,
     distance_km: f64,
@@ -694,18 +657,18 @@ fn build_line_items(
         .unwrap_or_default();
     let mut items = Vec::new();
 
-    // Row 31: De/Montage — if assembly or disassembly service requested
+    // De/Montage — if assembly or disassembly service requested
     let has_montage = notes_lower.contains("montage") || notes_lower.contains("demontage");
     if has_montage {
         items.push(OfferLineItem {
-            row: 31,
-            description: None,
+            description: "De/Montage".to_string(),
             quantity: 1.0,
-            unit_price: 50.0, // template preset: €50 per unit
+            unit_price: 50.0,
+            ..Default::default()
         });
     }
 
-    // Row 32: Halteverbotszone — count parking ban locations
+    // Halteverbotszone — count parking ban locations
     let mut halteverbot_count = 0.0;
     if notes_lower.contains("halteverbot auszug") {
         halteverbot_count += 1.0;
@@ -714,49 +677,51 @@ fn build_line_items(
         halteverbot_count += 1.0;
     }
     if halteverbot_count > 0.0 {
-        let desc = if halteverbot_count > 1.0 {
+        let remark = if halteverbot_count > 1.0 {
             Some("Beladestelle + Entladestelle".to_string())
         } else if notes_lower.contains("halteverbot auszug") {
             Some("Beladestelle".to_string())
         } else {
-            None // template default says "Entladestelle"
+            Some("Entladestelle".to_string())
         };
         items.push(OfferLineItem {
-            row: 32,
-            description: desc,
+            description: "Halteverbotszone".to_string(),
             quantity: halteverbot_count,
             unit_price: 100.0,
+            remark,
+            ..Default::default()
         });
     }
 
-    // Row 33: Umzugsmaterial — if Verpackungsservice/Einpackservice, note it
+    // Umzugsmaterial — if Verpackungsservice/Einpackservice
     if notes_lower.contains("verpackungsservice") || notes_lower.contains("einpackservice") {
         items.push(OfferLineItem {
-            row: 33,
-            description: Some("Umzugsmaterial inkl. Einpackservice (nach Aufwand)".to_string()),
+            description: "Umzugsmaterial".to_string(),
             quantity: 1.0,
-            unit_price: 30.0, // template preset: €30 per unit
+            unit_price: 30.0,
+            remark: Some("inkl. Einpackservice".to_string()),
+            ..Default::default()
         });
     }
 
-    // Row 39: Transporter — based on volume (2 trucks for >30m³)
+    // Transporter — based on volume (2 trucks for >30m³)
     let truck_count = if volume_m3 > 30.0 { 2.0 } else { 1.0 };
     items.push(OfferLineItem {
-        row: 39,
-        description: None,
+        description: "3,5t Transporter".to_string(),
         quantity: truck_count,
         unit_price: 60.0,
+        remark: Some("m. Koffer".to_string()),
+        ..Default::default()
     });
 
-    // Row 42: Anfahrt/Abfahrt — adjust based on distance
+    // Anfahrt/Abfahrt — adjust based on distance
     if distance_km > 0.0 {
-        // Price scales with distance: base €30 + €1.50/km
         let anfahrt_price = 30.0 + (distance_km * 1.5);
         items.push(OfferLineItem {
-            row: 42,
-            description: None,
+            description: "Anfahrt/Abfahrt".to_string(),
             quantity: 1.0,
             unit_price: anfahrt_price,
+            ..Default::default()
         });
     }
 
@@ -870,13 +835,8 @@ pub fn parse_detected_items(estimation: Option<&VolumeEstimationRow>) -> Vec<Det
         return result
             .detected_items
             .into_iter()
-            .map(depth_sensor_to_row)
+            .map(detected_item_to_row)
             .collect();
-    }
-
-    // Try as Vec<DepthSensorItem> (raw array from vision service)
-    if let Ok(items) = serde_json::from_value::<Vec<DepthSensorItem>>(data.clone()) {
-        return items.into_iter().map(depth_sensor_to_row).collect();
     }
 
     // Try VisionAnalysisResult (LLM, array of results)
@@ -884,7 +844,7 @@ pub fn parse_detected_items(estimation: Option<&VolumeEstimationRow>) -> Vec<Det
         return results
             .into_iter()
             .flat_map(|r| r.detected_items)
-            .map(vision_to_row)
+            .map(detected_item_to_row)
             .collect();
     }
 
@@ -893,13 +853,13 @@ pub fn parse_detected_items(estimation: Option<&VolumeEstimationRow>) -> Vec<Det
         return result
             .detected_items
             .into_iter()
-            .map(vision_to_row)
+            .map(detected_item_to_row)
             .collect();
     }
 
-    // Try Vec<DetectedItem>
+    // Try raw Vec<DetectedItem> (handles both old vision and depth_sensor arrays)
     if let Ok(items) = serde_json::from_value::<Vec<DetectedItem>>(data.clone()) {
-        return items.into_iter().map(vision_to_row).collect();
+        return items.into_iter().map(detected_item_to_row).collect();
     }
 
     // Try parsed inventory items (from VolumeCalculator items_list text)
@@ -1013,7 +973,7 @@ pub fn label_to_german(label: &str) -> Option<&'static str> {
     }
 }
 
-fn depth_sensor_to_row(item: DepthSensorItem) -> DetectedItemRow {
+fn detected_item_to_row(item: DetectedItem) -> DetectedItemRow {
     let german_name = item.german_name.or_else(|| label_to_german(&item.name).map(String::from));
     DetectedItemRow {
         name: item.name,
@@ -1032,18 +992,444 @@ fn depth_sensor_to_row(item: DepthSensorItem) -> DetectedItemRow {
     }
 }
 
-fn vision_to_row(item: DetectedItem) -> DetectedItemRow {
-    DetectedItemRow {
-        name: item.name,
-        volume_m3: item.estimated_volume_m3,
-        dimensions: None,
-        confidence: item.confidence,
-        german_name: None,
-        re_value: None,
-        volume_source: None,
-        crop_s3_key: None,
-        bbox: None,
-        bbox_image_index: None,
-        source_image_urls: None,
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_vol_est(result_data: serde_json::Value) -> VolumeEstimationRow {
+        VolumeEstimationRow {
+            result_data: Some(result_data),
+            source_data: None,
+            total_volume_m3: Some(10.0),
+            method: "depth_sensor".to_string(),
+        }
+    }
+
+    #[test]
+    fn parse_depth_sensor_result_data() {
+        let json = serde_json::json!({
+            "detected_items": [
+                {
+                    "name": "Sofa",
+                    "volume_m3": 1.2,
+                    "confidence": 0.85,
+                    "dimensions": {"length_m": 2.0, "width_m": 0.9, "height_m": 0.8},
+                    "category": "seating"
+                }
+            ],
+            "total_volume_m3": 1.2,
+            "confidence_score": 0.85,
+            "processing_time_ms": 5000
+        });
+        let est = make_vol_est(json);
+        let items = parse_detected_items(Some(&est));
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "Sofa");
+        assert!((items[0].volume_m3 - 1.2).abs() < 0.001);
+        assert!((items[0].confidence - 0.85).abs() < 0.001);
+        assert!(items[0].dimensions.is_some());
+    }
+
+    #[test]
+    fn parse_vision_llm_result_data() {
+        let json = serde_json::json!({
+            "detected_items": [
+                {"name": "Tisch", "estimated_volume_m3": 0.5, "confidence": 0.7}
+            ],
+            "total_volume_m3": 0.5,
+            "confidence_score": 0.7,
+            "room_type": "living_room"
+        });
+        let est = make_vol_est(json);
+        let items = parse_detected_items(Some(&est));
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "Tisch");
+        assert!((items[0].volume_m3 - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn parse_vision_llm_array_result_data() {
+        let json = serde_json::json!([
+            {
+                "detected_items": [
+                    {"name": "Schrank", "estimated_volume_m3": 2.0, "confidence": 0.9}
+                ],
+                "total_volume_m3": 2.0,
+                "confidence_score": 0.9
+            }
+        ]);
+        let est = make_vol_est(json);
+        let items = parse_detected_items(Some(&est));
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "Schrank");
+    }
+
+    #[test]
+    fn parse_empty_result_data() {
+        let est = VolumeEstimationRow {
+            result_data: None,
+            source_data: None,
+            total_volume_m3: None,
+            method: "vision".to_string(),
+        };
+        let items = parse_detected_items(Some(&est));
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn parse_no_estimation() {
+        let items = parse_detected_items(None);
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn parse_inventory_items() {
+        let json = serde_json::json!([
+            {"name": "Sofa", "quantity": 2, "volume_m3": 1.6}
+        ]);
+        let est = make_vol_est(json);
+        let items = parse_detected_items(Some(&est));
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "2x Sofa");
+        assert!((items[0].volume_m3 - 1.6).abs() < 0.001);
+    }
+
+    #[test]
+    fn depth_sensor_item_german_name_lookup() {
+        let json = serde_json::json!({
+            "detected_items": [
+                {"name": "sofa", "volume_m3": 1.0, "confidence": 0.9}
+            ],
+            "total_volume_m3": 1.0,
+            "confidence_score": 0.9,
+            "processing_time_ms": 3000
+        });
+        let est = make_vol_est(json);
+        let items = parse_detected_items(Some(&est));
+        assert_eq!(items[0].german_name.as_deref(), Some("Sofa, Couch, Liege"));
+    }
+
+    // --- build_line_items tests ---
+
+    #[test]
+    fn line_items_no_services() {
+        let items = build_line_items(None, 0.0, 20.0);
+        // Should only have truck, no anfahrt (distance=0)
+        assert_eq!(items.len(), 1);
+        assert!(items[0].description.contains("Transporter"));
+        assert_eq!(items[0].quantity, 1.0);
+        assert!(!items[0].is_labor);
+    }
+
+    #[test]
+    fn line_items_montage() {
+        let items = build_line_items(Some("montage"), 0.0, 20.0);
+        let montage = items.iter().find(|i| i.description.contains("Montage")).expect("should have montage");
+        assert_eq!(montage.quantity, 1.0);
+        assert_eq!(montage.unit_price, 50.0);
+    }
+
+    #[test]
+    fn line_items_demontage() {
+        let items = build_line_items(Some("Demontage"), 0.0, 20.0);
+        assert!(items.iter().any(|i| i.description.contains("Montage")));
+    }
+
+    #[test]
+    fn line_items_halteverbot_auszug_only() {
+        let items = build_line_items(Some("Halteverbot Auszug"), 0.0, 20.0);
+        let hv = items.iter().find(|i| i.description.contains("Halteverbot")).expect("should have halteverbot");
+        assert_eq!(hv.quantity, 1.0);
+        assert_eq!(hv.description, "Halteverbotszone");
+    }
+
+    #[test]
+    fn line_items_halteverbot_both() {
+        let items = build_line_items(Some("Halteverbot Auszug, Halteverbot Einzug"), 0.0, 20.0);
+        let hv = items.iter().find(|i| i.description.contains("Halteverbot")).expect("should have halteverbot");
+        assert_eq!(hv.quantity, 2.0);
+        assert_eq!(hv.description, "Halteverbotszone");
+    }
+
+    #[test]
+    fn line_items_einpackservice() {
+        let items = build_line_items(Some("einpackservice"), 0.0, 20.0);
+        let ep = items.iter().find(|i| i.description.contains("Umzugsmaterial")).expect("should have umzugsmaterial");
+        assert_eq!(ep.quantity, 1.0);
+        assert_eq!(ep.unit_price, 30.0);
+    }
+
+    #[test]
+    fn line_items_verpackungsservice() {
+        let items = build_line_items(Some("Verpackungsservice"), 0.0, 20.0);
+        assert!(items.iter().any(|i| i.description.contains("Umzugsmaterial")));
+    }
+
+    #[test]
+    fn line_items_truck_count_small() {
+        let items = build_line_items(None, 0.0, 30.0);
+        let truck = items.iter().find(|i| i.description.contains("Transporter")).unwrap();
+        assert_eq!(truck.quantity, 1.0);
+    }
+
+    #[test]
+    fn line_items_truck_count_large() {
+        let items = build_line_items(None, 0.0, 31.0);
+        let truck = items.iter().find(|i| i.description.contains("Transporter")).unwrap();
+        assert_eq!(truck.quantity, 2.0);
+    }
+
+    #[test]
+    fn line_items_anfahrt_distance() {
+        let items = build_line_items(None, 50.0, 20.0);
+        let anfahrt = items.iter().find(|i| i.description.contains("Anfahrt")).expect("should have anfahrt");
+        assert_eq!(anfahrt.quantity, 1.0);
+        assert!((anfahrt.unit_price - 105.0).abs() < 0.01, "30 + 50*1.5 = 105");
+    }
+
+    #[test]
+    fn line_items_all_services_combined() {
+        let items = build_line_items(
+            Some("Montage, Halteverbot Auszug, Halteverbot Einzug, Verpackungsservice"),
+            100.0,
+            35.0,
+        );
+        assert!(items.iter().any(|i| i.description.contains("Montage")), "montage");
+        assert!(items.iter().any(|i| i.description.contains("Halteverbot")), "halteverbot");
+        assert!(items.iter().any(|i| i.description.contains("Umzugsmaterial")), "umzugsmaterial");
+        let truck = items.iter().find(|i| i.description.contains("Transporter")).unwrap();
+        assert_eq!(truck.quantity, 2.0, "volume > 30 → 2 trucks");
+        let anfahrt = items.iter().find(|i| i.description.contains("Anfahrt")).unwrap();
+        assert!((anfahrt.unit_price - 180.0).abs() < 0.01, "30 + 100*1.5 = 180");
+    }
+
+    #[test]
+    fn line_items_zero_distance_no_anfahrt() {
+        let items = build_line_items(None, 0.0, 20.0);
+        assert!(!items.iter().any(|i| i.description.contains("Anfahrt")), "no anfahrt for zero distance");
+    }
+
+    // --- extract_services_and_message tests ---
+
+    #[test]
+    fn extract_services_none() {
+        let (services, msg) = extract_services_and_message(None);
+        assert!(services.is_empty());
+        assert!(msg.is_empty());
+    }
+
+    #[test]
+    fn extract_only_services() {
+        let (services, msg) = extract_services_and_message(Some("Halteverbot Auszug, Montage"));
+        assert!(services.contains("Halteverbot Auszug"));
+        assert!(services.contains("Montage"));
+        assert!(msg.is_empty());
+    }
+
+    #[test]
+    fn extract_only_message() {
+        let (services, msg) = extract_services_and_message(Some("Bitte vorsichtig mit dem Klavier"));
+        assert!(services.is_empty());
+        assert_eq!(msg, "Bitte vorsichtig mit dem Klavier");
+    }
+
+    #[test]
+    fn extract_mixed() {
+        let (services, msg) = extract_services_and_message(
+            Some("Montage, Bitte vorsichtig, Halteverbot Auszug")
+        );
+        assert!(services.contains("Montage"));
+        assert!(services.contains("Halteverbot Auszug"));
+        assert_eq!(msg, "Bitte vorsichtig");
+    }
+
+    #[test]
+    fn extract_floor_prefixes() {
+        let (services, msg) = extract_services_and_message(
+            Some("Auszug: 3. Stock, Einzug: 1. Stock")
+        );
+        assert!(services.contains("Auszug: 3. Stock"));
+        assert!(services.contains("Einzug: 1. Stock"));
+        assert!(msg.is_empty());
+    }
+
+    #[test]
+    fn extract_case_insensitive() {
+        // Note: the function converts to lowercase for matching
+        let (services, _msg) = extract_services_and_message(Some("MONTAGE"));
+        // "MONTAGE" trimmed lowercase = "montage" which matches
+        assert!(!services.is_empty());
+    }
+
+    // --- detect_salutation_and_greeting tests ---
+
+    #[test]
+    fn salutation_explicit_herr() {
+        let (sal, greet) = detect_salutation_and_greeting("Herr Müller");
+        assert_eq!(sal, "Herrn");
+        assert_eq!(greet, "Sehr geehrter Herr Müller,");
+    }
+
+    #[test]
+    fn salutation_explicit_frau() {
+        let (sal, greet) = detect_salutation_and_greeting("Frau Schmidt");
+        assert_eq!(sal, "Frau");
+        assert_eq!(greet, "Sehr geehrte Frau Schmidt,");
+    }
+
+    #[test]
+    fn salutation_female_first_name() {
+        let (sal, greet) = detect_salutation_and_greeting("Anna Müller");
+        assert_eq!(sal, "Frau");
+        assert_eq!(greet, "Sehr geehrte Frau Müller,");
+    }
+
+    #[test]
+    fn salutation_male_first_name() {
+        let (sal, greet) = detect_salutation_and_greeting("Thomas Müller");
+        assert_eq!(sal, "Herrn");
+        assert_eq!(greet, "Sehr geehrter Herr Müller,");
+    }
+
+    #[test]
+    fn salutation_single_name() {
+        let (sal, greet) = detect_salutation_and_greeting("Müller");
+        assert_eq!(sal, "");
+        assert_eq!(greet, "Sehr geehrte Damen und Herren,");
+    }
+
+    #[test]
+    fn salutation_unknown_first_name() {
+        let (sal, greet) = detect_salutation_and_greeting("Xandr Müller");
+        assert_eq!(sal, "Herrn");
+        assert_eq!(greet, "Sehr geehrter Herr Müller,");
+    }
+
+    #[test]
+    fn salutation_whitespace_handling() {
+        let (sal, greet) = detect_salutation_and_greeting("  Frau Schmidt  ");
+        assert_eq!(sal, "Frau");
+        assert_eq!(greet, "Sehr geehrte Frau Schmidt,");
+    }
+
+    // --- label_to_german tests ---
+
+    #[test]
+    fn german_label_sofa() {
+        assert_eq!(label_to_german("sofa"), Some("Sofa, Couch, Liege"));
+    }
+
+    #[test]
+    fn german_label_case_insensitive() {
+        assert_eq!(label_to_german("SOFA"), Some("Sofa, Couch, Liege"));
+    }
+
+    #[test]
+    fn german_label_unknown() {
+        assert_eq!(label_to_german("xyzabc"), None);
+    }
+
+    #[test]
+    fn german_label_all_categories() {
+        // One from each major category
+        assert!(label_to_german("chair").is_some(), "seating");
+        assert!(label_to_german("desk").is_some(), "tables");
+        assert!(label_to_german("bed").is_some(), "beds");
+        assert!(label_to_german("wardrobe").is_some(), "storage");
+        assert!(label_to_german("tv").is_some(), "electronics");
+        assert!(label_to_german("fridge").is_some(), "appliances");
+        assert!(label_to_german("box").is_some(), "boxes");
+        assert!(label_to_german("piano").is_some(), "instruments");
+        assert!(label_to_german("plant").is_some(), "misc");
+    }
+
+    #[test]
+    fn german_label_aliases() {
+        // "couch" and "sofa" map to same
+        assert_eq!(label_to_german("couch"), label_to_german("sofa"));
+    }
+
+    // --- format_city tests ---
+
+    #[test]
+    fn format_city_with_postal() {
+        let addr = AddressRow {
+            id: Uuid::nil(),
+            street: "Musterstr. 1".to_string(),
+            city: "Hildesheim".to_string(),
+            postal_code: Some("31134".to_string()),
+            floor: None,
+            elevator: None,
+        };
+        assert_eq!(format_city(&addr), "31134 Hildesheim");
+    }
+
+    #[test]
+    fn format_city_without_postal() {
+        let addr = AddressRow {
+            id: Uuid::nil(),
+            street: "Musterstr. 1".to_string(),
+            city: "Hildesheim".to_string(),
+            postal_code: None,
+            floor: None,
+            elevator: None,
+        };
+        assert_eq!(format_city(&addr), "Hildesheim");
+    }
+
+    #[test]
+    fn format_city_empty_postal() {
+        let addr = AddressRow {
+            id: Uuid::nil(),
+            street: "Musterstr. 1".to_string(),
+            city: "Hildesheim".to_string(),
+            postal_code: Some("".to_string()),
+            floor: None,
+            elevator: None,
+        };
+        assert_eq!(format_city(&addr), " Hildesheim");
+    }
+
+    // --- proptests ---
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn build_line_items_never_panics(
+            s in ".*",
+            dist in 0.0..1000.0f64,
+            vol in 0.0..200.0f64,
+        ) {
+            let _ = build_line_items(Some(&s), dist, vol);
+        }
+
+        #[test]
+        fn extract_services_never_panics(s in ".*") {
+            let _ = extract_services_and_message(Some(&s));
+        }
+
+        #[test]
+        fn detect_salutation_never_panics(s in ".*") {
+            let _ = detect_salutation_and_greeting(&s);
+        }
+
+        #[test]
+        fn label_to_german_never_panics(s in ".*") {
+            let _ = label_to_german(&s);
+        }
+
+        #[test]
+        fn parse_detected_items_never_panics(val in proptest::arbitrary::any::<String>()) {
+            // Create arbitrary JSON from the string (will usually fail to deserialize, but shouldn't panic)
+            let json_val = serde_json::Value::String(val);
+            let est = VolumeEstimationRow {
+                result_data: Some(json_val),
+                source_data: None,
+                total_volume_m3: None,
+                method: "test".to_string(),
+            };
+            let _ = parse_detected_items(Some(&est));
+        }
     }
 }

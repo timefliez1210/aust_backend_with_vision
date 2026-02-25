@@ -16,7 +16,10 @@ pub struct ClaudeProvider {
 impl ClaudeProvider {
     pub fn new(api_key: String, model: String) -> Self {
         Self {
-            client: Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build()
+                .expect("Failed to create HTTP client"),
             api_key,
             model,
         }
@@ -50,10 +53,6 @@ struct ClaudeContent {
 
 #[async_trait]
 impl LlmProvider for ClaudeProvider {
-    fn name(&self) -> &str {
-        "claude"
-    }
-
     #[instrument(skip(self, messages))]
     async fn complete(&self, messages: &[LlmMessage]) -> Result<String, LlmError> {
         let (system, messages) = extract_system_message(messages);

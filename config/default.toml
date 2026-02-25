@@ -6,9 +6,6 @@ port = 8080
 url = "postgres://aust:aust_dev_password@localhost/aust_backend"
 max_connections = 10
 
-[redis]
-url = "redis://localhost:6379"
-
 [storage]
 provider = "local"
 bucket = "./uploads"
