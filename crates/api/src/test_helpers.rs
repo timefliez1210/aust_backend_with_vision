@@ -145,11 +145,13 @@ pub fn generate_test_jwt() -> String {
 /// Insert a test customer and return its ID.
 pub async fn insert_test_customer(pool: &PgPool) -> uuid::Uuid {
     let id = uuid::Uuid::now_v7();
+    let email = format!("test-{}@example.com", id);
     sqlx::query(
-        "INSERT INTO customers (id, name, email, phone, created_at)
-         VALUES ($1, 'Test Kunde', 'test@example.com', '+4915112345678', NOW())",
+        "INSERT INTO customers (id, name, email, phone, created_at, updated_at)
+         VALUES ($1, 'Test Kunde', $2, '+4915112345678', NOW(), NOW())",
     )
     .bind(id)
+    .bind(&email)
     .execute(pool)
     .await
     .expect("insert test customer");
@@ -199,7 +201,7 @@ pub async fn insert_test_quote_with_status(pool: &PgPool, status: &str) -> uuid:
 
     sqlx::query(
         "INSERT INTO quotes (id, customer_id, origin_address_id, destination_address_id,
-         status, moving_date, estimated_volume_m3, notes, created_at, updated_at)
+         status, preferred_date, estimated_volume_m3, notes, created_at, updated_at)
          VALUES ($1, $2, $3, $4, $5, '2026-04-01', 20.0, 'Halteverbot Auszug', NOW(), NOW())",
     )
     .bind(id)
@@ -221,10 +223,10 @@ pub async fn insert_test_offer(
 ) -> uuid::Uuid {
     let id = uuid::Uuid::now_v7();
     sqlx::query(
-        "INSERT INTO offers (id, quote_id, status, total_price_cents, currency,
-         valid_until, persons, hours, rate_per_hour, pdf_url, created_at, updated_at)
+        "INSERT INTO offers (id, quote_id, status, price_cents, currency,
+         valid_until, persons, hours_estimated, rate_per_hour_cents, pdf_storage_key, created_at)
          VALUES ($1, $2, $3, 50000, 'EUR', NOW() + interval '14 days',
-         2, 4, 35.0, 'test.pdf', NOW(), NOW())",
+         2, 4.0, 3500, 'test.pdf', NOW())",
     )
     .bind(id)
     .bind(quote_id)
@@ -236,6 +238,8 @@ pub async fn insert_test_offer(
 }
 
 /// Insert a test booking and return its ID.
+/// Note: calendar_bookings has a unique partial index on (quote_id) WHERE status != 'cancelled',
+/// so only ONE active booking per quote is allowed.
 pub async fn insert_test_booking(
     pool: &PgPool,
     quote_id: uuid::Uuid,
@@ -244,8 +248,8 @@ pub async fn insert_test_booking(
     let id = uuid::Uuid::now_v7();
     sqlx::query(
         "INSERT INTO calendar_bookings (id, booking_date, quote_id, customer_name,
-         customer_email, status, notes, created_at, updated_at)
-         VALUES ($1, '2026-04-01', $2, 'Test Kunde', 'test@example.com', $3, '', NOW(), NOW())",
+         customer_email, status, created_at, updated_at)
+         VALUES ($1, '2026-04-01', $2, 'Test Kunde', 'test@example.com', $3, NOW(), NOW())",
     )
     .bind(id)
     .bind(quote_id)
