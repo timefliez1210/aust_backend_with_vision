@@ -434,6 +434,16 @@ pub async fn build_offer_with_overrides(
     let line_items_json = serde_json::to_value(&offer_data.line_items).ok();
     let rate_cents = (rate_override * 100.0).round() as i64;
 
+    // Compute actual netto from line items (must match XLSX SUM(G31:G42))
+    let actual_netto: f64 = offer_data.line_items.iter().map(|item| {
+        if item.is_labor {
+            item.quantity * item.unit_price * pricing_result.estimated_helpers as f64
+        } else {
+            item.quantity * item.unit_price
+        }
+    }).sum();
+    let actual_netto_cents = (actual_netto * 100.0).round() as i64;
+
     let row: OfferRow = sqlx::query_as(
         r#"
         INSERT INTO offers (id, quote_id, price_cents, currency, valid_until, pdf_storage_key, status, created_at,
@@ -445,7 +455,7 @@ pub async fn build_offer_with_overrides(
     )
     .bind(offer_id)
     .bind(quote_id)
-    .bind(pricing_result.total_price_cents)
+    .bind(actual_netto_cents)
     .bind("EUR")
     .bind(valid_until_date)
     .bind(Some(&s3_key))
@@ -495,7 +505,7 @@ pub async fn build_offer_with_overrides(
         persons: pricing_result.estimated_helpers,
         hours: pricing_result.estimated_hours,
         rate: rate_override,
-        netto_cents: pricing_result.total_price_cents,
+        netto_cents: actual_netto_cents,
         customer_message,
     };
 

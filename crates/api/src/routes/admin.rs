@@ -23,6 +23,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/customers", get(list_customers).post(create_customer))
         .route("/customers/{id}", get(get_customer).patch(update_customer))
         .route("/quotes", get(list_admin_quotes).post(create_quote))
+        .route("/quotes/{id}", get(get_quote_detail))
         .route("/offers", get(list_offers))
         .route("/offers/{id}", get(get_offer_detail).patch(update_offer))
         .route("/offers/{id}/regenerate", post(regenerate_offer))
@@ -636,6 +637,253 @@ async fn list_admin_quotes(
     Ok(Json(AdminQuotesListResponse { quotes, total }))
 }
 
+// --- Quote Detail (enriched with latest offer overlay) ---
+
+#[derive(Debug, Serialize)]
+struct QuoteDetailAddress {
+    street: String,
+    city: String,
+    postal_code: Option<String>,
+    floor: Option<String>,
+    elevator: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+struct QuoteDetailOffer {
+    offer_id: Uuid,
+    offer_number: Option<String>,
+    offer_status: String,
+    persons: i32,
+    hours: f64,
+    rate_cents: i64,
+    total_netto_cents: i64,
+    total_brutto_cents: i64,
+    line_items: Vec<OfferDetailLineItem>,
+    valid_until: Option<NaiveDate>,
+    pdf_url: Option<String>,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+struct QuoteDetailResponse {
+    id: Uuid,
+    status: String,
+    created_at: DateTime<Utc>,
+    customer_name: String,
+    customer_email: String,
+    customer_phone: Option<String>,
+    origin: Option<QuoteDetailAddress>,
+    destination: Option<QuoteDetailAddress>,
+    volume_m3: f64,
+    distance_km: f64,
+    preferred_date: Option<String>,
+    notes: Option<String>,
+    offer: Option<QuoteDetailOffer>,
+    items: Vec<OfferDetailItem>,
+}
+
+#[derive(Debug, FromRow)]
+struct QuoteDetailRow {
+    id: Uuid,
+    status: String,
+    estimated_volume_m3: Option<f64>,
+    distance_km: Option<f64>,
+    preferred_date: Option<DateTime<Utc>>,
+    notes: Option<String>,
+    created_at: DateTime<Utc>,
+    customer_name: Option<String>,
+    customer_email: String,
+    customer_phone: Option<String>,
+    origin_street: Option<String>,
+    origin_city: Option<String>,
+    origin_postal: Option<String>,
+    origin_floor: Option<String>,
+    origin_elevator: Option<bool>,
+    dest_street: Option<String>,
+    dest_city: Option<String>,
+    dest_postal: Option<String>,
+    dest_floor: Option<String>,
+    dest_elevator: Option<bool>,
+    // Latest offer (nullable)
+    offer_id: Option<Uuid>,
+    offer_number: Option<String>,
+    offer_status: Option<String>,
+    offer_persons: Option<i32>,
+    offer_hours: Option<f64>,
+    offer_rate_cents: Option<i64>,
+    offer_price_cents: Option<i64>,
+    offer_line_items_json: Option<serde_json::Value>,
+    offer_valid_until: Option<NaiveDate>,
+    offer_pdf_key: Option<String>,
+    offer_created_at: Option<DateTime<Utc>>,
+}
+
+async fn get_quote_detail(
+    State(state): State<Arc<AppState>>,
+    Extension(_claims): Extension<TokenClaims>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<QuoteDetailResponse>, ApiError> {
+    let row: Option<QuoteDetailRow> = sqlx::query_as(
+        r#"
+        SELECT q.id, q.status, q.estimated_volume_m3, q.distance_km, q.preferred_date, q.notes, q.created_at,
+               COALESCE(c.name, c.email) AS customer_name, c.email AS customer_email, c.phone AS customer_phone,
+               oa.street AS origin_street, oa.city AS origin_city, oa.postal_code AS origin_postal,
+               oa.floor AS origin_floor, oa.elevator AS origin_elevator,
+               da.street AS dest_street, da.city AS dest_city, da.postal_code AS dest_postal,
+               da.floor AS dest_floor, da.elevator AS dest_elevator,
+               lo.id AS offer_id, lo.offer_number, lo.status AS offer_status,
+               lo.persons AS offer_persons, lo.hours_estimated AS offer_hours,
+               lo.rate_per_hour_cents AS offer_rate_cents, lo.price_cents AS offer_price_cents,
+               lo.line_items_json AS offer_line_items_json, lo.valid_until AS offer_valid_until,
+               lo.pdf_storage_key AS offer_pdf_key, lo.created_at AS offer_created_at
+        FROM quotes q
+        JOIN customers c ON q.customer_id = c.id
+        LEFT JOIN addresses oa ON q.origin_address_id = oa.id
+        LEFT JOIN addresses da ON q.destination_address_id = da.id
+        LEFT JOIN LATERAL (
+            SELECT * FROM offers WHERE quote_id = q.id ORDER BY created_at DESC LIMIT 1
+        ) lo ON true
+        WHERE q.id = $1
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await?;
+
+    let row = row.ok_or_else(|| ApiError::NotFound(format!("Anfrage {id} nicht gefunden")))?;
+
+    let origin = match (&row.origin_street, &row.origin_city) {
+        (Some(s), Some(c)) => Some(QuoteDetailAddress {
+            street: s.clone(),
+            city: c.clone(),
+            postal_code: row.origin_postal.clone(),
+            floor: row.origin_floor.clone(),
+            elevator: row.origin_elevator,
+        }),
+        _ => None,
+    };
+    let destination = match (&row.dest_street, &row.dest_city) {
+        (Some(s), Some(c)) => Some(QuoteDetailAddress {
+            street: s.clone(),
+            city: c.clone(),
+            postal_code: row.dest_postal.clone(),
+            floor: row.dest_floor.clone(),
+            elevator: row.dest_elevator,
+        }),
+        _ => None,
+    };
+
+    let preferred_date = row.preferred_date.map(|d| d.format("%d.%m.%Y").to_string());
+
+    // Build offer overlay if a latest offer exists
+    let offer = if let Some(offer_id) = row.offer_id {
+        let persons = row.offer_persons.unwrap_or(2);
+        let netto = row.offer_price_cents.unwrap_or(0);
+        let brutto = (netto as f64 * 1.19).round() as i64;
+
+        let line_items: Vec<OfferDetailLineItem> = row
+            .offer_line_items_json
+            .as_ref()
+            .and_then(|json| serde_json::from_value::<Vec<serde_json::Value>>(json.clone()).ok())
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| {
+                        let label = item.get("description")
+                            .and_then(|d| d.as_str())
+                            .unwrap_or("Sonstiges")
+                            .to_string();
+                        let is_labor = item.get("is_labor").and_then(|b| b.as_bool()).unwrap_or(false);
+                        let quantity = item.get("quantity").and_then(|q| q.as_f64()).unwrap_or(1.0);
+                        let unit_price = item.get("unit_price").and_then(|p| p.as_f64()).unwrap_or(0.0);
+                        let unit_price_cents = (unit_price * 100.0).round() as i64;
+                        let total_cents = if is_labor {
+                            (quantity * unit_price * persons as f64 * 100.0).round() as i64
+                        } else {
+                            (quantity * unit_price * 100.0).round() as i64
+                        };
+                        OfferDetailLineItem { label, quantity, unit_price_cents, total_cents }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let pdf_url = row.offer_pdf_key.as_ref().map(|_| format!("/api/v1/offers/{offer_id}/pdf"));
+
+        Some(QuoteDetailOffer {
+            offer_id,
+            offer_number: row.offer_number,
+            offer_status: row.offer_status.unwrap_or_default(),
+            persons,
+            hours: row.offer_hours.unwrap_or(0.0),
+            rate_cents: row.offer_rate_cents.unwrap_or(3000),
+            total_netto_cents: netto,
+            total_brutto_cents: brutto,
+            line_items,
+            valid_until: row.offer_valid_until,
+            pdf_url,
+            created_at: row.offer_created_at.unwrap_or(row.created_at),
+        })
+    } else {
+        None
+    };
+
+    // Fetch detected items from volume estimations
+    let estimations: Vec<VolumeEstimationRow> = sqlx::query_as(
+        r#"
+        SELECT result_data, source_data, total_volume_m3, method
+        FROM volume_estimations
+        WHERE quote_id = $1 AND status = 'completed'
+        ORDER BY created_at
+        "#,
+    )
+    .bind(id)
+    .fetch_all(&state.db)
+    .await?;
+
+    let mut items: Vec<OfferDetailItem> = Vec::new();
+    for est in &estimations {
+        let detected = parse_detected_items(Some(est));
+        let source_s3_keys: Vec<String> = est
+            .source_data.as_ref()
+            .and_then(|sd| sd.get("s3_keys")?.as_array().map(|arr| {
+                arr.iter().filter_map(|v| v.as_str().map(String::from)).collect()
+            }))
+            .unwrap_or_default();
+        for d in &detected {
+            let crop_url = d.crop_s3_key.as_ref().map(|k| format!("/api/v1/estimates/images/{k}"));
+            let source_image_url = d.bbox_image_index
+                .and_then(|idx| source_s3_keys.get(idx))
+                .map(|k| format!("/api/v1/estimates/images/{k}"));
+            items.push(OfferDetailItem {
+                name: d.german_name.clone().unwrap_or_else(|| d.name.clone()),
+                volume_m3: d.volume_m3,
+                quantity: 1,
+                crop_url,
+                source_image_url,
+                bbox: d.bbox.clone(),
+            });
+        }
+    }
+
+    Ok(Json(QuoteDetailResponse {
+        id: row.id,
+        status: row.status,
+        created_at: row.created_at,
+        customer_name: row.customer_name.unwrap_or_default(),
+        customer_email: row.customer_email,
+        customer_phone: row.customer_phone,
+        origin,
+        destination,
+        volume_m3: row.estimated_volume_m3.unwrap_or(0.0),
+        distance_km: row.distance_km.unwrap_or(0.0),
+        preferred_date,
+        notes: row.notes,
+        offer,
+        items,
+    }))
+}
+
 // --- Offers ---
 
 #[derive(Debug, Deserialize)]
@@ -772,17 +1020,6 @@ struct OfferDetailRow {
     dest_postal: Option<String>,
 }
 
-/// Row label for XLSX template line items
-fn row_label(row: u32) -> &'static str {
-    match row {
-        31 => "De/Montage",
-        32 => "Halteverbotszone",
-        33 => "Umzugsmaterial",
-        39 => "Transporter",
-        42 => "Anfahrt/Abfahrt",
-        _ => "Sonstiges",
-    }
-}
 
 async fn get_offer_detail(
     State(state): State<Arc<AppState>>,
@@ -814,6 +1051,7 @@ async fn get_offer_detail(
     let row = row.ok_or_else(|| ApiError::NotFound(format!("Angebot {id} nicht gefunden")))?;
 
     // Parse line items from JSON
+    let persons = row.persons.unwrap_or(2);
     let line_items: Vec<OfferDetailLineItem> = row
         .line_items_json
         .as_ref()
@@ -824,13 +1062,21 @@ async fn get_offer_detail(
             items
                 .iter()
                 .map(|item| {
-                    let xlsx_row = item.get("row").and_then(|r| r.as_u64()).unwrap_or(0) as u32;
+                    let label = item.get("description")
+                        .and_then(|d| d.as_str())
+                        .unwrap_or("Sonstiges")
+                        .to_string();
+                    let is_labor = item.get("is_labor").and_then(|b| b.as_bool()).unwrap_or(false);
                     let quantity = item.get("quantity").and_then(|q| q.as_f64()).unwrap_or(1.0);
                     let unit_price = item.get("unit_price").and_then(|p| p.as_f64()).unwrap_or(0.0);
                     let unit_price_cents = (unit_price * 100.0).round() as i64;
-                    let total_cents = (quantity * unit_price * 100.0).round() as i64;
+                    let total_cents = if is_labor {
+                        (quantity * unit_price * persons as f64 * 100.0).round() as i64
+                    } else {
+                        (quantity * unit_price * 100.0).round() as i64
+                    };
                     OfferDetailLineItem {
-                        label: row_label(xlsx_row).to_string(),
+                        label,
                         quantity,
                         unit_price_cents,
                         total_cents,
@@ -907,7 +1153,7 @@ async fn get_offer_detail(
         destination_address: dest_addr,
         volume_m3: row.estimated_volume_m3.unwrap_or(0.0),
         distance_km: row.distance_km.unwrap_or(0.0),
-        persons: row.persons.unwrap_or(2),
+        persons,
         hours: row.hours_estimated.unwrap_or(4.0),
         rate_cents: row.rate_per_hour_cents.unwrap_or(3000),
         total_netto_cents: netto,
