@@ -10,6 +10,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::middleware::customer_auth::CustomerClaims;
+use crate::services::db::find_active_booking_id;
 use crate::{ApiError, AppState};
 
 /// Protected customer routes (require customer session token).
@@ -582,14 +583,7 @@ async fn accept_offer(
         .await?;
 
     // Confirm booking if exists
-    let booking_row: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT id FROM calendar_bookings WHERE quote_id = $1 AND status != 'cancelled' LIMIT 1",
-    )
-    .bind(quote_id)
-    .fetch_optional(&state.db)
-    .await?;
-
-    if let Some((booking_id,)) = booking_row {
+    if let Some(booking_id) = find_active_booking_id(&state.db, quote_id).await? {
         let _ = state.calendar.confirm_booking(booking_id).await;
     }
 
@@ -659,14 +653,7 @@ async fn reject_offer(
         .await?;
 
     // Cancel booking if exists
-    let booking_row: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT id FROM calendar_bookings WHERE quote_id = $1 AND status != 'cancelled' LIMIT 1",
-    )
-    .bind(quote_id)
-    .fetch_optional(&state.db)
-    .await?;
-
-    if let Some((booking_id,)) = booking_row {
+    if let Some(booking_id) = find_active_booking_id(&state.db, quote_id).await? {
         let _ = state.calendar.cancel_booking(booking_id).await;
     }
 

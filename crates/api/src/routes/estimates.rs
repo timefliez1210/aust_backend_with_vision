@@ -10,7 +10,8 @@ use sqlx::FromRow;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::{orchestrator, ApiError, AppState};
+use crate::services::db::{insert_estimation, update_quote_volume};
+use crate::{orchestrator, services, ApiError, AppState};
 use aust_core::models::{EstimationMethod, InventoryForm, VolumeEstimation};
 use aust_volume_estimator::VisionAnalyzer;
 
@@ -62,6 +63,31 @@ impl From<VolumeEstimationRow> for VolumeEstimation {
     }
 }
 
+impl From<crate::services::db::EstimationRow> for VolumeEstimation {
+    fn from(row: crate::services::db::EstimationRow) -> Self {
+        let method = match row.method.as_str() {
+            "vision" => EstimationMethod::Vision,
+            "inventory" => EstimationMethod::Inventory,
+            "depth_sensor" => EstimationMethod::DepthSensor,
+            "video" => EstimationMethod::Video,
+            "manual" => EstimationMethod::Manual,
+            _ => EstimationMethod::Manual,
+        };
+
+        VolumeEstimation {
+            id: row.id,
+            quote_id: row.quote_id,
+            method,
+            status: row.status,
+            source_data: row.source_data,
+            result_data: row.result_data,
+            total_volume_m3: row.total_volume_m3,
+            confidence_score: row.confidence_score,
+            created_at: row.created_at,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct VisionEstimateRequest {
     quote_id: Uuid,
@@ -74,29 +100,6 @@ struct ImageData {
     mime_type: String, // e.g., "image/jpeg"
 }
 
-/// Upload decoded images to S3, returning the list of S3 keys.
-async fn upload_images_to_s3(
-    storage: &dyn aust_storage::StorageProvider,
-    quote_id: Uuid,
-    estimation_id: Uuid,
-    images: &[(Vec<u8>, String)], // (data, mime_type)
-) -> Result<Vec<String>, ApiError> {
-    let mut s3_keys = Vec::with_capacity(images.len());
-    for (idx, (data, mime_type)) in images.iter().enumerate() {
-        let ext = match mime_type.as_str() {
-            "image/png" => "png",
-            "image/webp" => "webp",
-            _ => "jpg",
-        };
-        let key = format!("estimates/{quote_id}/{estimation_id}/{idx}.{ext}");
-        storage
-            .upload(&key, Bytes::from(data.clone()), mime_type)
-            .await
-            .map_err(|e| ApiError::Internal(format!("Failed to upload image to storage: {e}")))?;
-        s3_keys.push(key);
-    }
-    Ok(s3_keys)
-}
 
 async fn vision_estimate(
     State(state): State<Arc<AppState>>,
@@ -121,7 +124,7 @@ async fn vision_estimate(
         .collect::<Result<Vec<_>, ApiError>>()?;
 
     // Upload images to S3 for future retrieval
-    let s3_keys = upload_images_to_s3(&*state.storage, request.quote_id, id, &decoded).await;
+    let s3_keys = services::vision::upload_images_to_s3(&*state.storage, request.quote_id, id, &decoded).await;
     let s3_keys = match s3_keys {
         Ok(keys) => keys,
         Err(e) => {
@@ -152,42 +155,29 @@ async fn vision_estimate(
         "image_count": request.images.len(),
         "s3_keys": s3_keys,
     });
+    let result_data = serde_json::to_value(&results).ok();
 
-    let row: VolumeEstimationRow = sqlx::query_as(
-        r#"
-        INSERT INTO volume_estimations (id, quote_id, method, source_data, result_data, total_volume_m3, confidence_score, created_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        RETURNING id, quote_id, method, status, source_data, result_data, total_volume_m3, confidence_score, created_at
-        "#
+    let est = insert_estimation(
+        &state.db,
+        id,
+        request.quote_id,
+        EstimationMethod::Vision.as_str(),
+        &source_data,
+        result_data.as_ref(),
+        total_volume,
+        avg_confidence,
+        now,
     )
-    .bind(id)
-    .bind(request.quote_id)
-    .bind(EstimationMethod::Vision.as_str())
-    .bind(source_data)
-    .bind(serde_json::to_value(&results).ok())
-    .bind(total_volume)
-    .bind(avg_confidence)
-    .bind(now)
-    .fetch_one(&state.db)
     .await?;
 
-    // Update quote with estimated volume
-    sqlx::query(
-        "UPDATE quotes SET estimated_volume_m3 = $1, status = $2, updated_at = $3 WHERE id = $4",
-    )
-    .bind(total_volume)
-    .bind("volume_estimated")
-    .bind(now)
-    .bind(request.quote_id)
-    .execute(&state.db)
-    .await?;
+    update_quote_volume(&state.db, request.quote_id, total_volume, "volume_estimated", now).await?;
 
     // Auto-generate offer in background
     let state_clone = state.clone();
     let qid = request.quote_id;
     tokio::spawn(async move { orchestrator::try_auto_generate_offer(state_clone, qid).await });
 
-    Ok(Json(VolumeEstimation::from(row)))
+    Ok(Json(VolumeEstimation::from(est)))
 }
 
 async fn depth_sensor_estimate(
@@ -244,15 +234,15 @@ async fn depth_sensor_estimate(
     let id = Uuid::now_v7();
 
     // Upload images to S3
-    let s3_keys = upload_images_to_s3(&*state.storage, quote_id, id, &images).await?;
+    let s3_keys = services::vision::upload_images_to_s3(&*state.storage, quote_id, id, &images).await?;
 
     // Try the vision service first, fall back to LLM analysis
     let (total_volume, confidence, result_data, method) =
-        match try_vision_service(&state, &images, id, quote_id, id).await {
+        match services::vision::try_vision_service(&state, &images, id, quote_id, id).await {
             Ok((vol, conf, data)) => (vol, conf, data, EstimationMethod::DepthSensor),
             Err(e) => {
                 tracing::warn!("Vision service failed, falling back to LLM analysis: {e}");
-                fallback_llm_analysis(&state, &images).await?
+                services::vision::fallback_llm_analysis(&state, &images).await?
             }
         };
 
@@ -262,40 +252,26 @@ async fn depth_sensor_estimate(
         "s3_keys": s3_keys,
     });
 
-    let row: VolumeEstimationRow = sqlx::query_as(
-        r#"
-        INSERT INTO volume_estimations (id, quote_id, method, source_data, result_data, total_volume_m3, confidence_score, created_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        RETURNING id, quote_id, method, status, source_data, result_data, total_volume_m3, confidence_score, created_at
-        "#
+    let est = insert_estimation(
+        &state.db,
+        id,
+        quote_id,
+        method.as_str(),
+        &source_data,
+        result_data.as_ref(),
+        total_volume,
+        confidence,
+        now,
     )
-    .bind(id)
-    .bind(quote_id)
-    .bind(method.as_str())
-    .bind(source_data)
-    .bind(result_data)
-    .bind(total_volume)
-    .bind(confidence)
-    .bind(now)
-    .fetch_one(&state.db)
     .await?;
 
-    // Update quote with estimated volume
-    sqlx::query(
-        "UPDATE quotes SET estimated_volume_m3 = $1, status = $2, updated_at = $3 WHERE id = $4",
-    )
-    .bind(total_volume)
-    .bind("volume_estimated")
-    .bind(now)
-    .bind(quote_id)
-    .execute(&state.db)
-    .await?;
+    update_quote_volume(&state.db, quote_id, total_volume, "volume_estimated", now).await?;
 
     // Auto-generate offer in background
     let state_clone = state.clone();
     tokio::spawn(async move { orchestrator::try_auto_generate_offer(state_clone, quote_id).await });
 
-    Ok(Json(VolumeEstimation::from(row)))
+    Ok(Json(VolumeEstimation::from(est)))
 }
 
 async fn video_estimate(
@@ -400,7 +376,7 @@ async fn video_estimate(
             .await
             .map_err(|e| ApiError::Internal(format!("Failed to upload video to storage: {e}")))?;
 
-        // Insert estimation as "processing"
+        // Insert estimation as "processing" — this path uses a custom status so we keep the inline query
         let source_data = serde_json::json!({
             "video_s3_key": video_s3_key,
             "video_mime": video_mime,
@@ -602,15 +578,7 @@ async fn process_video_background(
     let combined_volume = total_volume.0.unwrap_or(0.0);
 
     // Update quote with combined estimated volume
-    let _ = sqlx::query(
-        "UPDATE quotes SET estimated_volume_m3 = $1, status = $2, updated_at = $3 WHERE id = $4",
-    )
-    .bind(combined_volume)
-    .bind("volume_estimated")
-    .bind(now)
-    .bind(quote_id)
-    .execute(&state.db)
-    .await;
+    let _ = update_quote_volume(&state.db, quote_id, combined_volume, "volume_estimated", now).await;
 
     tracing::info!(%quote_id, %estimation_id, combined_volume, "Background: all video estimations completed, triggering offer generation");
 
@@ -618,82 +586,6 @@ async fn process_video_background(
     orchestrator::try_auto_generate_offer(state, quote_id).await;
 }
 
-/// Try the Python vision service for 3D volume estimation.
-/// Sends raw image bytes directly via multipart upload.
-/// Uploads crop thumbnails to S3 and replaces base64 with S3 keys.
-async fn try_vision_service(
-    state: &AppState,
-    images: &[(Vec<u8>, String)],
-    job_id: Uuid,
-    quote_id: Uuid,
-    estimation_id: Uuid,
-) -> Result<(f64, f64, Option<serde_json::Value>), ApiError> {
-    let client = state
-        .vision_service
-        .as_ref()
-        .ok_or_else(|| ApiError::Internal("Vision service not configured".into()))?;
-
-    let response = client
-        .estimate_upload(&job_id.to_string(), images)
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-
-    // Upload crop thumbnails to S3 and replace base64 with S3 keys
-    let mut items_value = serde_json::to_value(&response.detected_items)
-        .map_err(|e| ApiError::Internal(format!("Failed to serialize items: {e}")))?;
-
-    if let Some(items_arr) = items_value.as_array_mut() {
-        for (idx, item_val) in items_arr.iter_mut().enumerate() {
-            if let Some(crop_b64) = item_val.get("crop_base64").and_then(|v| v.as_str()) {
-                if !crop_b64.is_empty() {
-                    let name = item_val.get("name").and_then(|v| v.as_str()).unwrap_or("item");
-                    let safe_name = name.replace(' ', "_").to_lowercase();
-                    let key = format!("estimates/{quote_id}/{estimation_id}/crops/{safe_name}_{idx}.jpg");
-                    if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(crop_b64) {
-                        if let Ok(_) = state.storage
-                            .upload(&key, Bytes::from(decoded), "image/jpeg")
-                            .await
-                        {
-                            item_val.as_object_mut().map(|obj| {
-                                obj.remove("crop_base64");
-                                obj.insert("crop_s3_key".to_string(), serde_json::Value::String(key));
-                            });
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let result_data = Some(items_value);
-    Ok((response.total_volume_m3, response.confidence_score, result_data))
-}
-
-/// Fallback: run LLM-based vision analysis on the raw image data.
-/// Returns (total_volume, confidence, result_data, method).
-async fn fallback_llm_analysis(
-    state: &AppState,
-    images: &[(Vec<u8>, String)],
-) -> Result<(f64, f64, Option<serde_json::Value>, EstimationMethod), ApiError> {
-    let analyzer = VisionAnalyzer::new(state.llm.clone());
-    let mut total_volume = 0.0;
-    let mut results = Vec::new();
-
-    for (data, mime_type) in images {
-        let result = analyzer
-            .analyze_image(data, mime_type)
-            .await
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
-        total_volume += result.total_volume_m3;
-        results.push(result);
-    }
-
-    let avg_confidence =
-        results.iter().map(|r| r.confidence_score).sum::<f64>() / results.len() as f64;
-    let result_data = serde_json::to_value(&results).ok();
-
-    Ok((total_volume, avg_confidence, result_data, EstimationMethod::Vision))
-}
 
 #[derive(Debug, Deserialize)]
 struct InventoryRequest {
@@ -713,41 +605,28 @@ async fn inventory_estimate(
     let id = Uuid::now_v7();
     let now = chrono::Utc::now();
 
-    let row: VolumeEstimationRow = sqlx::query_as(
-        r#"
-        INSERT INTO volume_estimations (id, quote_id, method, source_data, result_data, total_volume_m3, confidence_score, created_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        RETURNING id, quote_id, method, status, source_data, result_data, total_volume_m3, confidence_score, created_at
-        "#
+    let source_data = serde_json::to_value(&request.inventory).unwrap_or_default();
+    let est = insert_estimation(
+        &state.db,
+        id,
+        request.quote_id,
+        EstimationMethod::Inventory.as_str(),
+        &source_data,
+        None,
+        total_volume,
+        1.0,
+        now,
     )
-    .bind(id)
-    .bind(request.quote_id)
-    .bind(EstimationMethod::Inventory.as_str())
-    .bind(serde_json::to_value(&request.inventory).unwrap_or_default())
-    .bind(None::<serde_json::Value>)
-    .bind(total_volume)
-    .bind(1.0f64)
-    .bind(now)
-    .fetch_one(&state.db)
     .await?;
 
-    // Update quote with estimated volume
-    sqlx::query(
-        "UPDATE quotes SET estimated_volume_m3 = $1, status = $2, updated_at = $3 WHERE id = $4",
-    )
-    .bind(total_volume)
-    .bind("volume_estimated")
-    .bind(now)
-    .bind(request.quote_id)
-    .execute(&state.db)
-    .await?;
+    update_quote_volume(&state.db, request.quote_id, total_volume, "volume_estimated", now).await?;
 
     // Auto-generate offer in background
     let state_clone = state.clone();
     let qid = request.quote_id;
     tokio::spawn(async move { orchestrator::try_auto_generate_offer(state_clone, qid).await });
 
-    Ok(Json(VolumeEstimation::from(row)))
+    Ok(Json(VolumeEstimation::from(est)))
 }
 
 async fn get_estimate(

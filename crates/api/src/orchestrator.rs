@@ -4,7 +4,7 @@
 //! and get a regenerated offer.
 
 use crate::routes::offers::{build_offer, build_offer_with_overrides, GeneratedOffer, OfferOverrides};
-use crate::AppState;
+use crate::{services, AppState};
 use aust_core::config::TelegramConfig;
 use aust_core::models::MovingInquiry;
 use aust_distance_calculator::{RouteCalculator, RouteRequest};
@@ -476,7 +476,7 @@ async fn handle_complete_inquiry(
 
     // 2. Create origin address (if we have departure address)
     let origin_id = if let Some(ref addr) = inquiry.departure_address {
-        let (street, city, postal) = parse_address(addr);
+        let (street, city, postal) = services::vision::parse_address(addr);
         match sqlx::query_as::<_, (Uuid,)>(
             "INSERT INTO addresses (id, street, city, postal_code, floor, elevator) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
         )
@@ -501,7 +501,7 @@ async fn handle_complete_inquiry(
 
     // 3. Create destination address (if we have arrival address)
     let dest_id = if let Some(ref addr) = inquiry.arrival_address {
-        let (street, city, postal) = parse_address(addr);
+        let (street, city, postal) = services::vision::parse_address(addr);
         match sqlx::query_as::<_, (Uuid,)>(
             "INSERT INTO addresses (id, street, city, postal_code, floor, elevator) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
         )
@@ -774,30 +774,6 @@ pub fn parse_items_list_text(text: &str) -> Vec<ParsedInventoryItem> {
     }
 
     items
-}
-
-/// Parse a free-form address string into (street, city, postal_code).
-/// Best-effort: tries to split "Straße 1, 31157 Sarstedt" into parts.
-fn parse_address(addr: &str) -> (String, String, String) {
-    // Try to find a postal code (5-digit number typical for DE/AT)
-    let parts: Vec<&str> = addr.splitn(2, ',').collect();
-    if parts.len() == 2 {
-        let street = parts[0].trim().to_string();
-        let city_part = parts[1].trim();
-        // Try to extract postal code from city part
-        let mut postal = String::new();
-        let mut city = city_part.to_string();
-        for word in city_part.split_whitespace() {
-            if word.len() >= 4 && word.len() <= 5 && word.chars().all(|c| c.is_ascii_digit()) {
-                postal = word.to_string();
-                city = city_part.replace(word, "").trim().to_string();
-                break;
-            }
-        }
-        (street, city, postal)
-    } else {
-        (addr.to_string(), String::new(), String::new())
-    }
 }
 
 /// Build notes for the quote from inquiry data.

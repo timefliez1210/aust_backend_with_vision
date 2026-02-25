@@ -16,7 +16,10 @@ pub struct ClaudeProvider {
 impl ClaudeProvider {
     pub fn new(api_key: String, model: String) -> Self {
         Self {
-            client: Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build()
+                .expect("Failed to create HTTP client"),
             api_key,
             model,
         }

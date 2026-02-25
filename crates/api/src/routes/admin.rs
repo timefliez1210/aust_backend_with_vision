@@ -13,6 +13,8 @@ use aust_core::models::TokenClaims;
 
 use crate::orchestrator::parse_items_list_text;
 use crate::routes::offers::{build_offer_with_overrides, parse_detected_items, OfferOverrides, VolumeEstimationRow};
+use crate::services::db::insert_estimation_no_return;
+use crate::services::status_sync;
 use crate::{ApiError, AppState};
 
 pub fn router() -> Router<Arc<AppState>> {
@@ -525,21 +527,17 @@ async fn create_quote(
         let source_data = serde_json::json!({"source": "admin_manual"});
         let total_vol = volume_m3.unwrap_or(0.0);
 
-        sqlx::query(
-            r#"
-            INSERT INTO volume_estimations (id, quote_id, method, source_data, result_data, total_volume_m3, confidence_score, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-            "#,
+        insert_estimation_no_return(
+            &state.db,
+            Uuid::now_v7(),
+            quote_id,
+            "manual",
+            &source_data,
+            result_data.as_ref(),
+            total_vol,
+            0.8,
+            now,
         )
-        .bind(Uuid::now_v7())
-        .bind(quote_id)
-        .bind("manual")
-        .bind(source_data)
-        .bind(result_data)
-        .bind(total_vol)
-        .bind(0.8f64)
-        .bind(now)
-        .execute(&state.db)
         .await?;
     }
 
@@ -1187,55 +1185,13 @@ async fn set_quote_status(
     // Sync linked booking and offer status
     match body.status.as_str() {
         "accepted" => {
-            // Quote accepted → offer accepted, booking confirmed
-            sqlx::query(
-                "UPDATE offers SET status = 'accepted' WHERE quote_id = $1 AND status IN ('draft', 'sent')",
-            )
-            .bind(id)
-            .execute(&state.db)
-            .await?;
-
-            let booking_row: Option<(Uuid,)> = sqlx::query_as(
-                "SELECT id FROM calendar_bookings WHERE quote_id = $1 AND status != 'cancelled' LIMIT 1",
-            )
-            .bind(id)
-            .fetch_optional(&state.db)
-            .await?;
-
-            if let Some((booking_id,)) = booking_row {
-                let _ = state.calendar.confirm_booking(booking_id).await;
-            }
+            status_sync::sync_quote_accepted(&state.db, &state.calendar, id).await.ok();
         }
         "rejected" | "cancelled" => {
-            // Quote rejected/cancelled → booking cancelled
-            let booking_row: Option<(Uuid,)> = sqlx::query_as(
-                "SELECT id FROM calendar_bookings WHERE quote_id = $1 AND status != 'cancelled' LIMIT 1",
-            )
-            .bind(id)
-            .fetch_optional(&state.db)
-            .await?;
-
-            if let Some((booking_id,)) = booking_row {
-                let _ = state.calendar.cancel_booking(booking_id).await;
-            }
+            status_sync::sync_quote_cancelled(&state.db, &state.calendar, id).await.ok();
         }
         "offer_generated" | "offer_sent" | "pending" | "volume_estimated" => {
-            // Downgraded back to pre-acceptance → booking back to tentative
-            sqlx::query(
-                "UPDATE calendar_bookings SET status = 'tentative', updated_at = $1 WHERE quote_id = $2 AND status != 'cancelled'",
-            )
-            .bind(now)
-            .bind(id)
-            .execute(&state.db)
-            .await?;
-
-            // Also reset offer status back to draft/sent
-            sqlx::query(
-                "UPDATE offers SET status = 'draft' WHERE quote_id = $1 AND status = 'accepted'",
-            )
-            .bind(id)
-            .execute(&state.db)
-            .await?;
+            status_sync::sync_quote_downgraded(&state.db, id).await.ok();
         }
         _ => {}
     }
