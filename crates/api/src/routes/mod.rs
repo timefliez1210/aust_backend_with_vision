@@ -11,19 +11,24 @@ pub mod quotes;
 pub(crate) mod shared;
 
 use crate::AppState;
-use axum::extract::DefaultBodyLimit;
 use axum::Router;
 use std::sync::Arc;
 
-pub fn api_router() -> Router<Arc<AppState>> {
+/// Public API routes (no authentication required).
+pub fn public_api_router() -> Router<Arc<AppState>> {
     Router::new()
         .nest("/auth", auth::router())
+        .nest("/inquiries", inquiries::router())
+        .nest("/customer", customer::auth_router())
+        .nest("/estimates", estimates::public_router())
+}
+
+/// Protected API routes (require admin JWT).
+pub fn protected_api_router() -> Router<Arc<AppState>> {
+    Router::new()
         .nest("/quotes", quotes::router())
-        .nest("/estimates", estimates::router())
+        .nest("/estimates", estimates::protected_router())
         .nest("/distance", distance::router())
         .nest("/offers", offers::router())
         .nest("/calendar", calendar::router())
-        .nest("/inquiries", inquiries::router())
-        .nest("/customer", customer::auth_router())
-        .layer(DefaultBodyLimit::max(250 * 1024 * 1024)) // 250MB for image uploads
 }

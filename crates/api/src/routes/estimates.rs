@@ -15,14 +15,20 @@ use crate::{orchestrator, services, ApiError, AppState};
 use aust_core::models::{EstimationMethod, InventoryForm, VolumeEstimation};
 use aust_volume_estimator::VisionAnalyzer;
 
-pub fn router() -> Router<Arc<AppState>> {
+/// Public routes (no auth required) — image proxy for <img> tags.
+pub fn public_router() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/images/{*key}", get(serve_image))
+}
+
+/// Protected routes (require admin JWT).
+pub fn protected_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/vision", post(vision_estimate))
         .route("/inventory", post(inventory_estimate))
         .route("/depth-sensor", post(depth_sensor_estimate))
         .route("/video", post(video_estimate))
         .route("/{id}", get(get_estimate))
-        .route("/images/{*key}", get(serve_image))
 }
 
 #[derive(Debug, FromRow)]
