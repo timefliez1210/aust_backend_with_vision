@@ -29,6 +29,7 @@ struct VolumeEstimationRow {
     id: Uuid,
     quote_id: Uuid,
     method: String,
+    status: String,
     source_data: serde_json::Value,
     result_data: Option<serde_json::Value>,
     total_volume_m3: Option<f64>,
@@ -51,6 +52,7 @@ impl From<VolumeEstimationRow> for VolumeEstimation {
             id: row.id,
             quote_id: row.quote_id,
             method,
+            status: row.status,
             source_data: row.source_data,
             result_data: row.result_data,
             total_volume_m3: row.total_volume_m3,
@@ -155,7 +157,7 @@ async fn vision_estimate(
         r#"
         INSERT INTO volume_estimations (id, quote_id, method, source_data, result_data, total_volume_m3, confidence_score, created_at)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        RETURNING id, quote_id, method, source_data, result_data, total_volume_m3, confidence_score, created_at
+        RETURNING id, quote_id, method, status, source_data, result_data, total_volume_m3, confidence_score, created_at
         "#
     )
     .bind(id)
@@ -264,7 +266,7 @@ async fn depth_sensor_estimate(
         r#"
         INSERT INTO volume_estimations (id, quote_id, method, source_data, result_data, total_volume_m3, confidence_score, created_at)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        RETURNING id, quote_id, method, source_data, result_data, total_volume_m3, confidence_score, created_at
+        RETURNING id, quote_id, method, status, source_data, result_data, total_volume_m3, confidence_score, created_at
         "#
     )
     .bind(id)
@@ -299,13 +301,13 @@ async fn depth_sensor_estimate(
 async fn video_estimate(
     State(state): State<Arc<AppState>>,
     mut multipart: Multipart,
-) -> Result<Json<VolumeEstimation>, ApiError> {
+) -> Result<Json<Vec<VolumeEstimation>>, ApiError> {
     let mut quote_id: Option<Uuid> = None;
-    let mut video_data: Option<(Vec<u8>, String)> = None;
+    let mut videos: Vec<(Vec<u8>, String)> = Vec::new();
     let mut max_keyframes: Option<u32> = None;
     let mut detection_threshold: Option<f64> = None;
 
-    // Parse multipart form: quote_id + video file + optional params
+    // Parse multipart form: quote_id + video file(s) + optional params
     while let Some(field) = multipart
         .next_field()
         .await
@@ -337,82 +339,185 @@ async fn video_estimate(
                     .map_err(|e| ApiError::BadRequest(format!("Failed to read detection_threshold: {e}")))?;
                 detection_threshold = text.parse().ok();
             }
-            _ => {
-                // Treat as video file
+            "video" => {
+                // Infer content type from content_type header or file extension
                 let content_type = field
                     .content_type()
-                    .unwrap_or("video/mp4")
-                    .to_string();
-                if !content_type.starts_with("video/") {
-                    continue;
-                }
+                    .map(|ct| ct.to_string())
+                    .unwrap_or_default();
+                let file_name = field.file_name().unwrap_or("").to_lowercase();
+                let mime = if content_type.starts_with("video/") {
+                    content_type
+                } else if file_name.ends_with(".mov") {
+                    "video/quicktime".to_string()
+                } else if file_name.ends_with(".webm") {
+                    "video/webm".to_string()
+                } else if file_name.ends_with(".mkv") {
+                    "video/x-matroska".to_string()
+                } else {
+                    "video/mp4".to_string()
+                };
                 let data = field
                     .bytes()
                     .await
                     .map_err(|e| ApiError::BadRequest(format!("Failed to read video: {e}")))?;
-                video_data = Some((data.to_vec(), content_type));
+                videos.push((data.to_vec(), mime));
+            }
+            _ => {
+                // Ignore unknown fields
             }
         }
     }
 
     let quote_id =
         quote_id.ok_or_else(|| ApiError::Validation("quote_id field is required".into()))?;
-    let (video_bytes, video_mime) =
-        video_data.ok_or_else(|| ApiError::Validation("video file is required".into()))?;
+    if videos.is_empty() {
+        return Err(ApiError::Validation("At least one video file is required".into()));
+    }
 
-    let id = Uuid::now_v7();
+    // Check vision service is configured before uploading
+    if state.vision_service.is_none() {
+        return Err(ApiError::Internal("Vision service not configured".into()));
+    }
 
-    // Upload video to S3
-    let ext = match video_mime.as_str() {
-        "video/quicktime" => "mov",
-        "video/webm" => "webm",
-        "video/x-matroska" => "mkv",
-        _ => "mp4",
+    let now = chrono::Utc::now();
+    let mut estimations = Vec::with_capacity(videos.len());
+
+    for (video_bytes, video_mime) in videos {
+        let id = Uuid::now_v7();
+
+        // Upload video to S3
+        let ext = match video_mime.as_str() {
+            "video/quicktime" => "mov",
+            "video/webm" => "webm",
+            "video/x-matroska" => "mkv",
+            _ => "mp4",
+        };
+        let video_s3_key = format!("estimates/{quote_id}/{id}/video.{ext}");
+        state
+            .storage
+            .upload(&video_s3_key, Bytes::from(video_bytes.clone()), &video_mime)
+            .await
+            .map_err(|e| ApiError::Internal(format!("Failed to upload video to storage: {e}")))?;
+
+        // Insert estimation as "processing"
+        let source_data = serde_json::json!({
+            "video_s3_key": video_s3_key,
+            "video_mime": video_mime,
+        });
+
+        let row: VolumeEstimationRow = sqlx::query_as(
+            r#"
+            INSERT INTO volume_estimations (id, quote_id, method, status, source_data, total_volume_m3, confidence_score, created_at)
+            VALUES ($1, $2, $3, 'processing', $4, NULL, NULL, $5)
+            RETURNING id, quote_id, method, status, source_data, result_data, total_volume_m3, confidence_score, created_at
+            "#
+        )
+        .bind(id)
+        .bind(quote_id)
+        .bind(EstimationMethod::Video.as_str())
+        .bind(&source_data)
+        .bind(now)
+        .fetch_one(&state.db)
+        .await?;
+
+        tracing::info!(
+            %quote_id,
+            %id,
+            video_size_mb = video_bytes.len() / (1024 * 1024),
+            "Video uploaded, starting background processing..."
+        );
+
+        // Spawn background task for the long-running Modal call
+        let state_bg = state.clone();
+        tokio::spawn(async move {
+            process_video_background(state_bg, id, quote_id, video_bytes, video_mime, max_keyframes, detection_threshold).await;
+        });
+
+        estimations.push(VolumeEstimation::from(row));
+    }
+
+    // Update quote status to show processing is underway (once for all videos)
+    sqlx::query("UPDATE quotes SET status = 'processing', updated_at = $1 WHERE id = $2")
+        .bind(now)
+        .bind(quote_id)
+        .execute(&state.db)
+        .await?;
+
+    Ok(Json(estimations))
+}
+
+/// Background task: call Modal vision service, store results, trigger offer generation.
+async fn process_video_background(
+    state: Arc<AppState>,
+    estimation_id: Uuid,
+    quote_id: Uuid,
+    video_bytes: Vec<u8>,
+    video_mime: String,
+    max_keyframes: Option<u32>,
+    detection_threshold: Option<f64>,
+) {
+    let client = match state.vision_service.as_ref() {
+        Some(c) => c,
+        None => {
+            tracing::error!(%estimation_id, "Vision service not configured in background task");
+            let _ = sqlx::query("UPDATE volume_estimations SET status = 'failed' WHERE id = $1")
+                .bind(estimation_id)
+                .execute(&state.db)
+                .await;
+            return;
+        }
     };
-    let video_s3_key = format!("estimates/{quote_id}/{id}/video.{ext}");
-    state
-        .storage
-        .upload(&video_s3_key, Bytes::from(video_bytes.clone()), &video_mime)
-        .await
-        .map_err(|e| ApiError::Internal(format!("Failed to upload video to storage: {e}")))?;
-
-    // Call vision service video endpoint
-    let client = state
-        .vision_service
-        .as_ref()
-        .ok_or_else(|| ApiError::Internal("Vision service not configured".into()))?;
 
     tracing::info!(
         %quote_id,
+        %estimation_id,
         video_size_mb = video_bytes.len() / (1024 * 1024),
-        "Calling vision service video endpoint..."
+        "Background: calling vision service video endpoint..."
     );
 
-    let response = client
+    let response = match client
         .estimate_video(
-            &id.to_string(),
+            &estimation_id.to_string(),
             &video_bytes,
             &video_mime,
             max_keyframes,
             detection_threshold,
         )
         .await
-        .map_err(|e| {
-            tracing::error!(%quote_id, error = %e, "Vision service video call failed");
-            ApiError::Internal(e.to_string())
-        })?;
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(%quote_id, %estimation_id, error = %e, "Background: vision service video call failed");
+            let _ = sqlx::query("UPDATE volume_estimations SET status = 'failed' WHERE id = $1")
+                .bind(estimation_id)
+                .execute(&state.db)
+                .await;
+            return;
+        }
+    };
 
     tracing::info!(
         %quote_id,
+        %estimation_id,
         items = response.detected_items.len(),
         total_volume = response.total_volume_m3,
         processing_ms = response.processing_time_ms,
-        "Vision service video response received"
+        "Background: vision service video response received"
     );
 
     // Upload crop thumbnails to S3 and replace base64 with S3 keys
-    let mut items_value = serde_json::to_value(&response.detected_items)
-        .map_err(|e| ApiError::Internal(format!("Failed to serialize items: {e}")))?;
+    let mut items_value = match serde_json::to_value(&response.detected_items) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(%estimation_id, error = %e, "Background: failed to serialize items");
+            let _ = sqlx::query("UPDATE volume_estimations SET status = 'failed' WHERE id = $1")
+                .bind(estimation_id)
+                .execute(&state.db)
+                .await;
+            return;
+        }
+    };
 
     if let Some(items_arr) = items_value.as_array_mut() {
         for (idx, item_val) in items_arr.iter_mut().enumerate() {
@@ -420,7 +525,7 @@ async fn video_estimate(
                 if !crop_b64.is_empty() {
                     let name = item_val.get("name").and_then(|v| v.as_str()).unwrap_or("item");
                     let safe_name = name.replace(' ', "_").to_lowercase();
-                    let key = format!("estimates/{quote_id}/{id}/crops/{safe_name}_{idx}.jpg");
+                    let key = format!("estimates/{quote_id}/{estimation_id}/crops/{safe_name}_{idx}.jpg");
                     if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(crop_b64)
                     {
                         if state
@@ -444,45 +549,73 @@ async fn video_estimate(
     }
 
     let now = chrono::Utc::now();
-    let source_data = serde_json::json!({
-        "video_s3_key": video_s3_key,
-        "video_mime": video_mime,
-    });
 
-    let row: VolumeEstimationRow = sqlx::query_as(
+    // Update estimation with results
+    let _ = sqlx::query(
         r#"
-        INSERT INTO volume_estimations (id, quote_id, method, source_data, result_data, total_volume_m3, confidence_score, created_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        RETURNING id, quote_id, method, source_data, result_data, total_volume_m3, confidence_score, created_at
-        "#
+        UPDATE volume_estimations
+        SET status = 'completed', result_data = $1, total_volume_m3 = $2, confidence_score = $3
+        WHERE id = $4
+        "#,
     )
-    .bind(id)
-    .bind(quote_id)
-    .bind(EstimationMethod::Video.as_str())
-    .bind(source_data)
-    .bind(Some(items_value))
+    .bind(Some(&items_value))
     .bind(response.total_volume_m3)
     .bind(response.confidence_score)
-    .bind(now)
-    .fetch_one(&state.db)
-    .await?;
+    .bind(estimation_id)
+    .execute(&state.db)
+    .await;
 
-    // Update quote with estimated volume
-    sqlx::query(
+    // Check if other videos for this quote are still processing
+    let still_processing: (i64,) = match sqlx::query_as(
+        "SELECT COUNT(*) FROM volume_estimations WHERE quote_id = $1 AND status = 'processing'",
+    )
+    .bind(quote_id)
+    .fetch_one(&state.db)
+    .await
+    {
+        Ok(row) => row,
+        Err(e) => {
+            tracing::error!(%quote_id, error = %e, "Background: failed to check processing count");
+            (0,)
+        }
+    };
+
+    if still_processing.0 > 0 {
+        tracing::info!(
+            %quote_id,
+            %estimation_id,
+            still_processing = still_processing.0,
+            "Background: other videos still processing, skipping offer generation"
+        );
+        return;
+    }
+
+    // All videos done — sum volumes from all completed estimations
+    let total_volume: (Option<f64>,) = sqlx::query_as(
+        "SELECT SUM(total_volume_m3) FROM volume_estimations WHERE quote_id = $1 AND status = 'completed'",
+    )
+    .bind(quote_id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or((None,));
+
+    let combined_volume = total_volume.0.unwrap_or(0.0);
+
+    // Update quote with combined estimated volume
+    let _ = sqlx::query(
         "UPDATE quotes SET estimated_volume_m3 = $1, status = $2, updated_at = $3 WHERE id = $4",
     )
-    .bind(response.total_volume_m3)
+    .bind(combined_volume)
     .bind("volume_estimated")
     .bind(now)
     .bind(quote_id)
     .execute(&state.db)
-    .await?;
+    .await;
 
-    // Auto-generate offer in background
-    let state_clone = state.clone();
-    tokio::spawn(async move { orchestrator::try_auto_generate_offer(state_clone, quote_id).await });
+    tracing::info!(%quote_id, %estimation_id, combined_volume, "Background: all video estimations completed, triggering offer generation");
 
-    Ok(Json(VolumeEstimation::from(row)))
+    // Auto-generate offer
+    orchestrator::try_auto_generate_offer(state, quote_id).await;
 }
 
 /// Try the Python vision service for 3D volume estimation.
@@ -584,7 +717,7 @@ async fn inventory_estimate(
         r#"
         INSERT INTO volume_estimations (id, quote_id, method, source_data, result_data, total_volume_m3, confidence_score, created_at)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        RETURNING id, quote_id, method, source_data, result_data, total_volume_m3, confidence_score, created_at
+        RETURNING id, quote_id, method, status, source_data, result_data, total_volume_m3, confidence_score, created_at
         "#
     )
     .bind(id)
@@ -623,7 +756,7 @@ async fn get_estimate(
 ) -> Result<Json<VolumeEstimation>, ApiError> {
     let row: Option<VolumeEstimationRow> = sqlx::query_as(
         r#"
-        SELECT id, quote_id, method, source_data, result_data, total_volume_m3, confidence_score, created_at
+        SELECT id, quote_id, method, status, source_data, result_data, total_volume_m3, confidence_score, created_at
         FROM volume_estimations WHERE id = $1
         "#
     )
@@ -649,6 +782,14 @@ async fn serve_image(
         "image/png"
     } else if key.ends_with(".webp") {
         "image/webp"
+    } else if key.ends_with(".mp4") {
+        "video/mp4"
+    } else if key.ends_with(".mov") {
+        "video/quicktime"
+    } else if key.ends_with(".webm") {
+        "video/webm"
+    } else if key.ends_with(".mkv") {
+        "video/x-matroska"
     } else {
         "image/jpeg"
     };

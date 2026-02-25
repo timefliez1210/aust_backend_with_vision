@@ -29,6 +29,7 @@ pub struct VolumeEstimation {
     pub id: Uuid,
     pub quote_id: Uuid,
     pub method: EstimationMethod,
+    pub status: String,
     pub source_data: serde_json::Value,
     pub result_data: Option<serde_json::Value>,
     pub total_volume_m3: Option<f64>,

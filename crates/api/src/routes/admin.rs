@@ -842,45 +842,43 @@ async fn get_offer_detail(
         })
         .unwrap_or_default();
 
-    // Fetch detected items from volume estimation
-    let estimation: Option<VolumeEstimationRow> = sqlx::query_as(
+    // Fetch detected items from all completed volume estimations
+    let estimations: Vec<VolumeEstimationRow> = sqlx::query_as(
         r#"
         SELECT result_data, source_data, total_volume_m3, method
         FROM volume_estimations
-        WHERE quote_id = $1
-        ORDER BY created_at DESC LIMIT 1
+        WHERE quote_id = $1 AND status = 'completed'
+        ORDER BY created_at
         "#,
     )
     .bind(row.quote_id)
-    .fetch_optional(&state.db)
+    .fetch_all(&state.db)
     .await?;
 
-    let detected = parse_detected_items(estimation.as_ref());
-    let source_s3_keys: Vec<String> = estimation
-        .as_ref()
-        .and_then(|e| {
-            e.source_data.as_ref()?.get("s3_keys")?.as_array().map(|arr| {
+    let mut items: Vec<OfferDetailItem> = Vec::new();
+    for est in &estimations {
+        let detected = parse_detected_items(Some(est));
+        let source_s3_keys: Vec<String> = est
+            .source_data.as_ref()
+            .and_then(|sd| sd.get("s3_keys")?.as_array().map(|arr| {
                 arr.iter().filter_map(|v| v.as_str().map(String::from)).collect()
-            })
-        })
-        .unwrap_or_default();
-    let items: Vec<OfferDetailItem> = detected
-        .iter()
-        .map(|d| {
+            }))
+            .unwrap_or_default();
+        for d in &detected {
             let crop_url = d.crop_s3_key.as_ref().map(|k| format!("/api/v1/estimates/images/{k}"));
             let source_image_url = d.bbox_image_index
                 .and_then(|idx| source_s3_keys.get(idx))
                 .map(|k| format!("/api/v1/estimates/images/{k}"));
-            OfferDetailItem {
+            items.push(OfferDetailItem {
                 name: d.german_name.clone().unwrap_or_else(|| d.name.clone()),
                 volume_m3: d.volume_m3,
                 quantity: 1,
                 crop_url,
                 source_image_url,
                 bbox: d.bbox.clone(),
-            }
-        })
-        .collect();
+            });
+        }
+    }
 
     let netto = row.price_cents;
     let brutto = (netto as f64 * 1.19).round() as i64;

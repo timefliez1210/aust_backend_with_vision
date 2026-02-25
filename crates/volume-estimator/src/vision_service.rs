@@ -164,9 +164,12 @@ impl VisionServiceClient {
     ) -> Result<VisionServiceResponse, VolumeError> {
         let url = format!("{}/estimate/video", self.video_base_url);
 
-        // Build a client with extended timeout for video processing (600s)
+        // Force HTTP/1.1 — HTTP/2 can stall on large multipart uploads due to
+        // flow-control issues, causing reqwest's timeout to never fire.
         let video_client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(600))
+            .http1_only()
+            .connect_timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(660))
             .build()
             .map_err(|e| {
                 VolumeError::ExternalService(format!(
@@ -200,20 +203,49 @@ impl VisionServiceClient {
             });
         form = form.part("video", part);
 
-        // No retry for video — processing is too long to restart
-        let resp = video_client
-            .post(&url)
+        tracing::info!(%url, video_size = video_data.len(), "Sending video to vision service...");
+
+        // Hard outer timeout as safety net (tokio-level, cannot be defeated by
+        // stuck HTTP connections unlike reqwest's internal timeout)
+        let result = tokio::time::timeout(
+            Duration::from_secs(660),
+            self.send_video_request(&video_client, &url, form),
+        )
+        .await
+        .map_err(|_| {
+            tracing::error!("Vision service video request timed out (660s hard limit)");
+            VolumeError::ExternalService(
+                "Vision service video request timed out after 660s".to_string(),
+            )
+        })?;
+
+        result
+    }
+
+    async fn send_video_request(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        form: reqwest::multipart::Form,
+    ) -> Result<VisionServiceResponse, VolumeError> {
+        let resp = client
+            .post(url)
             .multipart(form)
             .send()
             .await
             .map_err(|e| {
+                tracing::error!(error = %e, "Vision service video send() failed");
                 VolumeError::ExternalService(format!(
                     "Vision service video request failed: {e}"
                 ))
             })?;
 
-        if resp.status().is_success() {
+        let status = resp.status();
+        tracing::info!(%status, "Vision service video response headers received");
+
+        if status.is_success() {
             let body = resp.text().await.map_err(|e| {
+                tracing::error!(error = %e, "Vision service video body read failed");
                 VolumeError::ExternalService(format!(
                     "Failed to read vision service video response body: {e}"
                 ))
@@ -234,8 +266,8 @@ impl VisionServiceClient {
                 ))
             })
         } else {
-            let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
+            tracing::error!(%status, %body, "Vision service video returned error");
             Err(VolumeError::ExternalService(format!(
                 "Vision service video returned {status}: {body}"
             )))
