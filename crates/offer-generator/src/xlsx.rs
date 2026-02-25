@@ -89,8 +89,6 @@ enum CellValue {
     Number(f64),
     /// Number with an explicit style index (used when inserting into a new cell).
     StyledNumber(f64, &'static str),
-    /// Formula — writes `<f>...</f>` into the cell (keeps original style).
-    Formula(String),
     /// Formula with an explicit style index.
     StyledFormula(String, &'static str),
 }
@@ -251,7 +249,9 @@ fn build_cell_modifications(
     const STYLES_AB: [&str; 2] = ["58", "53"]; // columns A, B
     const STYLES_C: [&str; 2] = ["59", "54"];  // column C
     const STYLES_DE: [&str; 2] = ["60", "55"]; // columns D, E
-    const STYLES_FG: [&str; 2] = ["61", "56"]; // columns F, G
+    const STYLES_F: [&str; 2] = ["61", "56"];          // column F (€)
+    const STYLES_F_LABOR: [&str; 2] = ["86", "85"];   // column F labor (€/Stunde)
+    const STYLES_G: [&str; 2] = ["84", "83"];          // column G (right-aligned €)
 
     // 1. Hide ALL template rows 31-42 and clear their content
     let mut hidden_rows: Vec<u32> = (31..=42).collect();
@@ -292,32 +292,34 @@ fn build_cell_modifications(
             format!("D{row}"),
             CellValue::StyledText(String::new(), STYLES_DE[color]),
         ));
-        // Write quantity and unit price
+        // Write quantity
         mods.push((
             format!("E{row}"),
             CellValue::StyledNumber(item.quantity, STYLES_DE[color]),
         ));
+        // Write unit price (€ format, labor uses €/Stunde)
+        let f_style = if item.is_labor { STYLES_F_LABOR[color] } else { STYLES_F[color] };
         mods.push((
             format!("F{row}"),
-            CellValue::StyledNumber(item.unit_price, STYLES_FG[color]),
+            CellValue::StyledNumber(item.unit_price, f_style),
         ));
 
-        // Write formula to G with correct alternating style
+        // Write formula to G with right-aligned € style
         if item.is_labor {
             mods.push(("J50".into(), CellValue::Number(data.persons as f64)));
             let formula = format!("IF(E{row}=\"\", 0, F{row}*E{row}*J50)");
-            mods.push((format!("G{row}"), CellValue::StyledFormula(formula, STYLES_FG[color])));
+            mods.push((format!("G{row}"), CellValue::StyledFormula(formula, STYLES_G[color])));
         } else {
             let formula = format!("IF(E{row}=\"\", 0, F{row}*E{row})");
-            mods.push((format!("G{row}"), CellValue::StyledFormula(formula, STYLES_FG[color])));
+            mods.push((format!("G{row}"), CellValue::StyledFormula(formula, STYLES_G[color])));
         }
     }
 
     // Remove unhidden rows from hidden list
     hidden_rows.retain(|r| !unhidden_rows.contains(r));
 
-    // Rewrite G44 formula: SUM instead of individual row references
-    mods.push(("G44".into(), CellValue::Formula("SUM(G31:G42)".into())));
+    // Rewrite G44 formula: SUM instead of individual row references (keep € right-aligned style)
+    mods.push(("G44".into(), CellValue::StyledFormula("SUM(G31:G42)".into(), "72")));
 
     (mods, hidden_rows, unhidden_rows)
 }
@@ -465,13 +467,6 @@ fn build_cell_xml(cell_ref: &str, style: Option<&str>, value: &CellValue) -> Str
             format!(
                 r#"<c r="{}" s="{}" t="n"><v>{}</v></c>"#,
                 cell_ref, forced_style, formatted
-            )
-        }
-        CellValue::Formula(formula) => {
-            let escaped = xml_escape(formula);
-            format!(
-                r#"<c r="{}"{} t="n"><f>{}</f></c>"#,
-                cell_ref, s_attr, escaped
             )
         }
         CellValue::StyledFormula(formula, forced_style) => {
