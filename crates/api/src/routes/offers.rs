@@ -25,6 +25,10 @@ use aust_offer_generator::{
 use aust_storage::StorageProvider;
 use tracing::warn;
 
+/// Register the public offer routes: generate, fetch, and download PDF.
+///
+/// **Caller**: `crates/api/src/routes/mod.rs` route tree assembly.
+/// **Why**: Exposes the offer lifecycle endpoints for both API consumers and the admin dashboard.
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/generate", post(generate_offer))
@@ -107,6 +111,7 @@ impl From<OfferRow> for Offer {
     }
 }
 
+/// SQLx projection row for the `customers` table used within offer generation.
 #[derive(Debug, FromRow)]
 pub(crate) struct CustomerRow {
     #[allow(dead_code)]
@@ -116,6 +121,7 @@ pub(crate) struct CustomerRow {
     pub phone: Option<String>,
 }
 
+/// SQLx projection row for the `addresses` table used within offer generation.
 #[derive(Debug, FromRow)]
 pub(crate) struct AddressRow {
     #[allow(dead_code)]
@@ -127,6 +133,8 @@ pub(crate) struct AddressRow {
     pub elevator: Option<bool>,
 }
 
+/// Minimal SQLx projection of `volume_estimations` used by `parse_detected_items` and
+/// re-exported to `admin` and `quotes` modules for the same purpose.
 #[derive(Debug, FromRow)]
 pub struct VolumeEstimationRow {
     pub result_data: Option<serde_json::Value>,
@@ -138,6 +146,9 @@ pub struct VolumeEstimationRow {
 }
 
 /// Summary data for the Telegram caption — populated during offer generation.
+///
+/// Passed alongside the PDF bytes to the Telegram approval bot so Alex can see key
+/// moving details without opening the PDF.
 pub struct TelegramSummary {
     pub customer_phone: String,
     pub origin_address: String,
@@ -159,6 +170,10 @@ pub struct TelegramSummary {
 }
 
 /// Result of offer generation — the offer record + PDF bytes for immediate use.
+///
+/// Returned by `build_offer_with_overrides`. The caller (API handler or orchestrator)
+/// uses `pdf_bytes` to upload to Telegram or attach to an email without a second
+/// round-trip to S3.
 pub struct GeneratedOffer {
     pub offer: Offer,
     pub pdf_bytes: Vec<u8>,
@@ -167,7 +182,14 @@ pub struct GeneratedOffer {
     pub summary: TelegramSummary,
 }
 
-/// Optional overrides for the offer (e.g. when admin edits via Telegram).
+/// Optional overrides applied during offer generation.
+///
+/// Used by the Telegram edit flow: Alex types a natural-language instruction, the LLM
+/// parses it into numeric fields here, and `build_offer_with_overrides` uses them
+/// instead of PricingEngine defaults.
+///
+/// Also used by the admin dashboard's regenerate endpoint for manual price/person/hour
+/// adjustments submitted as JSON.
 #[derive(Default)]
 pub struct OfferOverrides {
     pub price_cents: Option<i64>,
@@ -181,7 +203,26 @@ pub struct OfferOverrides {
     pub existing_offer_id: Option<Uuid>,
 }
 
-/// Core offer generation logic. Used by both the API endpoint and the orchestrator.
+/// Generate an offer with no manual overrides — delegates to `build_offer_with_overrides`.
+///
+/// **Caller**: `orchestrator::try_auto_generate_offer`, and any code path that needs a
+/// fresh offer without manual adjustments.
+/// **Why**: Convenience wrapper so callers do not need to construct a default
+/// `OfferOverrides` struct.
+///
+/// # Parameters
+/// - `db` — live PostgreSQL connection pool
+/// - `storage` — S3-compatible storage for uploading the PDF
+/// - `config` — application config (company depot address, rate per km, etc.)
+/// - `quote_id` — the quote to generate an offer for
+/// - `valid_days` — optional number of days until the offer expires
+///
+/// # Returns
+/// `GeneratedOffer` containing the persisted `Offer` record, the raw PDF bytes, and the
+/// `TelegramSummary` for the approval caption.
+///
+/// # Errors
+/// Propagates all errors from `build_offer_with_overrides`.
 pub async fn build_offer(
     db: &PgPool,
     storage: &dyn StorageProvider,
@@ -192,7 +233,37 @@ pub async fn build_offer(
     build_offer_with_overrides(db, storage, config, quote_id, valid_days, &OfferOverrides::default()).await
 }
 
-/// Core offer generation logic with optional overrides.
+/// Core offer generation pipeline with optional manual overrides.
+///
+/// **Caller**: `build_offer` (no overrides), `generate_offer` route handler (API),
+/// `orchestrator::try_auto_generate_offer` (background), `admin::regenerate_offer` (dashboard).
+/// **Why**: Central function for the entire quote-to-offer pipeline: fetches all required
+/// data, computes pricing, builds XLSX via template, converts to PDF via LibreOffice,
+/// uploads to S3, and inserts (or updates in-place) the offer DB record.
+///
+/// # Parameters
+/// - `db` — live PostgreSQL connection pool
+/// - `storage` — S3-compatible storage provider
+/// - `config` — application config including depot address, km rate, JWT secret, etc.
+/// - `quote_id` — the quote to generate an offer for; must have `estimated_volume_m3`
+/// - `valid_days` — optional offer validity period; stored in `offers.valid_until`
+/// - `overrides` — optional manual overrides for price, persons, hours, rate, or line items;
+///   when `existing_offer_id` is set, the existing offer record is updated in-place
+///   (preserving `offer_number` and `created_at`)
+///
+/// # Returns
+/// `GeneratedOffer` with the persisted `Offer`, raw PDF/XLSX bytes, customer email, and
+/// a `TelegramSummary` for the approval message caption.
+///
+/// # Errors
+/// - 404 if quote or customer not found
+/// - 400 if quote has no volume estimate
+/// - 500 on XLSX generation, PDF conversion, S3 upload, or DB errors
+///
+/// # Math
+/// Labor netto = `hours × persons × rate`
+/// Actual netto = `sum(flat_total for Fahrkostenpauschale) + sum(qty × price for non-labor items) + labor_netto`
+/// `rate = calculate_rate_override(price_override, rate_override, persons, hours, line_items)`
 pub async fn build_offer_with_overrides(
     db: &PgPool,
     storage: &dyn StorageProvider,
@@ -589,10 +660,19 @@ pub async fn build_offer_with_overrides(
     })
 }
 
-/// Extract recognized services and any remaining free-text customer message from quote notes.
+/// Split quote notes into a recognized services string and a free-text customer message.
 ///
-/// Notes format: "Halteverbot Auszug, Verpackungsservice, Montage, Bitte vorsichtig mit dem Klavier"
-/// Known service keywords are extracted; everything else is the customer message.
+/// **Caller**: `build_offer_with_overrides` — used to populate the `services` field in
+/// `TelegramSummary` and the `customer_message` field shown in the Telegram caption.
+/// **Why**: Notes are stored as a comma-separated mix of service keywords (e.g.
+/// "Halteverbot Auszug") and free-text remarks the customer typed. This function separates
+/// them so the two halves can be displayed independently.
+///
+/// # Parameters
+/// - `notes` — raw `quotes.notes` string, may be `None`
+///
+/// # Returns
+/// `(services_string, customer_message_string)` — both may be empty strings
 fn extract_services_and_message(notes: Option<&str>) -> (String, String) {
     let Some(notes) = notes else {
         return (String::new(), String::new());
@@ -628,6 +708,9 @@ fn extract_services_and_message(notes: Option<&str>) -> (String, String) {
     (services.join(", "), message_parts.join(", "))
 }
 
+/// Format a city string as "PLZ City" (or just "City" when postal code is absent).
+///
+/// **Caller**: `build_offer_with_overrides` for OfferData fields and address display strings.
 fn format_city(addr: &AddressRow) -> String {
     format!(
         "{}{}",
@@ -639,15 +722,36 @@ fn format_city(addr: &AddressRow) -> String {
     )
 }
 
-/// Detect the appropriate salutation and greeting from the customer name.
+/// Return just the greeting line for a customer name (e.g. "Sehr geehrter Herr Müller,").
 ///
-/// Returns (salutation for address block, greeting line).
-/// Uses common German female first names as a heuristic.
-/// Returns just the greeting line for a customer name (e.g. "Sehr geehrter Herr Müller,").
+/// **Caller**: `admin::build_email_draft` — used when building the default email body for
+/// the offer send flow in the admin dashboard.
+/// **Why**: Convenience wrapper around `detect_salutation_and_greeting` when only the
+/// greeting line is needed (not the address-block salutation).
+///
+/// # Parameters
+/// - `name` — customer display name (may include "Herr"/"Frau" prefix)
+///
+/// # Returns
+/// German greeting string, e.g. `"Sehr geehrte Frau Müller,"` or
+/// `"Sehr geehrte Damen und Herren,"` when gender cannot be determined.
 pub fn greeting_for_name(name: &str) -> String {
     detect_salutation_and_greeting(name).1
 }
 
+/// Detect the appropriate salutation and greeting line from a customer name.
+///
+/// **Caller**: `build_offer_with_overrides` (XLSX OfferData fields) and `greeting_for_name`.
+/// **Why**: The offer template needs both the address-block salutation (e.g. "Herrn") and
+/// a formal greeting line. Uses explicit "Herr"/"Frau" prefix first, then falls back to
+/// a heuristic lookup of common German/Austrian female first names.
+///
+/// # Parameters
+/// - `name` — raw customer name string
+///
+/// # Returns
+/// `(salutation, greeting)` — e.g. `("Herrn", "Sehr geehrter Herr Müller,")` or
+/// `("", "Sehr geehrte Damen und Herren,")` for single-word names
 fn detect_salutation_and_greeting(name: &str) -> (String, String) {
     // If the name contains "Frau" or "Herr" prefix, use that directly
     let name_trimmed = name.trim();
@@ -719,10 +823,30 @@ fn detect_salutation_and_greeting(name: &str) -> (String, String) {
     }
 }
 
-/// Compute the Fahrkostenpauschale line item by calling ORS for the full round-trip route:
-/// depot → origin → (optional stop) → destination → depot.
+/// Build the Fahrkostenpauschale (flat travel cost) line item.
 ///
-/// Falls back to `distance_km * 2 * rate` if ORS fails.
+/// **Caller**: `build_offer_with_overrides` — always the first non-labor line item.
+/// **Why**: Austrian moving companies charge a flat travel fee based on the full round-trip
+/// distance from the company depot, including any intermediate stop. This function calls
+/// OpenRouteService to calculate the exact route rather than doubling the stored one-way
+/// `distance_km`.
+///
+/// # Parameters
+/// - `config` — provides `company.depot_address` (ORS start/end point) and
+///   `company.fahrt_rate_per_km` (EUR per km)
+/// - `origin` — moving-out address; `None` triggers fallback
+/// - `destination` — moving-in address; `None` triggers fallback
+/// - `stop` — optional intermediate stop address (e.g. storage facility)
+/// - `distance_km` — stored one-way distance used only for the ORS fallback
+///
+/// # Returns
+/// An `OfferLineItem` with `flat_total` set (quantity and unit_price left at 0 because
+/// the total is a lump sum, not quantity × price).
+///
+/// # Math
+/// `flat_total = ORS_route_total_km × fahrt_rate_per_km`
+/// ORS route: `depot → origin → [stop] → destination → depot`
+/// Fallback: `flat_total = distance_km × 2.0 × fahrt_rate_per_km`
 async fn build_fahrt_item(
     config: &Config,
     origin: Option<&AddressRow>,
@@ -768,11 +892,27 @@ async fn build_fahrt_item(
     }
 }
 
-/// Build non-labor line items for the XLSX offer from quote notes.
+/// Derive the non-labor XLSX line items from quote notes keywords.
+///
+/// **Caller**: `build_offer_with_overrides` — called only when `overrides.line_items` is
+/// `None`; the result is appended after the labor item and the Fahrkostenpauschale.
+/// **Why**: Services requested by the customer (parking bans, packing, assembly) are stored
+/// as comma-separated keywords in `quotes.notes`. This function converts those keywords into
+/// typed `OfferLineItem` values that map to specific rows in the XLSX template.
+///
+/// # Parameters
+/// - `notes` — raw `quotes.notes` string (lowercase comparison used internally)
+///
+/// # Returns
+/// `Vec<OfferLineItem>` in template row order:
+/// - Demontage (row 31, €50) — if "demontage" in notes
+/// - Montage (row 31, €50) — if "montage" in notes (after stripping "demontage")
+/// - Halteverbotszone (row 32, €100/zone) — 1–3 zones depending on flags
+/// - Umzugsmaterial (row 33, €30) — if packing service requested
+/// - Nürnbergerversicherung (always last, €0, `flat_total = 0.0`)
 ///
 /// Does NOT include Fahrkostenpauschale (computed separately in `build_offer_with_overrides`)
-/// or the labor item (prepended separately).
-/// Always ends with Nürnbergerversicherung (€0) as the last item.
+/// or the labor item (prepended separately before this list is appended).
 fn build_line_items(notes: Option<&str>) -> Vec<OfferLineItem> {
     let notes_lower = notes
         .map(|n| n.to_lowercase())
@@ -853,12 +993,29 @@ fn build_line_items(notes: Option<&str>) -> Vec<OfferLineItem> {
     items
 }
 
-/// Back-calculate the hourly rate when a target price or explicit rate override is provided.
+/// Resolve the effective hourly rate, back-calculating from a target price when needed.
 ///
-/// Precedence:
-/// 1. `rate_override` — used directly
-/// 2. `price_cents_override` — back-calculates: `rate = (netto - other_items) / (persons × hours)`
-/// 3. Default €30/hr
+/// **Caller**: `build_offer_with_overrides` — called after pricing and line items are
+/// finalized, just before building `OfferData`.
+/// **Why**: Alex always thinks in brutto prices. When he overrides the total price in the
+/// Telegram edit flow, the LLM converts that to a netto value (÷ 1.19) and puts it in
+/// `price_cents_override`. This function back-calculates the per-hour rate such that the
+/// labor line item alone bridges the gap between the non-labor subtotal and the target netto.
+///
+/// # Parameters
+/// - `price_cents_override` — target total netto in cents; `None` means no price override
+/// - `rate_override` — explicit hourly rate in EUR; takes precedence over price override
+/// - `persons` — number of workers (clamped to ≥ 1 to avoid division by zero)
+/// - `hours` — estimated working hours (clamped to ≥ 1.0)
+/// - `line_items` — non-labor items used to calculate `other_items_netto`
+///
+/// # Returns
+/// Effective hourly rate in EUR (not cents). Default is `30.0` when no override is given.
+///
+/// # Math
+/// `other_items_netto = Σ flat_total || (qty × price)` for all non-labor items
+/// `labor_netto = max(0, target_netto - other_items_netto)`
+/// `rate = labor_netto / (persons × hours)`
 fn calculate_rate_override(
     price_cents_override: Option<i64>,
     rate_override: Option<f64>,
@@ -886,6 +1043,24 @@ fn calculate_rate_override(
 
 // --- API handlers ---
 
+/// `POST /api/v1/offers/generate` — Generate an offer from an existing quote.
+///
+/// **Caller**: Axum router / admin dashboard or external API consumers.
+/// **Why**: Entry point for the manual offer generation flow; delegates entirely to
+/// `build_offer_with_overrides` with any caller-supplied overrides.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool, storage, config)
+/// - `request` — JSON body with `quote_id` and optional override fields
+///   (`price_cents_netto`, `persons`, `hours`, `rate`, `line_items`)
+///
+/// # Returns
+/// `200 OK` with the persisted `Offer` JSON on success.
+///
+/// # Errors
+/// - `400` if quote has no volume estimate
+/// - `404` if quote or customer not found
+/// - `500` on XLSX/PDF/S3/DB failures
 async fn generate_offer(
     State(state): State<Arc<AppState>>,
     Json(request): Json<GenerateOfferRequest>,
@@ -915,6 +1090,20 @@ async fn generate_offer(
     Ok(Json(result.offer))
 }
 
+/// `GET /api/v1/offers/{id}` — Retrieve a single offer by ID.
+///
+/// **Caller**: Axum router / admin dashboard offer detail page.
+/// **Why**: Returns the raw `Offer` model (pricing, status, PDF key, line items JSON).
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool)
+/// - `id` — offer UUID path parameter
+///
+/// # Returns
+/// `200 OK` with `Offer` JSON.
+///
+/// # Errors
+/// - `404` if no offer with the given ID exists
 async fn get_offer(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
@@ -934,6 +1123,24 @@ async fn get_offer(
     Ok(Json(Offer::from(row)))
 }
 
+/// `GET /api/v1/offers/{id}/pdf` — Download the offer PDF (or XLSX fallback) from S3.
+///
+/// **Caller**: Axum router / admin dashboard "PDF herunterladen" button and Telegram bot
+/// approval flow.
+/// **Why**: Streams the offer file directly to the client with appropriate `Content-Type`
+/// and `Content-Disposition` headers for browser download.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool, storage)
+/// - `id` — offer UUID path parameter
+///
+/// # Returns
+/// File bytes with `Content-Type: application/pdf` (or `application/vnd.openxmlformats…`
+/// for XLSX fallback) and `Content-Disposition: attachment; filename="Angebot-{id}.pdf"`.
+///
+/// # Errors
+/// - `404` if offer or its PDF key does not exist
+/// - `500` if S3 download fails
 async fn get_offer_pdf(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
@@ -981,8 +1188,10 @@ async fn get_offer_pdf(
     ))
 }
 
-/// Parsed inventory item from VolumeCalculator items_list text.
-/// Matches the format stored by orchestrator::parse_items_list_text().
+/// Inventory item parsed from the VolumeCalculator `items_list` text format.
+///
+/// Matches the JSON schema stored by `orchestrator::parse_items_list_text()` in
+/// `volume_estimations.result_data` for `method = 'manual'` or `method = 'inventory'`.
 #[derive(Debug, Clone, serde::Deserialize)]
 struct ParsedInventoryItem {
     name: String,
@@ -990,7 +1199,27 @@ struct ParsedInventoryItem {
     volume_m3: f64,
 }
 
-/// Parse detected items from volume estimation result_data.
+/// Parse detected items from `volume_estimations.result_data` into a uniform `DetectedItemRow` list.
+///
+/// **Caller**: `build_offer_with_overrides` (for the XLSX items sheet), `quotes::get_quote`
+/// and `admin::get_quote_detail` (for the frontend item cards), `admin::get_offer_detail`.
+/// **Why**: The `result_data` column stores different JSON schemas depending on which
+/// estimation method was used. This function tries each known schema in priority order
+/// and returns the first successful parse.
+///
+/// # Parameters
+/// - `estimation` — the `VolumeEstimationRow` row; returns empty vec when `None`
+///
+/// # Returns
+/// Flat list of `DetectedItemRow` values. For inventory/manual items the `quantity` is
+/// baked into the name (e.g. "2x Sofa") and `volume_m3` is the already-multiplied total.
+///
+/// Deserialization priority:
+/// 1. `DepthSensorResult` (ML 3D pipeline result with `detected_items` + `dimensions`)
+/// 2. `Vec<VisionAnalysisResult>` (LLM per-image array)
+/// 3. Single `VisionAnalysisResult` (LLM single-image)
+/// 4. `Vec<DetectedItem>` (raw item array)
+/// 5. `Vec<ParsedInventoryItem>` (VolumeCalculator text format)
 pub fn parse_detected_items(estimation: Option<&VolumeEstimationRow>) -> Vec<DetectedItemRow> {
     let Some(est) = estimation else {
         return vec![];
@@ -1061,8 +1290,18 @@ pub fn parse_detected_items(estimation: Option<&VolumeEstimationRow>) -> Vec<Det
     vec![]
 }
 
-/// Map English detection labels to German Umzugsgutliste names.
-/// Mirrors the RE_CATALOG in services/vision/app/models/schemas.py.
+/// Map an English vision-model detection label to its German Umzugsgutliste name.
+///
+/// **Caller**: `detected_item_to_row` — applied when `DetectedItem.german_name` is absent.
+/// **Why**: Grounding DINO produces English class labels. The offer and the items sheet
+/// must use German Umzugsgutliste (moving goods list) terminology. This lookup mirrors
+/// the `RE_CATALOG` in `services/vision/app/models/schemas.py`.
+///
+/// # Parameters
+/// - `label` — English detection label (case-insensitive)
+///
+/// # Returns
+/// `Some(&str)` with the German Umzugsgutliste name, or `None` if unlisted.
 pub fn label_to_german(label: &str) -> Option<&'static str> {
     match label.to_lowercase().as_str() {
         // Seating
@@ -1142,6 +1381,18 @@ pub fn label_to_german(label: &str) -> Option<&'static str> {
     }
 }
 
+/// Convert a `DetectedItem` domain model into the flattened `DetectedItemRow` used in offer generation.
+///
+/// **Caller**: `parse_detected_items` — used for DepthSensorResult and VisionAnalysisResult paths.
+/// **Why**: `DetectedItemRow` is the struct expected by `OfferData.detected_items` for the
+/// XLSX items sheet. This conversion also fills in `german_name` via `label_to_german`
+/// when the original item did not carry one, and stringifies the `dimensions` struct.
+///
+/// # Parameters
+/// - `item` — raw `DetectedItem` from the ML or LLM pipeline
+///
+/// # Returns
+/// A `DetectedItemRow` ready for XLSX rendering.
 fn detected_item_to_row(item: DetectedItem) -> DetectedItemRow {
     let german_name = item.german_name.or_else(|| label_to_german(&item.name).map(String::from));
     DetectedItemRow {

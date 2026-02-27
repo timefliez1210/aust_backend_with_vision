@@ -10,6 +10,15 @@ A modular Rust backend for automating moving company operations - from initial c
 
 **Scale**: Single tenant, single region, <1000 requests/day
 
+## Documentation
+
+Full user-facing docs live in the repository root:
+
+- **[README.md](README.md)** — Quick-start, architecture overview, prerequisites, environment variables, deployment
+- **[docs/API.md](docs/API.md)** — Complete HTTP endpoint reference (request/response shapes, curl examples, business rules, status codes)
+
+**Keep these files current.** When you add, remove, or change an endpoint: update `docs/API.md`. When deployment steps, prerequisites, or config keys change: update `README.md`.
+
 ## Tech Stack
 
 | Component | Technology |
@@ -190,8 +199,8 @@ Four input sources feed into the pipeline:
 |--------|------------|-------------|--------|
 | A. Kontakt form | Email → email agent | None (general inquiry) | Working |
 | B. Kostenloses Angebot form | Email → email agent (JSON attachment) | VolumeCalculator items list | Working |
-| C. Photo webapp | Direct API POST | Vision pipeline (ML) | Not yet implemented |
-| D. Mobile app | Direct API POST | Depth sensor + AR | Not yet implemented |
+| C. Photo webapp | `POST /api/v1/inquiries/photo` | Vision pipeline (ML) | Implemented |
+| D. Mobile app | `POST /api/v1/inquiries/mobile` | Depth sensor + AR | Implemented |
 | E. Video upload | Admin dashboard → API | Video 3D reconstruction (MASt3R + SAM 2) | Implemented |
 
 ```
@@ -244,19 +253,23 @@ rate = (target_netto - sum_of_non_labor_line_items) / (persons × hours)
 
 ### XLSX Template Mapping
 
-The offer uses an XLSX template (`templates/Angebot_Vorlage.xlsx`). Key rows:
+The offer uses an XLSX template (`templates/Angebot_Vorlage.xlsx`). Line items are written dynamically into rows 31–42 (max 12 items). Item order:
 
-| Row | Column D | Column E | Column F | Description |
-|-----|----------|----------|----------|-------------|
-| 31 | De/Montage | quantity | €50/unit | Furniture assembly if requested |
-| 32 | Halteverbotszone | count (1-2) | €100/zone | Parking ban zones |
-| 33 | Umzugsmaterial | quantity | €30/unit | Packing service if requested |
-| 38 | N Umzugshelfer | hours | rate/hr | Labor (G38 = E38 × F38 × J50) |
-| 39 | Transporter | truck count | €60/truck | 1 truck, 2 if >30m³ |
-| 42 | Anfahrt/Abfahrt | quantity | distance-based | €30 + €1.50/km |
-| 44 | | | | **Netto total** (sum of G31:G42) |
+| Slot | Item | Notes |
+|------|------|-------|
+| 1 | **Fahrkostenpauschale** | Always first. `flat_total` set via ORS round-trip (depot→origin→[stop]→dest→depot). E/F blank, G = flat amount. |
+| 2 | Demontage | Only if notes contain "demontage" |
+| 3 | Montage | Only if notes contain "montage" |
+| 4 | Halteverbotszone | remark = Beladestelle / Entladestelle / both; qty = number of zones |
+| 5 | Umzugsmaterial | Only if notes contain "verpackungsservice" |
+| 6+ | Manual items | Möbellift, Kleiderboxen, Kartons — passed via `overrides.line_items` only |
+| Labor | N Umzugshelfer | `is_labor=true`. G = E × F × J50 (J50 holds persons count) |
+| Last | Nürnbergerversicherung | Always last; qty=1, price=0, total=0 |
+| **G44** | | **Netto total** — `SUM(G31:G42)` |
 
-The generator clears ALL template preset values (rows 31-42 except 38) before writing, ensuring only explicit line items contribute to the total.
+The generator hides ALL template rows 31–42 first, then writes only the active items starting at row 31. Rows beyond the item count stay hidden.
+
+**Removed items** (no longer generated): 3,5t Transporter, Anfahrt/Abfahrt (€30+€1.50/km).
 
 PDF output: columns A-H only (print area set to `$A$1:$H$120`), internal calculation columns I-P excluded.
 
@@ -300,6 +313,28 @@ Examples:
 - **Traits for abstraction**: `LlmProvider`, `StorageProvider` - pluggable implementations
 - **Factory functions**: `create_provider()` for centralized instantiation
 - **Service/Repository pattern**: Business logic in service layer, SQL in repository layer
+- **Function-level doc comments required**: Every `pub` function, `pub struct`, `pub enum`, and trait method must have a `///` doc comment. Add them to non-public functions too when the logic is non-obvious. Use this format:
+
+  ```rust
+  /// Brief one-line description.
+  ///
+  /// **Caller**: [module or function that calls this]
+  /// **Why**: [business reason — why this function needs to exist]
+  ///
+  /// # Parameters
+  /// - `param_name` — what it represents
+  ///
+  /// # Returns
+  /// What is returned and under what conditions
+  ///
+  /// # Errors
+  /// When this returns `Err` (omit section if the function is infallible)
+  ///
+  /// # Math
+  /// Include only when there is a real formula, e.g.:
+  /// `persons = ceil(volume_m3 / 5.0)`
+  /// `rate = (target_netto - non_labor_netto) / (persons × hours)`
+  ```
 
 ## Database Schema
 
@@ -333,13 +368,13 @@ Switch providers via `AUST__LLM__DEFAULT_PROVIDER` (claude/openai/ollama)
 ## High Priority
 
 ### Direct API Endpoints (Sources C + D)
-- [ ] `POST /api/v1/inquiries/photo` — multipart form + photos for webapp
-- [ ] `POST /api/v1/inquiries/mobile` — multipart form + photos + depth maps for mobile app
-- [ ] Wire both into vision pipeline → offer generation → Telegram approval
+- [x] `POST /api/v1/inquiries/photo` — multipart form + photos for webapp
+- [x] `POST /api/v1/inquiries/mobile` — multipart form + photos + depth maps for mobile app
+- [x] Wire both into vision pipeline → offer generation → Telegram approval
 
 ### Missing Offer Data
-- [ ] Auto-trigger distance calculation when addresses exist (currently `distance_km: 0.0`)
-- [ ] Add elevator field to addresses table and forms
+- [x] Auto-trigger distance calculation when addresses exist (`try_auto_generate_offer` now runs ORS when `distance_km=0`)
+- [x] Add elevator field to addresses table (migration done; form wiring for email path still partial)
 - [ ] Salutation detection: currently hardcodes "Herrn", should detect from name or store
 
 ### Authentication
@@ -377,9 +412,9 @@ Switch providers via `AUST__LLM__DEFAULT_PROVIDER` (claude/openai/ollama)
 - [ ] Prometheus metrics endpoint
 
 ### Testing
-- [ ] Unit tests for pricing engine and volume calculator
-- [ ] Integration tests with test database
-- [ ] API endpoint tests
+- [x] Unit tests for pricing engine and volume calculator
+- [x] Integration tests with test database
+- [x] API endpoint tests
 
 ### DevOps
 - [ ] GitHub Actions CI/CD

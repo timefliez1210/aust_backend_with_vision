@@ -19,8 +19,20 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-/// Format an address with floor and elevator info for Telegram display.
-/// e.g. "Musterstr. 1, 31135 Hildesheim (3. OG, kein Aufzug)"
+/// Format a single address string with floor and elevator info for Telegram display.
+///
+/// **Caller**: `send_offer_to_telegram`
+/// **Why**: Telegram caption must show the admin exactly where helpers are going and what
+/// access conditions they face (stairs vs elevator), so they can sanity-check the offer.
+///
+/// # Parameters
+/// - `address` — full address string, e.g. `"Musterstr. 1, 31135 Hildesheim"`
+/// - `floor` — floor descriptor, e.g. `"3. OG"` or `""` (empty = omit)
+/// - `elevator` — `Some(true)` = Aufzug, `Some(false)` = kein Aufzug, `None` = unknown (omit)
+///
+/// # Returns
+/// If floor/elevator info is available: `"Musterstr. 1, 31135 Hildesheim (3. OG, kein Aufzug)"`.
+/// If neither is known: the address string unchanged.
 fn format_address_line(address: &str, floor: &str, elevator: Option<bool>) -> String {
     let mut parts = Vec::new();
     if !floor.is_empty() {
@@ -38,8 +50,24 @@ fn format_address_line(address: &str, floor: &str, elevator: Option<bool>) -> St
     }
 }
 
-/// Check if a quote has enough data to auto-generate an offer, and do so.
-/// Called after volume estimation or distance calculation completes.
+/// Check whether a quote has enough data to auto-generate an offer, and do so if ready.
+///
+/// **Caller**: `handle_complete_inquiry` (immediately after quote + volume estimation are stored),
+/// and any endpoint that completes a volume estimation (e.g. `estimates::post_inventory`).
+/// **Why**: Offers should be generated and forwarded to Telegram without any manual trigger from
+/// Alex. The function is idempotent — it exits early if an offer already exists.
+///
+/// # Readiness criteria
+/// - Quote must have `estimated_volume_m3 > 0`.
+/// - Distance is not required; if missing and both addresses are present, this function
+///   automatically runs the route calculator and writes `distance_km` to the quote first.
+///
+/// # Parameters
+/// - `state` — shared application state (DB, storage, config)
+/// - `quote_id` — the quote to check and potentially generate an offer for
+///
+/// # Returns
+/// Nothing. Errors are logged and, if critical, forwarded to the admin via Telegram.
 pub async fn try_auto_generate_offer(state: Arc<AppState>, quote_id: Uuid) {
     // Check if an offer already exists for this quote
     let existing: Option<(Uuid,)> =
@@ -153,9 +181,20 @@ pub async fn try_auto_generate_offer(state: Arc<AppState>, quote_id: Uuid) {
     }
 }
 
-/// Auto-create a tentative booking when an offer is generated, if the quote has a preferred_date.
-/// Uses force_create_booking (bypasses capacity) — conflicts are intentional and shown in the dashboard.
-/// Failures are logged but never block offer generation.
+/// Auto-create a tentative calendar booking when an offer is generated for a quote that has a
+/// preferred moving date.
+///
+/// **Caller**: `try_auto_generate_offer`, called immediately after a successful offer build.
+/// **Why**: Reserving the date tentatively prevents the admin from accidentally double-booking
+/// while still reviewing the offer. The booking is visible in the dashboard even if over-capacity.
+///
+/// Uses `force_create_booking`, which intentionally bypasses capacity limits — resulting
+/// conflicts appear in the calendar dashboard as a warning rather than blocking the flow.
+/// All errors are logged but never propagated, so booking failures cannot break offer generation.
+///
+/// # Parameters
+/// - `state` — shared application state (DB, calendar service, config)
+/// - `quote_id` — the quote whose `preferred_date` is used as the booking date
 async fn auto_create_booking(state: &AppState, quote_id: Uuid) {
     // Fetch preferred_date from quote
     let row: Option<(Option<chrono::DateTime<chrono::Utc>>,)> =
@@ -246,7 +285,28 @@ async fn auto_create_booking(state: &AppState, quote_id: Uuid) {
     }
 }
 
-/// Send the generated offer PDF to Telegram with approve/edit/deny buttons.
+/// Send the generated offer PDF to the admin Telegram chat with inline action buttons.
+///
+/// **Caller**: `try_auto_generate_offer` (initial offer) and `handle_offer_edit` (regenerated
+/// offer after Alex's edits).
+/// **Why**: The Telegram message is the primary review UI for Alex. It shows all relevant
+/// move details and pricing so he can approve, request edits, or discard the offer.
+///
+/// The caption is formatted in Telegram Markdown and includes:
+/// - Customer name, email, phone
+/// - Origin/destination addresses with floor + elevator info (via `format_address_line`)
+/// - Preferred date, volume (m³), item count, distance (km)
+/// - Selected additional services
+/// - Brutto and netto prices, persons × hours × rate breakdown
+/// - Free-text customer message (if any)
+/// - Validity date
+///
+/// Inline keyboard: `✅ Senden` / `✏️ Bearbeiten` / `❌ Verwerfen`, each carrying
+/// `offer_approve:<id>`, `offer_edit:<id>`, or `offer_deny:<id>` as callback data.
+///
+/// # Parameters
+/// - `config` — Telegram bot config (token + admin chat ID)
+/// - `generated` — offer data including the rendered PDF bytes and offer summary
 async fn send_offer_to_telegram(config: &TelegramConfig, generated: &GeneratedOffer) {
     let client = Client::new();
     let api_url = format!(
@@ -360,7 +420,18 @@ async fn send_offer_to_telegram(config: &TelegramConfig, generated: &GeneratedOf
     }
 }
 
-/// Send a simple error notification to the admin via Telegram.
+/// Send a plain-text error notification to the admin Telegram chat.
+///
+/// **Caller**: `try_auto_generate_offer` when offer generation fails.
+/// **Why**: The admin (Alex) has no other way to learn about silent background failures.
+/// Sending a message to Telegram ensures errors surface immediately rather than being
+/// silently swallowed.
+///
+/// The message is prefixed with `⚠️` so it is visually distinct from normal offer messages.
+///
+/// # Parameters
+/// - `config` — Telegram bot config (token + admin chat ID)
+/// - `message` — German-language error description to display
 async fn notify_telegram_error(config: &TelegramConfig, message: &str) {
     let client = Client::new();
     let api_url = format!(
@@ -388,8 +459,30 @@ struct EditingOffer {
     quote_id: Uuid,
 }
 
-/// Background task that handles offer approval/edit/deny events forwarded from the
-/// email agent's Telegram polling loop via an mpsc channel.
+/// Long-running background task that processes offer lifecycle events from the Telegram poller.
+///
+/// **Caller**: `main.rs`, spawned as a Tokio task at startup alongside the email agent.
+/// **Why**: The email agent's Telegram poller runs in a separate task and forwards button
+/// callbacks and free-text messages via an unbounded mpsc channel. This task owns the
+/// event loop that routes each event to the appropriate handler.
+///
+/// # Event dispatch
+///
+/// | Event | Action |
+/// |---|---|
+/// | `InquiryComplete(inquiry)` | `handle_complete_inquiry` — full DB pipeline + offer generation |
+/// | `OfferApprove(id)` | `handle_offer_approval` — email PDF to customer |
+/// | `OfferEdit(id)` | Enter edit mode, prompt Alex for instructions |
+/// | `OfferEditText(text)` | `handle_offer_edit` — LLM parse + regenerate offer |
+/// | `OfferDeny(id)` | `handle_offer_denial` — mark offer rejected |
+///
+/// Edit-mode state is tracked locally in `editing: Option<EditingOffer>`. Free-text messages
+/// are only consumed when edit mode is active; otherwise they are silently ignored.
+/// Typing "Abbrechen" or "Cancel" exits edit mode without regenerating.
+///
+/// # Parameters
+/// - `state` — shared application state
+/// - `rx` — receiving end of the mpsc channel from the email agent's Telegram poller
 pub async fn run_offer_event_handler(
     state: Arc<AppState>,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<ApprovalDecision>,
@@ -488,8 +581,36 @@ pub async fn run_offer_event_handler(
     }
 }
 
-/// Handle a complete inquiry: create customer + addresses + quote in DB,
-/// set volume estimate, and trigger offer generation → PDF → Telegram.
+/// Handle a fully-parsed moving inquiry: create all DB records and kick off offer generation.
+///
+/// **Caller**: `run_offer_event_handler` on `ApprovalDecision::InquiryComplete`.
+/// **Why**: This is the entry point for the email-to-offer pipeline. A single `MovingInquiry`
+/// carries everything the system needs to create the customer record, addresses, quote, volume
+/// estimation, and first offer in a single atomic sequence.
+///
+/// # Pipeline steps
+/// 1. Upsert customer by email (name/phone updated if previously unknown).
+/// 2. Parse and insert origin address (street/city/postal from free-text).
+/// 3. Parse and insert destination address.
+/// 4. (Optional) Parse and insert intermediate stop address.
+/// 5. Auto-calculate route distance if both addresses are present.
+/// 6. Determine volume — use `inquiry.volume_m3` if provided, otherwise apply
+///    room-count heuristics from `inquiry.notes` (default 25 m³).
+/// 7. Build comma-separated service notes via `build_quote_notes` and insert quote
+///    with status `"volume_estimated"`.
+/// 8. Insert a `volume_estimations` row (method `"manual"`) carrying the parsed items list.
+/// 9. Link the most-recent open email thread to the new quote.
+/// 10. Delegate to `try_auto_generate_offer` → PDF → Telegram.
+///
+/// # Parameters
+/// - `state` — shared application state
+/// - `_client`, `_bot_token`, `_chat_id` — retained for symmetry with other handlers
+///   (error notifications are delegated to `try_auto_generate_offer`)
+/// - `inquiry` — fully-parsed inquiry from the email agent
+///
+/// # Errors
+/// DB errors in steps 1 and 5 abort early (logged). Address and volume errors are
+/// non-fatal and result in `NULL` fields on the quote.
 async fn handle_complete_inquiry(
     state: &Arc<AppState>,
     _client: &Client,
@@ -775,10 +896,31 @@ pub struct ParsedInventoryItem {
     pub volume_m3: f64,
 }
 
-/// Parse VolumeCalculator items_list text into structured items.
-/// Handles both newline-separated and comma-separated formats:
-/// - "1x Bettumbau (0.30 m³)\n1x Nachttisch (0.20 m³)"
-/// - "1x Bettumbau (0.30 m³), 1x Nachttisch (0.20 m³)"
+/// Parse the VolumeCalculator `items_list` string into a structured list of inventory items.
+///
+/// **Caller**: `handle_complete_inquiry` when `inquiry.items_list` is present; the result is
+/// stored as `result_data` on the `volume_estimations` row and later used by `XlsxGenerator`
+/// to populate the "Erfasste Gegenstände" sheet in the offer XLSX.
+/// **Why**: The customer-facing VolumeCalculator app produces a flat text representation of
+/// the inventory. This parser normalises it so the data can be stored and rendered in the
+/// offer template without any further string manipulation.
+///
+/// # Accepted formats
+/// - Newline-separated: `"1x Bettumbau (0.30 m³)\n1x Nachttisch (0.20 m³)"`
+/// - Comma-separated:   `"1x Bettumbau (0.30 m³), 1x Nachttisch (0.20 m³)"`
+/// - Mixed: a line may itself contain multiple comma-separated items.
+///
+/// Per-item parsing:
+/// - Quantity prefix: `"2x "` or `"2 x "` at the start of an item.
+/// - Volume suffix: parenthesized notation `"(0.80 m³)"` or German decimal `"(0,80 m³)"`.
+///   Accepted unit spellings: `m³` and `m3`.
+///
+/// # Parameters
+/// - `text` — raw items_list string from `MovingInquiry.items_list`
+///
+/// # Returns
+/// Zero or more `ParsedInventoryItem` values. Items with an empty name after stripping are
+/// discarded. Items without a parseable volume get `volume_m3 = 0.0`.
 pub fn parse_items_list_text(text: &str) -> Vec<ParsedInventoryItem> {
     let mut items = Vec::new();
 
@@ -873,7 +1015,23 @@ pub fn parse_items_list_text(text: &str) -> Vec<ParsedInventoryItem> {
     items
 }
 
-/// Build notes for the quote from inquiry data.
+/// Build the comma-separated `quotes.notes` string from a `MovingInquiry`.
+///
+/// **Caller**: `handle_complete_inquiry`, step 7.
+/// **Why**: The pricing engine and line-item builder (`build_line_items` in `offers.rs`)
+/// parse `quotes.notes` to determine which surcharge rows to include in the XLSX offer
+/// (parking bans, packing service, assembly/disassembly, etc.). Storing services as a
+/// comma-separated string avoids schema changes for each new service type while keeping
+/// the data human-readable in the DB.
+///
+/// # Parameters
+/// - `inquiry` — the fully-parsed `MovingInquiry` whose boolean service flags and floor
+///   strings are serialised into the notes
+///
+/// # Returns
+/// A comma-separated string such as
+/// `"Auszug: 1. Stock, Einzug: 3. Stock, Halteverbot Auszug, Verpackungsservice, Montage"`.
+/// Returns an empty string when no flags are set and `inquiry.notes` is `None`.
 fn build_quote_notes(inquiry: &MovingInquiry) -> String {
     let mut parts = Vec::new();
 
@@ -914,7 +1072,34 @@ fn build_quote_notes(inquiry: &MovingInquiry) -> String {
     parts.join(", ")
 }
 
-/// Apply edit instructions and regenerate the offer.
+/// Parse Alex's free-text edit instructions and regenerate the offer with the requested overrides.
+///
+/// **Caller**: `run_offer_event_handler` on `ApprovalDecision::OfferEditText`, after Alex
+/// has entered edit mode by pressing ✏️ and typed his adjustment.
+/// **Why**: Alex reviews offers in Telegram and may want to adjust price, headcount, hours, or
+/// volume before sending to the customer. Rather than opening a backend admin panel, he types
+/// natural language German instructions and the system re-generates the PDF in-place.
+///
+/// # Flow
+/// 1. Fetch current offer details for LLM context (`fetch_current_offer_summary`).
+/// 2. Call `llm_parse_edit_instructions` to extract numeric overrides; on failure fall
+///    back to regex-based `parse_edit_instructions`.
+/// 3. If `volume_m3` was overridden, write it back to `quotes.estimated_volume_m3`.
+/// 4. Rebuild the offer with the parsed overrides, preserving the existing offer ID and
+///    offer number (`existing_offer_id = Some(old_offer_id)`).
+/// 5. Send the new PDF to Telegram via `send_offer_to_telegram`.
+///
+/// # Parameters
+/// - `state` — shared application state
+/// - `client` — HTTP client for Telegram API calls
+/// - `bot_token` — Telegram bot token
+/// - `chat_id` — admin Telegram chat ID
+/// - `old_offer_id` — the offer being replaced (its ID is reused in the regenerated offer)
+/// - `quote_id` — the quote this offer belongs to
+/// - `instructions` — raw German free-text from Alex, e.g. `"800 Euro, 4 Helfer"`
+///
+/// # Errors
+/// Generation errors are sent back to Alex as a German error message via Telegram.
 async fn handle_offer_edit(
     state: &AppState,
     client: &Client,
@@ -1005,7 +1190,25 @@ impl std::fmt::Display for OfferSummary {
     }
 }
 
-/// Fetch current offer details for LLM context.
+/// Fetch the current offer's price and the quote's volume/distance to build an `OfferSummary`.
+///
+/// **Caller**: `handle_offer_edit`, before calling `llm_parse_edit_instructions`.
+/// **Why**: The LLM prompt includes the current offer state so Alex can say things like
+/// "reduce by 50 euros" and the LLM can compute the new absolute price rather than needing
+/// the full context to be re-fetched inside the LLM layer.
+///
+/// Persons and hours are reverse-engineered from volume using the same heuristic the pricing
+/// engine uses: `persons = ceil(volume / 10)`, `hours = ceil(volume / (persons × 2))`.
+/// This gives approximate values sufficient for LLM context — the authoritative recalculation
+/// happens in `build_offer_with_overrides`.
+///
+/// # Parameters
+/// - `db` — database connection pool
+/// - `offer_id` — offer whose `price_cents` is fetched
+/// - `quote_id` — quote whose `estimated_volume_m3` and `distance_km` are fetched
+///
+/// # Returns
+/// An `OfferSummary` with sensible defaults (`0` price, `25.0` m³) if the rows are missing.
 async fn fetch_current_offer_summary(db: &PgPool, offer_id: Uuid, quote_id: Uuid) -> OfferSummary {
     // Get offer price
     let price: Option<(i64,)> = sqlx::query_as("SELECT price_cents FROM offers WHERE id = $1")
@@ -1042,15 +1245,36 @@ async fn fetch_current_offer_summary(db: &PgPool, offer_id: Uuid, quote_id: Uuid
     }
 }
 
-/// Use LLM to parse Alex's natural language edit instructions into numeric overrides.
+/// Use the configured LLM to parse Alex's natural language edit instructions into numeric overrides.
 ///
-/// Alex can say things like:
-/// - "mach das Angebot auf 350 Euro" or "350 brutto" or just "350"
-/// - "4 Helfer, 6 Stunden"
-/// - "Stundensatz 35"
+/// **Caller**: `handle_offer_edit`.
+/// **Why**: Regex parsing (`parse_edit_instructions`) handles straightforward phrases but
+/// fails on paraphrases like "mach das Angebot billiger" or "nehmt einen Helfer weg". The LLM
+/// understands context and can compute derived values (e.g. back-calculate netto from brutto).
 ///
-/// Default behavior: a bare price like "350" or "350 Euro" is treated as brutto.
-/// Alex always thinks in brutto prices.
+/// If the LLM call or JSON parsing fails, `handle_offer_edit` falls back to `parse_edit_instructions`.
+///
+/// # Math
+/// Alex always thinks and speaks in **brutto** prices (incl. 19% VAT).
+/// A bare number like `"800"` or `"800 Euro"` is always treated as brutto:
+///
+/// `price_cents_netto = round(brutto / 1.19 × 100)`
+///
+/// Only the explicit keyword `"netto"` bypasses the conversion:
+///
+/// `price_cents_netto = round(netto × 100)`
+///
+/// # Parameters
+/// - `llm` — LLM provider instance (Claude, OpenAI, or Ollama)
+/// - `instructions` — Alex's raw German free-text, e.g. `"mach auf 800 Euro, 4 Helfer"`
+/// - `current` — current offer summary embedded in the system prompt for context
+///
+/// # Returns
+/// `Ok(EditOverrides)` with only the fields that were explicitly mentioned set.
+/// Fields not mentioned remain `None` so they are not overridden in `build_offer_with_overrides`.
+///
+/// # Errors
+/// Returns `Err(String)` if the LLM call fails or the response cannot be parsed as JSON.
 async fn llm_parse_edit_instructions(
     llm: &dyn LlmProvider,
     instructions: &str,
@@ -1141,13 +1365,36 @@ struct EditOverrides {
     volume_m3: Option<f64>,
 }
 
-/// Parse simple German edit instructions into numeric overrides.
-/// Supports patterns like:
-/// - "Preis auf 800 Euro" / "Preis: 800" / "800€"
-/// - "4 Helfer" / "Helfer: 4"
-/// - "6 Stunden" / "Stunden: 6"
-/// - "Stundensatz 35" / "Rate: 35"
-/// - "Volumen 15" / "15 m³"
+/// Regex-based fallback parser for Alex's German edit instructions.
+///
+/// **Caller**: `handle_offer_edit`, used when `llm_parse_edit_instructions` fails.
+/// **Why**: Provides a deterministic, offline fallback that handles the most common
+/// instruction patterns without requiring a live LLM.
+///
+/// The text is split on `,`, `.`, `;`, and `\n` and each segment is checked for keyword
+/// patterns. Only the first matching number per segment is extracted.
+///
+/// # Supported patterns
+/// - Price: `"Preis auf 800 Euro"` / `"800€"` / `"Preis: 500"` / `"350 brutto"`
+/// - Persons: `"4 Helfer"` / `"Helfer: 4"` / `"3 Mann"`
+/// - Hours: `"6 Stunden"` / `"Stunden: 6"`
+/// - Rate: `"Stundensatz 35"` / `"Rate: 35"`
+/// - Volume: `"15 m³"` / `"Volumen 15"` / `"15 Kubikmeter"`
+///
+/// # Math
+/// Alex always thinks in **brutto** prices. Unless `"netto"` is present, every extracted
+/// price number is treated as brutto and converted to netto cents:
+///
+/// `price_cents_netto = floor(brutto / 1.19 × 100)`
+///
+/// If both `"netto"` and `"brutto"` appear in the same segment, `"netto"` takes precedence
+/// (the `netto` check executes first in the condition chain).
+///
+/// # Parameters
+/// - `text` — free-text German instruction from Alex
+///
+/// # Returns
+/// `EditOverrides` with only the detected fields set; undetected fields remain `None`.
 fn parse_edit_instructions(text: &str) -> EditOverrides {
     let mut overrides = EditOverrides::default();
     let text_lower = text.to_lowercase();
@@ -1205,7 +1452,22 @@ fn parse_edit_instructions(text: &str) -> EditOverrides {
     overrides
 }
 
-/// Extract the first number from a string.
+/// Extract the first numeric value (integer or decimal) from a string.
+///
+/// **Caller**: `parse_edit_instructions`, once per keyword-matched segment.
+/// **Why**: Price and quantity values are embedded in natural language and must be
+/// extracted without splitting the string into tokens, since the number can appear
+/// anywhere relative to the keyword.
+///
+/// Scanning stops at the first non-numeric, non-decimal character encountered after
+/// at least one digit has been seen. Both `.` and `,` are treated as decimal separators
+/// (German locale uses commas), though only the first separator is meaningful.
+///
+/// # Parameters
+/// - `s` — the string segment to scan
+///
+/// # Returns
+/// `Some(f64)` for the first number found, or `None` if the string contains no digits.
 fn extract_number(s: &str) -> Option<f64> {
     let mut num_str = String::new();
     let mut found_digit = false;
@@ -1228,6 +1490,26 @@ fn extract_number(s: &str) -> Option<f64> {
     num_str.parse::<f64>().ok()
 }
 
+/// Download the approved offer PDF from S3 and email it to the customer.
+///
+/// **Caller**: `run_offer_event_handler` on `ApprovalDecision::OfferApprove`.
+/// **Why**: Alex presses ✅ in Telegram after reviewing the PDF. At that point the offer
+/// should be delivered to the customer without further manual steps.
+///
+/// # Flow
+/// 1. Look up `customer.email` and `offer.pdf_storage_key` by joining `offers → quotes → customers`.
+/// 2. Download PDF bytes from S3/MinIO via the storage provider.
+/// 3. Send the PDF as an email attachment via SMTP (`send_offer_email`).
+/// 4. On success: mark offer `status = 'sent'`, quote `status = 'offer_sent'`, and store the
+///    outbound email in the `email_messages` table for the customer's thread.
+/// 5. Confirm success or report error back to Alex via Telegram.
+///
+/// # Parameters
+/// - `state` — shared application state (DB, storage, email config)
+/// - `client` — HTTP client for Telegram API calls
+/// - `bot_token` — Telegram bot token
+/// - `chat_id` — admin Telegram chat ID
+/// - `offer_id` — the offer to approve and send
 async fn handle_offer_approval(
     state: &AppState,
     client: &Client,
@@ -1350,6 +1632,19 @@ async fn handle_offer_approval(
     }
 }
 
+/// Mark a rejected offer and its parent quote as `'rejected'` in the database.
+///
+/// **Caller**: `run_offer_event_handler` on `ApprovalDecision::OfferDeny`.
+/// **Why**: Alex presses ❌ in Telegram when the offer is wrong or not relevant (e.g. spam
+/// inquiry). Marking both `offers.status` and `quotes.status` as rejected prevents the offer
+/// from appearing in pending dashboards and allows future reporting on rejection rates.
+///
+/// # Parameters
+/// - `state` — shared application state (DB)
+/// - `client` — HTTP client for Telegram API calls
+/// - `bot_token` — Telegram bot token
+/// - `chat_id` — admin Telegram chat ID
+/// - `offer_id` — the offer to reject
 async fn handle_offer_denial(
     state: &AppState,
     client: &Client,
@@ -1385,7 +1680,26 @@ async fn handle_offer_denial(
     send_telegram_message(client, bot_token, chat_id, "❌ Angebot verworfen.").await;
 }
 
-/// Send an email with the offer PDF attached.
+/// Send the offer PDF to a customer via SMTP with a standard German cover letter.
+///
+/// **Caller**: `handle_offer_approval` (approval flow) and the admin API route
+/// `POST /api/v1/offers/{id}/send` (manual re-send from the dashboard).
+/// **Why**: Encapsulates SMTP send logic and the standard body text so that both callers
+/// produce identical emails. The offer PDF is attached under the filename `Angebot-<id>.pdf`.
+///
+/// Uses `crate::services::email::{build_email_with_attachment, send_email}` internally.
+///
+/// # Parameters
+/// - `state` — shared application state (email config: SMTP host/port, credentials, from address)
+/// - `to` — customer email address
+/// - `pdf_bytes` — raw PDF bytes to attach
+/// - `offer_id` — used for the attachment filename and for logging
+///
+/// # Returns
+/// `Ok(())` on successful SMTP delivery.
+///
+/// # Errors
+/// Returns `Err(String)` if the email cannot be built (e.g. invalid address) or SMTP delivery fails.
 pub async fn send_offer_email(
     state: &AppState,
     to: &str,
@@ -1428,6 +1742,27 @@ pub async fn send_offer_email(
     Ok(())
 }
 
+/// Send the offer PDF to a customer via SMTP with a caller-supplied subject and body.
+///
+/// **Caller**: The admin API route `POST /api/v1/offers/{id}/send` when the request body
+/// includes a custom `subject` and/or `body` (editable email draft feature).
+/// **Why**: Alex sometimes wants to personalise the cover letter before sending, e.g. to
+/// reference a phone conversation or add a special note. This variant accepts arbitrary
+/// subject and body strings instead of the standard template used by `send_offer_email`.
+///
+/// # Parameters
+/// - `state` — shared application state (email config)
+/// - `to` — customer email address
+/// - `pdf_bytes` — raw PDF bytes to attach
+/// - `offer_id` — used for the attachment filename and for logging
+/// - `subject` — custom email subject line
+/// - `body` — custom plain-text email body
+///
+/// # Returns
+/// `Ok(())` on successful SMTP delivery.
+///
+/// # Errors
+/// Returns `Err(String)` if the email cannot be built or SMTP delivery fails.
 pub async fn send_offer_email_custom(
     state: &AppState,
     to: &str,
@@ -1466,6 +1801,18 @@ pub async fn send_offer_email_custom(
     Ok(())
 }
 
+/// Send a plain-text message to the admin Telegram chat.
+///
+/// **Caller**: Multiple handlers throughout the orchestrator — used for status confirmations
+/// (e.g. "✅ Angebot gesendet"), edit-mode prompts, error reports, and cancellation notices.
+/// **Why**: Centralises the Telegram `sendMessage` API call so all handlers share the same
+/// error handling (log on failure, never panic).
+///
+/// # Parameters
+/// - `client` — shared `reqwest::Client`
+/// - `bot_token` — Telegram bot token
+/// - `chat_id` — admin Telegram chat ID
+/// - `text` — message text (plain text, no Markdown parsing)
 async fn send_telegram_message(client: &Client, bot_token: &str, chat_id: i64, text: &str) {
     let api_url = format!("https://api.telegram.org/bot{bot_token}/sendMessage");
     let payload = serde_json::json!({

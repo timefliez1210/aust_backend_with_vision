@@ -18,6 +18,12 @@ use crate::services::db::insert_estimation_no_return;
 use crate::services::status_sync;
 use crate::{ApiError, AppState};
 
+/// Register all admin-panel routes (protected under JWT middleware).
+///
+/// **Caller**: `crates/api/src/routes/mod.rs` route tree assembly, nested under the admin
+/// JWT authentication middleware.
+/// **Why**: Consolidates every dashboard endpoint — customers, quotes, offers, addresses,
+/// email threads, users, and orders — into a single router mounted at `/api/v1/admin`.
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/dashboard", get(dashboard))
@@ -75,6 +81,19 @@ struct ActivityItem {
     created_at: DateTime<Utc>,
 }
 
+/// `GET /api/v1/admin/dashboard` — Return headline KPIs and recent activity for the dashboard.
+///
+/// **Caller**: Axum router / admin dashboard home page on load.
+/// **Why**: Aggregates open quote count, draft offer count, today's bookings, total customers,
+/// the 10 most recent offer events, and dates in the next 30 days where bookings exceed
+/// capacity — all in one query round-trip for the dashboard overview card.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool, config for `calendar.default_capacity`)
+/// - `_claims` — JWT claims injected by middleware (unused; auth check performed by middleware)
+///
+/// # Returns
+/// `200 OK` with `DashboardResponse` JSON.
 async fn dashboard(
     State(state): State<Arc<AppState>>,
     Extension(_claims): Extension<TokenClaims>,
@@ -206,6 +225,17 @@ struct CustomerListResponse {
     total: i64,
 }
 
+/// `GET /api/v1/admin/customers` — List customers with optional full-text search.
+///
+/// **Caller**: Axum router / admin dashboard customers list page.
+/// **Why**: Paginated, ILIKE-searchable customer listing for the admin panel.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool)
+/// - `query` — optional `search` (matched against name and email), `limit`, `offset`
+///
+/// # Returns
+/// `200 OK` with `CustomerListResponse` containing `customers` array and `total` count.
 async fn list_customers(
     State(state): State<Arc<AppState>>,
     Extension(_claims): Extension<TokenClaims>,
@@ -273,6 +303,21 @@ struct CustomerOffer {
     sent_at: Option<DateTime<Utc>>,
 }
 
+/// `GET /api/v1/admin/customers/{id}` — Retrieve a customer with their quotes and offers.
+///
+/// **Caller**: Axum router / admin dashboard customer detail page.
+/// **Why**: Returns customer contact info plus all associated quotes and offers,
+/// ordered newest-first, for the admin CRM view.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool)
+/// - `id` — customer UUID path parameter
+///
+/// # Returns
+/// `200 OK` with `CustomerDetailResponse`.
+///
+/// # Errors
+/// - `404` if customer not found
 async fn get_customer(
     State(state): State<Arc<AppState>>,
     Extension(_claims): Extension<TokenClaims>,
@@ -330,6 +375,22 @@ struct UpdateCustomerRequest {
     email: Option<String>,
 }
 
+/// `PATCH /api/v1/admin/customers/{id}` — Partially update a customer's contact fields.
+///
+/// **Caller**: Axum router / admin dashboard customer edit form.
+/// **Why**: Allows correcting a customer's name, phone, or email without touching other
+/// fields (COALESCE-based partial update).
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool)
+/// - `id` — customer UUID path parameter
+/// - `request` — optional `name`, `phone`, `email` fields
+///
+/// # Returns
+/// `200 OK` with updated `CustomerListItem`.
+///
+/// # Errors
+/// - `404` if customer not found
 async fn update_customer(
     State(state): State<Arc<AppState>>,
     Extension(_claims): Extension<TokenClaims>,
@@ -366,6 +427,22 @@ struct CreateCustomerRequest {
     phone: Option<String>,
 }
 
+/// `POST /api/v1/admin/customers` — Create a new customer record.
+///
+/// **Caller**: Axum router / admin dashboard "Neuer Kunde" form.
+/// **Why**: Allows manually creating a customer before creating a quote for walk-in or
+/// phone inquiries that bypass the email pipeline.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool)
+/// - `request` — JSON body with `email` (required), optional `name` and `phone`
+///
+/// # Returns
+/// `201 Created` with the new `CustomerListItem` JSON.
+///
+/// # Errors
+/// - `400` if a customer with the same email already exists
+/// - `500` on other DB failures
 async fn create_customer(
     State(state): State<Arc<AppState>>,
     Extension(_claims): Extension<TokenClaims>,
@@ -431,6 +508,25 @@ struct CreateQuoteResponse {
     destination_address_id: Uuid,
 }
 
+/// `POST /api/v1/admin/quotes` — Create a quote with inline address creation.
+///
+/// **Caller**: Axum router / admin dashboard "Neue Anfrage" form.
+/// **Why**: Unlike the public `POST /api/v1/quotes`, this endpoint creates the origin and
+/// destination `addresses` records inline (no pre-existing address IDs needed) and also
+/// accepts an optional `items_list` in VolumeCalculator text format, which is parsed into
+/// a `volume_estimations` record so the quote is immediately ready for offer generation.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool)
+/// - `request` — JSON body with `customer_id`, `origin`, `destination` address structs,
+///   optional `preferred_date`, `estimated_volume_m3`, `distance_km`, `notes`, `items_list`
+///
+/// # Returns
+/// `201 Created` with `CreateQuoteResponse` (quote ID, origin and destination address IDs).
+///
+/// # Errors
+/// - `404` if the referenced customer does not exist
+/// - `500` on DB failures
 async fn create_quote(
     State(state): State<Arc<AppState>>,
     Extension(_claims): Extension<TokenClaims>,
@@ -583,6 +679,19 @@ struct AdminQuotesListResponse {
     total: i64,
 }
 
+/// `GET /api/v1/admin/quotes` — List quotes with customer name and city columns for the dashboard.
+///
+/// **Caller**: Axum router / admin dashboard quotes list page.
+/// **Why**: Richer than the public list endpoint — joins customers and addresses so the
+/// table can display customer name, email, origin city, and destination city without
+/// separate requests. Supports status filter and full-text search on customer name/email.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool)
+/// - `query` — optional `status`, `search`, `limit` (max 100), `offset`
+///
+/// # Returns
+/// `200 OK` with `AdminQuotesListResponse` containing `quotes` and `total`.
 async fn list_admin_quotes(
     State(state): State<Arc<AppState>>,
     Extension(_claims): Extension<TokenClaims>,
@@ -694,6 +803,8 @@ struct AdminEstimationRow {
 }
 
 impl AdminEstimationRow {
+    /// Convert the full estimation DB row into the lightweight `EstimationSummary` used in
+    /// list views. Builds source image/video URL proxies and counts detected items.
     fn to_summary(&self) -> EstimationSummary {
         let source_video_url = self.source_data.get("video_s3_key")
             .and_then(|v| v.as_str())
@@ -787,6 +898,23 @@ struct QuoteDetailRow {
     offer_created_at: Option<DateTime<Utc>>,
 }
 
+/// `GET /api/v1/admin/quotes/{id}` — Return the full enriched quote detail for the admin dashboard.
+///
+/// **Caller**: Axum router / admin dashboard quote detail page.
+/// **Why**: Single query (LATERAL JOIN for latest offer) fetching quote, customer, both
+/// addresses, the latest offer with all line items, and all volume estimation batches
+/// (including processing/failed ones the frontend needs to show delete buttons for).
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool)
+/// - `id` — quote UUID path parameter
+///
+/// # Returns
+/// `200 OK` with `QuoteDetailResponse` JSON including origin/destination addresses, the
+/// latest offer's full line-item breakdown, estimation summaries, and detected items.
+///
+/// # Errors
+/// - `404` if quote not found
 async fn get_quote_detail(
     State(state): State<Arc<AppState>>,
     Extension(_claims): Extension<TokenClaims>,
@@ -985,6 +1113,18 @@ struct OfferListResponse {
     total: i64,
 }
 
+/// `GET /api/v1/admin/offers` — List offers with customer name and brutto price for the dashboard.
+///
+/// **Caller**: Axum router / admin dashboard offers list page.
+/// **Why**: Joins customers to display customer name alongside offer number, status, and
+/// brutto price (netto × 1.19). Supports status filtering.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool)
+/// - `query` — optional `status`, `limit` (max 100), `offset`
+///
+/// # Returns
+/// `200 OK` with `OfferListResponse` containing `offers` and `total`.
 async fn list_offers(
     State(state): State<Arc<AppState>>,
     Extension(_claims): Extension<TokenClaims>,
@@ -1102,6 +1242,22 @@ struct OfferDetailRow {
 }
 
 
+/// `GET /api/v1/admin/offers/{id}` — Return the full enriched offer detail for the admin dashboard.
+///
+/// **Caller**: Axum router / admin dashboard offer detail page.
+/// **Why**: Joins quote, customer, and addresses to provide all display fields in one call.
+/// Also returns the full line-item breakdown, volume estimation summaries, detected item
+/// cards, and the pre-populated email draft (subject + body) for the "Senden" dialog.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool)
+/// - `id` — offer UUID path parameter
+///
+/// # Returns
+/// `200 OK` with `OfferDetailResponse` JSON.
+///
+/// # Errors
+/// - `404` if offer not found
 async fn get_offer_detail(
     State(state): State<Arc<AppState>>,
     Extension(_claims): Extension<TokenClaims>,
@@ -1261,6 +1417,10 @@ async fn get_offer_detail(
     }))
 }
 
+/// Format an address from nullable street, postal code, and city into a display string.
+///
+/// **Caller**: `get_offer_detail` — for `origin_address` and `destination_address` fields.
+/// Returns an empty string when street or city is missing.
 fn format_address(street: Option<&str>, postal: Option<&str>, city: Option<&str>) -> String {
     match (street, city) {
         (Some(s), Some(c)) => {
@@ -1271,6 +1431,18 @@ fn format_address(street: Option<&str>, postal: Option<&str>, city: Option<&str>
     }
 }
 
+/// Build the default email body for the offer send dialog.
+///
+/// **Caller**: `get_offer_detail` — populates the `email_body` field so the admin can
+/// review and optionally edit the text before clicking "Senden".
+/// **Why**: Uses `greeting_for_name` to personalise the salutation. The resulting text is
+/// shown as an editable draft in the dashboard's offer detail "Senden" dialog.
+///
+/// # Parameters
+/// - `customer_name` — customer display name (may be empty string if only email is known)
+///
+/// # Returns
+/// Multi-line German email body string.
 fn build_email_draft(customer_name: &str) -> String {
     let greeting = crate::routes::offers::greeting_for_name(customer_name);
     format!(
@@ -1296,6 +1468,23 @@ struct UpdateOfferRequest {
     line_items_json: Option<serde_json::Value>,
 }
 
+/// `PATCH /api/v1/admin/offers/{id}` — Partially update offer metadata in the DB without regenerating the PDF.
+///
+/// **Caller**: Axum router / admin dashboard offer edit form (inline field edits).
+/// **Why**: Allows changing price, persons, hours, rate, validity date, status, or the
+/// stored line items JSON without running the full XLSX→PDF pipeline. Useful for quick
+/// corrections that only need the DB record updated (e.g. setting `valid_until`).
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool)
+/// - `id` — offer UUID path parameter
+/// - `request` — partial update fields; omitted fields are unchanged (COALESCE)
+///
+/// # Returns
+/// `200 OK` with `{"ok": true}`.
+///
+/// # Errors
+/// - `404` if offer not found
 async fn update_offer(
     State(state): State<Arc<AppState>>,
     Extension(_claims): Extension<TokenClaims>,
@@ -1355,6 +1544,25 @@ struct RegenerateLineItem {
     remark: Option<String>,
 }
 
+/// `POST /api/v1/admin/offers/{id}/regenerate` — Regenerate the offer PDF with optional overrides.
+///
+/// **Caller**: Axum router / admin dashboard "Angebot neu generieren" action.
+/// **Why**: Re-runs the full `build_offer_with_overrides` pipeline for an existing offer,
+/// updating the PDF in S3 and refreshing the DB record in-place (same `offer_number`,
+/// same `id`). Used when Alex wants to adjust price, persons, hours, or line items after
+/// the initial generation.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool, storage, config)
+/// - `id` — offer UUID path parameter (becomes `existing_offer_id` override → in-place update)
+/// - `request` — optional `price_cents`, `persons`, `hours`, `rate`, `line_items` overrides
+///
+/// # Returns
+/// `200 OK` with summary JSON containing `id`, `quote_id`, `price_cents`, `status`.
+///
+/// # Errors
+/// - `404` if offer not found
+/// - `400`/`500` propagated from `build_offer_with_overrides`
 async fn regenerate_offer(
     State(state): State<Arc<AppState>>,
     Extension(_claims): Extension<TokenClaims>,
@@ -1403,8 +1611,26 @@ async fn regenerate_offer(
     })))
 }
 
-/// Re-estimate an offer: refresh distance from ORS, recalculate pricing, and regenerate the PDF
-/// while keeping the same offer ID and offer number.
+/// `POST /api/v1/admin/offers/{id}/re-estimate` — Refresh distance from ORS and regenerate the offer PDF.
+///
+/// **Caller**: Axum router / admin dashboard "Neu kalkulieren" button.
+/// **Why**: When an address is corrected after the initial offer was generated, the stored
+/// `distance_km` may be stale. This endpoint first queries OpenRouteService for the current
+/// route (origin → optional stop → destination), writes the new `distance_km` to the quote,
+/// then runs `build_offer_with_overrides` in-place (preserving offer ID and number) so the
+/// Fahrkostenpauschale and labor hours are recalculated from scratch.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool, storage, config, ORS API key)
+/// - `id` — offer UUID path parameter
+///
+/// # Returns
+/// `200 OK` with summary JSON containing `id`, `quote_id`, `price_cents`, `status`, `offer_number`.
+///
+/// # Errors
+/// - `404` if offer or quote not found
+/// - ORS distance failures are logged as warnings; the existing `distance_km` is kept
+/// - `500` on DB or XLSX/PDF/S3 failures
 async fn re_estimate_offer(
     State(state): State<Arc<AppState>>,
     Extension(_claims): Extension<TokenClaims>,
@@ -1520,6 +1746,26 @@ struct SendOfferRequest {
     email_body: Option<String>,
 }
 
+/// `POST /api/v1/admin/offers/{id}/send` — Send the offer PDF to the customer via SMTP.
+///
+/// **Caller**: Axum router / admin dashboard "Senden" button in the offer detail dialog.
+/// **Why**: Downloads the PDF from S3, sends it as an email attachment to the customer,
+/// and updates both `offers.status = 'sent'` and `quotes.status = 'offer_sent'`.
+/// Accepts optional custom `email_subject` and `email_body`; falls back to the
+/// auto-generated draft if not provided.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool, storage, SMTP config via orchestrator)
+/// - `id` — offer UUID path parameter
+/// - `request` — optional `email_subject` and `email_body` overrides
+///
+/// # Returns
+/// `200 OK` with `{"message": "Angebot an <email> gesendet", "sent_at": ...}`.
+///
+/// # Errors
+/// - `404` if offer not found
+/// - `400` if offer has no associated PDF
+/// - `500` on S3 download or SMTP send failures
 async fn send_offer(
     State(state): State<Arc<AppState>>,
     Extension(_claims): Extension<TokenClaims>,
@@ -1578,6 +1824,21 @@ async fn send_offer(
     })))
 }
 
+/// `POST /api/v1/admin/offers/{id}/reject` — Mark an offer as rejected.
+///
+/// **Caller**: Axum router / admin dashboard "Verwerfen" button.
+/// **Why**: Sets `offers.status = 'rejected'` and cascades `quotes.status = 'rejected'`
+/// so the quote is removed from active pipelines.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool)
+/// - `id` — offer UUID path parameter
+///
+/// # Returns
+/// `200 OK` with `{"message": "Angebot verworfen", "id": ...}`.
+///
+/// # Errors
+/// - `404` if offer not found
 async fn reject_offer(
     State(state): State<Arc<AppState>>,
     Extension(_claims): Extension<TokenClaims>,
@@ -1622,6 +1883,25 @@ struct SetQuoteStatusRequest {
     status: String,
 }
 
+/// `POST /api/v1/admin/quotes/{id}/status` — Force-set a quote to any valid status.
+///
+/// **Caller**: Axum router / admin dashboard status override control.
+/// **Why**: Manual status management for edge cases (e.g. marking a quote "done" or
+/// "paid" after a cash transaction). Validates the status string against the full
+/// allowed set, then calls `status_sync` helpers to cascade the change to linked
+/// bookings and offers (e.g. confirming a booking when the quote is accepted).
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool, calendar service)
+/// - `id` — quote UUID path parameter
+/// - `body` — JSON body with `status` string
+///
+/// # Returns
+/// `200 OK` with `{"message": "Status auf '<status>' gesetzt", "status": ...}`.
+///
+/// # Errors
+/// - `400` if the status value is not in the allowed set
+/// - `404` if quote not found
 async fn set_quote_status(
     State(state): State<Arc<AppState>>,
     Extension(_claims): Extension<TokenClaims>,
@@ -1720,6 +2000,19 @@ struct OrdersListResponse {
     total: i64,
 }
 
+/// `GET /api/v1/admin/orders` — List confirmed orders (quotes in accepted/done/paid status).
+///
+/// **Caller**: Axum router / admin dashboard "Aufträge" tab.
+/// **Why**: Orders are quotes that have been accepted. This endpoint filters by the three
+/// order-phase statuses and joins booking dates and the latest offer's brutto price for
+/// the order management table. Results are sorted by `preferred_date` (moving date) ascending.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool)
+/// - `query` — optional `status` (single order status filter or all), `search`, `limit`, `offset`
+///
+/// # Returns
+/// `200 OK` with `OrdersListResponse` containing `orders` and `total`.
 async fn list_orders(
     State(state): State<Arc<AppState>>,
     Extension(_claims): Extension<TokenClaims>,
@@ -1858,6 +2151,23 @@ struct AddressResponse {
     elevator: Option<bool>,
 }
 
+/// `PATCH /api/v1/admin/addresses/{id}` — Partially update an address record.
+///
+/// **Caller**: Axum router / admin dashboard address edit form on the quote detail page.
+/// **Why**: Allows correcting street, city, postal code, floor, or elevator without
+/// creating a new address record. After editing, the admin typically uses `re-estimate`
+/// to refresh the distance and regenerate the offer.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool)
+/// - `id` — address UUID path parameter
+/// - `request` — partial update fields; omitted fields are unchanged
+///
+/// # Returns
+/// `200 OK` with updated `AddressResponse`.
+///
+/// # Errors
+/// - `404` if address not found
 async fn update_address(
     State(state): State<Arc<AppState>>,
     Extension(_claims): Extension<TokenClaims>,
@@ -1905,6 +2215,16 @@ struct UserListResponse {
     users: Vec<UserListItem>,
 }
 
+/// `GET /api/v1/admin/users` — List all admin users.
+///
+/// **Caller**: Axum router / admin dashboard settings → user management page.
+/// **Why**: Shows all registered admin accounts ordered by creation date.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool)
+///
+/// # Returns
+/// `200 OK` with `UserListResponse` containing all users (id, email, name, role, created_at).
 async fn list_users(
     State(state): State<Arc<AppState>>,
     Extension(_claims): Extension<TokenClaims>,
@@ -1918,6 +2238,23 @@ async fn list_users(
     Ok(Json(UserListResponse { users }))
 }
 
+/// `POST /api/v1/admin/users/{id}/delete` — Delete an admin user account.
+///
+/// **Caller**: Axum router / admin dashboard user management page.
+/// **Why**: Hard-deletes the user record. Prevents self-deletion (a user cannot delete
+/// their own account) to avoid lockout.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool)
+/// - `claims` — JWT claims of the currently authenticated user (used for self-deletion check)
+/// - `id` — user UUID path parameter
+///
+/// # Returns
+/// `200 OK` with `{"ok": true}`.
+///
+/// # Errors
+/// - `400` if the user tries to delete their own account
+/// - `404` if user not found
 async fn delete_user(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<TokenClaims>,
@@ -1943,6 +2280,21 @@ async fn delete_user(
 
 // --- Delete individual records ---
 
+/// `POST /api/v1/admin/offers/{id}/delete` — Hard-delete an offer record.
+///
+/// **Caller**: Axum router / admin dashboard "Löschen" action on an offer.
+/// **Why**: Permanently removes the offer row. Does not delete the S3 PDF (use a
+/// dedicated storage cleanup if needed). Does not cascade to the quote status.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool)
+/// - `id` — offer UUID path parameter
+///
+/// # Returns
+/// `200 OK` with `{"ok": true}`.
+///
+/// # Errors
+/// - `404` if offer not found
 async fn delete_offer(
     State(state): State<Arc<AppState>>,
     Extension(_claims): Extension<TokenClaims>,
@@ -1958,6 +2310,21 @@ async fn delete_offer(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
+/// `POST /api/v1/admin/quotes/{id}/delete` — Hard-delete a quote and its dependent records.
+///
+/// **Caller**: Axum router / admin dashboard "Anfrage löschen" action.
+/// **Why**: Cascades via FK to `volume_estimations` and `offers` (and their S3 PDFs are
+/// orphaned — handle separately if needed). Use for test data cleanup or GDPR erasure.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool)
+/// - `id` — quote UUID path parameter
+///
+/// # Returns
+/// `200 OK` with `{"ok": true}`.
+///
+/// # Errors
+/// - `404` if quote not found
 async fn delete_quote(
     State(state): State<Arc<AppState>>,
     Extension(_claims): Extension<TokenClaims>,
@@ -1974,6 +2341,22 @@ async fn delete_quote(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
+/// `POST /api/v1/admin/customers/{id}/delete` — Hard-delete a customer and all their data.
+///
+/// **Caller**: Axum router / admin dashboard customer delete action.
+/// **Why**: Cascades via FK to quotes, offers, volume_estimations, email_threads, and
+/// email_messages. Use for GDPR erasure requests. S3 objects (PDFs, images) are orphaned
+/// and must be cleaned separately.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool)
+/// - `id` — customer UUID path parameter
+///
+/// # Returns
+/// `200 OK` with `{"ok": true}`.
+///
+/// # Errors
+/// - `404` if customer not found
 async fn delete_customer(
     State(state): State<Arc<AppState>>,
     Extension(_claims): Extension<TokenClaims>,
@@ -2019,6 +2402,19 @@ struct EmailThreadListResponse {
     total: i64,
 }
 
+/// `GET /api/v1/admin/emails` — List email threads with customer info and last-message metadata.
+///
+/// **Caller**: Axum router / admin dashboard "E-Mails" tab.
+/// **Why**: Provides an inbox-style view of all email threads: customer name/email,
+/// message count, last message direction, and timestamp. Supports full-text search on
+/// customer name, email, and thread subject.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool)
+/// - `query` — optional `search`, `limit`, `offset`
+///
+/// # Returns
+/// `200 OK` with `EmailThreadListResponse` containing `threads` and `total`.
 async fn list_email_threads(
     State(state): State<Arc<AppState>>,
     Extension(_claims): Extension<TokenClaims>,
@@ -2105,6 +2501,21 @@ struct EmailMessageItem {
     created_at: DateTime<Utc>,
 }
 
+/// `GET /api/v1/admin/emails/{id}` — Return an email thread with all its messages.
+///
+/// **Caller**: Axum router / admin dashboard email thread detail page.
+/// **Why**: Returns the thread header and all non-discarded messages in chronological order.
+/// Draft messages are included so the admin can review before sending.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool)
+/// - `id` — thread UUID path parameter
+///
+/// # Returns
+/// `200 OK` with `EmailThreadDetailResponse` (thread + messages array).
+///
+/// # Errors
+/// - `404` if thread not found
 async fn get_email_thread(
     State(state): State<Arc<AppState>>,
     Extension(_claims): Extension<TokenClaims>,
@@ -2141,7 +2552,23 @@ async fn get_email_thread(
     Ok(Json(EmailThreadDetailResponse { thread, messages }))
 }
 
-/// Send a draft email via SMTP (approve from dashboard).
+/// `POST /api/v1/admin/emails/messages/{id}/send` — Send a draft email via SMTP.
+///
+/// **Caller**: Axum router / admin dashboard "Senden" button in the email thread view.
+/// **Why**: Fetches the draft message body and the customer's real email (via the thread →
+/// customer join), sends via SMTP, and marks the message as `sent`. The `to_address` is
+/// corrected to the real customer email (overriding whatever placeholder was stored).
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool, SMTP config)
+/// - `id` — email_message UUID path parameter (must have `status = 'draft'`)
+///
+/// # Returns
+/// `200 OK` with `{"message": "E-Mail an <email> gesendet"}`.
+///
+/// # Errors
+/// - `404` if the draft message does not exist or is not in draft status
+/// - `500` on SMTP failures
 async fn send_draft_email(
     State(state): State<Arc<AppState>>,
     Extension(_claims): Extension<TokenClaims>,
@@ -2184,7 +2611,21 @@ async fn send_draft_email(
     })))
 }
 
-/// Discard a draft email (reject from dashboard).
+/// `POST /api/v1/admin/emails/messages/{id}/discard` — Discard a draft email.
+///
+/// **Caller**: Axum router / admin dashboard "Verwerfen" button in the email thread view.
+/// **Why**: Sets `email_messages.status = 'discarded'` so the draft is excluded from the
+/// thread view without being physically deleted. Prevents accidental sends of stale drafts.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool)
+/// - `id` — email_message UUID path parameter (must have `status = 'draft'`)
+///
+/// # Returns
+/// `200 OK` with `{"ok": true}`.
+///
+/// # Errors
+/// - `404` if draft not found or already processed
 async fn discard_draft_email(
     State(state): State<Arc<AppState>>,
     Extension(_claims): Extension<TokenClaims>,
@@ -2212,6 +2653,22 @@ struct UpdateDraftRequest {
     body_text: Option<String>,
 }
 
+/// `PATCH /api/v1/admin/emails/messages/{id}` — Edit the subject or body of a draft email.
+///
+/// **Caller**: Axum router / admin dashboard email draft editor.
+/// **Why**: Allows Alex to tweak the LLM-generated draft before sending. Only drafts can
+/// be edited (status check via `WHERE status = 'draft'`).
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool)
+/// - `id` — email_message UUID path parameter
+/// - `request` — optional `subject` and/or `body_text` fields to overwrite
+///
+/// # Returns
+/// `200 OK` with `{"ok": true}`.
+///
+/// # Errors
+/// - `404` if draft not found or already sent/discarded
 async fn update_draft_email(
     State(state): State<Arc<AppState>>,
     Extension(_claims): Extension<TokenClaims>,
@@ -2244,6 +2701,23 @@ struct ReplyRequest {
     body_text: String,
 }
 
+/// `POST /api/v1/admin/emails/{id}/reply` — Create a new draft reply in an existing thread.
+///
+/// **Caller**: Axum router / admin dashboard thread reply composer.
+/// **Why**: Inserts a new outbound `email_messages` row in `draft` status tied to the
+/// existing thread, without sending it immediately. The admin then uses `send_draft_email`
+/// to approve and send.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool, email config for `from_address`)
+/// - `thread_id` — thread UUID path parameter
+/// - `request` — `body_text` (required) and optional `subject` override
+///
+/// # Returns
+/// `201 Created` with `{"id": ..., "status": "draft"}`.
+///
+/// # Errors
+/// - `404` if thread not found
 async fn reply_to_thread(
     State(state): State<Arc<AppState>>,
     Extension(_claims): Extension<TokenClaims>,
@@ -2305,6 +2779,19 @@ struct ComposeEmailRequest {
     body_text: String,
 }
 
+/// `POST /api/v1/admin/emails/compose` — Compose a new outbound email to any address.
+///
+/// **Caller**: Axum router / admin dashboard "Neue E-Mail" compose button.
+/// **Why**: Creates a new thread (upserts the customer by email) and a draft message in
+/// one operation, allowing the admin to initiate contact with a customer not yet in the
+/// system. The draft is saved and can be reviewed before sending via `send_draft_email`.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool, email config for `from_address`)
+/// - `request` — `customer_email`, `subject`, `body_text` (all required)
+///
+/// # Returns
+/// `201 Created` with `{"thread_id": ..., "message_id": ...}`.
 async fn compose_email(
     State(state): State<Arc<AppState>>,
     Extension(_claims): Extension<TokenClaims>,
@@ -2367,7 +2854,21 @@ async fn compose_email(
     ))
 }
 
-/// Send a plain text email via SMTP.
+/// Send a plain-text email via SMTP using the configured outbound email credentials.
+///
+/// **Caller**: `send_draft_email` — the only SMTP send path in the admin module.
+/// **Why**: Thin wrapper around `services::email::{build_plain_email, send_email}` so the
+/// SMTP credentials from `Config.email` stay out of individual route handlers.
+///
+/// # Parameters
+/// - `email_config` — SMTP host/port/credentials and from_address/from_name
+/// - `to` — recipient email address
+/// - `subject` — email subject line
+/// - `body` — plain-text body
+///
+/// # Errors
+/// Returns `Err(String)` describing the failure if building the message or the SMTP
+/// transmission fails.
 async fn send_plain_email(
     email_config: &aust_core::config::EmailConfig,
     to: &str,

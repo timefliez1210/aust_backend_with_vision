@@ -5,21 +5,41 @@ use aust_core::models::{RouteLeg, RouteResult};
 use serde::Deserialize;
 use tracing::info;
 
+/// Price rate charged per driven kilometre, in euro cents.
+/// €1.00 per km → 100 cents. Change here to adjust the distance pricing.
 const PRICE_PER_KM_CENTS: i64 = 100; // €1.00 per km
 
+/// High-level orchestrator for multi-stop route calculation.
+///
+/// Chains `Geocoder` (address → coordinates) and `DistanceRouter` (coordinates
+/// → driving km + minutes) for an ordered list of N addresses, then totals the
+/// legs and computes a price.
+///
+/// **Caller**: Instantiated once at startup in `main.rs` and shared via
+/// `Arc<RouteCalculator>` between the distance API route handler and the
+/// orchestrator.
 pub struct RouteCalculator {
     geocoder: Geocoder,
     router: DistanceRouter,
 }
 
-/// Input for multi-stop route calculation.
+/// Input for a multi-stop route calculation.
+///
+/// **Caller**: `POST /api/v1/distance/calculate` deserialises the request body
+/// into this struct. The orchestrator also constructs it directly when
+/// calculating the move distance after address creation.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RouteRequest {
     /// Ordered list of addresses (minimum 2).
+    /// Route is calculated sequentially: `addresses[0] → addresses[1] → … → addresses[N-1]`.
     pub addresses: Vec<String>,
 }
 
 impl RouteCalculator {
+    /// Creates a new `RouteCalculator` with a shared OpenRouteService API key.
+    ///
+    /// # Parameters
+    /// - `api_key` — ORS API key used for both geocoding and routing requests.
     pub fn new(api_key: String) -> Self {
         Self {
             geocoder: Geocoder::new(api_key.clone()),
@@ -27,8 +47,25 @@ impl RouteCalculator {
         }
     }
 
-    /// Calculate the full route through all addresses in order.
-    /// Geocodes each address, then calculates distance for each consecutive pair.
+    /// Calculate the full driving route through all addresses in order.
+    ///
+    /// **Caller**: Distance API route handler and orchestrator.
+    /// **Why**: Moving jobs often have an intermediate Zwischenstopp, so the
+    /// route is N stops, not just origin → destination.
+    ///
+    /// # Parameters
+    /// - `request` — Ordered list of at least 2 free-text address strings.
+    ///
+    /// # Returns
+    /// A `RouteResult` with per-leg distances/durations and aggregated totals.
+    ///
+    /// # Errors
+    /// - `DistanceError::Routing` — fewer than 2 addresses supplied.
+    /// - `DistanceError::Geocoding` — any address could not be resolved.
+    /// - `DistanceError::Api` / `DistanceError::Network` — ORS request failures.
+    ///
+    /// # Math
+    /// `price_cents = ceil(total_distance_km) × PRICE_PER_KM_CENTS`
     pub async fn calculate(&self, request: &RouteRequest) -> Result<RouteResult, DistanceError> {
         if request.addresses.len() < 2 {
             return Err(DistanceError::Routing(

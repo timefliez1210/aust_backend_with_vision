@@ -18,66 +18,139 @@ const TEMPLATE_BYTES: &[u8] = include_bytes!("../../../templates/offer_template.
 // Public data types
 // ---------------------------------------------------------------------------
 
+/// All data needed to fill the XLSX offer template for one moving job.
+///
+/// **Caller**: `crates/api/src/routes/offers.rs` assembles this from the
+///             database quote/offer record and passes it to `generate_offer_xlsx`.
+/// **Why**: Acts as a single, serialisable transfer object between the HTTP
+/// route and the XLSX generator so neither side leaks domain types into the
+/// other's module.
+///
+/// Most string fields are pre-formatted for German display (e.g. `moving_date`
+/// is already `"DD.MM.YYYY"`, `origin_floor_info` is already `"3. Stock"`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OfferData {
+    /// Offer reference number printed on the document title line.
     pub offer_number: String,
+    /// Document creation date (written to cell G16 as an Excel serial number).
     pub date: chrono::NaiveDate,
+    /// Optional validity expiry date (not currently written to the template).
     pub valid_until: Option<chrono::NaiveDate>,
+    /// Customer salutation, e.g. `"Herrn"` or `"Frau"` (cell A8).
     pub customer_salutation: String,
+    /// Full customer name (cell A9).
     pub customer_name: String,
+    /// Customer street + house number (cell A10).
     pub customer_street: String,
+    /// Customer postal code + city (cell A11).
     pub customer_city: String,
+    /// Customer phone number (cell B18).
     pub customer_phone: String,
+    /// Customer e-mail address (cell A12 — rendered as plain text, not hyperlink).
     pub customer_email: String,
+    /// Opening salutation line, e.g. `"Sehr geehrter Herr Müller,"` (cell A20).
     pub greeting: String,
+    /// Moving date as a pre-formatted German string, e.g. `"15.04.2026"` (cell B17).
     pub moving_date: String,
+    /// Origin street + house number (cell A26).
     pub origin_street: String,
+    /// Origin postal code + city (cell A27).
     pub origin_city: String,
+    /// Origin floor description, e.g. `"3. Stock"` or `"EG"` (cell A28).
     pub origin_floor_info: String,
+    /// Destination street + house number (cell F26).
     pub dest_street: String,
+    /// Destination postal code + city (cell F27).
     pub dest_city: String,
+    /// Destination floor description (cell F28).
     pub dest_floor_info: String,
+    /// Estimated move volume in cubic metres (used in the "Umzugspauschale" label at A29).
     pub volume_m3: f64,
+    /// Number of workers — written to cell J50 so the labor formula `G38 = E38*F38*J50` works.
     pub persons: u32,
+    /// Estimated job duration in hours (used in the labor line item's quantity column E).
     pub estimated_hours: f64,
+    /// Hourly rate per worker in euros (used in the labor line item's unit-price column F).
     pub rate_per_person_hour: f64,
+    /// Line items written sequentially into rows 31-42 of the template.
+    /// Maximum 12 items (slots 31-42). Extra items are silently truncated.
     pub line_items: Vec<OfferLineItem>,
+    /// Optional detected/parsed inventory items added to the second sheet.
+    /// If empty, no second sheet is created.
     pub detected_items: Vec<DetectedItemRow>,
 }
 
+/// A single line item written into one row of the XLSX offer template (rows 31-42).
+///
+/// **Caller**: `crates/api/src/routes/offers.rs` (`build_line_items` function)
+/// **Why**: The offer template has a fixed set of rows for services. Each
+/// `OfferLineItem` maps one-to-one to a template row and carries all the data
+/// the XLSX generator needs to fill columns A-G correctly.
+///
+/// The generator writes items sequentially starting from row 31. Unused rows
+/// are hidden so the PDF appears clean.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OfferLineItem {
+    /// Service description written to column A (merged with B), e.g. `"Halteverbotszone"`.
     pub description: String,
+    /// Quantity written to column E, e.g. number of parking ban zones or hours worked.
     pub quantity: f64,
+    /// Unit price in euros written to column F, e.g. `100.0` for €100/zone.
     pub unit_price: f64,
+    /// When `true`, column F is styled as an hourly rate (€/Stunde) and the
+    /// G-column formula multiplies by `J50` (number of workers):
+    /// `G = E × F × J50`.
     #[serde(default)]
     pub is_labor: bool,
+    /// Optional remark written to column C (Bemerkung), e.g. a note about the service.
     #[serde(default)]
     pub remark: Option<String>,
-    /// When set, E and F columns are left blank and G is written as this flat value (no formula).
-    /// Used for Fahrkostenpauschale where the total is computed externally (ORS route).
+    /// When set, columns E and F are left blank and G is written as this flat
+    /// euro value directly (no formula). Used for Fahrkostenpauschale where
+    /// the total is computed externally from the ORS route distance.
     #[serde(default)]
     pub flat_total: Option<f64>,
 }
 
+/// A single detected or inventory item written to the second XLSX sheet
+/// ("Erfasste Gegenstände").
+///
+/// **Caller**: `crates/api/src/routes/offers.rs` and `crates/volume-estimator`
+/// **Why**: When a customer submits photos or an inventory form, the vision
+/// pipeline returns a list of recognised furniture items. This struct carries
+/// one item through to the XLSX so Alex can review exactly what was detected.
+///
+/// Only `name` and `volume_m3` are strictly required. The remaining fields are
+/// optional metadata surfaced from the ML pipeline for debugging.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectedItemRow {
+    /// Item name as detected, may include a quantity prefix like `"2x Sofa"`.
     pub name: String,
+    /// Volume contribution of this item in cubic metres.
     pub volume_m3: f64,
+    /// Human-readable dimension string, e.g. `"2.00×0.90×0.80 m"` (optional).
     pub dimensions: Option<String>,
+    /// Detection confidence score in `[0.0, 1.0]` from the ML model.
     pub confidence: f64,
+    /// German display name from the RE catalogue lookup, if matched.
     #[serde(default)]
     pub german_name: Option<String>,
+    /// RE (Raumeinheit) catalogue value — 1 RE = 0.1 m³.
     #[serde(default)]
     pub re_value: Option<f64>,
+    /// Which method produced the volume: `"re_lookup"`, `"geometric"`, etc.
     #[serde(default)]
     pub volume_source: Option<String>,
+    /// S3 key of the cropped detection image, for debugging in the admin UI.
     #[serde(default)]
     pub crop_s3_key: Option<String>,
+    /// Bounding box `[x1, y1, x2, y2]` in normalised image coordinates.
     #[serde(default)]
     pub bbox: Option<Vec<f64>>,
+    /// Index of the source image this detection came from (0-based).
     #[serde(default)]
     pub bbox_image_index: Option<usize>,
+    /// Pre-signed S3 URLs of the source images this item was detected in.
     #[serde(default)]
     pub source_image_urls: Option<Vec<String>>,
 }
@@ -86,14 +159,28 @@ pub struct DetectedItemRow {
 // Cell value types for modifications
 // ---------------------------------------------------------------------------
 
+/// Internal representation of the value to write into a single XLSX cell.
+///
+/// **Why**: The XLSX XML format represents text, numbers, and formulas
+/// differently (`t="inlineStr"`, `t="n"`, `<f>` element). This enum lets the
+/// XML-building code branch cleanly without separate functions for each type.
+///
+/// The `Styled*` variants carry a hard-coded style index string that overrides
+/// whatever style the template cell already has. The un-styled variants
+/// (`Text`, `Number`) preserve the original template style.
 enum CellValue {
+    /// Plain UTF-8 text; preserves the existing template cell style.
     Text(String),
-    /// Text with an explicit style index (overrides the template cell's style).
+    /// Text with an explicit style index string (overrides the template cell's style).
+    /// The `&'static str` is a decimal style index from `xl/styles.xml`, e.g. `"58"`.
     StyledText(String, &'static str),
+    /// Numeric value; preserves the existing template cell style.
     Number(f64),
-    /// Number with an explicit style index (used when inserting into a new cell).
+    /// Numeric value with an explicit style index (used when inserting into a new cell
+    /// that has no pre-existing style in the template).
     StyledNumber(f64, &'static str),
-    /// Formula with an explicit style index.
+    /// Excel formula string with an explicit style index.
+    /// The cached `<v>` element is omitted so LibreOffice must recalculate on open.
     StyledFormula(String, &'static str),
 }
 
@@ -101,7 +188,35 @@ enum CellValue {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Generate an XLSX offer from template + data. Returns the final XLSX bytes.
+/// Generate a complete XLSX offer document from the embedded template and offer data.
+///
+/// **Caller**: `crates/api/src/routes/offers.rs` — called from both the initial
+///             generation path and the Telegram edit/regenerate path.
+/// **Why**: The XLSX template already has company branding, borders, merged cells,
+/// print settings, and formulas set up. This function surgically replaces only the
+/// dynamic cell values, hiding/showing rows as needed, without touching any of the
+/// template's formatting or structure.
+///
+/// High-level steps:
+/// 1. Open the embedded template ZIP.
+/// 2. Build all cell modifications, hidden-row lists, and unhidden-row lists from `data`.
+/// 3. Apply modifications to `sheet1.xml` (cell values, row visibility, formula caches).
+/// 4. Strip hyperlinks from `sheet1.xml` and its `.rels` file (email as plain text).
+/// 5. Patch `workbook.xml`: fix print area to A:H, force recalculation, add items sheet ref.
+/// 6. Patch `[Content_Types].xml` and `workbook.xml.rels` if an items sheet is needed.
+/// 7. Fix date format in `styles.xml` from `m/d/yyyy` to `dd.mm.yyyy`.
+/// 8. Re-assemble all XML files back into a new ZIP.
+///
+/// # Parameters
+/// - `data` — fully populated `OfferData` struct
+///
+/// # Returns
+/// Raw bytes of a valid `.xlsx` file ready to pass to `convert_xlsx_to_pdf`.
+///
+/// # Errors
+/// - `OfferError::Template` if the embedded template ZIP is corrupt
+/// - `OfferError::Template` if any internal XML file is not valid UTF-8
+/// - `OfferError::Template` if ZIP reassembly fails
 pub fn generate_offer_xlsx(data: &OfferData) -> Result<Vec<u8>, OfferError> {
     let mut template_zip = ZipArchive::new(Cursor::new(TEMPLATE_BYTES))
         .map_err(|e| OfferError::Template(format!("Failed to read template ZIP: {e}")))?;
@@ -186,6 +301,24 @@ pub fn generate_offer_xlsx(data: &OfferData) -> Result<Vec<u8>, OfferError> {
 // Build cell modifications from OfferData
 // ---------------------------------------------------------------------------
 
+/// Build the complete list of cell value changes, rows to hide, and rows to show.
+///
+/// **Why**: Separates the "what to change" logic from the "how to change XML" logic.
+/// All domain knowledge about which cell holds which offer field lives here, not in
+/// the XML manipulation functions.
+///
+/// The function hides ALL template line-item rows (31-42) first, then writes items
+/// sequentially starting at row 31, un-hiding only the rows actually used. This
+/// ensures unused rows (and their preset values) never appear in the PDF.
+///
+/// # Parameters
+/// - `data` — the fully populated `OfferData` to read field values from
+///
+/// # Returns
+/// A tuple of:
+/// - `Vec<(String, CellValue)>` — `(cell_ref, value)` pairs to apply to `sheet1.xml`
+/// - `Vec<u32>` — row numbers to hide (all unused line-item rows)
+/// - `Vec<u32>` — row numbers to un-hide (only the rows that contain a line item)
 fn build_cell_modifications(
     data: &OfferData,
 ) -> (Vec<(String, CellValue)>, Vec<u32>, Vec<u32>) {
@@ -345,8 +478,23 @@ fn build_cell_modifications(
 // XML modification engine
 // ---------------------------------------------------------------------------
 
-/// Apply cell modifications, row hiding, and row un-hiding to the sheet1 XML.
-/// Uses targeted string surgery — the template XML has a known, predictable structure.
+/// Apply all cell modifications, row-hide operations, and row-unhide operations to
+/// a `sheet1.xml` string, then strip stale formula cached values.
+///
+/// **Why**: The XLSX XML manipulation approach avoids a full parse-and-serialize
+/// round-trip (which would lose style indices, merge-cell info, etc.). Instead,
+/// targeted string surgery is used — the template XML structure is stable and
+/// well-known, so positional searches are reliable.
+///
+/// # Parameters
+/// - `xml` — raw content of `xl/worksheets/sheet1.xml` from the template
+/// - `cell_mods` — `(cell_ref, value)` pairs; applied in order
+/// - `hidden_rows` — row numbers to add `hidden="true"` to
+/// - `unhidden_rows` — row numbers to set `hidden="false"` on (overrides any
+///   pre-existing hidden flag from the template)
+///
+/// # Returns
+/// Modified XML string ready to be written back into the output ZIP.
 fn apply_modifications(
     xml: &str,
     cell_mods: &[(String, CellValue)],
@@ -377,8 +525,24 @@ fn apply_modifications(
     result
 }
 
-/// Set a cell's value in the sheet XML.
-/// Handles three cases: cell exists with children, cell is self-closing, cell doesn't exist.
+/// Replace the value of a single cell in `sheet1.xml`.
+///
+/// **Why**: Handles the three real-world cases that arise from the template:
+/// 1. The `<c>` element already exists with child elements — replace the whole element.
+/// 2. The `<c>` element is self-closing `<c ... />` — replace with a full element.
+/// 3. The cell does not exist at all — insert it into the correct row (or create the row).
+///
+/// The function preserves the original cell's `s="N"` style attribute unless the
+/// `CellValue` variant is a `Styled*` type, in which case the provided style wins.
+///
+/// # Parameters
+/// - `xml` — the current `sheet1.xml` content
+/// - `cell_ref` — Excel address string, e.g. `"A8"`, `"G44"`, `"J50"`
+/// - `value` — the `CellValue` variant determining type and content of the new cell
+///
+/// # Returns
+/// A new `String` with the cell replaced. Returns the original string unchanged if
+/// the cell cannot be located or its boundaries cannot be parsed.
 fn set_cell_value(xml: &str, cell_ref: &str, value: &CellValue) -> String {
     let ref_pattern = format!(r#"r="{}""#, cell_ref);
 
@@ -415,8 +579,19 @@ fn set_cell_value(xml: &str, cell_ref: &str, value: &CellValue) -> String {
     }
 }
 
-/// Find the end of a <c ...>...</c> or <c .../> element.
-/// Returns the byte offset PAST the closing tag, relative to the input.
+/// Find the byte offset just past the end of a `<c ...>...</c>` or `<c .../>` element.
+///
+/// **Why**: XLSX cell elements can be self-closing (`<c r="A1"/>`) or have
+/// nested children (`<c r="A1"><v>42</v></c>`). A depth-counting byte scan handles
+/// both cases without a full XML parser.
+///
+/// # Parameters
+/// - `fragment` — a string slice starting at the opening `<c` of the cell element
+///
+/// # Returns
+/// `Some(offset)` — byte offset from the start of `fragment` to one byte past the
+/// closing `/>` or `</c>`, ready to use as a slice upper bound.
+/// `None` if the element boundary cannot be found (malformed XML).
 fn find_cell_end(fragment: &str) -> Option<usize> {
     // Check for self-closing <c ... />
     let mut depth = 0;
@@ -451,7 +626,22 @@ fn find_cell_end(fragment: &str) -> Option<usize> {
     None
 }
 
-/// Build a <c> element XML string.
+/// Build a complete `<c>` XML element string for the given cell reference and value.
+///
+/// **Why**: Centralises the XLSX XML cell format so all cell-writing paths
+/// produce consistent, valid XML. Each `CellValue` variant maps to a specific
+/// OOXML cell type:
+/// - `Text` / `StyledText` → `t="inlineStr"` with `<is><t>…</t></is>`
+/// - `Number` / `StyledNumber` → `t="n"` with `<v>…</v>`
+/// - `StyledFormula` → `t="n"` with `<f>…</f>` (no cached `<v>`)
+///
+/// # Parameters
+/// - `cell_ref` — Excel address string, e.g. `"A8"`
+/// - `style` — optional style index from the original cell; ignored for `Styled*` variants
+/// - `value` — the value type and content to encode
+///
+/// # Returns
+/// A complete, self-contained `<c>…</c>` XML string.
 fn build_cell_xml(cell_ref: &str, style: Option<&str>, value: &CellValue) -> String {
     let s_attr = match style {
         Some(s) => format!(r#" s="{}""#, s),
@@ -496,7 +686,24 @@ fn build_cell_xml(cell_ref: &str, style: Option<&str>, value: &CellValue) -> Str
     }
 }
 
-/// Insert a cell into an existing row (for cells that don't exist in the template).
+/// Insert a new `<c>` element into the sheet XML for a cell that does not yet exist.
+///
+/// **Why**: Not every cell in the template has an explicit `<c>` element — Excel
+/// omits cells that are empty. When the generator needs to write to such a cell
+/// (e.g. J50 for the persons count), it must inject a new element into the
+/// correct `<row>` block.
+///
+/// Falls back to inserting a new `<row>` containing the cell just before
+/// `</sheetData>` if the row itself does not exist in the template.
+///
+/// # Parameters
+/// - `xml` — current `sheet1.xml` content
+/// - `cell_ref` — Excel address of the new cell, e.g. `"J50"`
+/// - `value` — the value to write into the new cell
+///
+/// # Returns
+/// Modified XML string with the new cell inserted. Returns the original string
+/// unchanged if neither the row nor `<sheetData>` can be located.
 fn insert_cell(xml: &str, cell_ref: &str, value: &CellValue) -> String {
     let row_num = extract_row_number(cell_ref);
     let row_pattern = format!(r#"r="{}""#, row_num);
@@ -545,7 +752,18 @@ fn insert_cell(xml: &str, cell_ref: &str, value: &CellValue) -> String {
     xml.to_string()
 }
 
-/// Add or set hidden="1" attribute on a <row> element.
+/// Set `hidden="true"` on the `<row>` element for the given row number.
+///
+/// **Why**: Unused line-item rows in the template (31-42) are hidden so they
+/// don't appear in the PDF. The function handles two sub-cases: the row already
+/// has `hidden="false"` (replace it), or has no `hidden` attribute at all (insert it).
+///
+/// # Parameters
+/// - `xml` — current `sheet1.xml` content
+/// - `row_num` — 1-based XLSX row number to hide
+///
+/// # Returns
+/// Modified XML string. Returns the original if the row is not found.
 fn hide_row(xml: &str, row_num: u32) -> String {
     let row_r = format!(r#"<row r="{}""#, row_num);
     if let Some(pos) = xml.find(&row_r) {
@@ -577,7 +795,19 @@ fn hide_row(xml: &str, row_num: u32) -> String {
     xml.to_string()
 }
 
-/// Remove hidden="true" attribute from a <row> element (make it visible).
+/// Set `hidden="false"` on the `<row>` element for the given row number.
+///
+/// **Why**: Template rows that were previously hidden (e.g. from a prior generation
+/// cycle baked into the template) must be explicitly un-hidden when the generator
+/// wants to use them. The function replaces `hidden="true"` with `hidden="false"`;
+/// if no hidden attribute is present the row is already visible and no change is made.
+///
+/// # Parameters
+/// - `xml` — current `sheet1.xml` content
+/// - `row_num` — 1-based XLSX row number to make visible
+///
+/// # Returns
+/// Modified XML string. Returns the original if the row is not found or already visible.
 fn unhide_row(xml: &str, row_num: u32) -> String {
     let row_r = format!(r#"<row r="{}""#, row_num);
     if let Some(pos) = xml.find(&row_r) {
@@ -600,8 +830,21 @@ fn unhide_row(xml: &str, row_num: u32) -> String {
     xml.to_string()
 }
 
-/// Remove cached <v>...</v> values from cells that have formulas (<f>...</f>).
-/// This forces LibreOffice to recalculate all formulas on open.
+/// Remove stale `<v>…</v>` cached values from all formula cells in `sheet1.xml`.
+///
+/// **Why**: The XLSX template contains formula cells with cached `<v>` values
+/// from the last time the template was saved in Excel. After the generator rewrites
+/// E/F cells with new quantities and prices, those cached values no longer match.
+/// LibreOffice will display the stale cache if it exists, so stripping them forces
+/// a full recalculation on open. Combined with `fullCalcOnLoad="true"` in `workbook.xml`,
+/// this guarantees the PDF reflects the actual formula results.
+///
+/// # Parameters
+/// - `xml` — `sheet1.xml` content after all cell modifications have been applied
+///
+/// # Returns
+/// XML string with `<v>…</v>` and `<v/>` elements removed from every cell that
+/// also contains a `<f>…</f>` formula element.
 fn strip_formula_cached_values(xml: &str) -> String {
     let mut result = String::with_capacity(xml.len());
     let mut pos = 0;
@@ -640,7 +883,17 @@ fn strip_formula_cached_values(xml: &str) -> String {
     result
 }
 
-/// Remove <v>...</v> element from a cell XML fragment.
+/// Remove the `<v>…</v>` or `<v/>` cached-value element from a single cell XML fragment.
+///
+/// **Why**: Called by `strip_formula_cached_values` for each formula cell. Handles
+/// both the common `<v>number</v>` form and the rare empty `<v/>` variant.
+///
+/// # Parameters
+/// - `cell` — the full `<c>…</c>` XML fragment for one cell
+///
+/// # Returns
+/// The cell fragment with the `<v>` element removed. Returns the original string
+/// unchanged if no `<v>` element is found.
 fn strip_v_element(cell: &str) -> String {
     if let Some(v_start) = cell.find("<v>") {
         if let Some(v_end) = cell[v_start..].find("</v>") {
@@ -664,7 +917,20 @@ fn strip_v_element(cell: &str) -> String {
 // Workbook modification
 // ---------------------------------------------------------------------------
 
-/// Fix the print area (A:H only), force recalculation, and optionally add items sheet reference.
+/// Patch `workbook.xml`: fix the print area, force formula recalculation, and
+/// optionally register the items sheet.
+///
+/// **Why**: The template's `workbook.xml` has a dual print area
+/// (`A:H` + `I:P`) that would include the internal calculation columns in the PDF.
+/// This function narrows it to `A:H` only. It also sets `fullCalcOnLoad="true"`
+/// so LibreOffice recalculates all formulas when it opens the file.
+///
+/// # Parameters
+/// - `xml` — raw content of `xl/workbook.xml`
+/// - `add_items_sheet` — when `true`, inject a `<sheet>` element for sheet2
+///
+/// # Returns
+/// Modified `workbook.xml` content string.
 fn modify_workbook(xml: &str, add_items_sheet: bool) -> String {
     let mut result = xml.to_string();
 
@@ -682,7 +948,19 @@ fn modify_workbook(xml: &str, add_items_sheet: bool) -> String {
     result
 }
 
-/// Add fullCalcOnLoad="true" to <calcPr> so LibreOffice recalculates all formulas.
+/// Add `fullCalcOnLoad="true"` to the `<calcPr>` element in `workbook.xml`.
+///
+/// **Why**: Without this flag, LibreOffice trusts the stale cached `<v>` values
+/// in formula cells. Even after `strip_formula_cached_values` removes those caches,
+/// `fullCalcOnLoad` is needed as a belt-and-suspenders measure to guarantee that
+/// the SUM in G44 and all line-item totals are recalculated before PDF rendering.
+///
+/// # Parameters
+/// - `xml` — raw `workbook.xml` content
+///
+/// # Returns
+/// Modified string with `fullCalcOnLoad="true"` injected into `<calcPr>`.
+/// Returns the original if `<calcPr>` is not found.
 fn force_recalc(xml: &str) -> String {
     if let Some(pos) = xml.find("<calcPr") {
         if let Some(gt) = xml[pos..].find("/>") {
@@ -698,7 +976,20 @@ fn force_recalc(xml: &str) -> String {
     xml.to_string()
 }
 
-/// Replace the dual-range print area with A:H only.
+/// Replace the dual-range `_xlnm.Print_Area` defined name with `Tabelle1!$A$1:$H$120`.
+///
+/// **Why**: The template was saved with a print area that includes two ranges:
+/// `Tabelle1!$A$1:$H$120,Tabelle1!$I$1:$P$43`. Columns I-P hold internal
+/// calculation helper values (e.g. J50 for worker count) that must not appear
+/// in the customer-facing PDF. Replacing the defined name removes them from
+/// the print area before LibreOffice converts the file.
+///
+/// # Parameters
+/// - `xml` — raw `workbook.xml` content
+///
+/// # Returns
+/// Modified string with the print area limited to columns A-H.
+/// Returns the original if `_xlnm.Print_Area` is not found.
 fn fix_print_area(xml: &str) -> String {
     if let Some(start) = xml.find("_xlnm.Print_Area") {
         if let Some(content_start) = xml[start..].find('>') {
@@ -716,7 +1007,19 @@ fn fix_print_area(xml: &str) -> String {
     xml.to_string()
 }
 
-/// Add a <sheet> element for the items sheet.
+/// Inject a `<sheet>` element for "Erfasste Gegenstände" into `workbook.xml`.
+///
+/// **Why**: The items sheet (sheet2.xml) is dynamically created when the offer has
+/// detected inventory items. The workbook must reference it so Excel/LibreOffice
+/// recognises the sheet exists. The sheet is assigned relationship ID `rId5`
+/// (chosen to avoid collisions with the template's existing rId1-rId4).
+///
+/// # Parameters
+/// - `xml` — raw `workbook.xml` content
+///
+/// # Returns
+/// Modified string with the `<sheet>` element inserted just before `</sheets>`.
+/// Returns the original if `</sheets>` is not found.
 fn add_items_sheet_to_workbook(xml: &str) -> String {
     // Insert before </sheets>
     let marker = "</sheets>";
@@ -743,6 +1046,24 @@ fn add_items_sheet_to_workbook(xml: &str) -> String {
 // 22 = full border, fill4, center/v-center                      (data row B number)
 // 75 = full border, no fill, general                            (total row)
 
+/// Build the complete XML for the "Erfasste Gegenstände" (detected items) second sheet.
+///
+/// **Why**: When a customer submits photos or an inventory form, the detected items
+/// are shown on a separate sheet so Alex can review them alongside the offer. The
+/// sheet lists each item's sequential number, name (with quantity prefix stripped),
+/// quantity, and volume in m³, with a bold orange total row at the bottom.
+///
+/// Style indices reference the shared `xl/styles.xml` from the template ZIP:
+/// - `79` = orange header background, bold white, left-aligned
+/// - `80` = orange header background, bold white, centre-aligned
+/// - `81` = white-fill data row, centre-aligned
+/// - `82` = blue-fill (odd) data row, centre-aligned
+///
+/// # Parameters
+/// - `items` — slice of detected/inventory items; must be non-empty (caller checks)
+///
+/// # Returns
+/// A complete `xl/worksheets/sheet2.xml` content string ready to write into the output ZIP.
 fn build_items_sheet_xml(items: &[DetectedItemRow]) -> String {
     let mut xml = String::with_capacity(8192);
 
@@ -855,6 +1176,18 @@ fn build_items_sheet_xml(items: &[DetectedItemRow]) -> String {
 // Content_Types and relationship updates
 // ---------------------------------------------------------------------------
 
+/// Register `xl/worksheets/sheet2.xml` in `[Content_Types].xml`.
+///
+/// **Why**: Every part of an OOXML package must have a corresponding `<Override>`
+/// entry in `[Content_Types].xml` or the file is invalid. Without this entry,
+/// Excel and LibreOffice silently ignore sheet2.xml.
+///
+/// # Parameters
+/// - `xml` — raw `[Content_Types].xml` content
+///
+/// # Returns
+/// Modified string with the sheet2 override entry inserted before `</Types>`.
+/// Returns the original if `</Types>` is not found.
 fn add_sheet2_content_type(xml: &str) -> String {
     let new_entry =
         r#"<Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>"#;
@@ -868,6 +1201,19 @@ fn add_sheet2_content_type(xml: &str) -> String {
     xml.to_string()
 }
 
+/// Add a `<Relationship>` entry for sheet2 into `xl/_rels/workbook.xml.rels`.
+///
+/// **Why**: The workbook's relationship file maps logical relationship IDs (like `rId5`)
+/// to physical file paths (like `worksheets/sheet2.xml`). Without this entry,
+/// the `<sheet r:id="rId5">` element added to `workbook.xml` has no target and
+/// the XLSX package is invalid.
+///
+/// # Parameters
+/// - `xml` — raw `xl/_rels/workbook.xml.rels` content
+///
+/// # Returns
+/// Modified string with the sheet2 relationship inserted before `</Relationships>`.
+/// Returns the original if `</Relationships>` is not found.
 fn add_sheet2_relationship(xml: &str) -> String {
     let new_rel = r#"<Relationship Id="rId5" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/>"#;
     if let Some(pos) = xml.find("</Relationships>") {
@@ -880,8 +1226,23 @@ fn add_sheet2_relationship(xml: &str) -> String {
     xml.to_string()
 }
 
-/// Remove the `<hyperlinks>...</hyperlinks>` section from sheet1.xml.
-/// This converts linked cells (E-Mail, email address) to plain text.
+/// Remove the `<hyperlinks>…</hyperlinks>` section from `sheet1.xml`.
+///
+/// **Why**: The template was saved with email addresses formatted as clickable
+/// hyperlinks. When LibreOffice converts the file to PDF it renders those as
+/// blue underlined links. The offer document should display the customer's email
+/// as plain text matching the rest of the address block. Removing the
+/// `<hyperlinks>` block demotes those cells to plain inline strings.
+///
+/// The companion function `strip_hyperlink_rels` removes the corresponding
+/// relationship entries from `sheet1.xml.rels`.
+///
+/// # Parameters
+/// - `xml` — raw `sheet1.xml` content
+///
+/// # Returns
+/// Modified string with the entire `<hyperlinks>…</hyperlinks>` block removed.
+/// Returns the original if the block is not found.
 fn strip_hyperlinks(xml: &str) -> String {
     if let Some(start) = xml.find("<hyperlinks>") {
         if let Some(end_tag) = xml[start..].find("</hyperlinks>") {
@@ -895,7 +1256,18 @@ fn strip_hyperlinks(xml: &str) -> String {
     xml.to_string()
 }
 
-/// Remove hyperlink Relationship entries from sheet1.xml.rels, keeping the drawing rel.
+/// Remove all hyperlink `<Relationship>` entries from `xl/worksheets/_rels/sheet1.xml.rels`.
+///
+/// **Why**: Each hyperlink in the sheet has a corresponding relationship entry of
+/// type `…/hyperlink`. After removing the `<hyperlinks>` block from `sheet1.xml`,
+/// these relationship entries are orphaned and can cause validation warnings. The
+/// drawing relationship (for the company logo image) is preserved.
+///
+/// # Parameters
+/// - `xml` — raw `xl/worksheets/_rels/sheet1.xml.rels` content
+///
+/// # Returns
+/// Modified string with all `<Relationship>` elements containing `"hyperlink"` removed.
 fn strip_hyperlink_rels(xml: &str) -> String {
     let mut result = String::with_capacity(xml.len());
     let mut pos = 0;
@@ -929,6 +1301,30 @@ fn strip_hyperlink_rels(xml: &str) -> String {
 // ZIP assembly
 // ---------------------------------------------------------------------------
 
+/// Reassemble the final XLSX ZIP from the template and all modified XML files.
+///
+/// **Why**: XLSX is a ZIP of XML files. The generator modifies only six of those
+/// files; all others (drawings, media, shared strings, theme, etc.) are copied
+/// bit-for-bit from the template. This function iterates over every entry in the
+/// template ZIP, replaces modified entries by name, and optionally appends
+/// `sheet2.xml` for the detected items.
+///
+/// # Parameters
+/// - `template_zip` — the already-opened template `ZipArchive`
+/// - `sheet1_xml` — modified `xl/worksheets/sheet1.xml` content
+/// - `workbook_xml` — modified `xl/workbook.xml` content
+/// - `content_types_xml` — modified `[Content_Types].xml` content
+/// - `rels_xml` — modified `xl/_rels/workbook.xml.rels` content
+/// - `sheet1_rels_xml` — modified `xl/worksheets/_rels/sheet1.xml.rels` content
+/// - `styles_xml` — modified `xl/styles.xml` content (German date format)
+/// - `items_sheet_xml` — optional `xl/worksheets/sheet2.xml` content; appended if `Some`
+///
+/// # Returns
+/// Raw bytes of the assembled `.xlsx` file.
+///
+/// # Errors
+/// - `OfferError::Template` if any template ZIP entry cannot be read
+/// - `OfferError::Template` if writing to the output ZIP fails
 fn assemble_xlsx(
     template_zip: &mut ZipArchive<Cursor<&[u8]>>,
     sheet1_xml: &str,
@@ -991,6 +1387,22 @@ fn assemble_xlsx(
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Read a named entry from a `ZipArchive` into a `Vec<u8>`.
+///
+/// **Why**: Every XML file in the template ZIP must be extracted before it can be
+/// modified. This helper centralises the error mapping from `zip::ZipError` and
+/// `std::io::Error` to `OfferError::Template`.
+///
+/// # Parameters
+/// - `archive` — the open `ZipArchive` wrapping the template bytes
+/// - `name` — the ZIP entry path, e.g. `"xl/worksheets/sheet1.xml"`
+///
+/// # Returns
+/// Raw byte content of the ZIP entry.
+///
+/// # Errors
+/// - `OfferError::Template` if the entry does not exist in the archive
+/// - `OfferError::Template` if reading the entry fails
 fn read_zip_entry(archive: &mut ZipArchive<Cursor<&[u8]>>, name: &str) -> Result<Vec<u8>, OfferError> {
     let mut file = archive.by_name(name).map_err(|e| {
         OfferError::Template(format!("ZIP entry '{name}' not found: {e}"))
@@ -1002,7 +1414,20 @@ fn read_zip_entry(archive: &mut ZipArchive<Cursor<&[u8]>>, name: &str) -> Result
     Ok(data)
 }
 
-/// Extract an XML attribute value from a tag fragment.
+/// Extract the value of a named XML attribute from a tag fragment string.
+///
+/// **Why**: Used by `set_cell_value` to preserve the existing `s="N"` style index
+/// from the original template cell when building the replacement `<c>` element.
+///
+/// Assumes the value is enclosed in double-quotes (`attr="value"`). Single-quote
+/// form is not handled since OOXML always uses double quotes.
+///
+/// # Parameters
+/// - `tag` — a substring of XML containing the attribute, e.g. `r#"<c r="A8" s="4""#`
+/// - `attr_name` — the attribute name to look up, e.g. `"s"`
+///
+/// # Returns
+/// `Some(value)` with the attribute's string value, or `None` if not found.
 fn extract_attribute(tag: &str, attr_name: &str) -> Option<String> {
     let pattern = format!(r#"{}=""#, attr_name);
     if let Some(start) = tag.find(&pattern) {
@@ -1014,20 +1439,65 @@ fn extract_attribute(tag: &str, attr_name: &str) -> Option<String> {
     None
 }
 
-/// Extract the row number from a cell reference like "A8" → 8, "AB123" → 123.
+/// Extract the numeric row index from an Excel cell reference string.
+///
+/// **Why**: Used by `insert_cell` to find the correct `<row r="N">` element when
+/// a cell needs to be added to the sheet XML.
+///
+/// # Parameters
+/// - `cell_ref` — an Excel cell address, e.g. `"A8"`, `"G44"`, `"AB123"`
+///
+/// # Returns
+/// The `u32` row number. Returns `1` if no digit sequence is found.
+///
+/// # Examples
+/// ```
+/// // "A8" → 8, "G44" → 44, "J50" → 50, "AB123" → 123
+/// ```
 fn extract_row_number(cell_ref: &str) -> u32 {
     let num_start = cell_ref.find(|c: char| c.is_ascii_digit()).unwrap_or(0);
     cell_ref[num_start..].parse().unwrap_or(1)
 }
 
-/// Convert a chrono::NaiveDate to an Excel serial date number.
-/// Excel serial: days since 1899-12-30 (accounting for the Lotus 1-2-3 leap year bug).
+/// Convert a `chrono::NaiveDate` to an Excel serial date number.
+///
+/// **Why**: Excel stores dates as floating-point day counts since a fixed epoch.
+/// Writing the date as a plain serial number to a cell with a date-format style
+/// (`s="10"`) causes both Excel and LibreOffice to render it as `dd.mm.yyyy`.
+///
+/// The epoch is 1899-12-30 (not 1900-01-01) because Excel historically included
+/// a phantom leap day for 1900-02-29 to maintain Lotus 1-2-3 compatibility.
+/// Subtracting from 1899-12-30 implicitly accounts for this off-by-one.
+///
+/// # Parameters
+/// - `date` — the calendar date to convert
+///
+/// # Returns
+/// `f64` Excel serial number, e.g. `46107.0` for 2026-04-01.
+///
+/// # Math
+/// `serial = (date - 1899-12-30).num_days()`
 fn date_to_excel_serial(date: chrono::NaiveDate) -> f64 {
     let base = chrono::NaiveDate::from_ymd_opt(1899, 12, 30).unwrap();
     (date - base).num_days() as f64
 }
 
-/// Format a number for XLSX: avoid scientific notation, reasonable precision.
+/// Format an `f64` as a decimal string suitable for embedding in XLSX XML.
+///
+/// **Why**: Rust's default `Display` for `f64` can emit scientific notation
+/// (`1e15`) or excessive decimal places, both of which are invalid in XLSX `<v>`
+/// elements or produce rendering artefacts in Excel. This function produces the
+/// shortest clean decimal representation.
+///
+/// Integer-valued floats are formatted without a decimal point (`30.0` → `"30"`).
+/// Non-integer values are formatted with up to 10 decimal places and then have
+/// trailing zeros and the trailing decimal point trimmed.
+///
+/// # Parameters
+/// - `n` — the number to format
+///
+/// # Returns
+/// Decimal string representation, e.g. `"30"`, `"51.29"`, `"2.1"`.
 fn format_number(n: f64) -> String {
     if n == n.floor() && n.abs() < 1e15 {
         format!("{}", n as i64)
@@ -1040,7 +1510,19 @@ fn format_number(n: f64) -> String {
     }
 }
 
-/// Escape text for XML content.
+/// Escape a string for safe embedding in XML text content or attribute values.
+///
+/// **Why**: Customer data (names, addresses) can contain `&`, `<`, `>`, `"`, and `'`
+/// characters that are XML metacharacters. Unescaped, they would produce malformed
+/// XLSX XML and potentially a corrupt file.
+///
+/// # Parameters
+/// - `s` — the raw string to escape
+///
+/// # Returns
+/// A new `String` with the five XML special characters replaced by their entity
+/// references: `&` → `&amp;`, `<` → `&lt;`, `>` → `&gt;`, `"` → `&quot;`,
+/// `'` → `&apos;`.
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -1049,10 +1531,18 @@ fn xml_escape(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+/// Map a `zip::result::ZipError` to `OfferError::Template`.
+///
+/// Used as a closure in `.map_err(map_zip)` calls when writing ZIP entries
+/// so the error type is consistent throughout `assemble_xlsx`.
 fn map_zip(e: zip::result::ZipError) -> OfferError {
     OfferError::Template(format!("ZIP error: {e}"))
 }
 
+/// Map a `std::io::Error` to `OfferError::Template`.
+///
+/// Used as a closure in `.map_err(map_io)` calls when writing raw bytes
+/// into ZIP entries inside `assemble_xlsx`.
 fn map_io(e: std::io::Error) -> OfferError {
     OfferError::Template(format!("IO error: {e}"))
 }

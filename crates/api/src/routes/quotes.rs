@@ -13,6 +13,11 @@ use crate::routes::offers::{parse_detected_items, VolumeEstimationRow};
 use crate::routes::shared::QuoteRow;
 use aust_core::models::{CreateQuote, Quote, QuoteStatus, UpdateQuote};
 
+/// Register the quote CRUD routes.
+///
+/// **Caller**: `crates/api/src/routes/mod.rs` route tree assembly.
+/// **Why**: Exposes the full quote lifecycle — create, list, detail, update, delete, and
+/// manual estimation-item editing.
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/", post(create_quote).get(list_quotes))
@@ -37,6 +42,21 @@ struct QuoteListResponse {
 }
 
 
+/// `POST /api/v1/quotes` — Create a new quote with `pending` status.
+///
+/// **Caller**: Axum router / external API consumers or test scripts.
+/// **Why**: Basic quote creation with customer and address references. No volume estimation
+/// is performed here; clients call the estimate endpoints separately.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool)
+/// - `request` — `CreateQuote` JSON body with `customer_id`, address IDs, and optional fields
+///
+/// # Returns
+/// `200 OK` with the newly created `Quote` JSON (status = "pending").
+///
+/// # Errors
+/// - `500` on DB constraint violations or connection failures
 async fn create_quote(
     State(state): State<Arc<AppState>>,
     Json(request): Json<CreateQuote>,
@@ -179,6 +199,25 @@ struct VolumeEstimationDbRow {
     source_data: Option<serde_json::Value>,
 }
 
+/// `GET /api/v1/quotes/{id}` — Fetch a fully enriched quote with customer, addresses,
+/// estimation items, linked offers, and the latest offer pricing overlay.
+///
+/// **Caller**: Axum router / customer-facing webapp and admin dashboard quote detail.
+/// **Why**: Aggregates all data a client needs for the quote detail view in a single
+/// request: customer contact info, both addresses (with floor/elevator), all completed
+/// volume estimations aggregated into one item list, and the full line-item breakdown
+/// of the most recent offer.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool, storage)
+/// - `id` — quote UUID path parameter
+///
+/// # Returns
+/// `200 OK` with `EnrichedQuote` JSON containing nested customer, addresses, estimation,
+/// offers list, and `latest_offer` pricing overlay.
+///
+/// # Errors
+/// - `404` if quote or customer not found
 async fn get_quote(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
@@ -411,7 +450,19 @@ async fn get_quote(
     }))
 }
 
-/// Extract non-service text from notes as "customer message"
+/// Extract free-text customer remarks from quote notes, stripping known service keywords.
+///
+/// **Caller**: `get_quote` — populates `QuoteInfo.customer_message` for display in the
+/// frontend quote detail card.
+/// **Why**: `quotes.notes` mixes service flags ("Halteverbot Auszug") with actual customer
+/// remarks. This helper filters out the known service strings so only the human-readable
+/// message is returned.
+///
+/// # Parameters
+/// - `notes` — raw `quotes.notes` value; returns `None` when absent
+///
+/// # Returns
+/// `Some(String)` with the joined non-service note parts, or `None` when nothing remains.
 fn extract_customer_message(notes: Option<&str>) -> Option<String> {
     let notes = notes?;
     let known = [
@@ -436,6 +487,18 @@ fn extract_customer_message(notes: Option<&str>) -> Option<String> {
     }
 }
 
+/// `GET /api/v1/quotes` — List quotes with optional filtering by status or customer.
+///
+/// **Caller**: Axum router / external API consumers.
+/// **Why**: Paginated quote listing for API consumers and simple integrations. Does not
+/// include joined customer or address data (use `get_quote` for enriched detail).
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool)
+/// - `query` — optional `status`, `customer_id`, `limit` (max 100, default 50), `offset`
+///
+/// # Returns
+/// `200 OK` with `QuoteListResponse` containing `quotes`, `total`, `limit`, `offset`.
 async fn list_quotes(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListQuotesQuery>,
@@ -482,6 +545,22 @@ async fn list_quotes(
     }))
 }
 
+/// `PATCH /api/v1/quotes/{id}` — Partially update a quote's fields.
+///
+/// **Caller**: Axum router / admin dashboard and external API consumers.
+/// **Why**: Allows updating any subset of mutable quote fields (addresses, status,
+/// volume, distance, date, notes) via a COALESCE-based partial update.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool)
+/// - `id` — quote UUID path parameter
+/// - `request` — `UpdateQuote` JSON body with optional fields; omitted fields are unchanged
+///
+/// # Returns
+/// `200 OK` with the updated `Quote` JSON.
+///
+/// # Errors
+/// - `404` if no quote with the given ID exists
 async fn update_quote(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
@@ -520,6 +599,22 @@ async fn update_quote(
     Ok(Json(Quote::from(row)))
 }
 
+/// `DELETE /api/v1/quotes/{id}` — Soft-delete a quote by setting its status to "cancelled".
+///
+/// **Caller**: Axum router / external API consumers.
+/// **Why**: Quotes are not physically deleted so that linked offers, estimations, and email
+/// threads remain auditable. Setting status to "cancelled" effectively removes the quote
+/// from active pipelines.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool)
+/// - `id` — quote UUID path parameter
+///
+/// # Returns
+/// `200 OK` with the updated `Quote` JSON (status = "cancelled").
+///
+/// # Errors
+/// - `404` if no quote with the given ID exists
 async fn soft_delete_quote(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
@@ -570,6 +665,28 @@ struct UpdateEstimationItem {
     dimensions: Option<serde_json::Value>,
 }
 
+/// `PUT /api/v1/quotes/{id}/estimation-items` — Replace the detected items on the latest
+/// volume estimation and recalculate the quote's total volume.
+///
+/// **Caller**: Axum router / admin dashboard item editor (after the user edits item quantities
+/// or removes false detections from the vision pipeline output).
+/// **Why**: The ML/LLM pipeline may detect duplicate or incorrect items. This endpoint lets
+/// Alex correct the item list before regenerating the offer. It overwrites `result_data` and
+/// `total_volume_m3` on the most recent `volume_estimations` row, then updates
+/// `quotes.estimated_volume_m3` with the new sum.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool)
+/// - `quote_id` — quote UUID path parameter
+/// - `request` — list of `UpdateEstimationItem` (name, volume_m3, quantity, confidence, +
+///   preserved vision metadata fields for round-trip fidelity)
+///
+/// # Returns
+/// `200 OK` with updated `EstimationInfo` including new `total_volume_m3` and item list.
+///
+/// # Errors
+/// - `404` if no estimation exists for the given quote
+/// - `500` on serialization or DB failures
 async fn update_estimation_items(
     State(state): State<Arc<AppState>>,
     Path(quote_id): Path<Uuid>,
@@ -662,12 +779,22 @@ async fn update_estimation_items(
     }))
 }
 
-/// Map a raw line_items_json entry into an `OfferLineItemDetail`.
+/// Convert a raw `line_items_json` entry from the DB into a typed `OfferLineItemDetail`.
 ///
-/// Handles three pricing modes stored in the JSON:
-/// - `flat_total` present: total = flat_total (used for Fahrkostenpauschale)
-/// - `is_labor = true`:    total = quantity × unit_price × persons
-/// - otherwise:            total = quantity × unit_price
+/// **Caller**: `get_quote` (latest offer pricing overlay) and `admin::get_quote_detail`.
+/// **Why**: `offers.line_items_json` stores the serialized `Vec<OfferLineItem>` from offer
+/// generation. At read time we need typed structs for the frontend. Three pricing modes
+/// are supported to match how the XLSX SUM(G31:G42) computes totals:
+/// - `flat_total` key present → `total = flat_total` (Fahrkostenpauschale lump sum)
+/// - `is_labor = true` → `total = quantity × unit_price × persons`
+/// - otherwise → `total = quantity × unit_price`
+///
+/// # Parameters
+/// - `item` — one element from the `line_items_json` array
+/// - `persons` — worker count from `offers.persons`; used for labor total calculation
+///
+/// # Returns
+/// `OfferLineItemDetail` with cents-based totals for frontend display.
 pub(crate) fn map_offer_line_item_detail(item: &serde_json::Value, persons: i32) -> OfferLineItemDetail {
     let label = item.get("description").and_then(|d| d.as_str()).unwrap_or("Sonstiges").to_string();
     let remark = item.get("remark").and_then(|r| r.as_str()).map(String::from);

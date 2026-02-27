@@ -14,6 +14,11 @@ use aust_calendar::{
 };
 use crate::{ApiError, AppState};
 
+/// Register the calendar and booking routes.
+///
+/// **Caller**: `crates/api/src/routes/mod.rs` route tree assembly.
+/// **Why**: Exposes availability checking, schedule overview, booking CRUD, and daily
+/// capacity overrides for the moving company calendar.
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/availability", get(check_availability))
@@ -28,6 +33,21 @@ struct AvailabilityQuery {
     date: NaiveDate,
 }
 
+/// `GET /api/v1/calendar/availability?date=YYYY-MM-DD` — Check availability for a specific date.
+///
+/// **Caller**: Axum router / customer-facing booking calendar and admin scheduling view.
+/// **Why**: Returns whether the requested date is available and, if not, suggests nearby
+/// alternative dates (count configured in `Config.calendar.alternatives_count`).
+///
+/// # Parameters
+/// - `state` — shared AppState (calendar service)
+/// - `query` — `date` query parameter (NaiveDate, format YYYY-MM-DD)
+///
+/// # Returns
+/// `200 OK` with `AvailabilityResult` (available flag + alternative dates).
+///
+/// # Errors
+/// - `500` on calendar service failures
 async fn check_availability(
     State(state): State<Arc<AppState>>,
     Query(query): Query<AvailabilityQuery>,
@@ -62,6 +82,24 @@ struct EnrichedScheduleEntry {
     bookings: Vec<EnrichedBooking>,
 }
 
+/// `GET /api/v1/calendar/schedule?from=YYYY-MM-DD&to=YYYY-MM-DD` — Fetch the schedule for a date range.
+///
+/// **Caller**: Axum router / admin dashboard calendar view.
+/// **Why**: Returns each date in the range with its availability status and all bookings
+/// for that day. Also enriches bookings with the latest non-rejected offer's netto price
+/// so the calendar view can display the job value without extra requests. Maximum range is
+/// 90 days.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool, calendar service)
+/// - `query` — `from` and `to` NaiveDate query parameters
+///
+/// # Returns
+/// `200 OK` with `Vec<EnrichedScheduleEntry>` (date, availability, enriched bookings).
+///
+/// # Errors
+/// - `400` if `from > to` or the range exceeds 90 days
+/// - `500` on calendar service failures
 async fn get_schedule(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ScheduleQuery>,
@@ -129,6 +167,22 @@ async fn get_schedule(
     Ok(Json(enriched))
 }
 
+/// `POST /api/v1/calendar/bookings` — Create a new moving booking.
+///
+/// **Caller**: Axum router / admin dashboard booking creation.
+/// **Why**: Delegates to `CalendarService.create_booking`, which checks capacity before
+/// inserting. Returns a `FullyBooked` error (mapped to 400) if the date is at capacity.
+///
+/// # Parameters
+/// - `state` — shared AppState (calendar service)
+/// - `request` — `NewBooking` JSON body (date, optional quote_id, notes)
+///
+/// # Returns
+/// `200 OK` with the created `Booking` JSON.
+///
+/// # Errors
+/// - `400` if the selected date is fully booked
+/// - `500` on DB failures
 async fn create_booking(
     State(state): State<Arc<AppState>>,
     Json(request): Json<NewBooking>,
@@ -147,6 +201,19 @@ async fn create_booking(
     Ok(Json(booking))
 }
 
+/// `GET /api/v1/calendar/bookings/{id}` — Retrieve a single booking by ID.
+///
+/// **Caller**: Axum router / admin dashboard booking detail.
+///
+/// # Parameters
+/// - `state` — shared AppState (calendar service)
+/// - `id` — booking UUID path parameter
+///
+/// # Returns
+/// `200 OK` with `Booking` JSON.
+///
+/// # Errors
+/// - `404` if booking not found
 async fn get_booking(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
@@ -168,6 +235,24 @@ struct UpdateBookingRequest {
     status: String,
 }
 
+/// `PATCH /api/v1/calendar/bookings/{id}` — Update booking status (confirm or cancel).
+///
+/// **Caller**: Axum router / admin dashboard booking management.
+/// **Why**: Only "confirmed" and "cancelled" status transitions are accepted. When a
+/// booking with a linked `quote_id` is confirmed or cancelled, `status_sync` cascades the
+/// change to the quote status so the pipeline state stays consistent.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool, calendar service)
+/// - `id` — booking UUID path parameter
+/// - `request` — JSON body with `status` field ("confirmed" or "cancelled")
+///
+/// # Returns
+/// `200 OK` with updated `Booking` JSON.
+///
+/// # Errors
+/// - `400` if status is not "confirmed" or "cancelled"
+/// - `404` if booking not found
 async fn update_booking(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
@@ -203,6 +288,21 @@ async fn update_booking(
     Ok(Json(booking))
 }
 
+/// `DELETE /api/v1/calendar/bookings/{id}` — Hard-delete a booking record.
+///
+/// **Caller**: Axum router / admin dashboard "Buchung löschen" action.
+/// **Why**: Permanently removes the booking. Does not update the linked quote status —
+/// use `update_booking` with "cancelled" first if status sync is needed.
+///
+/// # Parameters
+/// - `state` — shared AppState (calendar service)
+/// - `id` — booking UUID path parameter
+///
+/// # Returns
+/// `200 OK` with `{"ok": true}`.
+///
+/// # Errors
+/// - `404` if booking not found
 async fn delete_booking_handler(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
@@ -219,6 +319,24 @@ async fn delete_booking_handler(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
+/// `PUT /api/v1/calendar/capacity/{date}` — Override the daily booking capacity for a specific date.
+///
+/// **Caller**: Axum router / admin dashboard capacity management.
+/// **Why**: The default daily capacity is set in `Config.calendar.default_capacity`. This
+/// endpoint upserts a `calendar_capacity_overrides` row so a particular day can have a
+/// different limit (e.g. set to 0 for holidays or set higher for extra crew days).
+///
+/// # Parameters
+/// - `state` — shared AppState (calendar service)
+/// - `date` — NaiveDate path parameter (YYYY-MM-DD)
+/// - `request` — JSON body with `capacity` (non-negative integer)
+///
+/// # Returns
+/// `200 OK` with `CapacityOverride` JSON.
+///
+/// # Errors
+/// - `400` if `capacity < 0`
+/// - `500` on DB failures
 async fn set_capacity(
     State(state): State<Arc<AppState>>,
     Path(date): Path<NaiveDate>,

@@ -16,13 +16,22 @@ use crate::{orchestrator, services, ApiError, AppState};
 use aust_core::models::{EstimationMethod, InventoryForm, VolumeEstimation};
 use aust_volume_estimator::VisionAnalyzer;
 
-/// Public routes (no auth required) — image proxy for <img> tags.
+/// Register the public estimation routes (no auth required).
+///
+/// **Caller**: `crates/api/src/routes/mod.rs` route tree assembly.
+/// **Why**: Image/video proxy must be public so `<img>` tags in the admin dashboard can
+/// load estimation images directly without carrying an auth header.
 pub fn public_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/images/{*key}", get(serve_image))
 }
 
-/// Protected routes (require admin JWT).
+/// Register the protected estimation routes (require admin JWT).
+///
+/// **Caller**: `crates/api/src/routes/mod.rs` route tree assembly, nested under admin
+/// JWT middleware.
+/// **Why**: All write operations (running vision models, storing results) and the delete
+/// endpoint must be admin-only.
 pub fn protected_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/vision", post(vision_estimate))
@@ -108,6 +117,23 @@ struct ImageData {
 }
 
 
+/// `POST /api/v1/estimates/vision` — Run LLM image analysis on base64-encoded photos.
+///
+/// **Caller**: Axum router / admin dashboard and photo webapp (source C pipeline).
+/// **Why**: Accepts one or more photos as base64 JSON, uploads them to S3 for later display,
+/// runs `VisionAnalyzer` (LLM vision) on each image, stores a `volume_estimations` record,
+/// updates the quote volume, and spawns a background task to auto-generate an offer.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool, LLM provider, storage)
+/// - `request` — JSON body with `quote_id` and `images` (array of `{data, mime_type}`)
+///
+/// # Returns
+/// `200 OK` with the newly created `VolumeEstimation` JSON (status = "completed").
+///
+/// # Errors
+/// - `400` if `images` is empty or base64 decoding fails
+/// - `500` on LLM analysis, S3 upload, or DB failures
 async fn vision_estimate(
     State(state): State<Arc<AppState>>,
     Json(request): Json<VisionEstimateRequest>,
@@ -187,6 +213,25 @@ async fn vision_estimate(
     Ok(Json(VolumeEstimation::from(est)))
 }
 
+/// `POST /api/v1/estimates/depth-sensor` — Run the 3D ML pipeline on multipart-uploaded images.
+///
+/// **Caller**: Axum router / mobile app depth-sensor flow (source D pipeline).
+/// **Why**: Receives `multipart/form-data` with `quote_id` and one or more image files,
+/// uploads images to S3, calls the Modal vision service (Grounding DINO + SAM 2 + depth),
+/// and falls back to LLM vision analysis if the vision service is unavailable.
+/// After storing results, auto-generates an offer in the background.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool, LLM provider, vision service client, storage)
+/// - `multipart` — multipart form with `quote_id` field + image file fields
+///
+/// # Returns
+/// `200 OK` with the newly created `VolumeEstimation` JSON.
+/// The `method` field reflects whether the ML pipeline or LLM fallback was used.
+///
+/// # Errors
+/// - `400` if multipart parsing fails, `quote_id` is missing/invalid, or no images provided
+/// - `500` on S3 upload, vision service, or DB failures
 async fn depth_sensor_estimate(
     State(state): State<Arc<AppState>>,
     mut multipart: Multipart,
@@ -281,6 +326,26 @@ async fn depth_sensor_estimate(
     Ok(Json(VolumeEstimation::from(est)))
 }
 
+/// `POST /api/v1/estimates/video` — Upload video(s) and start the 3D reconstruction pipeline.
+///
+/// **Caller**: Axum router / admin dashboard video upload (planned) and direct API consumers.
+/// **Why**: Accepts one or more video files via multipart upload. Each video is stored in S3
+/// and a `volume_estimations` row is inserted with status `processing`. Long-running Modal
+/// calls (MASt3R + SAM 2 tracking + RE lookup) run in a Tokio background task to avoid
+/// blocking the HTTP response. Returns immediately with the `processing` estimation records.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool, storage, vision service client — must be configured)
+/// - `multipart` — form with `quote_id`, `video` file(s), and optional `max_keyframes` /
+///   `detection_threshold` tuning parameters
+///
+/// # Returns
+/// `200 OK` with a `Vec<VolumeEstimation>` (one per video, all in status "processing").
+/// The actual results are written by `process_video_background` when Modal finishes.
+///
+/// # Errors
+/// - `400` if multipart parsing fails, `quote_id` missing, or no videos provided
+/// - `500` if vision service is not configured or S3/DB fails
 async fn video_estimate(
     State(state): State<Arc<AppState>>,
     mut multipart: Multipart,
@@ -430,7 +495,29 @@ async fn video_estimate(
     Ok(Json(estimations))
 }
 
-/// Background task: call Modal vision service, store results, trigger offer generation.
+/// Background task: call the Modal video pipeline, persist results, and trigger offer generation.
+///
+/// **Caller**: Spawned by `video_estimate` via `tokio::spawn` for each uploaded video.
+/// **Why**: The MASt3R 3D reconstruction + SAM 2 tracking pipeline can take 60–600 seconds
+/// on Modal. This function runs asynchronously after the HTTP response has been returned so
+/// the client is not blocked. On completion it:
+/// 1. Uploads crop thumbnails (base64 → S3)
+/// 2. Updates the `volume_estimations` row to `completed` with `result_data`
+/// 3. Waits until all videos for the quote finish processing
+/// 4. Sums volumes across completed estimations and updates the quote
+/// 5. Calls `try_auto_generate_offer` to produce the offer and Telegram notification
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool, storage, vision service client)
+/// - `estimation_id` — the `volume_estimations` row to update
+/// - `quote_id` — the parent quote
+/// - `video_bytes` — raw video data sent to Modal
+/// - `video_mime` — MIME type string (e.g. "video/mp4")
+/// - `max_keyframes` — optional cap on extracted keyframes passed to Modal
+/// - `detection_threshold` — optional confidence threshold passed to Modal
+///
+/// # Errors
+/// Errors are logged and the estimation status is set to `failed`; no panic propagation.
 async fn process_video_background(
     state: Arc<AppState>,
     estimation_id: Uuid,
@@ -600,6 +687,23 @@ struct InventoryRequest {
     inventory: InventoryForm,
 }
 
+/// `POST /api/v1/estimates/inventory` — Calculate volume from a structured inventory form.
+///
+/// **Caller**: Axum router / "Kostenloses Angebot" form flow and admin manual entry.
+/// **Why**: When the customer fills in the structured moving goods form (VolumeCalculator),
+/// volumes are computed deterministically from item counts — no ML or vision required.
+/// Confidence is fixed at 1.0 because the user explicitly listed their items.
+/// After storing results, auto-generates an offer in the background.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool)
+/// - `request` — JSON body with `quote_id` and `inventory` form data
+///
+/// # Returns
+/// `200 OK` with the newly created `VolumeEstimation` JSON (status = "completed").
+///
+/// # Errors
+/// - `500` on `InventoryProcessor` failures or DB errors
 async fn inventory_estimate(
     State(state): State<Arc<AppState>>,
     Json(request): Json<InventoryRequest>,
@@ -636,6 +740,21 @@ async fn inventory_estimate(
     Ok(Json(VolumeEstimation::from(est)))
 }
 
+/// `GET /api/v1/estimates/{id}` — Retrieve a single volume estimation by ID.
+///
+/// **Caller**: Axum router / polling clients waiting for `processing` → `completed` transitions.
+/// **Why**: Returns the raw `VolumeEstimation` record including `status`, so the frontend
+/// can poll until a video processing job finishes.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool)
+/// - `id` — estimation UUID path parameter
+///
+/// # Returns
+/// `200 OK` with `VolumeEstimation` JSON.
+///
+/// # Errors
+/// - `404` if no estimation with the given ID exists
 async fn get_estimate(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
@@ -654,8 +773,21 @@ async fn get_estimate(
     Ok(Json(VolumeEstimation::from(row)))
 }
 
-/// Collect all S3 keys associated with an estimation (video, images, crop thumbnails).
-/// Used before deletion to clean up storage.
+/// Collect all S3 object keys associated with an estimation, for pre-deletion cleanup.
+///
+/// **Caller**: `delete_estimate` (before the DB row is removed).
+/// **Why**: Estimations reference several S3 objects that must be deleted alongside the DB
+/// row to avoid orphaned storage objects: the original video or image files, and per-item
+/// crop thumbnails generated by the vision pipeline.
+///
+/// # Parameters
+/// - `source_data` — `volume_estimations.source_data` JSON; contains `video_s3_key` for
+///   video estimations or `s3_keys` array for image estimations
+/// - `result_data` — optional `volume_estimations.result_data` JSON; items may carry
+///   `crop_s3_key` values for crop thumbnail objects
+///
+/// # Returns
+/// Flat `Vec<String>` of S3 keys. May be empty if no objects are referenced.
 pub fn collect_estimation_s3_keys(
     source_data: &serde_json::Value,
     result_data: Option<&serde_json::Value>,
@@ -688,6 +820,24 @@ pub fn collect_estimation_s3_keys(
     keys
 }
 
+/// `DELETE /api/v1/estimates/{id}` — Delete an estimation and its associated S3 objects.
+///
+/// **Caller**: Axum router / admin dashboard item editor (when removing a bad estimation batch).
+/// **Why**: Deleting an estimation must also remove its S3 files (video, images, crop
+/// thumbnails) to avoid orphaned objects. After deletion, the quote's volume is
+/// recalculated from the remaining completed estimations, and its status is reset to
+/// "new" if no estimations remain.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool, storage)
+/// - `id` — estimation UUID path parameter
+///
+/// # Returns
+/// `204 No Content` on success.
+///
+/// # Errors
+/// - `404` if no estimation with the given ID exists
+/// - `500` on DB failures (S3 deletion errors are logged as warnings and do not fail the request)
 async fn delete_estimate(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
@@ -745,6 +895,22 @@ async fn delete_estimate(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `GET /api/v1/estimates/images/{*key}` — Proxy an S3 object (image or video) to the browser.
+///
+/// **Caller**: Axum public router / `<img>` and `<video>` tags in the admin dashboard.
+/// **Why**: S3/MinIO objects are not directly accessible from the browser in the dev
+/// environment. This proxy route downloads the object from storage and streams it back
+/// with the correct `Content-Type`, inferred from the file extension.
+///
+/// # Parameters
+/// - `state` — shared AppState (storage)
+/// - `key` — full S3 key (wildcard path segment), e.g. `estimates/uuid/uuid/0.jpg`
+///
+/// # Returns
+/// File bytes with appropriate `Content-Type` header.
+///
+/// # Errors
+/// - `500` if the S3 download fails (key not found returns the storage provider's error)
 async fn serve_image(
     State(state): State<Arc<AppState>>,
     Path(key): Path<String>,

@@ -4,22 +4,36 @@ use serde::Deserialize;
 use tracing::{debug, info};
 use uuid::Uuid;
 
-/// JSON form submission from send-mail.php (attached as .json file).
+/// Raw JSON form data from the "Kostenloses Angebot" Netlify form, sent as a
+/// `.json` email attachment by the `send-mail.php` handler.
+///
+/// All fields are `Option` because not every customer fills in every field.
+/// Field names match the HTML `name` attributes of the web form (German).
 #[derive(Debug, Deserialize)]
 struct FormSubmission {
+    /// HTML form `name` attribute value (e.g., `"kostenloses-angebot"`).
     #[serde(rename = "form-name")]
     form_name: Option<String>,
     name: Option<String>,
+    /// Customer's real email address (distinct from the IMAP sender which is
+    /// always `angebot@aust-umzuege.de`).
     email: Option<String>,
     phone: Option<String>,
+    /// Customer's preferred moving date; may be ISO (`2025-03-15`) or German
+    /// (`15.03.2025`) format.
     wunschtermin: Option<String>,
+    /// Departure street address (Auszugsadresse).
     auszugsadresse: Option<String>,
+    /// Floor at departure (e.g., `"2. Stock"`, `"Erdgeschoss"`).
     #[serde(rename = "etage-auszug")]
     etage_auszug: Option<String>,
+    /// Parking ban needed at departure; `"on"` = true, absent = false.
     #[serde(rename = "halteverbot-auszug")]
     halteverbot_auszug: Option<String>,
+    /// Elevator at departure; `"on"` = true, absent = false.
     #[serde(rename = "aufzug-auszug")]
     aufzug_auszug: Option<String>,
+    /// Arrival street address (Einzugsadresse).
     einzugsadresse: Option<String>,
     #[serde(rename = "etage-einzug")]
     etage_einzug: Option<String>,
@@ -27,6 +41,7 @@ struct FormSubmission {
     halteverbot_einzug: Option<String>,
     #[serde(rename = "aufzug-einzug")]
     aufzug_einzug: Option<String>,
+    /// Optional intermediate stop address (Zwischenstopp).
     #[serde(rename = "zwischenstopp-adresse")]
     zwischenstopp_adresse: Option<String>,
     #[serde(rename = "etage-zwischenstopp")]
@@ -35,24 +50,48 @@ struct FormSubmission {
     halteverbot_zwischenstopp: Option<String>,
     #[serde(rename = "aufzug-zwischenstopp")]
     aufzug_zwischenstopp: Option<String>,
+    /// Total moving volume in cubic metres as a string (may use comma as decimal separator).
     #[serde(rename = "umzugsvolumen-m3")]
     umzugsvolumen_m3: Option<String>,
+    /// VolumeCalculator items list (e.g., `"2x Sofa, Couch (0.80 m³)\n1x Tisch (0.40 m³)"`).
     #[serde(rename = "gegenstaende-liste")]
     gegenstaende_liste: Option<String>,
+    /// Comma-separated additional services (e.g., `"Möbeldemontage, Einpackservice"`).
     zusatzleistungen: Option<String>,
+    /// Free-text customer message.
     nachricht: Option<String>,
 }
 
+/// Converts raw `ParsedEmail` values into a structured `MovingInquiry`.
+///
+/// Strategy (in priority order):
+/// 1. Try to deserialise a `.json` attachment (most reliable; comes from the
+///    "Kostenloses Angebot" web form via `send-mail.php`).
+/// 2. Detect email type from body text markers and parse key/value fields.
+/// 3. Fall back to free-text mode, storing the body in `notes` for the LLM
+///    responder to extract data in a subsequent step.
 pub struct EmailParser;
 
 impl EmailParser {
+    /// Creates a new `EmailParser`.
     pub fn new() -> Self {
         Self
     }
 
-    /// Parse an incoming email into a MovingInquiry, extracting as much
+    /// Parse an incoming email into a `MovingInquiry`, extracting as much
     /// structured data as possible. Works for both form submissions and
     /// free-text emails.
+    ///
+    /// **Caller**: `EmailProcessor::process_incoming_email` calls this for
+    /// every new IMAP message.
+    ///
+    /// # Parameters
+    /// - `email` — The decoded IMAP message including body and attachments.
+    ///
+    /// # Returns
+    /// A `MovingInquiry` with as many fields populated as the input allows.
+    /// The caller should check `inquiry.is_complete()` before proceeding to
+    /// offer generation.
     pub fn parse_inquiry(&self, email: &ParsedEmail) -> MovingInquiry {
         // Try JSON attachment first (most reliable for form submissions)
         if let Some(inquiry) = self.try_parse_json_attachment(email) {
@@ -97,6 +136,14 @@ impl EmailParser {
     }
 
     /// Try to parse a JSON attachment from the email (send-mail.php form data).
+    ///
+    /// Looks for the first attachment with content-type `application/json` or
+    /// filename ending in `.json`, then deserialises it as `FormSubmission`.
+    ///
+    /// # Returns
+    /// `Some(MovingInquiry)` when a valid JSON attachment was found and parsed,
+    /// `None` when no JSON attachment exists or parsing failed (caller falls
+    /// through to text-based parsing).
     fn try_parse_json_attachment(&self, email: &ParsedEmail) -> Option<MovingInquiry> {
         let json_attachment = email.attachments.iter().find(|a| {
             a.content_type.contains("json")
@@ -181,6 +228,16 @@ impl EmailParser {
     }
 
     /// Detect whether the email body is a structured form submission or free-text.
+    ///
+    /// Detection is based on known marker strings produced by the website's
+    /// `send-mail.php` handler. Both "Neue Angebotsanfrage" and "Kostenloses
+    /// Angebot" variants are recognised as `QuoteForm`.
+    ///
+    /// # Parameters
+    /// - `body` — Plain-text email body.
+    ///
+    /// # Returns
+    /// `InquirySource::QuoteForm`, `ContactForm`, or `DirectEmail`.
     fn detect_source(&self, body: &str) -> InquirySource {
         let lower = body.to_lowercase();
 
@@ -197,10 +254,17 @@ impl EmailParser {
         }
     }
 
-    /// Parse a "Kostenloses Angebot" form submission email.
-    /// Handles two formats:
-    /// 1. Flat: "Auszugsadresse: ...", "Etage Auszug: ...", "Halteverbot Auszug: Ja"
-    /// 2. Sectioned: "--- Auszugsadresse ---" followed by "Adresse: ...", "Etage: ...", "Halteverbot: Ja"
+    /// Parse a "Kostenloses Angebot" form submission email using text extraction.
+    ///
+    /// Handles two formats produced by `send-mail.php`:
+    /// 1. **Flat**: `"Auszugsadresse: …"`, `"Etage Auszug: …"`, `"Halteverbot Auszug: Ja"`
+    /// 2. **Sectioned**: `"--- Auszugsadresse ---"` followed by `"Adresse: …"`, `"Etage: …"`
+    ///
+    /// The flat format is tried first; if the field is absent, the section-based
+    /// format is attempted as a fallback.
+    ///
+    /// **Note**: `departure_elevator` and `arrival_elevator` are not captured in
+    /// text-format emails — only JSON attachments contain those values.
     fn parse_quote_form(
         &self,
         email: &ParsedEmail,
@@ -312,6 +376,10 @@ impl EmailParser {
     }
 
     /// Parse a basic contact form submission.
+    ///
+    /// Contact forms only have name, email, phone, and a free-text message.
+    /// All move-specific fields are left as defaults; the LLM responder will
+    /// ask the customer for them.
     fn parse_contact_form(
         &self,
         email: &ParsedEmail,
@@ -338,7 +406,12 @@ impl EmailParser {
         }
     }
 
-    /// Parse a free-text email or media email.
+    /// Parse a free-text or media email.
+    ///
+    /// For direct emails the structured fields cannot be reliably extracted
+    /// without an LLM, so only the sender info is populated here. The full
+    /// body is stored in `notes` so the responder step can pass it to the LLM
+    /// for structured data extraction.
     fn parse_freetext(
         &self,
         email: &ParsedEmail,
@@ -366,7 +439,11 @@ impl Default for EmailParser {
     }
 }
 
-/// Extract a "Key: Value" field from a structured email body.
+/// Extract a `"Key: Value"` field from a structured email body.
+///
+/// Matches lines where the line starts with `key` followed by an optional
+/// space and colon (handles both `"Key: Value"` and `"Key : Value"`).
+/// Returns `None` for empty values, `"-"`, `"Keine"`, or `"keine"`.
 fn extract_field(body: &str, key: &str) -> Option<String> {
     for line in body.lines() {
         let trimmed = line.trim();
@@ -382,7 +459,10 @@ fn extract_field(body: &str, key: &str) -> Option<String> {
     None
 }
 
-/// Extract a boolean field (looks for "Ja"/"Nein" pattern).
+/// Extract a boolean field by looking for "Ja"/"Nein"/"yes"/"true" patterns.
+///
+/// Returns `Some(true)` for affirmative values, `Some(false)` for negatives,
+/// and `None` when the key is not present.
 fn extract_bool_field(body: &str, key: &str) -> Option<bool> {
     extract_field(body, key).map(|v| {
         let lower = v.to_lowercase();
@@ -390,8 +470,14 @@ fn extract_bool_field(body: &str, key: &str) -> Option<bool> {
     })
 }
 
-/// Extract a field from within a section delimited by "--- SectionName ---".
-/// Scans lines after the section header until the next section or end of block.
+/// Extract a field from within a section delimited by `"--- SectionName ---"`.
+///
+/// Scans lines after the section header until the next section delimiter or the
+/// end of the body. Case-insensitive matching for both section name and key.
+///
+/// # Parameters
+/// - `section` — Section header text (e.g., `"Auszugsadresse"`).
+/// - `key` — Field name within the section (e.g., `"Adresse"`).
 fn extract_section_field(body: &str, section: &str, key: &str) -> Option<String> {
     let section_lower = section.to_lowercase();
     let key_lower = key.to_lowercase();
@@ -428,7 +514,10 @@ fn extract_section_field(body: &str, section: &str, key: &str) -> Option<String>
     None
 }
 
-/// Extract a boolean from within a section.
+/// Extract a boolean field from within a named section.
+///
+/// Delegates to `extract_section_field` then maps the value with affirmative
+/// detection (`"ja"`, `"yes"`, `"true"`).
 fn extract_section_bool(body: &str, section: &str, key: &str) -> Option<bool> {
     extract_section_field(body, section, key).map(|v| {
         let lower = v.to_lowercase();
@@ -436,9 +525,22 @@ fn extract_section_bool(body: &str, section: &str, key: &str) -> Option<bool> {
     })
 }
 
-/// Extract a multi-line field value. The first line is "Key: value",
-/// continuation lines start with a digit+x pattern (e.g. "1x Sofa...")
-/// or any non-labeled line until the next "Key:" field.
+/// Extract a multi-line field value from the email body.
+///
+/// The first match line is `"Key: first_value"`. Continuation lines are
+/// collected until the next `"Key: …"` field, a section delimiter (`---`,
+/// `===`), or end of body. Blank lines within the items block are skipped.
+///
+/// Used for the `"Gegenstände"` items list which may span many lines:
+/// ```text
+/// Gegenstände: 1x Bettumbau (0.30 m³)
+/// 1x Französisches Bett komplett (1.50 m³)
+/// 1x Nachttisch (0.20 m³)
+/// Zusatzleistungen: Einpackservice
+/// ```
+///
+/// # Parameters
+/// - `key` — The field name that starts the block (e.g., `"Gegenstände"`).
 fn extract_multiline_field(body: &str, key: &str) -> Option<String> {
     let mut lines_iter = body.lines().peekable();
     let mut result_lines = Vec::new();
@@ -493,8 +595,15 @@ fn extract_multiline_field(body: &str, key: &str) -> Option<String> {
     }
 }
 
-/// Last-resort email extraction: scan the body for email addresses
-/// and return the first one that isn't the company/sender address.
+/// Last-resort email address extraction: scans the body for email-like tokens
+/// and returns the first one that is not the company sender address.
+///
+/// Used when the structured `"E-Mail:"` field is absent from the email body
+/// (e.g., older form versions that omit it).
+///
+/// # Parameters
+/// - `body` — Plain-text email body to scan.
+/// - `sender` — IMAP `From:` address to exclude (usually `angebot@aust-umzuege.de`).
 fn extract_email_from_body(body: &str, sender: &str) -> Option<String> {
     let sender_lower = sender.to_lowercase();
     // Simple email regex: word chars + dots/hyphens @ domain
@@ -515,7 +624,16 @@ fn extract_email_from_body(body: &str, sender: &str) -> Option<String> {
     None
 }
 
-/// Parse a date string in common German formats.
+/// Parse a date string in common German and ISO formats.
+///
+/// Tries each format in order; returns `None` when no format matches rather
+/// than panicking.
+///
+/// # Supported formats
+/// - ISO: `2025-03-15`
+/// - German full: `15.03.2025`
+/// - German short month: `15.3.2025`
+/// - German 2-digit year: `15.03.25`
 fn parse_date(s: &str) -> Option<NaiveDate> {
     let s = s.trim();
 

@@ -2,17 +2,27 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// How the volume of a moving job was estimated.
+///
+/// Determines which pipeline was used and therefore which fields in
+/// `VolumeEstimation::result_data` are populated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EstimationMethod {
+    /// LLM vision analysis of customer-supplied photos (Claude / OpenAI).
     Vision,
+    /// Manual item list submitted via the "Gegenstände" form field.
     Inventory,
+    /// 3D depth-sensor pipeline (Grounding DINO + SAM 2 + Depth Anything V2).
     DepthSensor,
+    /// 3D video reconstruction pipeline (MASt3R + SAM 2 temporal tracking).
     Video,
+    /// Volume entered manually by an admin without any automated pipeline.
     Manual,
 }
 
 impl EstimationMethod {
+    /// Returns the lowercase snake_case string stored in the database.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Vision => "vision",
@@ -24,46 +34,88 @@ impl EstimationMethod {
     }
 }
 
+/// Stored volume estimation record linked to a quote.
+///
+/// The `source_data` JSONB column captures what was sent to the pipeline
+/// (e.g., image descriptions or item lists). `result_data` stores the raw
+/// pipeline response, and `total_volume_m3` is the final agreed-upon value
+/// used in offer pricing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VolumeEstimation {
+    /// UUID v7 primary key.
     pub id: Uuid,
+    /// The quote this estimation belongs to.
     pub quote_id: Uuid,
+    /// Pipeline used to produce this estimation.
     pub method: EstimationMethod,
+    /// Processing status: `"pending"`, `"completed"`, or `"failed"`.
     pub status: String,
+    /// Raw input passed to the pipeline (e.g., base64 images or item strings).
     pub source_data: serde_json::Value,
+    /// Raw output from the pipeline (provider-specific shape).
     pub result_data: Option<serde_json::Value>,
+    /// Final aggregated volume in cubic metres; `None` while `status = "pending"`.
     pub total_volume_m3: Option<f64>,
+    /// Pipeline confidence score in the range [0, 1]; `None` for manual entries.
     pub confidence_score: Option<f64>,
     pub created_at: DateTime<Utc>,
 }
 
+/// Input for creating a new volume estimation record.
+///
+/// **Caller**: API route handlers for `/estimates/vision`, `/estimates/depth-sensor`,
+/// `/estimates/video`, and `/estimates/inventory` create one of these before
+/// dispatching to the relevant pipeline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateVolumeEstimation {
     pub quote_id: Uuid,
     pub method: EstimationMethod,
+    /// Serialised input data to be stored for auditing (e.g., image metadata or
+    /// the raw items list string).
     pub source_data: serde_json::Value,
 }
 
+/// A single item in a manually entered inventory list.
+///
+/// **Caller**: `InventoryForm` submissions from the API or from parsed email
+/// Gegenstände fields. Items are summed to produce `total_volume_m3`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InventoryItem {
+    /// Human-readable item name in German (e.g., `"Sofa, Couch"`).
     pub name: String,
+    /// Number of identical items.
     pub quantity: u32,
+    /// Volume per single item in cubic metres.
     pub volume_m3: f64,
+    /// Optional category for grouping (e.g., `"Wohnzimmer"`, `"Schlafzimmer"`).
     pub category: Option<String>,
 }
 
+/// A complete manual inventory form submission.
+///
+/// **Caller**: `POST /api/v1/estimates/inventory` deserialises the request body
+/// into this struct.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InventoryForm {
     pub items: Vec<InventoryItem>,
+    /// Free-text notes from the customer (e.g., fragile items, disassembly needed).
     pub additional_notes: Option<String>,
 }
 
+/// LLM vision analysis output for a set of room photos.
+///
+/// **Caller**: The `estimates/vision` route handler returns this in the API
+/// response after the LLM has analysed the uploaded images.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VisionAnalysisResult {
     pub detected_items: Vec<DetectedItem>,
+    /// Sum of all detected item volumes in cubic metres.
     pub total_volume_m3: f64,
+    /// Overall confidence score in the range [0, 1].
     pub confidence_score: f64,
+    /// Inferred room type (e.g., `"Wohnzimmer"`, `"Schlafzimmer"`); `None` when ambiguous.
     pub room_type: Option<String>,
+    /// Qualitative notes from the LLM about the analysis (e.g., unusual items).
     pub analysis_notes: Option<String>,
 }
 
@@ -74,26 +126,40 @@ pub struct VisionAnalysisResult {
 /// with existing JSON in the database.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectedItem {
+    /// German item name (e.g., `"Sofa, Couch"`).
     pub name: String,
+    /// Estimated volume of this item in cubic metres.
+    /// Also accepted as `estimated_volume_m3` for backward compatibility.
     #[serde(alias = "estimated_volume_m3")]
     pub volume_m3: f64,
+    /// Confidence score for this individual item in the range [0, 1].
     pub confidence: f64,
+    /// Physical dimensions measured or estimated by the pipeline.
     #[serde(default)]
     pub dimensions: Option<ItemDimensions>,
+    /// Item category for grouping in the output report.
     #[serde(default)]
     pub category: Option<String>,
+    /// Localised German display name (from the RE catalogue lookup).
     #[serde(default)]
     pub german_name: Option<String>,
+    /// RE (Raumeinheit) value from the Alltransport 24 catalogue (1 RE = 0.1 m³).
+    /// `None` when the item was not found in the catalogue and was measured geometrically.
     #[serde(default)]
     pub re_value: Option<f64>,
+    /// How the volume was determined: `"re_catalog"` or `"geometric_obb"`.
     #[serde(default)]
     pub volume_source: Option<String>,
+    /// Bounding box `[x1, y1, x2, y2]` in pixels within the source image.
     #[serde(default)]
     pub bbox: Option<Vec<f64>>,
+    /// Index into the images array identifying which image this bbox belongs to.
     #[serde(default)]
     pub bbox_image_index: Option<usize>,
+    /// S3 key for the cropped item image stored during vision processing.
     #[serde(default)]
     pub crop_s3_key: Option<String>,
+    /// Indices of images in which this item was detected (for deduplication).
     #[serde(default)]
     pub seen_in_images: Option<Vec<usize>>,
 }
@@ -101,14 +167,27 @@ pub struct DetectedItem {
 /// Type alias for backward compatibility — `DepthSensorItem` was merged into `DetectedItem`.
 pub type DepthSensorItem = DetectedItem;
 
+/// 3D depth-sensor pipeline output for a set of images.
+///
+/// **Caller**: The vision sidecar service returns this JSON shape; the
+/// `estimates/depth-sensor` route handler deserialises it and persists it as
+/// `result_data` on the `VolumeEstimation` record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DepthSensorResult {
     pub detected_items: Vec<DetectedItem>,
+    /// Sum of all detected item volumes in cubic metres.
     pub total_volume_m3: f64,
+    /// Overall pipeline confidence score in the range [0, 1].
     pub confidence_score: f64,
+    /// Wall-clock processing time in milliseconds.
     pub processing_time_ms: u64,
 }
 
+/// Physical dimensions of a detected item, measured or estimated in metres.
+///
+/// **Why**: Stored alongside each `DetectedItem` so that RE-catalogue lookups
+/// can be cross-validated against geometric measurements, and for display in
+/// the "Erfasste Gegenstände" items sheet of the offer XLSX.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ItemDimensions {
     pub length_m: f64,

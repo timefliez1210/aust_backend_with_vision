@@ -8,16 +8,33 @@ use crate::error::CalendarError;
 use crate::models::*;
 use crate::repository;
 
-/// Calendar service handling availability checking, booking management,
-/// and capacity overrides.
+/// Business logic layer for moving job calendar management.
+///
+/// Wraps the raw SQL repository with capacity checks, Sunday skipping, and
+/// alternative date suggestions. Instantiated once at startup and shared via
+/// `Arc<CalendarService>`.
+///
+/// **Caller**: API route handlers in `crates/api/src/routes/calendar.rs` and
+/// the Telegram approval flow in `crates/email-agent`.
 pub struct CalendarService {
     pool: PgPool,
+    /// Maximum simultaneous bookings per day (from `CalendarConfig::default_capacity`).
     default_capacity: i32,
+    /// How many alternative dates to suggest when a requested date is full.
     alternatives_count: usize,
+    /// How far forward/backward to search for alternatives (in calendar days).
     search_window_days: i64,
 }
 
 impl CalendarService {
+    /// Creates a new `CalendarService`.
+    ///
+    /// # Parameters
+    /// - `pool` — Shared PostgreSQL connection pool.
+    /// - `default_capacity` — Maximum bookings per day when no override exists.
+    /// - `alternatives_count` — Number of alternative dates returned when the
+    ///   requested date is fully booked.
+    /// - `search_window_days` — Maximum offset (days) to search for alternatives.
     pub fn new(
         pool: PgPool,
         default_capacity: i32,
@@ -32,7 +49,10 @@ impl CalendarService {
         }
     }
 
-    /// Get the effective capacity for a date (override or default).
+    /// Get the effective booking capacity for a date.
+    ///
+    /// Returns the `calendar_capacity_overrides` value when one exists for the
+    /// date, otherwise falls back to `default_capacity`.
     async fn effective_capacity(&self, date: NaiveDate) -> Result<i32, CalendarError> {
         if let Some(ovr) = repository::get_capacity_override(&self.pool, date).await? {
             Ok(ovr.capacity)
@@ -41,7 +61,9 @@ impl CalendarService {
         }
     }
 
-    /// Build a DateAvailability for a single date.
+    /// Build a `DateAvailability` snapshot for a single date.
+    ///
+    /// Queries active booking count and compares it to the effective capacity.
     async fn date_availability(&self, date: NaiveDate) -> Result<DateAvailability, CalendarError> {
         let capacity = self.effective_capacity(date).await?;
         let booked = repository::count_bookings_for_date(&self.pool, date).await?;
@@ -56,8 +78,17 @@ impl CalendarService {
         })
     }
 
-    /// Check availability for a specific date.
-    /// If unavailable, also returns up to N nearest alternative dates.
+    /// Check availability for a specific date, returning alternative dates when
+    /// the requested date is fully booked.
+    ///
+    /// **Caller**: `GET /api/v1/calendar/availability?date=YYYY-MM-DD`.
+    ///
+    /// # Parameters
+    /// - `date` — The customer's preferred moving date.
+    ///
+    /// # Returns
+    /// An `AvailabilityResult` with the requested date's slot info and, when the
+    /// date is unavailable, up to `alternatives_count` nearby open dates.
     pub async fn check_availability(
         &self,
         date: NaiveDate,
@@ -81,7 +112,20 @@ impl CalendarService {
     }
 
     /// Find the N nearest available dates around a target date.
-    /// Searches outward (+1, -1, +2, -2, ...), skipping Sundays and past dates.
+    ///
+    /// Searches outward from the target (+1 day, -1 day, +2 days, -2 days, …),
+    /// skipping Sundays and dates in the past.
+    ///
+    /// **Caller**: `check_availability` (when the requested date is full) and
+    /// the Telegram approval flow (to suggest rescheduling options).
+    ///
+    /// # Parameters
+    /// - `around` — The date to search from.
+    /// - `count` — Maximum number of alternatives to return.
+    ///
+    /// # Returns
+    /// Up to `count` available `DateAvailability` entries sorted by proximity
+    /// to `around`.
     pub async fn find_nearest_available(
         &self,
         around: NaiveDate,
@@ -127,6 +171,8 @@ impl CalendarService {
     }
 
     /// Get all active bookings for a specific date.
+    ///
+    /// **Caller**: Admin dashboard day-detail view.
     pub async fn get_bookings_for_date(
         &self,
         date: NaiveDate,
@@ -134,8 +180,18 @@ impl CalendarService {
         repository::get_bookings_for_date(&self.pool, date).await
     }
 
-    /// Create a booking, respecting capacity limits.
-    /// Returns an error if the date is fully booked.
+    /// Create a booking for a date, respecting the effective capacity limit.
+    ///
+    /// **Caller**: `POST /api/v1/calendar/bookings` and the email agent when a
+    /// customer's preferred date is available.
+    ///
+    /// # Returns
+    /// The newly created `Booking` record with its generated UUID and timestamps.
+    ///
+    /// # Errors
+    /// - `CalendarError::FullyBooked` — the date has reached its capacity limit.
+    ///   The error message includes slot counts so the Telegram flow can present
+    ///   a force-book option to Alex.
     pub async fn create_booking(
         &self,
         booking: NewBooking,
@@ -159,7 +215,13 @@ impl CalendarService {
         Ok(result)
     }
 
-    /// Force-create a booking, ignoring capacity limits (admin override).
+    /// Force-create a booking, ignoring the capacity limit (admin override).
+    ///
+    /// **Caller**: Telegram approval flow when Alex explicitly approves overbooking
+    /// after receiving a `CalendarError::FullyBooked` from `create_booking`.
+    ///
+    /// # Returns
+    /// The newly created `Booking` record.
     pub async fn force_create_booking(
         &self,
         booking: NewBooking,
@@ -173,7 +235,12 @@ impl CalendarService {
         Ok(result)
     }
 
-    /// Cancel a booking.
+    /// Set a booking's status to `"cancelled"`.
+    ///
+    /// **Caller**: `PATCH /api/v1/calendar/bookings/{id}` with `status: "cancelled"`.
+    ///
+    /// # Errors
+    /// - `CalendarError::NotFound` — booking ID does not exist.
     pub async fn cancel_booking(&self, id: Uuid) -> Result<Booking, CalendarError> {
         let booking = repository::update_booking_status(&self.pool, id, "cancelled")
             .await?
@@ -183,7 +250,13 @@ impl CalendarService {
         Ok(booking)
     }
 
-    /// Confirm a tentative booking.
+    /// Set a booking's status to `"confirmed"`.
+    ///
+    /// **Caller**: `PATCH /api/v1/calendar/bookings/{id}` with `status: "confirmed"`,
+    /// or the email agent when a customer accepts a tentative booking.
+    ///
+    /// # Errors
+    /// - `CalendarError::NotFound` — booking ID does not exist.
     pub async fn confirm_booking(&self, id: Uuid) -> Result<Booking, CalendarError> {
         let booking = repository::update_booking_status(&self.pool, id, "confirmed")
             .await?
@@ -193,7 +266,19 @@ impl CalendarService {
         Ok(booking)
     }
 
-    /// Set a capacity override for a specific date.
+    /// Set or update the capacity limit for a specific date.
+    ///
+    /// **Caller**: `PUT /api/v1/calendar/capacity/{date}` and the Telegram
+    /// `/kapazitaet` command.
+    ///
+    /// Setting `capacity = 0` effectively blocks the date from new bookings.
+    ///
+    /// # Parameters
+    /// - `date` — The calendar date to override.
+    /// - `capacity` — New maximum booking count (must be ≥ 0).
+    ///
+    /// # Errors
+    /// - `CalendarError::Validation` — `capacity` is negative.
     pub async fn set_capacity(
         &self,
         date: NaiveDate,
@@ -210,7 +295,19 @@ impl CalendarService {
         Ok(result)
     }
 
-    /// Get the schedule (availability + bookings) for a date range.
+    /// Get the full schedule (availability + bookings) for a date range.
+    ///
+    /// **Caller**: `GET /api/v1/calendar/schedule?from=…&to=…`. The admin
+    /// dashboard uses this to render the monthly calendar view.
+    ///
+    /// # Parameters
+    /// - `from` — First date of the range (inclusive).
+    /// - `to` — Last date of the range (inclusive). Capped to 90 days by the
+    ///   API route handler.
+    ///
+    /// # Returns
+    /// One `ScheduleEntry` per day from `from` to `to`, including days with no
+    /// bookings (so the calendar always has a complete grid).
     pub async fn get_schedule(
         &self,
         from: NaiveDate,
@@ -266,7 +363,14 @@ impl CalendarService {
         Ok(entries)
     }
 
-    /// Delete a booking by ID.
+    /// Permanently delete a booking by ID.
+    ///
+    /// **Caller**: Admin-only `DELETE /api/v1/calendar/bookings/{id}`.
+    /// Prefer `cancel_booking` for normal workflow; `delete_booking` is for
+    /// data cleanup only.
+    ///
+    /// # Errors
+    /// - `CalendarError::NotFound` — booking ID does not exist.
     pub async fn delete_booking(&self, id: Uuid) -> Result<(), CalendarError> {
         let deleted = repository::delete_booking(&self.pool, id).await?;
         if !deleted {
@@ -276,7 +380,12 @@ impl CalendarService {
         Ok(())
     }
 
-    /// Get a single booking by ID.
+    /// Fetch a single booking by its UUID.
+    ///
+    /// **Caller**: `GET /api/v1/calendar/bookings/{id}`.
+    ///
+    /// # Errors
+    /// - `CalendarError::NotFound` — booking ID does not exist.
     pub async fn get_booking(&self, id: Uuid) -> Result<Booking, CalendarError> {
         repository::get_booking_by_id(&self.pool, id)
             .await?

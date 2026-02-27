@@ -17,13 +17,22 @@ use aust_core::models::{AuthToken, CreateUser, LoginRequest, TokenClaims, UserRo
 
 use crate::{ApiError, AppState};
 
+/// Register the public authentication routes (login and token refresh).
+///
+/// **Caller**: `crates/api/src/routes/mod.rs` route tree assembly.
+/// **Why**: Login and refresh must be publicly accessible (no existing JWT required).
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/login", post(login))
         .route("/refresh", post(refresh_token))
 }
 
-/// Routes that require authentication (nested under admin middleware)
+/// Register the protected authentication routes (require an existing valid JWT).
+///
+/// **Caller**: `crates/api/src/routes/mod.rs` route tree assembly, nested under the admin
+/// JWT middleware.
+/// **Why**: Register and change-password must be gated so only authenticated admins can
+/// create new accounts or change passwords.
 pub fn protected_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/register", post(register))
@@ -38,6 +47,26 @@ struct UserRow {
     role: String,
 }
 
+/// Mint a new access token and refresh token pair for a user.
+///
+/// **Caller**: `login` and `refresh_token` handlers.
+/// **Why**: Centralises JWT creation so both login and refresh use identical signing
+/// logic. Access token expiry is configurable via `Config.auth.jwt_expiry_hours`;
+/// refresh token is always fixed at 7 days.
+///
+/// # Parameters
+/// - `user_id` — UUID placed in the `sub` claim
+/// - `email` — stored in the token claims for display purposes
+/// - `role` — `UserRole` enum stored in the claims for middleware authorisation
+/// - `jwt_secret` — HMAC-SHA256 signing secret from config
+/// - `expiry_hours` — access token lifetime in hours
+///
+/// # Returns
+/// `AuthToken` with `access_token`, `refresh_token`, `token_type = "Bearer"`, and
+/// `expires_in` (seconds).
+///
+/// # Errors
+/// - `500` if JWT encoding fails (should only happen with an invalid secret format)
 fn create_tokens(
     user_id: Uuid,
     email: &str,
@@ -86,6 +115,23 @@ fn create_tokens(
     })
 }
 
+/// `POST /api/v1/auth/login` — Authenticate an admin user and return JWT tokens.
+///
+/// **Caller**: Axum router / admin dashboard login page.
+/// **Why**: Verifies email + Argon2 password hash, then mints a short-lived access token
+/// and a 7-day refresh token.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool, JWT config)
+/// - `request` — `LoginRequest` JSON body with `email` and `password`
+///
+/// # Returns
+/// `200 OK` with `AuthToken` JSON (access_token, refresh_token, token_type, expires_in).
+///
+/// # Errors
+/// - `400` if email or password fields are empty
+/// - `401` if credentials are invalid (same message for email-not-found and wrong password,
+///   to prevent user enumeration)
 async fn login(
     State(state): State<Arc<AppState>>,
     Json(request): Json<LoginRequest>,
@@ -132,6 +178,22 @@ struct RefreshRequest {
     refresh_token: String,
 }
 
+/// `POST /api/v1/auth/refresh` — Exchange a valid refresh token for a new token pair.
+///
+/// **Caller**: Axum router / admin dashboard token refresh logic.
+/// **Why**: Validates the refresh token signature and expiry, verifies the user still
+/// exists in the DB, and issues fresh access + refresh tokens. This allows the dashboard
+/// to stay authenticated without re-entering credentials.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool, JWT config)
+/// - `request` — JSON body with `refresh_token` string
+///
+/// # Returns
+/// `200 OK` with new `AuthToken` JSON.
+///
+/// # Errors
+/// - `401` if the refresh token is invalid, expired, or the user no longer exists
 async fn refresh_token(
     State(state): State<Arc<AppState>>,
     Json(request): Json<RefreshRequest>,
@@ -171,6 +233,21 @@ async fn refresh_token(
 
 // --- Register ---
 
+/// Hash a plaintext password with Argon2id using a random salt.
+///
+/// **Caller**: `register` and `change_password` handlers.
+/// **Why**: Centralises Argon2 hashing so both account creation and password change use
+/// identical parameters (Argon2 default configuration).
+///
+/// # Parameters
+/// - `password` — plaintext password string
+///
+/// # Returns
+/// PHC string (e.g. `$argon2id$v=19$m=19456,t=2,p=1$...`) suitable for storage in
+/// `users.password_hash`.
+///
+/// # Errors
+/// - `500` if Argon2 hashing fails (should not occur in normal operation)
 fn hash_password(password: &str) -> Result<String, ApiError> {
     let salt = SaltString::generate(&mut OsRng);
     let hash = Argon2::default()
@@ -187,6 +264,23 @@ struct RegisterResponse {
     role: UserRole,
 }
 
+/// `POST /api/v1/auth/register` — Register a new admin user (protected, requires existing JWT).
+///
+/// **Caller**: Axum protected router / admin dashboard "Neuen Benutzer anlegen" form.
+/// **Why**: Creates a new user with a hashed password. The `CreateUser` struct is validated
+/// (email format, minimum password length) before insertion. Returns a conflict error if
+/// the email is already taken.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool)
+/// - `request` — `CreateUser` JSON body (email, password, name, optional role)
+///
+/// # Returns
+/// `200 OK` with `RegisterResponse` (id, email, name, role).
+///
+/// # Errors
+/// - `400` if validation fails (bad email format, short password, duplicate email)
+/// - `500` on DB or hashing failures
 async fn register(
     State(state): State<Arc<AppState>>,
     Json(request): Json<CreateUser>,
@@ -244,6 +338,24 @@ struct ChangePasswordRequest {
     new_password: String,
 }
 
+/// `POST /api/v1/auth/change-password` — Change the authenticated user's password.
+///
+/// **Caller**: Axum protected router / admin dashboard account settings page.
+/// **Why**: Requires the user to supply their current password before accepting the new one,
+/// preventing account takeover if a session token is stolen. Minimum new password length
+/// is 8 characters.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool)
+/// - `claims` — JWT claims of the currently authenticated user (provides `sub` user ID)
+/// - `request` — JSON body with `current_password` and `new_password`
+///
+/// # Returns
+/// `200 OK` with `{"ok": true}`.
+///
+/// # Errors
+/// - `400` if new password is shorter than 8 characters or current password is wrong
+/// - `404` if the user is not found (should not occur with a valid token)
 async fn change_password(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<TokenClaims>,
