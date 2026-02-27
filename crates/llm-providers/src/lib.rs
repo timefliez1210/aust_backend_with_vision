@@ -1,3 +1,19 @@
+/// Pluggable LLM abstraction supporting Claude, OpenAI, and Ollama.
+///
+/// The primary entry point is [`create_provider`], which reads [`LlmConfig`]
+/// and returns an `Arc<dyn LlmProvider>` ready for injection.
+///
+/// # Provider selection
+/// Controlled by `LlmConfig::default_provider`:
+/// - `"claude"` → [`ClaudeProvider`] (Anthropic Messages API; best for German)
+/// - `"openai"` → [`OpenAiProvider`] (OpenAI Chat Completions; alternative)
+/// - `"ollama"` → [`OllamaProvider`] (local self-hosted; privacy-focused)
+///
+/// # Key types
+/// - [`LlmProvider`] — async trait with `complete` and `analyze_image` methods.
+/// - [`LlmMessage`] / [`LlmRole`] — message envelope for multi-turn prompts.
+/// - [`LlmError`] — all failure modes.
+/// - [`MockLlmProvider`] — deterministic test double.
 pub mod error;
 pub mod mock;
 pub mod traits;
@@ -16,6 +32,22 @@ pub use traits::{LlmMessage, LlmProvider, LlmRole};
 use aust_core::config::LlmConfig;
 use std::sync::Arc;
 
+/// Instantiate the configured LLM provider and return it as a trait object.
+///
+/// **Caller**: `src/main.rs` at startup; the returned `Arc` is cloned into
+/// every service that needs LLM access (email agent, offer generator, volume
+/// estimator).
+///
+/// # Parameters
+/// - `config` — The `[llm]` section of the application config.
+///
+/// # Returns
+/// An `Arc<dyn LlmProvider>` wrapping the selected backend, ready to share
+/// across async tasks.
+///
+/// # Errors
+/// - `LlmError::Configuration` when `default_provider` names an unknown backend,
+///   or when the required sub-config (e.g., `claude.api_key`) is absent.
 pub fn create_provider(config: &LlmConfig) -> Result<Arc<dyn LlmProvider>, LlmError> {
     match config.default_provider.as_str() {
         "claude" => {

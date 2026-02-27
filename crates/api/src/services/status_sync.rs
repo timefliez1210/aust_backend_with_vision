@@ -204,4 +204,67 @@ mod tests {
         let status = get_quote_status(&pool, quote_id).await;
         assert_eq!(status, "accepted"); // Not downgraded because b1 still exists
     }
+
+    #[tokio::test]
+    async fn sync_quote_downgraded_reverts_booking_to_tentative() {
+        let pool = test_db_pool().await;
+        let quote_id = insert_test_quote_with_status(&pool, "accepted").await;
+        let booking_id = insert_test_booking(&pool, quote_id, "confirmed").await;
+
+        sync_quote_downgraded(&pool, quote_id).await.unwrap();
+
+        let status = get_booking_status(&pool, booking_id).await;
+        assert_eq!(status, "tentative");
+    }
+
+    #[tokio::test]
+    async fn sync_quote_downgraded_reverts_offer_to_draft() {
+        let pool = test_db_pool().await;
+        let quote_id = insert_test_quote_with_status(&pool, "accepted").await;
+        let offer_id = insert_test_offer(&pool, quote_id, "accepted").await;
+
+        sync_quote_downgraded(&pool, quote_id).await.unwrap();
+
+        let status = get_offer_status(&pool, offer_id).await;
+        assert_eq!(status, "draft");
+    }
+
+    #[tokio::test]
+    async fn sync_booking_cancelled_rejects_quote_when_last_booking() {
+        let pool = test_db_pool().await;
+        let quote_id = insert_test_quote_with_status(&pool, "offer_sent").await;
+        let booking_id = insert_test_booking(&pool, quote_id, "confirmed").await;
+
+        // Cancel the booking first so sync_booking_cancelled sees zero active bookings
+        let calendar = aust_calendar::CalendarService::new(pool.clone(), 3, 3, 14);
+        calendar.cancel_booking(booking_id).await.unwrap();
+
+        sync_booking_cancelled(&pool, quote_id).await.unwrap();
+
+        let status = get_quote_status(&pool, quote_id).await;
+        assert_eq!(status, "rejected");
+    }
+
+    #[tokio::test]
+    async fn sync_booking_confirmed_updates_offer_status() {
+        let pool = test_db_pool().await;
+        let quote_id = insert_test_quote_with_status(&pool, "offer_sent").await;
+        let offer_id = insert_test_offer(&pool, quote_id, "sent").await;
+        insert_test_booking(&pool, quote_id, "tentative").await;
+
+        sync_booking_confirmed(&pool, quote_id).await.unwrap();
+
+        let status = get_offer_status(&pool, offer_id).await;
+        assert_eq!(status, "accepted");
+    }
+
+    #[tokio::test]
+    async fn sync_quote_accepted_with_no_booking_does_not_error() {
+        let pool = test_db_pool().await;
+        let quote_id = insert_test_quote_with_status(&pool, "offer_sent").await;
+
+        let calendar = aust_calendar::CalendarService::new(pool.clone(), 3, 3, 14);
+        let result = sync_quote_accepted(&pool, &calendar, quote_id).await;
+        assert!(result.is_ok());
+    }
 }

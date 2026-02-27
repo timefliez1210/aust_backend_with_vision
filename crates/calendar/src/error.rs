@@ -1,16 +1,24 @@
 use thiserror::Error;
 
+/// All failure modes for the calendar service.
 #[derive(Debug, Error)]
 pub enum CalendarError {
+    /// An underlying SQLx / PostgreSQL error.
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
 
+    /// The requested booking date has reached its capacity limit.
+    /// The payload string contains a human-readable explanation including
+    /// the slot counts, so it can be forwarded to the Telegram approval flow
+    /// for Alex to decide whether to force-book.
     #[error("Date is fully booked: {0}")]
     FullyBooked(String),
 
+    /// A booking or capacity override with the given ID does not exist.
     #[error("Booking not found: {0}")]
     NotFound(String),
 
+    /// The caller supplied an invalid value (e.g., negative capacity).
     #[error("Invalid input: {0}")]
     Validation(String),
 }

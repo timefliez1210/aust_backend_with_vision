@@ -38,6 +38,15 @@ impl StorageProvider for LocalStorage {
     }
 
     #[instrument(skip(self))]
+    async fn delete(&self, key: &str) -> Result<(), StorageError> {
+        let path = self.get_full_path(key);
+        if path.exists() {
+            fs::remove_file(&path).await?;
+        }
+        Ok(())
+    }
+
+    #[instrument(skip(self))]
     async fn download(&self, key: &str) -> Result<Bytes, StorageError> {
         let path = self.get_full_path(key);
 

@@ -1,17 +1,64 @@
 use aust_core::models::{PricingBreakdown, PricingInput, PricingResult};
 use chrono::Datelike;
 
+/// Stateless engine that derives labor cost, worker count, and estimated hours
+/// from volume, floor, elevator, and date inputs.
+///
+/// **Caller**: `crates/api/src/routes/offers.rs` (via `build_line_items`),
+///             `crates/email-agent` (via the orchestrator)
+/// **Why**: Centralises all pricing logic in one place so changes to rates or
+/// formulas only need to happen here, and are testable in isolation.
+///
+/// The engine does NOT handle distance-based costs; those are expressed as
+/// a flat `Fahrkostenpauschale` line item built separately in the route handler.
 pub struct PricingEngine {
+    /// Labor rate stored as integer cents to avoid floating-point drift.
+    /// Default: 3000 cents = €30.00 per person-hour.
     rate_per_person_hour: i64,
 }
 
 impl PricingEngine {
+    /// Create a `PricingEngine` with the default rate of €30.00 per person-hour.
+    ///
+    /// **Caller**: `crates/api/src/routes/offers.rs`
+    /// **Why**: Provides a single construction point; when the rate becomes
+    /// configurable from the database (see TODO in CLAUDE.md), this is the
+    /// function to update.
     pub fn new() -> Self {
         Self {
             rate_per_person_hour: 3000, // €30/hr
         }
     }
 
+    /// Calculate the full pricing result from a set of moving-job inputs.
+    ///
+    /// **Caller**: `crates/api/src/routes/offers.rs` (directly) and
+    ///             the Telegram edit flow (to recompute after overrides)
+    /// **Why**: Encapsulates the complete pricing formula so callers receive
+    /// ready-to-use worker counts, hours, and cost breakdowns without
+    /// reimplementing the arithmetic.
+    ///
+    /// # Parameters
+    /// - `input` — volume, optional floor numbers, elevator availability at each
+    ///   stop, and optional preferred moving date
+    ///
+    /// # Returns
+    /// A `PricingResult` containing:
+    /// - `estimated_helpers` — number of workers to send
+    /// - `estimated_hours` — expected job duration in hours
+    /// - `total_price_cents` — total labor cost including any date surcharge
+    /// - `breakdown` — itemised cost breakdown for transparency
+    ///
+    /// # Math
+    /// ```text
+    /// persons_base    = max(2, ceil(volume_m3 / 5.0))
+    /// highest_floor   = max floor without elevator across origin, dest, stop
+    /// extra_workers   = max(0, highest_floor - 1)   // floor 1 = no extra
+    /// total_persons   = persons_base + extra_workers
+    /// hours           = max(1.0, volume_m3 / (total_persons × 0.625))
+    /// base_labor      = total_persons × hours × rate_per_person_hour (cents)
+    /// total_price     = base_labor + date_adjustment
+    /// ```
     pub fn calculate(&self, input: &PricingInput) -> PricingResult {
         // Base workers: ceil(volume_m3 / 5.0), minimum 2
         let persons_base = ((input.volume_m3 / 5.0).ceil() as u32).max(2);
@@ -64,6 +111,17 @@ impl PricingEngine {
         }
     }
 
+    /// Return any date-based price surcharge in cents.
+    ///
+    /// **Why**: Saturday moves require extra crew coordination and are priced at
+    /// a premium. No surcharge applies on any other day, including Sunday (moves
+    /// on Sundays are not typically offered).
+    ///
+    /// # Parameters
+    /// - `input` — pricing input; only `preferred_date` is examined here
+    ///
+    /// # Returns
+    /// `5000` (= €50.00) if the preferred date falls on a Saturday, `0` otherwise.
     fn calculate_date_adjustment(&self, input: &PricingInput) -> i64 {
         if let Some(date) = input.preferred_date {
             let weekday = date.weekday();
@@ -77,7 +135,27 @@ impl PricingEngine {
 
 /// Parse a German floor string to a numeric floor number.
 ///
-/// "Erdgeschoss" → 0, "Hochparterre" → 0, "1. Stock" → 1, …, "Höher als 6. Stock" → 7
+/// **Caller**: `crates/api/src/routes/offers.rs` (converts form field values to
+///             `u32` before passing to `PricingEngine::calculate`)
+/// **Why**: The Austrian moving form uses German-language dropdown values for
+/// floor selection. This function bridges the human-readable labels to the
+/// numeric values the pricing engine needs.
+///
+/// # Parameters
+/// - `floor_str` — a German floor label, e.g. `"Erdgeschoss"`, `"3. Stock"`,
+///   `"Hochparterre"`, or `"Höher als 6. Stock"`
+///
+/// # Returns
+/// A `u32` floor index where 0 = ground floor, 1 = first floor above ground, etc.
+/// Unknown strings return `0` (treated as ground floor) — never panics.
+///
+/// # Examples
+/// ```
+/// assert_eq!(parse_floor("Erdgeschoss"), 0);
+/// assert_eq!(parse_floor("Hochparterre"), 0);
+/// assert_eq!(parse_floor("3. Stock"), 3);
+/// assert_eq!(parse_floor("Höher als 6. Stock"), 7);
+/// ```
 pub fn parse_floor(floor_str: &str) -> u32 {
     let s = floor_str.trim();
     match s {
@@ -95,6 +173,8 @@ pub fn parse_floor(floor_str: &str) -> u32 {
     }
 }
 
+/// Delegates to [`PricingEngine::new`] so `PricingEngine` can be used with
+/// `Default`-based construction patterns (e.g. `PricingEngine::default()`).
 impl Default for PricingEngine {
     fn default() -> Self {
         Self::new()

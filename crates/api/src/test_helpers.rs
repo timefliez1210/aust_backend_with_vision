@@ -238,6 +238,62 @@ pub async fn insert_test_offer(
     id
 }
 
+/// Insert a test offer with a specific line_items_json and persons count.
+/// Used to test LatestOfferPricing endpoint rendering (flat_total, labor, regular items).
+pub async fn insert_test_offer_with_line_items(
+    pool: &PgPool,
+    quote_id: uuid::Uuid,
+    status: &str,
+    persons: i32,
+    price_cents: i64,
+    line_items: serde_json::Value,
+) -> uuid::Uuid {
+    let id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO offers (id, quote_id, status, price_cents, currency,
+         valid_until, persons, hours_estimated, rate_per_hour_cents, pdf_storage_key,
+         line_items_json, created_at)
+         VALUES ($1, $2, $3, $4, 'EUR', NOW() + interval '14 days',
+         $5, 8.0, 3500, 'test.pdf', $6, NOW())",
+    )
+    .bind(id)
+    .bind(quote_id)
+    .bind(status)
+    .bind(price_cents)
+    .bind(persons)
+    .bind(line_items)
+    .execute(pool)
+    .await
+    .expect("insert test offer with line items");
+    id
+}
+
+/// Insert a test quote with addresses but with distance_km = 0 (the pre-calculation state).
+/// Useful for testing distance auto-calculation logic.
+pub async fn insert_test_quote_no_distance(pool: &PgPool, volume_m3: f64) -> uuid::Uuid {
+    let id = uuid::Uuid::now_v7();
+    let customer_id = insert_test_customer(pool).await;
+    let origin_id =
+        insert_test_address(pool, "Musterstr. 1", "Hildesheim", "31134", Some(0), None).await;
+    let dest_id =
+        insert_test_address(pool, "Zielstr. 5", "Hannover", "30159", Some(0), None).await;
+
+    sqlx::query(
+        "INSERT INTO quotes (id, customer_id, origin_address_id, destination_address_id,
+         status, estimated_volume_m3, distance_km, notes, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, 'volume_estimated', $5, 0.0, NULL, NOW(), NOW())",
+    )
+    .bind(id)
+    .bind(customer_id)
+    .bind(origin_id)
+    .bind(dest_id)
+    .bind(volume_m3)
+    .execute(pool)
+    .await
+    .expect("insert test quote no distance");
+    id
+}
+
 /// Insert a test booking and return its ID.
 /// Note: calendar_bookings has a unique partial index on (quote_id) WHERE status != 'cancelled',
 /// so only ONE active booking per quote is allowed.

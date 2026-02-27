@@ -2,10 +2,31 @@ use crate::OfferError;
 use std::path::PathBuf;
 use tokio::process::Command;
 
-/// Convert xlsx bytes to PDF using LibreOffice headless.
+/// Convert XLSX bytes to a PDF using LibreOffice in headless mode.
 ///
-/// Requires `libreoffice` to be installed and accessible in PATH.
+/// **Caller**: `crates/api/src/routes/offers.rs` (after `generate_offer_xlsx`)
+/// **Why**: LibreOffice faithfully renders the full XLSX layout — column widths,
+/// merged cells, page breaks, and the print area — so the output PDF looks
+/// identical to what a user would see when printing from Excel/Calc.
+///
+/// The function writes the XLSX to a temporary file, invokes LibreOffice
+/// (`--headless --calc --convert-to pdf`), then reads the resulting `offer.pdf`
+/// back into memory. The temp directory is cleaned up automatically on drop.
+///
+/// Requires `libreoffice` to be installed and accessible in `PATH`.
 /// On Ubuntu/Debian: `apt install libreoffice-calc`
+///
+/// # Parameters
+/// - `xlsx_bytes` — raw bytes of the generated XLSX file
+///
+/// # Returns
+/// Raw PDF bytes ready to be uploaded to S3 or served directly.
+///
+/// # Errors
+/// - `OfferError::Pdf` if the temp directory cannot be created
+/// - `OfferError::Pdf` if `libreoffice` is not found or exits non-zero
+/// - `OfferError::Pdf` if the output PDF file is missing after conversion
+/// - `OfferError::Pdf` if reading the PDF bytes fails
 pub async fn convert_xlsx_to_pdf(xlsx_bytes: &[u8]) -> Result<Vec<u8>, OfferError> {
     let tmp_dir = tempfile::tempdir()
         .map_err(|e| OfferError::Pdf(format!("Failed to create temp dir: {e}")))?;

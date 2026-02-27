@@ -63,6 +63,18 @@ impl StorageProvider for S3Storage {
     }
 
     #[instrument(skip(self))]
+    async fn delete(&self, key: &str) -> Result<(), StorageError> {
+        self.client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|e| StorageError::S3(e.to_string()))?;
+        Ok(())
+    }
+
+    #[instrument(skip(self))]
     async fn download(&self, key: &str) -> Result<Bytes, StorageError> {
         let response = self
             .client
