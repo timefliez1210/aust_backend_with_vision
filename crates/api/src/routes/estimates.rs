@@ -1,5 +1,6 @@
 use axum::{
     extract::{Multipart, Path, State},
+    http::StatusCode,
     routing::{get, post},
     Json, Router,
 };
@@ -28,7 +29,7 @@ pub fn protected_router() -> Router<Arc<AppState>> {
         .route("/inventory", post(inventory_estimate))
         .route("/depth-sensor", post(depth_sensor_estimate))
         .route("/video", post(video_estimate))
-        .route("/{id}", get(get_estimate))
+        .route("/{id}", get(get_estimate).delete(delete_estimate))
 }
 
 #[derive(Debug, FromRow)]
@@ -653,6 +654,97 @@ async fn get_estimate(
     Ok(Json(VolumeEstimation::from(row)))
 }
 
+/// Collect all S3 keys associated with an estimation (video, images, crop thumbnails).
+/// Used before deletion to clean up storage.
+pub fn collect_estimation_s3_keys(
+    source_data: &serde_json::Value,
+    result_data: Option<&serde_json::Value>,
+) -> Vec<String> {
+    let mut keys = Vec::new();
+
+    // Video key (video estimations)
+    if let Some(k) = source_data.get("video_s3_key").and_then(|v| v.as_str()) {
+        keys.push(k.to_string());
+    }
+
+    // Image keys (vision / depth-sensor estimations)
+    if let Some(arr) = source_data.get("s3_keys").and_then(|v| v.as_array()) {
+        for v in arr {
+            if let Some(k) = v.as_str() {
+                keys.push(k.to_string());
+            }
+        }
+    }
+
+    // Crop thumbnail keys stored on each detected item in result_data
+    if let Some(items) = result_data.and_then(|v| v.as_array()) {
+        for item in items {
+            if let Some(k) = item.get("crop_s3_key").and_then(|v| v.as_str()) {
+                keys.push(k.to_string());
+            }
+        }
+    }
+
+    keys
+}
+
+async fn delete_estimate(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    // Fetch the estimation to collect S3 keys and quote_id
+    let row: Option<VolumeEstimationRow> = sqlx::query_as(
+        r#"
+        SELECT id, quote_id, method, status, source_data, result_data, total_volume_m3, confidence_score, created_at
+        FROM volume_estimations WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await?;
+
+    let row = row.ok_or_else(|| ApiError::NotFound(format!("Estimation {id} not found")))?;
+    let quote_id = row.quote_id;
+
+    // Collect S3 keys and delete objects (best-effort — don't fail the request on storage errors)
+    let s3_keys = collect_estimation_s3_keys(&row.source_data, row.result_data.as_ref());
+    for key in s3_keys {
+        if let Err(e) = state.storage.delete(&key).await {
+            tracing::warn!(estimation_id = %id, key = %key, error = %e, "Failed to delete estimation S3 object");
+        }
+    }
+
+    // Delete estimation from DB
+    sqlx::query("DELETE FROM volume_estimations WHERE id = $1")
+        .bind(id)
+        .execute(&state.db)
+        .await?;
+
+    // Recalculate quote volume from remaining completed estimations and update quote
+    let total: (Option<f64>,) = sqlx::query_as(
+        "SELECT SUM(total_volume_m3) FROM volume_estimations WHERE quote_id = $1 AND status = 'completed'",
+    )
+    .bind(quote_id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or((None,));
+
+    let combined_volume = total.0.unwrap_or(0.0);
+    let now = chrono::Utc::now();
+
+    // Only update volume/status if there are still estimations; otherwise reset to new
+    let new_status = if combined_volume > 0.0 { "volume_estimated" } else { "new" };
+    sqlx::query("UPDATE quotes SET estimated_volume_m3 = $1, status = $2, updated_at = $3 WHERE id = $4")
+        .bind(combined_volume)
+        .bind(new_status)
+        .bind(now)
+        .bind(quote_id)
+        .execute(&state.db)
+        .await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn serve_image(
     State(state): State<Arc<AppState>>,
     Path(key): Path<String>,
@@ -683,4 +775,76 @@ async fn serve_image(
         [(axum::http::header::CONTENT_TYPE, content_type.to_string())],
         file_bytes,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn s3_keys_empty_source() {
+        let source = serde_json::json!({});
+        let keys = collect_estimation_s3_keys(&source, None);
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn s3_keys_video_key() {
+        let source = serde_json::json!({
+            "video_s3_key": "estimates/abc/def/video.mp4"
+        });
+        let keys = collect_estimation_s3_keys(&source, None);
+        assert_eq!(keys, vec!["estimates/abc/def/video.mp4"]);
+    }
+
+    #[test]
+    fn s3_keys_image_keys_array() {
+        let source = serde_json::json!({
+            "s3_keys": ["estimates/abc/def/0.jpg", "estimates/abc/def/1.jpg"]
+        });
+        let keys = collect_estimation_s3_keys(&source, None);
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains(&"estimates/abc/def/0.jpg".to_string()));
+        assert!(keys.contains(&"estimates/abc/def/1.jpg".to_string()));
+    }
+
+    #[test]
+    fn s3_keys_crop_keys_from_result_data() {
+        let source = serde_json::json!({});
+        let result = serde_json::json!([
+            {"name": "Sofa", "crop_s3_key": "estimates/abc/def/crops/sofa_0.jpg"},
+            {"name": "Tisch", "crop_s3_key": "estimates/abc/def/crops/tisch_1.jpg"},
+            {"name": "Stuhl"}  // no crop_s3_key
+        ]);
+        let keys = collect_estimation_s3_keys(&source, Some(&result));
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains(&"estimates/abc/def/crops/sofa_0.jpg".to_string()));
+        assert!(keys.contains(&"estimates/abc/def/crops/tisch_1.jpg".to_string()));
+    }
+
+    #[test]
+    fn s3_keys_combined_video_and_crops() {
+        let source = serde_json::json!({
+            "video_s3_key": "estimates/q/e/video.mp4"
+        });
+        let result = serde_json::json!([
+            {"crop_s3_key": "estimates/q/e/crops/item_0.jpg"}
+        ]);
+        let keys = collect_estimation_s3_keys(&source, Some(&result));
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains(&"estimates/q/e/video.mp4".to_string()));
+        assert!(keys.contains(&"estimates/q/e/crops/item_0.jpg".to_string()));
+    }
+
+    #[test]
+    fn s3_keys_no_duplicates_for_items_without_crops() {
+        let source = serde_json::json!({
+            "s3_keys": ["estimates/abc/0.jpg"]
+        });
+        let result = serde_json::json!([
+            {"name": "Tisch"}  // no crop
+        ]);
+        let keys = collect_estimation_s3_keys(&source, Some(&result));
+        assert_eq!(keys, vec!["estimates/abc/0.jpg"]);
+    }
 }

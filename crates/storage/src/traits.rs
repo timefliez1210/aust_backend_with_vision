@@ -8,4 +8,5 @@ pub trait StorageProvider: Send + Sync {
 
     async fn download(&self, key: &str) -> Result<Bytes, StorageError>;
 
+    async fn delete(&self, key: &str) -> Result<(), StorageError>;
 }
