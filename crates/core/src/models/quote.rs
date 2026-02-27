@@ -48,6 +48,7 @@ pub struct Quote {
     pub customer_id: Uuid,
     pub origin_address_id: Option<Uuid>,
     pub destination_address_id: Option<Uuid>,
+    pub stop_address_id: Option<Uuid>,
     pub status: QuoteStatus,
     pub estimated_volume_m3: Option<f64>,
     pub distance_km: Option<f64>,

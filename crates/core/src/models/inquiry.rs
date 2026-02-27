@@ -22,17 +22,20 @@ pub struct MovingInquiry {
     pub departure_address: Option<String>,
     pub departure_floor: Option<String>,
     pub departure_parking_ban: Option<bool>,
+    pub departure_elevator: Option<bool>,
 
     // Intermediate stop (Zwischenstopp)
     pub has_intermediate_stop: bool,
     pub intermediate_address: Option<String>,
     pub intermediate_floor: Option<String>,
     pub intermediate_parking_ban: Option<bool>,
+    pub intermediate_elevator: Option<bool>,
 
     // Arrival (Einzug)
     pub arrival_address: Option<String>,
     pub arrival_floor: Option<String>,
     pub arrival_parking_ban: Option<bool>,
+    pub arrival_elevator: Option<bool>,
 
     // Volume
     pub volume_m3: Option<f64>,

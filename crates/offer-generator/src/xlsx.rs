@@ -54,6 +54,10 @@ pub struct OfferLineItem {
     pub is_labor: bool,
     #[serde(default)]
     pub remark: Option<String>,
+    /// When set, E and F columns are left blank and G is written as this flat value (no formula).
+    /// Used for Fahrkostenpauschale where the total is computed externally (ORS route).
+    #[serde(default)]
+    pub flat_total: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -292,26 +296,39 @@ fn build_cell_modifications(
             format!("D{row}"),
             CellValue::StyledText(String::new(), STYLES_DE[color]),
         ));
-        // Write quantity
-        mods.push((
-            format!("E{row}"),
-            CellValue::StyledNumber(item.quantity, STYLES_DE[color]),
-        ));
-        // Write unit price (€ format, labor uses €/Stunde)
-        let f_style = if item.is_labor { STYLES_F_LABOR[color] } else { STYLES_F[color] };
-        mods.push((
-            format!("F{row}"),
-            CellValue::StyledNumber(item.unit_price, f_style),
-        ));
-
-        // Write formula to G with right-aligned € style
-        if item.is_labor {
-            mods.push(("J50".into(), CellValue::Number(data.persons as f64)));
-            let formula = format!("IF(E{row}=\"\", 0, F{row}*E{row}*J50)");
-            mods.push((format!("G{row}"), CellValue::StyledFormula(formula, STYLES_G[color])));
+        if let Some(ft) = item.flat_total {
+            // Flat-total item (e.g. Fahrkostenpauschale): E and F blank, G = flat value
+            mods.push((
+                format!("E{row}"),
+                CellValue::StyledText(String::new(), STYLES_DE[color]),
+            ));
+            mods.push((
+                format!("F{row}"),
+                CellValue::StyledText(String::new(), STYLES_F[color]),
+            ));
+            mods.push((format!("G{row}"), CellValue::StyledNumber(ft, STYLES_G[color])));
         } else {
-            let formula = format!("IF(E{row}=\"\", 0, F{row}*E{row})");
-            mods.push((format!("G{row}"), CellValue::StyledFormula(formula, STYLES_G[color])));
+            // Write quantity
+            mods.push((
+                format!("E{row}"),
+                CellValue::StyledNumber(item.quantity, STYLES_DE[color]),
+            ));
+            // Write unit price (€ format, labor uses €/Stunde)
+            let f_style = if item.is_labor { STYLES_F_LABOR[color] } else { STYLES_F[color] };
+            mods.push((
+                format!("F{row}"),
+                CellValue::StyledNumber(item.unit_price, f_style),
+            ));
+
+            // Write formula to G with right-aligned € style
+            if item.is_labor {
+                mods.push(("J50".into(), CellValue::Number(data.persons as f64)));
+                let formula = format!("IF(E{row}=\"\", 0, F{row}*E{row}*J50)");
+                mods.push((format!("G{row}"), CellValue::StyledFormula(formula, STYLES_G[color])));
+            } else {
+                let formula = format!("IF(E{row}=\"\", 0, F{row}*E{row})");
+                mods.push((format!("G{row}"), CellValue::StyledFormula(formula, STYLES_G[color])));
+            }
         }
     }
 

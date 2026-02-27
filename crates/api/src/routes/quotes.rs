@@ -75,6 +75,7 @@ struct EnrichedQuote {
     destination_address: Option<QuoteAddress>,
     estimation: Option<EstimationInfo>,
     offers: Vec<QuoteOffer>,
+    latest_offer: Option<LatestOfferPricing>,
 }
 
 #[derive(Debug, Serialize)]
@@ -147,6 +148,27 @@ struct QuoteOffer {
     created_at: chrono::DateTime<chrono::Utc>,
 }
 
+#[derive(Debug, Serialize)]
+struct OfferLineItemDetail {
+    label: String,
+    quantity: f64,
+    unit_price_cents: i64,
+    total_cents: i64,
+    is_labor: bool,
+}
+
+/// Pricing data from the latest offer, used to overlay on the Anfrage view
+#[derive(Debug, Serialize)]
+struct LatestOfferPricing {
+    offer_id: Uuid,
+    persons: i32,
+    hours: f64,
+    rate_cents: i64,
+    total_netto_cents: i64,
+    total_brutto_cents: i64,
+    line_items: Vec<OfferLineItemDetail>,
+}
+
 #[derive(Debug, FromRow)]
 struct VolumeEstimationDbRow {
     id: Uuid,
@@ -217,15 +239,28 @@ async fn get_quote(
     .fetch_all(&state.db)
     .await?;
 
-    let estimation = if est_rows.is_empty() {
+    // Fetch original video URLs from ALL estimations (including processing/failed)
+    let all_video_rows: Vec<(Option<serde_json::Value>,)> = sqlx::query_as(
+        "SELECT source_data FROM volume_estimations WHERE quote_id = $1 AND method = 'video' ORDER BY created_at",
+    )
+    .bind(id)
+    .fetch_all(&state.db)
+    .await?;
+    let mut all_source_videos: Vec<String> = Vec::new();
+    for (sd,) in &all_video_rows {
+        if let Some(key) = sd.as_ref().and_then(|sd| sd.get("video_s3_key")?.as_str()) {
+            all_source_videos.push(format!("/api/v1/estimates/images/{key}"));
+        }
+    }
+
+    let estimation = if est_rows.is_empty() && all_source_videos.is_empty() {
         None
     } else {
         let mut all_items: Vec<EstimationItem> = Vec::new();
         let mut all_source_images: Vec<String> = Vec::new();
-        let mut all_source_videos: Vec<String> = Vec::new();
         let mut total_volume = 0.0;
-        let first_id = est_rows[0].id;
-        let first_method = est_rows[0].method.clone();
+        let first_id = est_rows.first().map(|r| r.id).unwrap_or_default();
+        let first_method = est_rows.first().map(|r| r.method.clone()).unwrap_or_else(|| "video".to_string());
 
         for est in &est_rows {
             let vol_est = VolumeEstimationRow {
@@ -251,10 +286,7 @@ async fn get_quote(
                 all_source_images.push(format!("/api/v1/estimates/images/{k}"));
             }
 
-            // Collect source videos
-            if let Some(video_key) = est.source_data.as_ref().and_then(|sd| sd.get("video_s3_key")?.as_str()) {
-                all_source_videos.push(format!("/api/v1/estimates/images/{video_key}"));
-            }
+            // source_videos already collected above (all statuses)
 
             total_volume += est.total_volume_m3.unwrap_or(0.0);
 
@@ -312,6 +344,62 @@ async fn get_quote(
     .fetch_all(&state.db)
     .await?;
 
+    // Fetch latest offer's full pricing data for overlay
+    let latest_offer: Option<LatestOfferPricing> = {
+        #[derive(FromRow)]
+        struct LatestOfferRow {
+            id: Uuid,
+            price_cents: i64,
+            persons: Option<i32>,
+            hours_estimated: Option<f64>,
+            rate_per_hour_cents: Option<i64>,
+            line_items_json: Option<serde_json::Value>,
+        }
+        let row: Option<LatestOfferRow> = sqlx::query_as(
+            r#"
+            SELECT id, price_cents, persons, hours_estimated, rate_per_hour_cents, line_items_json
+            FROM offers WHERE quote_id = $1
+            ORDER BY created_at DESC LIMIT 1
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await?;
+
+        row.map(|r| {
+            let persons = r.persons.unwrap_or(2);
+            let netto = r.price_cents;
+            let brutto = (netto as f64 * 1.19).round() as i64;
+            let line_items: Vec<OfferLineItemDetail> = r.line_items_json
+                .and_then(|json| serde_json::from_value::<Vec<serde_json::Value>>(json).ok())
+                .map(|items| {
+                    items.iter().map(|item| {
+                        let label = item.get("description").and_then(|d| d.as_str()).unwrap_or("Sonstiges").to_string();
+                        let is_labor = item.get("is_labor").and_then(|b| b.as_bool()).unwrap_or(false);
+                        let quantity = item.get("quantity").and_then(|q| q.as_f64()).unwrap_or(1.0);
+                        let unit_price = item.get("unit_price").and_then(|p| p.as_f64()).unwrap_or(0.0);
+                        let unit_price_cents = (unit_price * 100.0).round() as i64;
+                        let total_cents = if is_labor {
+                            (quantity * unit_price * persons as f64 * 100.0).round() as i64
+                        } else {
+                            (quantity * unit_price * 100.0).round() as i64
+                        };
+                        OfferLineItemDetail { label, quantity, unit_price_cents, total_cents, is_labor }
+                    }).collect()
+                })
+                .unwrap_or_default();
+            LatestOfferPricing {
+                offer_id: r.id,
+                persons,
+                hours: r.hours_estimated.unwrap_or(0.0),
+                rate_cents: r.rate_per_hour_cents.unwrap_or(3000),
+                total_netto_cents: netto,
+                total_brutto_cents: brutto,
+                line_items,
+            }
+        })
+    };
+
     // Extract customer message from notes (non-service parts)
     let customer_message = extract_customer_message(quote.notes.as_deref());
 
@@ -330,6 +418,7 @@ async fn get_quote(
         destination_address,
         estimation,
         offers,
+        latest_offer,
     }))
 }
 

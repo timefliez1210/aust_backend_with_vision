@@ -12,15 +12,18 @@ use uuid::Uuid;
 
 use crate::{ApiError, AppState};
 use crate::routes::shared::QuoteRow;
+use aust_core::config::Config;
 use aust_core::models::{
     DepthSensorResult, DetectedItem, Offer, OfferStatus, PricingInput, Quote,
     VisionAnalysisResult,
 };
+use aust_distance_calculator::{RouteCalculator, RouteRequest};
 use aust_offer_generator::{
     convert_xlsx_to_pdf, generate_offer_xlsx, parse_floor, DetectedItemRow, OfferData,
     OfferLineItem, PricingEngine,
 };
 use aust_storage::StorageProvider;
+use tracing::warn;
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -41,6 +44,17 @@ struct GenerateOfferRequest {
     hours: Option<f64>,
     #[serde(default)]
     rate: Option<f64>,
+    #[serde(default)]
+    line_items: Option<Vec<GenerateLineItem>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GenerateLineItem {
+    description: String,
+    quantity: f64,
+    unit_price: f64,
+    #[serde(default)]
+    remark: Option<String>,
 }
 
 
@@ -160,22 +174,29 @@ pub struct OfferOverrides {
     pub persons: Option<u32>,
     pub hours: Option<f64>,
     pub rate: Option<f64>,
+    /// Custom non-labor line items. When set, replaces `build_line_items()` output.
+    pub line_items: Option<Vec<OfferLineItem>>,
+    /// When set, UPDATE this offer in-place instead of INSERTing a new one.
+    /// The offer_number and created_at are preserved; pricing/PDF/line_items are refreshed.
+    pub existing_offer_id: Option<Uuid>,
 }
 
 /// Core offer generation logic. Used by both the API endpoint and the orchestrator.
 pub async fn build_offer(
     db: &PgPool,
     storage: &dyn StorageProvider,
+    config: &Config,
     quote_id: Uuid,
     valid_days: Option<i64>,
 ) -> Result<GeneratedOffer, ApiError> {
-    build_offer_with_overrides(db, storage, quote_id, valid_days, &OfferOverrides::default()).await
+    build_offer_with_overrides(db, storage, config, quote_id, valid_days, &OfferOverrides::default()).await
 }
 
 /// Core offer generation logic with optional overrides.
 pub async fn build_offer_with_overrides(
     db: &PgPool,
     storage: &dyn StorageProvider,
+    config: &Config,
     quote_id: Uuid,
     valid_days: Option<i64>,
     overrides: &OfferOverrides,
@@ -183,8 +204,8 @@ pub async fn build_offer_with_overrides(
     // 1. Fetch quote
     let quote_row: QuoteRow = sqlx::query_as(
         r#"
-        SELECT id, customer_id, origin_address_id, destination_address_id, status,
-               estimated_volume_m3, distance_km, preferred_date, notes, created_at, updated_at
+        SELECT id, customer_id, origin_address_id, destination_address_id, stop_address_id,
+               status, estimated_volume_m3, distance_km, preferred_date, notes, created_at, updated_at
         FROM quotes WHERE id = $1
         "#,
     )
@@ -228,6 +249,15 @@ pub async fn build_offer_with_overrides(
         None
     };
 
+    let stop_address: Option<AddressRow> = if let Some(addr_id) = quote.stop_address_id {
+        sqlx::query_as("SELECT id, street, city, postal_code, floor, elevator FROM addresses WHERE id = $1")
+            .bind(addr_id)
+            .fetch_optional(db)
+            .await?
+    } else {
+        None
+    };
+
     // 4. Fetch latest volume estimation for detected items
     let estimation: Option<VolumeEstimationRow> = sqlx::query_as(
         r#"
@@ -255,6 +285,11 @@ pub async fn build_offer_with_overrides(
         .and_then(|a| a.floor.as_deref())
         .map(parse_floor);
 
+    let stop_floor = stop_address
+        .as_ref()
+        .and_then(|a| a.floor.as_deref())
+        .map(parse_floor);
+
     let pricing_input = PricingInput {
         volume_m3: volume,
         distance_km: distance,
@@ -263,6 +298,8 @@ pub async fn build_offer_with_overrides(
         floor_destination: dest_floor,
         has_elevator_origin: origin.as_ref().and_then(|a| a.elevator),
         has_elevator_destination: destination.as_ref().and_then(|a| a.elevator),
+        floor_stop: stop_floor,
+        has_elevator_stop: stop_address.as_ref().and_then(|a| a.elevator),
     };
 
     let pricing_engine = PricingEngine::new();
@@ -279,39 +316,34 @@ pub async fn build_offer_with_overrides(
         pricing_result.total_price_cents = price;
     }
 
-    // 7. Build line items from quote notes (services, parking bans) and pricing
-    let line_items = build_line_items(
-        quote.notes.as_deref(),
-        distance,
-        volume,
-    );
-
-    // Determine rate: if price was overridden, back-calculate so xlsx formula matches.
-    // The xlsx netto total (G44) = labor (G38) + sum of other line items.
-    // G38 = hours × rate × persons.
-    // So: rate = (target_netto - other_items_netto) / (persons × hours)
-    let rate_override = if let Some(r) = overrides.rate {
-        r
-    } else if overrides.price_cents.is_some() {
-        let persons = pricing_result.estimated_helpers.max(1) as f64;
-        let hours = pricing_result.estimated_hours.max(1.0);
-        let target_netto = pricing_result.total_price_cents as f64 / 100.0;
-
-        // Sum up non-labor line items that contribute to the XLSX netto total
-        let other_items_netto: f64 = line_items
-            .iter()
-            .filter(|li| !li.is_labor)
-            .map(|li| li.quantity * li.unit_price)
-            .sum();
-
-        let labor_netto = (target_netto - other_items_netto).max(0.0);
-        labor_netto / (persons * hours)
+    // 7. Build line items: use overrides if provided, else derive from quote notes + route
+    let line_items = if let Some(ref items) = overrides.line_items {
+        items.clone()
     } else {
-        30.0
+        // Compute Fahrkostenpauschale via ORS route: depot→origin→(stop)→dest→depot
+        let fahrt_item = build_fahrt_item(
+            config,
+            origin.as_ref(),
+            destination.as_ref(),
+            stop_address.as_ref(),
+            distance,
+        )
+        .await;
+
+        let mut items = vec![fahrt_item];
+        items.extend(build_line_items(quote.notes.as_deref()));
+        items
     };
 
+    let rate_override = calculate_rate_override(
+        overrides.price_cents,
+        overrides.rate,
+        pricing_result.estimated_helpers,
+        pricing_result.estimated_hours,
+        &line_items,
+    );
+
     // 8. Build OfferData
-    let offer_id = Uuid::now_v7();
     let now = chrono::Utc::now();
     let today = now.date_naive();
 
@@ -351,10 +383,23 @@ pub async fn build_offer_with_overrides(
         .and_then(|a| a.floor.clone())
         .unwrap_or_default();
 
-    let (seq_val,): (i64,) = sqlx::query_as("SELECT nextval('offer_number_seq')")
-        .fetch_one(db)
+    // Get or generate offer ID and number (UPDATE-in-place when existing_offer_id is set)
+    let (offer_id, offer_number) = if let Some(existing_id) = overrides.existing_offer_id {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT offer_number FROM offers WHERE id = $1"
+        )
+        .bind(existing_id)
+        .fetch_optional(db)
         .await?;
-    let offer_number = format!("{}-{:04}", today.format("%Y"), seq_val);
+        let (offer_number,) = row.ok_or_else(|| ApiError::NotFound(format!("Offer {existing_id} not found")))?;
+        (existing_id, offer_number)
+    } else {
+        let (seq_val,): (i64,) = sqlx::query_as("SELECT nextval('offer_number_seq')")
+            .fetch_one(db)
+            .await?;
+        let offer_number = format!("{}-{:04}", today.format("%Y"), seq_val);
+        (Uuid::now_v7(), offer_number)
+    };
 
     // Extract services and customer message from notes
     let (services_str, customer_message) = extract_services_and_message(quote.notes.as_deref());
@@ -429,14 +474,15 @@ pub async fn build_offer_with_overrides(
             }
         };
 
-    // 10. Insert offer record
-    // Serialize line items for storage
+    // 10. Insert or update offer record
     let line_items_json = serde_json::to_value(&offer_data.line_items).ok();
     let rate_cents = (rate_override * 100.0).round() as i64;
 
     // Compute actual netto from line items (must match XLSX SUM(G31:G42))
     let actual_netto: f64 = offer_data.line_items.iter().map(|item| {
-        if item.is_labor {
+        if let Some(ft) = item.flat_total {
+            ft
+        } else if item.is_labor {
             item.quantity * item.unit_price * pricing_result.estimated_helpers as f64
         } else {
             item.quantity * item.unit_price
@@ -444,30 +490,55 @@ pub async fn build_offer_with_overrides(
     }).sum();
     let actual_netto_cents = (actual_netto * 100.0).round() as i64;
 
-    let row: OfferRow = sqlx::query_as(
-        r#"
-        INSERT INTO offers (id, quote_id, price_cents, currency, valid_until, pdf_storage_key, status, created_at,
-                            offer_number, persons, hours_estimated, rate_per_hour_cents, line_items_json)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-        RETURNING id, quote_id, price_cents, currency, valid_until, pdf_storage_key, status, created_at, sent_at,
-                  offer_number, persons, hours_estimated, rate_per_hour_cents, line_items_json
-        "#,
-    )
-    .bind(offer_id)
-    .bind(quote_id)
-    .bind(actual_netto_cents)
-    .bind("EUR")
-    .bind(valid_until_date)
-    .bind(Some(&s3_key))
-    .bind(OfferStatus::Draft.as_str())
-    .bind(now)
-    .bind(&offer_number)
-    .bind(pricing_result.estimated_helpers as i32)
-    .bind(pricing_result.estimated_hours)
-    .bind(rate_cents)
-    .bind(&line_items_json)
-    .fetch_one(db)
-    .await?;
+    let row: OfferRow = if overrides.existing_offer_id.is_some() {
+        sqlx::query_as(
+            r#"
+            UPDATE offers
+            SET price_cents = $1, pdf_storage_key = $2, status = $3,
+                persons = $4, hours_estimated = $5, rate_per_hour_cents = $6,
+                line_items_json = $7
+            WHERE id = $8
+            RETURNING id, quote_id, price_cents, currency, valid_until, pdf_storage_key, status,
+                      created_at, sent_at, offer_number, persons, hours_estimated,
+                      rate_per_hour_cents, line_items_json
+            "#,
+        )
+        .bind(actual_netto_cents)
+        .bind(Some(&s3_key))
+        .bind(OfferStatus::Draft.as_str())
+        .bind(pricing_result.estimated_helpers as i32)
+        .bind(pricing_result.estimated_hours)
+        .bind(rate_cents)
+        .bind(&line_items_json)
+        .bind(offer_id)
+        .fetch_one(db)
+        .await?
+    } else {
+        sqlx::query_as(
+            r#"
+            INSERT INTO offers (id, quote_id, price_cents, currency, valid_until, pdf_storage_key, status, created_at,
+                                offer_number, persons, hours_estimated, rate_per_hour_cents, line_items_json)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            RETURNING id, quote_id, price_cents, currency, valid_until, pdf_storage_key, status, created_at, sent_at,
+                      offer_number, persons, hours_estimated, rate_per_hour_cents, line_items_json
+            "#,
+        )
+        .bind(offer_id)
+        .bind(quote_id)
+        .bind(actual_netto_cents)
+        .bind("EUR")
+        .bind(valid_until_date)
+        .bind(Some(&s3_key))
+        .bind(OfferStatus::Draft.as_str())
+        .bind(now)
+        .bind(&offer_number)
+        .bind(pricing_result.estimated_helpers as i32)
+        .bind(pricing_result.estimated_hours)
+        .bind(rate_cents)
+        .bind(&line_items_json)
+        .fetch_one(db)
+        .await?
+    };
 
     // Update quote status
     sqlx::query("UPDATE quotes SET status = $1, updated_at = $2 WHERE id = $3")
@@ -572,6 +643,11 @@ fn format_city(addr: &AddressRow) -> String {
 ///
 /// Returns (salutation for address block, greeting line).
 /// Uses common German female first names as a heuristic.
+/// Returns just the greeting line for a customer name (e.g. "Sehr geehrter Herr Müller,").
+pub fn greeting_for_name(name: &str) -> String {
+    detect_salutation_and_greeting(name).1
+}
+
 fn detect_salutation_and_greeting(name: &str) -> (String, String) {
     // If the name contains "Frau" or "Herr" prefix, use that directly
     let name_trimmed = name.trim();
@@ -643,25 +719,81 @@ fn detect_salutation_and_greeting(name: &str) -> (String, String) {
     }
 }
 
-/// Build non-labor line items for the XLSX offer from quote notes, distance, and pricing.
+/// Compute the Fahrkostenpauschale line item by calling ORS for the full round-trip route:
+/// depot → origin → (optional stop) → destination → depot.
 ///
-/// Items are written dynamically into rows 31-42 (no fixed row assignments).
-/// Labor is prepended separately in `build_offer_with_overrides()`.
-fn build_line_items(
-    notes: Option<&str>,
+/// Falls back to `distance_km * 2 * rate` if ORS fails.
+async fn build_fahrt_item(
+    config: &Config,
+    origin: Option<&AddressRow>,
+    destination: Option<&AddressRow>,
+    stop: Option<&AddressRow>,
     distance_km: f64,
-    volume_m3: f64,
-) -> Vec<OfferLineItem> {
+) -> OfferLineItem {
+    let depot = config.company.depot_address.clone();
+    let rate = config.company.fahrt_rate_per_km;
+
+    let format_addr = |a: &AddressRow| -> String {
+        match &a.postal_code {
+            Some(plz) => format!("{}, {} {}", a.street, plz, a.city),
+            None => format!("{}, {}", a.street, a.city),
+        }
+    };
+
+    let flat_total = if let (Some(orig), Some(dest)) = (origin, destination) {
+        let mut route_addrs = vec![depot.clone(), format_addr(orig)];
+        if let Some(s) = stop {
+            route_addrs.push(format_addr(s));
+        }
+        route_addrs.push(format_addr(dest));
+        route_addrs.push(depot.clone());
+
+        let calculator = RouteCalculator::new(config.maps.api_key.clone());
+        match calculator.calculate(&RouteRequest { addresses: route_addrs }).await {
+            Ok(result) => result.total_distance_km * rate,
+            Err(e) => {
+                warn!("Fahrkostenpauschale route calculation failed ({e}), using fallback");
+                distance_km * 2.0 * rate
+            }
+        }
+    } else {
+        // No addresses — use stored distance as fallback
+        distance_km * 2.0 * rate
+    };
+
+    OfferLineItem {
+        description: "Fahrkostenpauschale".to_string(),
+        flat_total: Some(flat_total),
+        ..Default::default()
+    }
+}
+
+/// Build non-labor line items for the XLSX offer from quote notes.
+///
+/// Does NOT include Fahrkostenpauschale (computed separately in `build_offer_with_overrides`)
+/// or the labor item (prepended separately).
+/// Always ends with Nürnbergerversicherung (€0) as the last item.
+fn build_line_items(notes: Option<&str>) -> Vec<OfferLineItem> {
     let notes_lower = notes
         .map(|n| n.to_lowercase())
         .unwrap_or_default();
     let mut items = Vec::new();
 
-    // De/Montage — if assembly or disassembly service requested
-    let has_montage = notes_lower.contains("montage") || notes_lower.contains("demontage");
-    if has_montage {
+    // Demontage — if disassembly service requested
+    if notes_lower.contains("demontage") {
         items.push(OfferLineItem {
-            description: "De/Montage".to_string(),
+            description: "Demontage".to_string(),
+            quantity: 1.0,
+            unit_price: 50.0,
+            ..Default::default()
+        });
+    }
+
+    // Montage — if assembly requested (check after removing "demontage" to avoid false match)
+    let without_demontage = notes_lower.replace("demontage", "");
+    if without_demontage.contains("montage") {
+        items.push(OfferLineItem {
+            description: "Montage".to_string(),
             quantity: 1.0,
             unit_price: 50.0,
             ..Default::default()
@@ -669,24 +801,29 @@ fn build_line_items(
     }
 
     // Halteverbotszone — count parking ban locations
-    let mut halteverbot_count = 0.0;
-    if notes_lower.contains("halteverbot auszug") {
-        halteverbot_count += 1.0;
-    }
-    if notes_lower.contains("halteverbot einzug") {
-        halteverbot_count += 1.0;
-    }
-    if halteverbot_count > 0.0 {
-        let remark = if halteverbot_count > 1.0 {
-            Some("Beladestelle + Entladestelle".to_string())
-        } else if notes_lower.contains("halteverbot auszug") {
-            Some("Beladestelle".to_string())
-        } else {
-            Some("Entladestelle".to_string())
+    let has_auszug_ban = notes_lower.contains("halteverbot auszug");
+    let has_einzug_ban = notes_lower.contains("halteverbot einzug");
+    let has_zwischenstopp_ban = notes_lower.contains("halteverbot zwischenstopp");
+
+    let halteverbot_count =
+        has_auszug_ban as u32 + has_einzug_ban as u32 + has_zwischenstopp_ban as u32;
+
+    if halteverbot_count > 0 {
+        let remark = match (has_auszug_ban, has_einzug_ban, has_zwischenstopp_ban) {
+            (true, true, false) => Some("Beladestelle + Entladestelle".to_string()),
+            (true, false, false) => Some("Beladestelle".to_string()),
+            (false, true, false) => Some("Entladestelle".to_string()),
+            (true, true, true) => {
+                Some("Beladestelle + Entladestelle + Zwischenstopp".to_string())
+            }
+            (true, false, true) => Some("Beladestelle + Zwischenstopp".to_string()),
+            (false, true, true) => Some("Entladestelle + Zwischenstopp".to_string()),
+            (false, false, true) => Some("Zwischenstopp".to_string()),
+            _ => None,
         };
         items.push(OfferLineItem {
             description: "Halteverbotszone".to_string(),
-            quantity: halteverbot_count,
+            quantity: halteverbot_count as f64,
             unit_price: 100.0,
             remark,
             ..Default::default()
@@ -699,33 +836,52 @@ fn build_line_items(
             description: "Umzugsmaterial".to_string(),
             quantity: 1.0,
             unit_price: 30.0,
-            remark: Some("inkl. Einpackservice".to_string()),
+            remark: Some("Stretchfolie, Decken, Gurte Einzelpreis 30,00 €".to_string()),
             ..Default::default()
         });
     }
 
-    // Transporter — based on volume (2 trucks for >30m³)
-    let truck_count = if volume_m3 > 30.0 { 2.0 } else { 1.0 };
+    // Nürnbergerversicherung — always last, €0
     items.push(OfferLineItem {
-        description: "3,5t Transporter".to_string(),
-        quantity: truck_count,
-        unit_price: 60.0,
-        remark: Some("m. Koffer".to_string()),
+        description: "Nürnbergerversicherung".to_string(),
+        quantity: 1.0,
+        unit_price: 0.0,
+        flat_total: Some(0.0),
         ..Default::default()
     });
 
-    // Anfahrt/Abfahrt — adjust based on distance
-    if distance_km > 0.0 {
-        let anfahrt_price = 30.0 + (distance_km * 1.5);
-        items.push(OfferLineItem {
-            description: "Anfahrt/Abfahrt".to_string(),
-            quantity: 1.0,
-            unit_price: anfahrt_price,
-            ..Default::default()
-        });
-    }
-
     items
+}
+
+/// Back-calculate the hourly rate when a target price or explicit rate override is provided.
+///
+/// Precedence:
+/// 1. `rate_override` — used directly
+/// 2. `price_cents_override` — back-calculates: `rate = (netto - other_items) / (persons × hours)`
+/// 3. Default €30/hr
+fn calculate_rate_override(
+    price_cents_override: Option<i64>,
+    rate_override: Option<f64>,
+    persons: u32,
+    hours: f64,
+    line_items: &[OfferLineItem],
+) -> f64 {
+    if let Some(r) = rate_override {
+        r
+    } else if let Some(price_cents) = price_cents_override {
+        let persons = persons.max(1) as f64;
+        let hours = hours.max(1.0);
+        let target_netto = price_cents as f64 / 100.0;
+        let other_items_netto: f64 = line_items
+            .iter()
+            .filter(|li| !li.is_labor)
+            .map(|li| li.flat_total.unwrap_or(li.quantity * li.unit_price))
+            .sum();
+        let labor_netto = (target_netto - other_items_netto).max(0.0);
+        labor_netto / (persons * hours)
+    } else {
+        30.0
+    }
 }
 
 // --- API handlers ---
@@ -739,9 +895,22 @@ async fn generate_offer(
         persons: request.persons,
         hours: request.hours,
         rate: request.rate,
+        line_items: request.line_items.map(|items| {
+            items
+                .into_iter()
+                .map(|li| OfferLineItem {
+                    description: li.description,
+                    quantity: li.quantity,
+                    unit_price: li.unit_price,
+                    remark: li.remark,
+                    ..Default::default()
+                })
+                .collect()
+        }),
+        existing_offer_id: None,
     };
     let result = build_offer_with_overrides(
-        &state.db, &*state.storage, request.quote_id, request.valid_days, &overrides
+        &state.db, &*state.storage, &state.config, request.quote_id, request.valid_days, &overrides
     ).await?;
     Ok(Json(result.offer))
 }
@@ -1112,101 +1281,103 @@ mod tests {
     // --- build_line_items tests ---
 
     #[test]
-    fn line_items_no_services() {
-        let items = build_line_items(None, 0.0, 20.0);
-        // Should only have truck, no anfahrt (distance=0)
-        assert_eq!(items.len(), 1);
-        assert!(items[0].description.contains("Transporter"));
-        assert_eq!(items[0].quantity, 1.0);
-        assert!(!items[0].is_labor);
+    fn always_has_versicherung_last() {
+        let items = build_line_items(None);
+        assert!(!items.is_empty(), "should have at least Versicherung");
+        let last = items.last().unwrap();
+        assert_eq!(last.description, "Nürnbergerversicherung");
+        assert_eq!(last.unit_price, 0.0);
+        assert_eq!(last.flat_total, Some(0.0));
     }
 
     #[test]
-    fn line_items_montage() {
-        let items = build_line_items(Some("montage"), 0.0, 20.0);
-        let montage = items.iter().find(|i| i.description.contains("Montage")).expect("should have montage");
-        assert_eq!(montage.quantity, 1.0);
-        assert_eq!(montage.unit_price, 50.0);
+    fn no_transporter_item() {
+        let items = build_line_items(None);
+        assert!(!items.iter().any(|i| i.description.contains("Transporter")), "Transporter must not appear");
     }
 
     #[test]
-    fn line_items_demontage() {
-        let items = build_line_items(Some("Demontage"), 0.0, 20.0);
-        assert!(items.iter().any(|i| i.description.contains("Montage")));
+    fn no_anfahrt_item() {
+        let items = build_line_items(None);
+        assert!(!items.iter().any(|i| i.description.contains("Anfahrt")), "Anfahrt must not appear");
     }
 
     #[test]
-    fn line_items_halteverbot_auszug_only() {
-        let items = build_line_items(Some("Halteverbot Auszug"), 0.0, 20.0);
-        let hv = items.iter().find(|i| i.description.contains("Halteverbot")).expect("should have halteverbot");
+    fn demontage_separate_from_montage() {
+        // Only "Demontage" in notes → only Demontage item, no Montage
+        let items = build_line_items(Some("Demontage"));
+        assert!(items.iter().any(|i| i.description == "Demontage"), "should have Demontage");
+        assert!(!items.iter().any(|i| i.description == "Montage"), "should NOT have Montage");
+    }
+
+    #[test]
+    fn montage_separate_from_demontage() {
+        // Only "Montage" (no "demontage") → only Montage item
+        let items = build_line_items(Some("Montage"));
+        assert!(items.iter().any(|i| i.description == "Montage"), "should have Montage");
+        assert!(!items.iter().any(|i| i.description == "Demontage"), "should NOT have Demontage");
+    }
+
+    #[test]
+    fn both_services_both_items() {
+        // Both Demontage and Montage in notes → both items
+        let items = build_line_items(Some("Montage, Demontage"));
+        assert!(items.iter().any(|i| i.description == "Demontage"), "should have Demontage");
+        assert!(items.iter().any(|i| i.description == "Montage"), "should have Montage");
+    }
+
+    #[test]
+    fn halteverbot_auszug_only() {
+        let items = build_line_items(Some("Halteverbot Auszug"));
+        let hv = items.iter().find(|i| i.description == "Halteverbotszone").expect("should have halteverbot");
         assert_eq!(hv.quantity, 1.0);
-        assert_eq!(hv.description, "Halteverbotszone");
+        assert_eq!(hv.remark.as_deref(), Some("Beladestelle"));
     }
 
     #[test]
-    fn line_items_halteverbot_both() {
-        let items = build_line_items(Some("Halteverbot Auszug, Halteverbot Einzug"), 0.0, 20.0);
-        let hv = items.iter().find(|i| i.description.contains("Halteverbot")).expect("should have halteverbot");
+    fn halteverbot_einzug_only() {
+        let items = build_line_items(Some("Halteverbot Einzug"));
+        let hv = items.iter().find(|i| i.description == "Halteverbotszone").expect("should have halteverbot");
+        assert_eq!(hv.quantity, 1.0);
+        assert_eq!(hv.remark.as_deref(), Some("Entladestelle"));
+    }
+
+    #[test]
+    fn halteverbot_both() {
+        let items = build_line_items(Some("Halteverbot Auszug, Halteverbot Einzug"));
+        let hv = items.iter().find(|i| i.description == "Halteverbotszone").expect("should have halteverbot");
         assert_eq!(hv.quantity, 2.0);
-        assert_eq!(hv.description, "Halteverbotszone");
+        assert_eq!(hv.remark.as_deref(), Some("Beladestelle + Entladestelle"));
     }
 
     #[test]
-    fn line_items_einpackservice() {
-        let items = build_line_items(Some("einpackservice"), 0.0, 20.0);
-        let ep = items.iter().find(|i| i.description.contains("Umzugsmaterial")).expect("should have umzugsmaterial");
-        assert_eq!(ep.quantity, 1.0);
-        assert_eq!(ep.unit_price, 30.0);
+    fn halteverbot_intermediate() {
+        let items = build_line_items(Some("Halteverbot Auszug, Halteverbot Einzug, Halteverbot Zwischenstopp"));
+        let hv = items.iter().find(|i| i.description == "Halteverbotszone").expect("should have halteverbot");
+        assert_eq!(hv.quantity, 3.0);
     }
 
     #[test]
-    fn line_items_verpackungsservice() {
-        let items = build_line_items(Some("Verpackungsservice"), 0.0, 20.0);
-        assert!(items.iter().any(|i| i.description.contains("Umzugsmaterial")));
+    fn umzugsmaterial_remark() {
+        let items = build_line_items(Some("einpackservice"));
+        let um = items.iter().find(|i| i.description == "Umzugsmaterial").expect("should have umzugsmaterial");
+        assert_eq!(um.unit_price, 30.0);
+        assert_eq!(um.remark.as_deref(), Some("Stretchfolie, Decken, Gurte Einzelpreis 30,00 €"));
     }
 
     #[test]
-    fn line_items_truck_count_small() {
-        let items = build_line_items(None, 0.0, 30.0);
-        let truck = items.iter().find(|i| i.description.contains("Transporter")).unwrap();
-        assert_eq!(truck.quantity, 1.0);
+    fn verpackungsservice_triggers_umzugsmaterial() {
+        let items = build_line_items(Some("Verpackungsservice"));
+        assert!(items.iter().any(|i| i.description == "Umzugsmaterial"));
     }
 
     #[test]
-    fn line_items_truck_count_large() {
-        let items = build_line_items(None, 0.0, 31.0);
-        let truck = items.iter().find(|i| i.description.contains("Transporter")).unwrap();
-        assert_eq!(truck.quantity, 2.0);
-    }
-
-    #[test]
-    fn line_items_anfahrt_distance() {
-        let items = build_line_items(None, 50.0, 20.0);
-        let anfahrt = items.iter().find(|i| i.description.contains("Anfahrt")).expect("should have anfahrt");
-        assert_eq!(anfahrt.quantity, 1.0);
-        assert!((anfahrt.unit_price - 105.0).abs() < 0.01, "30 + 50*1.5 = 105");
-    }
-
-    #[test]
-    fn line_items_all_services_combined() {
-        let items = build_line_items(
-            Some("Montage, Halteverbot Auszug, Halteverbot Einzug, Verpackungsservice"),
-            100.0,
-            35.0,
-        );
-        assert!(items.iter().any(|i| i.description.contains("Montage")), "montage");
-        assert!(items.iter().any(|i| i.description.contains("Halteverbot")), "halteverbot");
-        assert!(items.iter().any(|i| i.description.contains("Umzugsmaterial")), "umzugsmaterial");
-        let truck = items.iter().find(|i| i.description.contains("Transporter")).unwrap();
-        assert_eq!(truck.quantity, 2.0, "volume > 30 → 2 trucks");
-        let anfahrt = items.iter().find(|i| i.description.contains("Anfahrt")).unwrap();
-        assert!((anfahrt.unit_price - 180.0).abs() < 0.01, "30 + 100*1.5 = 180");
-    }
-
-    #[test]
-    fn line_items_zero_distance_no_anfahrt() {
-        let items = build_line_items(None, 0.0, 20.0);
-        assert!(!items.iter().any(|i| i.description.contains("Anfahrt")), "no anfahrt for zero distance");
+    fn versicherung_zero_price() {
+        let items = build_line_items(None);
+        let v = items.iter().find(|i| i.description == "Nürnbergerversicherung").unwrap();
+        assert_eq!(v.quantity, 1.0);
+        assert_eq!(v.unit_price, 0.0);
+        assert_eq!(v.flat_total, Some(0.0));
     }
 
     // --- extract_services_and_message tests ---
@@ -1396,12 +1567,12 @@ mod tests {
 
     proptest! {
         #[test]
-        fn build_line_items_never_panics(
-            s in ".*",
-            dist in 0.0..1000.0f64,
-            vol in 0.0..200.0f64,
-        ) {
-            let _ = build_line_items(Some(&s), dist, vol);
+        fn build_line_items_never_panics(s in ".*") {
+            let items = build_line_items(Some(&s));
+            // Must always end with Nürnbergerversicherung
+            assert!(!items.is_empty());
+            let last = items.last().unwrap();
+            assert_eq!(last.description, "Nürnbergerversicherung");
         }
 
         #[test]
@@ -1430,6 +1601,117 @@ mod tests {
                 method: "test".to_string(),
             };
             let _ = parse_detected_items(Some(&est));
+        }
+    }
+
+    // --- calculate_rate_override tests ---
+
+    #[test]
+    fn rate_no_override_returns_default() {
+        let rate = calculate_rate_override(None, None, 2, 4.0, &[]);
+        assert!((rate - 30.0).abs() < 0.001, "default rate should be 30");
+    }
+
+    #[test]
+    fn rate_explicit_override_used_directly() {
+        let rate = calculate_rate_override(None, Some(45.0), 2, 4.0, &[]);
+        assert!((rate - 45.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn rate_explicit_wins_over_price() {
+        // When both are set, explicit rate wins
+        let rate = calculate_rate_override(Some(100_00), Some(50.0), 2, 4.0, &[]);
+        assert!((rate - 50.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn rate_back_calculated_no_other_items() {
+        // Target €400 netto, 2 persons × 4 hours, no other items → rate = 400/(2×4) = 50
+        let rate = calculate_rate_override(Some(40_000), None, 2, 4.0, &[]);
+        assert!((rate - 50.0).abs() < 0.001, "expected 50.0, got {rate}");
+    }
+
+    #[test]
+    fn rate_back_calculated_with_other_items() {
+        // Target €400 netto, other items = €60 (Halteverbot), labor = €340, 2 persons × 4hrs → rate = 340/8 = 42.5
+        let items = vec![OfferLineItem {
+            description: "Halteverbotszone".to_string(),
+            quantity: 1.0,
+            unit_price: 60.0,
+            is_labor: false,
+            ..Default::default()
+        }];
+        let rate = calculate_rate_override(Some(40_000), None, 2, 4.0, &items);
+        assert!((rate - 42.5).abs() < 0.001, "expected 42.5, got {rate}");
+    }
+
+    #[test]
+    fn flat_total_excluded_from_other_items() {
+        // Fahrkostenpauschale with flat_total=60 should be included in other_items via flat_total
+        let items = vec![OfferLineItem {
+            description: "Fahrkostenpauschale".to_string(),
+            flat_total: Some(60.0),
+            ..Default::default()
+        }];
+        // Target €400 netto, other items = €60 flat, labor = €340, 2 persons × 4hrs → rate = 42.5
+        let rate = calculate_rate_override(Some(40_000), None, 2, 4.0, &items);
+        assert!((rate - 42.5).abs() < 0.001, "flat_total should be subtracted from labor budget");
+    }
+
+    #[test]
+    fn versicherung_zero_no_effect_on_rate() {
+        // Nürnbergerversicherung flat_total=0 should not change rate
+        let items = vec![OfferLineItem {
+            description: "Nürnbergerversicherung".to_string(),
+            flat_total: Some(0.0),
+            ..Default::default()
+        }];
+        let rate = calculate_rate_override(Some(40_000), None, 2, 4.0, &items);
+        // No change: 40_000/100 / (2*4) = 50
+        assert!((rate - 50.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn rate_back_calculated_saturates_at_zero() {
+        // Target €50 netto, other items = €100 — labor cost can't be negative → rate = 0
+        let items = vec![OfferLineItem {
+            description: "Halteverbot".to_string(),
+            quantity: 1.0,
+            unit_price: 100.0,
+            is_labor: false,
+            ..Default::default()
+        }];
+        let rate = calculate_rate_override(Some(5_000), None, 2, 4.0, &items);
+        assert!(rate >= 0.0, "rate must not be negative");
+        assert!((rate - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn rate_back_calculated_persons_zero_uses_one() {
+        // persons=0 should use 1 to avoid division by zero
+        let rate = calculate_rate_override(Some(40_000), None, 0, 4.0, &[]);
+        assert!(rate.is_finite() && rate > 0.0);
+    }
+
+    #[test]
+    fn rate_back_calculated_hours_zero_uses_one() {
+        // hours=0 should use 1.0 to avoid division by zero
+        let rate = calculate_rate_override(Some(40_000), None, 2, 0.0, &[]);
+        assert!(rate.is_finite() && rate > 0.0);
+    }
+
+    proptest! {
+        #[test]
+        fn calculate_rate_override_never_panics(
+            price in proptest::option::of(0i64..1_000_000i64),
+            rate in proptest::option::of(0.0f64..500.0f64),
+            persons in 0u32..10u32,
+            hours in 0.0f64..24.0f64,
+        ) {
+            let result = calculate_rate_override(price, rate, persons, hours, &[]);
+            assert!(result.is_finite());
+            assert!(result >= 0.0);
         }
     }
 }

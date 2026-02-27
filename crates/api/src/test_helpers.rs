@@ -73,6 +73,7 @@ pub fn test_config() -> Config {
         },
         calendar: CalendarConfig::default(),
         vision_service: VisionServiceConfig::default(),
+        company: CompanyConfig::default(),
     }
 }
 

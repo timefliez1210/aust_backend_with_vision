@@ -72,7 +72,7 @@ pub async fn try_auto_generate_offer(state: Arc<AppState>, quote_id: Uuid) {
 
     info!("Auto-generating offer for quote {quote_id}");
 
-    match build_offer(&state.db, &*state.storage, quote_id, Some(30)).await {
+    match build_offer(&state.db, &*state.storage, &state.config, quote_id, Some(30)).await {
         Ok(generated) => {
             info!(
                 "Offer {} generated for quote {quote_id} (€{:.2})",
@@ -485,7 +485,7 @@ async fn handle_complete_inquiry(
         .bind(&city)
         .bind(&postal)
         .bind(&inquiry.departure_floor)
-        .bind(None::<bool>) // email inquiries don't capture elevator yet
+        .bind(inquiry.departure_elevator)
         .fetch_one(&state.db)
         .await
         {
@@ -510,7 +510,7 @@ async fn handle_complete_inquiry(
         .bind(&city)
         .bind(&postal)
         .bind(&inquiry.arrival_floor)
-        .bind(None::<bool>) // email inquiries don't capture elevator yet
+        .bind(inquiry.arrival_elevator)
         .fetch_one(&state.db)
         .await
         {
@@ -524,14 +524,50 @@ async fn handle_complete_inquiry(
         None
     };
 
-    // 3b. Calculate distance if both addresses exist
+    // 3b. Create intermediate stop address (if any)
+    let stop_id = if inquiry.has_intermediate_stop {
+        if let Some(ref addr) = inquiry.intermediate_address {
+            let (street, city, postal) = services::vision::parse_address(addr);
+            match sqlx::query_as::<_, (Uuid,)>(
+                "INSERT INTO addresses (id, street, city, postal_code, floor, elevator) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+            )
+            .bind(Uuid::now_v7())
+            .bind(&street)
+            .bind(&city)
+            .bind(&postal)
+            .bind(&inquiry.intermediate_floor)
+            .bind(inquiry.intermediate_elevator)
+            .fetch_one(&state.db)
+            .await
+            {
+                Ok((id,)) => Some(id),
+                Err(e) => {
+                    warn!("Failed to create stop address: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // 3c. Calculate distance if both addresses exist (include intermediate stop in route)
     let distance_km = if let (Some(ref dep), Some(ref arr)) =
         (&inquiry.departure_address, &inquiry.arrival_address)
     {
         let calculator = RouteCalculator::new(state.config.maps.api_key.clone());
+        let mut route_addresses = vec![dep.clone()];
+        if inquiry.has_intermediate_stop {
+            if let Some(ref stop_addr) = inquiry.intermediate_address {
+                route_addresses.push(stop_addr.clone());
+            }
+        }
+        route_addresses.push(arr.clone());
         match calculator
             .calculate(&RouteRequest {
-                addresses: vec![dep.clone(), arr.clone()],
+                addresses: route_addresses,
             })
             .await
         {
@@ -585,15 +621,16 @@ async fn handle_complete_inquiry(
 
     if let Err(e) = sqlx::query(
         r#"
-        INSERT INTO quotes (id, customer_id, origin_address_id, destination_address_id,
+        INSERT INTO quotes (id, customer_id, origin_address_id, destination_address_id, stop_address_id,
                            status, estimated_volume_m3, distance_km, preferred_date, notes, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11)
         "#,
     )
     .bind(quote_id)
     .bind(customer_id)
     .bind(origin_id)
     .bind(dest_id)
+    .bind(stop_id)
     .bind("volume_estimated")
     .bind(volume_m3)
     .bind(distance_km)
@@ -792,6 +829,9 @@ fn build_quote_notes(inquiry: &MovingInquiry) -> String {
     if inquiry.arrival_parking_ban == Some(true) {
         parts.push("Halteverbot Einzug".to_string());
     }
+    if inquiry.intermediate_parking_ban == Some(true) {
+        parts.push("Halteverbot Zwischenstopp".to_string());
+    }
     if inquiry.service_packing {
         parts.push("Verpackungsservice".to_string());
     }
@@ -851,27 +891,17 @@ async fn handle_offer_edit(
             .await;
     }
 
-    // Delete the old offer so build_offer can create a fresh one
-    let _ = sqlx::query("DELETE FROM offers WHERE id = $1")
-        .bind(old_offer_id)
-        .execute(&state.db)
-        .await;
-
-    // Also reset quote status so offer generation proceeds
-    let _ = sqlx::query("UPDATE quotes SET status = 'volume_estimated' WHERE id = $1")
-        .bind(quote_id)
-        .execute(&state.db)
-        .await;
-
-    // Regenerate with overrides baked into the xlsx/PDF
+    // Regenerate with overrides baked into the xlsx/PDF, preserving the existing offer ID and number
     let offer_overrides = OfferOverrides {
         price_cents: overrides.price_cents,
         persons: overrides.persons,
         hours: overrides.hours,
         rate: overrides.rate,
+        line_items: None,
+        existing_offer_id: Some(old_offer_id),
     };
 
-    match build_offer_with_overrides(&state.db, &*state.storage, quote_id, Some(30), &offer_overrides).await {
+    match build_offer_with_overrides(&state.db, &*state.storage, &state.config, quote_id, Some(30), &offer_overrides).await {
         Ok(generated) => {
             info!(
                 "Offer {} regenerated for quote {quote_id} (€{:.2})",
@@ -1333,6 +1363,44 @@ pub async fn send_offer_email(
     .map_err(|e| e.to_string())?;
 
     info!("Offer email sent to {to}");
+    Ok(())
+}
+
+pub async fn send_offer_email_custom(
+    state: &AppState,
+    to: &str,
+    pdf_bytes: &[u8],
+    offer_id: Uuid,
+    subject: &str,
+    body: &str,
+) -> Result<(), String> {
+    use crate::services::email::{build_email_with_attachment, send_email};
+
+    let email_config = &state.config.email;
+
+    let message = build_email_with_attachment(
+        &email_config.from_address,
+        &email_config.from_name,
+        to,
+        subject,
+        body,
+        pdf_bytes,
+        &format!("Angebot-{offer_id}.pdf"),
+        "application/pdf",
+    )
+    .map_err(|e| format!("Failed to build email: {e}"))?;
+
+    send_email(
+        &email_config.smtp_host,
+        email_config.smtp_port,
+        &email_config.username,
+        &email_config.password,
+        message,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    info!("Offer email sent to {to} (custom)");
     Ok(())
 }
 
