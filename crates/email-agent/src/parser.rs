@@ -782,4 +782,181 @@ mod tests {
         assert!(complete.is_complete());
         assert_eq!(complete.completeness(), 1.0);
     }
+
+    // ---------------------------------------------------------------
+    // Helper: build a ParsedEmail with a JSON attachment
+    // ---------------------------------------------------------------
+    fn make_json_email(json: &str) -> ParsedEmail {
+        use aust_core::models::EmailAttachment;
+        ParsedEmail {
+            from: "umzug@example.com".to_string(),
+            to: "umzug@example.com".to_string(),
+            subject: "Neue Angebotsanfrage".to_string(),
+            body_text: "some text body".to_string(),
+            body_html: None,
+            message_id: "test@test".to_string(),
+            date: chrono::Utc::now(),
+            attachments: vec![EmailAttachment {
+                filename: "form-data.json".to_string(),
+                content_type: "application/json".to_string(),
+                data: json.as_bytes().to_vec(),
+            }],
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Elevator field tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn elevator_on_maps_to_true() {
+        let json = r#"{
+            "form-name": "kostenloses-angebot",
+            "name": "Test User",
+            "email": "test@example.com",
+            "aufzug-auszug": "on"
+        }"#;
+        let email = make_json_email(json);
+        let inquiry = EmailParser::new().parse_inquiry(&email);
+        assert_eq!(inquiry.departure_elevator, Some(true));
+    }
+
+    #[test]
+    fn elevator_absent_maps_to_false() {
+        let json = r#"{
+            "form-name": "kostenloses-angebot",
+            "name": "Test User",
+            "email": "test@example.com"
+        }"#;
+        let email = make_json_email(json);
+        let inquiry = EmailParser::new().parse_inquiry(&email);
+        assert_eq!(inquiry.departure_elevator, Some(false));
+    }
+
+    #[test]
+    fn elevator_empty_string_maps_to_false() {
+        let json = r#"{
+            "form-name": "kostenloses-angebot",
+            "name": "Test User",
+            "email": "test@example.com",
+            "aufzug-auszug": ""
+        }"#;
+        let email = make_json_email(json);
+        let inquiry = EmailParser::new().parse_inquiry(&email);
+        assert_eq!(inquiry.departure_elevator, Some(false));
+    }
+
+    #[test]
+    fn all_three_elevator_fields() {
+        let json = r#"{
+            "form-name": "kostenloses-angebot",
+            "name": "Test User",
+            "email": "test@example.com",
+            "aufzug-auszug": "on",
+            "aufzug-einzug": "on",
+            "aufzug-zwischenstopp": ""
+        }"#;
+        let email = make_json_email(json);
+        let inquiry = EmailParser::new().parse_inquiry(&email);
+        assert_eq!(inquiry.departure_elevator, Some(true));
+        assert_eq!(inquiry.arrival_elevator, Some(true));
+        assert_eq!(inquiry.intermediate_elevator, Some(false));
+    }
+
+    #[test]
+    fn elevator_zwischenstopp_on() {
+        let json = r#"{
+            "form-name": "kostenloses-angebot",
+            "name": "Test User",
+            "email": "test@example.com",
+            "aufzug-zwischenstopp": "on"
+        }"#;
+        let email = make_json_email(json);
+        let inquiry = EmailParser::new().parse_inquiry(&email);
+        assert_eq!(inquiry.intermediate_elevator, Some(true));
+    }
+
+    // ---------------------------------------------------------------
+    // Edge case tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn corrupted_json_returns_none() {
+        let email = make_json_email("not valid json");
+        let parser = EmailParser::new();
+        // try_parse_json_attachment is private but accessible from within the module
+        let result = parser.try_parse_json_attachment(&email);
+        assert!(result.is_none(), "Corrupted JSON should return None, not panic");
+    }
+
+    #[test]
+    fn empty_json_object_returns_inquiry_with_defaults() {
+        let email = make_json_email("{}");
+        let parser = EmailParser::new();
+        // An empty JSON object deserializes into FormSubmission (all fields Option::None),
+        // so try_parse_json_attachment returns Some with defaults filled in.
+        let result = parser.try_parse_json_attachment(&email);
+        assert!(result.is_some(), "Empty JSON object should still produce a MovingInquiry");
+        let inquiry = result.unwrap();
+        // email falls back to the IMAP sender
+        assert_eq!(inquiry.email, "umzug@example.com");
+        assert_eq!(inquiry.name, None);
+    }
+
+    #[test]
+    fn missing_email_field_uses_imap_sender() {
+        let json = r#"{
+            "form-name": "kostenloses-angebot",
+            "name": "Test User"
+        }"#;
+        let email = make_json_email(json);
+        let inquiry = EmailParser::new().parse_inquiry(&email);
+        // When "email" field is absent, the parser falls back to the IMAP sender
+        assert_eq!(inquiry.email, "umzug@example.com");
+    }
+
+    #[test]
+    fn german_date_format() {
+        let json = r#"{
+            "form-name": "kostenloses-angebot",
+            "name": "Test User",
+            "email": "test@example.com",
+            "wunschtermin": "15.03.2026"
+        }"#;
+        let email = make_json_email(json);
+        let inquiry = EmailParser::new().parse_inquiry(&email);
+        assert_eq!(
+            inquiry.preferred_date,
+            Some(NaiveDate::from_ymd_opt(2026, 3, 15).unwrap())
+        );
+    }
+
+    #[test]
+    fn iso_date_format() {
+        let json = r#"{
+            "form-name": "kostenloses-angebot",
+            "name": "Test User",
+            "email": "test@example.com",
+            "wunschtermin": "2026-03-15"
+        }"#;
+        let email = make_json_email(json);
+        let inquiry = EmailParser::new().parse_inquiry(&email);
+        assert_eq!(
+            inquiry.preferred_date,
+            Some(NaiveDate::from_ymd_opt(2026, 3, 15).unwrap())
+        );
+    }
+
+    #[test]
+    fn invalid_date_gracefully_ignored() {
+        let json = r#"{
+            "form-name": "kostenloses-angebot",
+            "name": "Test User",
+            "email": "test@example.com",
+            "wunschtermin": "not-a-date"
+        }"#;
+        let email = make_json_email(json);
+        let inquiry = EmailParser::new().parse_inquiry(&email);
+        assert_eq!(inquiry.preferred_date, None, "Invalid date should be None, not panic");
+    }
 }

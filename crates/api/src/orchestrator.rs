@@ -1509,4 +1509,131 @@ mod tests {
             let _ = parse_items_list_text(&s);
         }
     }
+
+    // ---------------------------------------------------------------
+    // build_quote_notes tests
+    // ---------------------------------------------------------------
+
+    fn minimal_inquiry() -> MovingInquiry {
+        MovingInquiry {
+            id: uuid::Uuid::nil(),
+            email: "test@example.com".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn notes_empty_inquiry() {
+        let inquiry = minimal_inquiry();
+        let notes = build_quote_notes(&inquiry);
+        assert_eq!(notes, "");
+    }
+
+    #[test]
+    fn notes_departure_floor_only() {
+        let mut inquiry = minimal_inquiry();
+        inquiry.departure_floor = Some("3. Stock".to_string());
+        let notes = build_quote_notes(&inquiry);
+        assert!(notes.contains("Auszug: 3. Stock"), "notes = {notes}");
+    }
+
+    #[test]
+    fn notes_arrival_floor_only() {
+        let mut inquiry = minimal_inquiry();
+        inquiry.arrival_floor = Some("EG".to_string());
+        let notes = build_quote_notes(&inquiry);
+        assert!(notes.contains("Einzug: EG"), "notes = {notes}");
+    }
+
+    #[test]
+    fn notes_both_floors() {
+        let mut inquiry = minimal_inquiry();
+        inquiry.departure_floor = Some("2. Stock".to_string());
+        inquiry.arrival_floor = Some("EG".to_string());
+        let notes = build_quote_notes(&inquiry);
+        assert!(notes.contains("Auszug: 2. Stock"), "notes = {notes}");
+        assert!(notes.contains("Einzug: EG"), "notes = {notes}");
+        // Should be comma-separated
+        assert!(notes.contains(", "), "parts should be comma-separated: {notes}");
+    }
+
+    #[test]
+    fn notes_halteverbot_auszug() {
+        let mut inquiry = minimal_inquiry();
+        inquiry.departure_parking_ban = Some(true);
+        let notes = build_quote_notes(&inquiry);
+        assert!(notes.contains("Halteverbot Auszug"), "notes = {notes}");
+    }
+
+    #[test]
+    fn notes_halteverbot_einzug() {
+        let mut inquiry = minimal_inquiry();
+        inquiry.arrival_parking_ban = Some(true);
+        let notes = build_quote_notes(&inquiry);
+        assert!(notes.contains("Halteverbot Einzug"), "notes = {notes}");
+    }
+
+    #[test]
+    fn notes_halteverbot_zwischenstopp() {
+        let mut inquiry = minimal_inquiry();
+        inquiry.intermediate_parking_ban = Some(true);
+        let notes = build_quote_notes(&inquiry);
+        assert!(notes.contains("Halteverbot Zwischenstopp"), "notes = {notes}");
+    }
+
+    #[test]
+    fn notes_all_services() {
+        let mut inquiry = minimal_inquiry();
+        inquiry.service_packing = true;
+        inquiry.service_assembly = true;
+        inquiry.service_disassembly = true;
+        inquiry.service_storage = true;
+        inquiry.service_disposal = true;
+        let notes = build_quote_notes(&inquiry);
+        assert!(notes.contains("Verpackungsservice"), "notes = {notes}");
+        assert!(notes.contains("Montage"), "notes = {notes}");
+        assert!(notes.contains("Demontage"), "notes = {notes}");
+        assert!(notes.contains("Einlagerung"), "notes = {notes}");
+        assert!(notes.contains("Entsorgung"), "notes = {notes}");
+    }
+
+    #[test]
+    fn notes_passthrough_notes_field() {
+        let mut inquiry = minimal_inquiry();
+        inquiry.notes = Some("Bitte vorsichtig mit dem Klavier".to_string());
+        let notes = build_quote_notes(&inquiry);
+        assert!(
+            notes.contains("Bitte vorsichtig mit dem Klavier"),
+            "notes = {notes}"
+        );
+    }
+
+    #[test]
+    fn notes_full_inquiry() {
+        let mut inquiry = minimal_inquiry();
+        inquiry.departure_floor = Some("1. Stock".to_string());
+        inquiry.arrival_floor = Some("3. Stock".to_string());
+        inquiry.departure_parking_ban = Some(true);
+        inquiry.arrival_parking_ban = Some(true);
+        inquiry.intermediate_parking_ban = Some(true);
+        inquiry.service_packing = true;
+        inquiry.service_assembly = true;
+        inquiry.service_disassembly = true;
+        inquiry.service_storage = true;
+        inquiry.service_disposal = true;
+        inquiry.notes = Some("Klavier im 1. OG".to_string());
+        let notes = build_quote_notes(&inquiry);
+
+        assert!(notes.contains("Auszug: 1. Stock"), "notes = {notes}");
+        assert!(notes.contains("Einzug: 3. Stock"), "notes = {notes}");
+        assert!(notes.contains("Halteverbot Auszug"), "notes = {notes}");
+        assert!(notes.contains("Halteverbot Einzug"), "notes = {notes}");
+        assert!(notes.contains("Halteverbot Zwischenstopp"), "notes = {notes}");
+        assert!(notes.contains("Verpackungsservice"), "notes = {notes}");
+        assert!(notes.contains("Montage"), "notes = {notes}");
+        assert!(notes.contains("Demontage"), "notes = {notes}");
+        assert!(notes.contains("Einlagerung"), "notes = {notes}");
+        assert!(notes.contains("Entsorgung"), "notes = {notes}");
+        assert!(notes.contains("Klavier im 1. OG"), "notes = {notes}");
+    }
 }

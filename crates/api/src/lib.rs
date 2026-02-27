@@ -877,4 +877,476 @@ mod integration_tests {
         let body = body_json(resp).await;
         assert_eq!(body["offset"], 100);
     }
+
+    // ========== Error Path Tests ==========
+
+    #[tokio::test]
+    async fn get_nonexistent_customer_returns_404() {
+        let (app, _pool) = setup().await;
+        let fake_id = uuid::Uuid::new_v4();
+        let resp = app
+            .oneshot(authed_get(&format!("/api/v1/admin/customers/{fake_id}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+    }
+
+    #[tokio::test]
+    async fn update_nonexistent_address_returns_404() {
+        let (app, _pool) = setup().await;
+        let fake_id = uuid::Uuid::new_v4();
+        let resp = app
+            .oneshot(authed_patch(
+                &format!("/api/v1/admin/addresses/{fake_id}"),
+                serde_json::json!({ "street": "Test" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+    }
+
+    #[tokio::test]
+    async fn create_quote_with_volume_sets_status_volume_estimated() {
+        let (app, pool) = setup().await;
+        let customer_id = insert_test_customer(&pool).await;
+
+        let resp = app
+            .clone()
+            .oneshot(authed_post(
+                "/api/v1/admin/quotes",
+                serde_json::json!({
+                    "customer_id": customer_id,
+                    "origin": {
+                        "street": "Musterstr. 1",
+                        "city": "Hildesheim",
+                        "postal_code": "31135"
+                    },
+                    "destination": {
+                        "street": "Zielstr. 5",
+                        "city": "Hannover"
+                    },
+                    "estimated_volume_m3": 20.0
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+        let create_body = body_json(resp).await;
+        let quote_id = create_body["id"].as_str().unwrap();
+
+        // GET the quote via admin detail endpoint
+        let resp = app
+            .oneshot(authed_get(&format!("/api/v1/admin/quotes/{quote_id}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = body_json(resp).await;
+        assert_eq!(body["status"], "volume_estimated");
+    }
+
+    #[tokio::test]
+    async fn create_quote_without_volume_sets_status_pending() {
+        let (app, pool) = setup().await;
+        let customer_id = insert_test_customer(&pool).await;
+
+        let resp = app
+            .clone()
+            .oneshot(authed_post(
+                "/api/v1/admin/quotes",
+                serde_json::json!({
+                    "customer_id": customer_id,
+                    "origin": {
+                        "street": "Musterstr. 1",
+                        "city": "Hildesheim"
+                    },
+                    "destination": {
+                        "street": "Zielstr. 5",
+                        "city": "Hannover"
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+        let create_body = body_json(resp).await;
+        let quote_id = create_body["id"].as_str().unwrap();
+
+        // GET the quote — status should be pending
+        let resp = app
+            .oneshot(authed_get(&format!("/api/v1/admin/quotes/{quote_id}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = body_json(resp).await;
+        assert_eq!(body["status"], "pending");
+    }
+
+    #[tokio::test]
+    async fn list_admin_offers_returns_200() {
+        let (app, _pool) = setup().await;
+        let resp = app
+            .oneshot(authed_get("/api/v1/admin/offers"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn get_offer_detail_returns_correct_structure() {
+        let (app, pool) = setup().await;
+        let quote_id = insert_test_quote(&pool).await;
+        let offer_id = insert_test_offer(&pool, quote_id, "draft").await;
+
+        let resp = app
+            .oneshot(authed_get(&format!("/api/v1/admin/offers/{offer_id}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = body_json(resp).await;
+        assert!(body.get("id").is_some(), "response should have id");
+        assert!(body.get("status").is_some(), "response should have status");
+        assert!(
+            body.get("total_netto_cents").is_some(),
+            "response should have total_netto_cents"
+        );
+    }
+
+    // ========== Quote Detail with Elevator ==========
+
+    #[tokio::test]
+    async fn quote_detail_includes_elevator_on_addresses() {
+        let (app, pool) = setup().await;
+        let customer_id = insert_test_customer(&pool).await;
+
+        // Create quote with elevator fields via admin endpoint
+        let resp = app
+            .clone()
+            .oneshot(authed_post(
+                "/api/v1/admin/quotes",
+                serde_json::json!({
+                    "customer_id": customer_id,
+                    "origin": {
+                        "street": "Musterstr. 1",
+                        "city": "Hildesheim",
+                        "postal_code": "31135",
+                        "floor": "3. Stock",
+                        "elevator": false
+                    },
+                    "destination": {
+                        "street": "Zielstr. 5",
+                        "city": "Hannover",
+                        "elevator": true
+                    }
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+        let create_body = body_json(resp).await;
+        let quote_id = create_body["id"].as_str().unwrap();
+
+        // GET quote detail — should include elevator on addresses
+        let resp = app
+            .oneshot(authed_get(&format!("/api/v1/admin/quotes/{quote_id}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = body_json(resp).await;
+        assert_eq!(
+            body["origin"]["elevator"], false,
+            "origin elevator should be false"
+        );
+        assert_eq!(
+            body["destination"]["elevator"], true,
+            "destination elevator should be true"
+        );
+    }
+
+    // ========== Pagination Edge Cases ==========
+
+    #[tokio::test]
+    async fn list_quotes_with_zero_limit_returns_empty() {
+        let (app, _pool) = setup().await;
+        let resp = app
+            .oneshot(authed_get("/api/v1/quotes?limit=0"))
+            .await
+            .unwrap();
+        let status = resp.status().as_u16();
+        // limit=0 is passed through to SQL LIMIT 0 which returns empty results
+        // (not rejected as invalid)
+        assert_eq!(status, 200, "limit=0 should return 200 with empty results");
+        let body = body_json(resp).await;
+        assert!(
+            body["quotes"].as_array().unwrap().is_empty(),
+            "limit=0 should return no quotes"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_quotes_offset_beyond_total_returns_empty() {
+        let (app, pool) = setup().await;
+        insert_test_quote(&pool).await;
+
+        let resp = app
+            .oneshot(authed_get("/api/v1/quotes?limit=10&offset=9999"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = body_json(resp).await;
+        assert!(
+            body["quotes"].as_array().unwrap().is_empty(),
+            "offset beyond total should return empty array"
+        );
+    }
+
+    // ========== Status Transitions ==========
+
+    #[tokio::test]
+    async fn set_quote_status_to_done() {
+        let (app, pool) = setup().await;
+        let quote_id = insert_test_quote(&pool).await;
+
+        let resp = app
+            .oneshot(authed_post(
+                &format!("/api/v1/admin/quotes/{quote_id}/status"),
+                serde_json::json!({ "status": "done" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn set_quote_status_invalid_returns_400() {
+        let (app, pool) = setup().await;
+        let quote_id = insert_test_quote(&pool).await;
+
+        let resp = app
+            .oneshot(authed_post(
+                &format!("/api/v1/admin/quotes/{quote_id}/status"),
+                serde_json::json!({ "status": "flying_monkeys" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            400,
+            "invalid status should return 400 Bad Request"
+        );
+    }
+}
+
+#[cfg(test)]
+mod calendar_service_tests {
+    use aust_calendar::{CalendarService, NewBooking};
+    use chrono::{Datelike, NaiveDate};
+    use crate::test_helpers::*;
+
+    /// Helper to build a NewBooking for a given date with no quote_id.
+    fn new_booking(date: NaiveDate) -> NewBooking {
+        NewBooking {
+            booking_date: date,
+            quote_id: None,
+            customer_name: Some("Test Kunde".to_string()),
+            customer_email: Some("cal-test@example.com".to_string()),
+            departure_address: None,
+            arrival_address: None,
+            volume_m3: None,
+            distance_km: None,
+            description: None,
+            status: "confirmed".to_string(),
+        }
+    }
+
+    /// Clean all bookings for a specific date to ensure test isolation.
+    async fn clean_date(pool: &sqlx::PgPool, date: NaiveDate) {
+        sqlx::query("DELETE FROM calendar_bookings WHERE booking_date = $1")
+            .bind(date)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    #[tokio::test]
+    async fn availability_empty_db_is_available() {
+        let pool = test_db_pool().await;
+        let date = NaiveDate::from_ymd_opt(2098, 6, 2).unwrap(); // Monday
+        clean_date(&pool, date).await;
+        let svc = CalendarService::new(pool.clone(), 3, 3, 30);
+
+        let result = svc.check_availability(date).await.unwrap();
+
+        assert!(result.requested_date_available);
+        assert_eq!(result.requested_date_info.capacity, 3);
+        assert_eq!(result.requested_date_info.booked, 0);
+    }
+
+    #[tokio::test]
+    async fn availability_at_capacity_is_unavailable() {
+        let pool = test_db_pool().await;
+        let date = NaiveDate::from_ymd_opt(2098, 6, 3).unwrap(); // Tuesday
+        clean_date(&pool, date).await;
+        let svc = CalendarService::new(pool.clone(), 1, 3, 30);
+
+        svc.create_booking(new_booking(date)).await.unwrap();
+
+        let result = svc.check_availability(date).await.unwrap();
+        assert!(!result.requested_date_available);
+        assert_eq!(result.requested_date_info.remaining, 0);
+    }
+
+    #[tokio::test]
+    async fn availability_suggests_alternatives_when_full() {
+        let pool = test_db_pool().await;
+        let date = NaiveDate::from_ymd_opt(2098, 6, 4).unwrap(); // Wednesday
+        clean_date(&pool, date).await;
+        let svc = CalendarService::new(pool.clone(), 1, 3, 30);
+
+        svc.create_booking(new_booking(date)).await.unwrap();
+
+        let result = svc.check_availability(date).await.unwrap();
+        assert!(!result.requested_date_available);
+        assert!(!result.alternatives.is_empty(), "should suggest alternatives");
+        for alt in &result.alternatives {
+            assert!(alt.available);
+        }
+    }
+
+    #[tokio::test]
+    async fn create_booking_succeeds_when_capacity_available() {
+        let pool = test_db_pool().await;
+        let date = NaiveDate::from_ymd_opt(2098, 6, 9).unwrap(); // Monday
+        clean_date(&pool, date).await;
+        let svc = CalendarService::new(pool.clone(), 2, 3, 30);
+
+        let result = svc.create_booking(new_booking(date)).await;
+        assert!(result.is_ok());
+        let booking = result.unwrap();
+        assert_eq!(booking.booking_date, date);
+        assert_eq!(booking.status, "confirmed");
+    }
+
+    #[tokio::test]
+    async fn create_booking_fails_when_at_capacity() {
+        let pool = test_db_pool().await;
+        let date = NaiveDate::from_ymd_opt(2098, 6, 10).unwrap(); // Tuesday
+        clean_date(&pool, date).await;
+        let svc = CalendarService::new(pool.clone(), 1, 3, 30);
+
+        svc.create_booking(new_booking(date)).await.unwrap();
+
+        let result = svc.create_booking(new_booking(date)).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, aust_calendar::CalendarError::FullyBooked(_)),
+            "expected FullyBooked error, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn force_create_booking_bypasses_capacity() {
+        let pool = test_db_pool().await;
+        let date = NaiveDate::from_ymd_opt(2098, 6, 11).unwrap(); // Wednesday
+        clean_date(&pool, date).await;
+        let svc = CalendarService::new(pool.clone(), 1, 3, 30);
+
+        svc.create_booking(new_booking(date)).await.unwrap();
+
+        // force_create should succeed even though capacity=1 and 1 booking exists
+        let result = svc.force_create_booking(new_booking(date)).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn cancel_booking_sets_status() {
+        let pool = test_db_pool().await;
+        let date = NaiveDate::from_ymd_opt(2098, 6, 12).unwrap(); // Thursday
+        clean_date(&pool, date).await;
+        let svc = CalendarService::new(pool.clone(), 3, 3, 30);
+
+        let booking = svc.create_booking(new_booking(date)).await.unwrap();
+
+        svc.cancel_booking(booking.id).await.unwrap();
+
+        let status = get_booking_status(&pool, booking.id).await;
+        assert_eq!(status, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn confirm_booking_sets_status() {
+        let pool = test_db_pool().await;
+        let date = NaiveDate::from_ymd_opt(2098, 6, 16).unwrap(); // Monday
+        clean_date(&pool, date).await;
+        let svc = CalendarService::new(pool.clone(), 3, 3, 30);
+
+        let mut nb = new_booking(date);
+        nb.status = "tentative".to_string();
+        let booking = svc.create_booking(nb).await.unwrap();
+
+        svc.confirm_booking(booking.id).await.unwrap();
+
+        let status = get_booking_status(&pool, booking.id).await;
+        assert_eq!(status, "confirmed");
+    }
+
+    #[tokio::test]
+    async fn set_capacity_override_takes_effect() {
+        let pool = test_db_pool().await;
+        let date = NaiveDate::from_ymd_opt(2098, 6, 17).unwrap(); // Tuesday
+        clean_date(&pool, date).await;
+        let svc = CalendarService::new(pool.clone(), 3, 3, 30);
+
+        svc.set_capacity(date, 0).await.unwrap();
+
+        let result = svc.check_availability(date).await.unwrap();
+        assert!(!result.requested_date_available);
+        assert_eq!(result.requested_date_info.capacity, 0);
+    }
+
+    #[tokio::test]
+    async fn find_nearest_available_skips_sundays() {
+        let pool = test_db_pool().await;
+        // 2098-07-05 = Saturday, 2098-07-06 = Sunday, 2098-07-07 = Monday
+        let sat = NaiveDate::from_ymd_opt(2098, 7, 5).unwrap();
+        let mon = NaiveDate::from_ymd_opt(2098, 7, 7).unwrap();
+        let tue = NaiveDate::from_ymd_opt(2098, 7, 8).unwrap();
+        clean_date(&pool, sat).await;
+        clean_date(&pool, mon).await;
+        clean_date(&pool, tue).await;
+        assert_eq!(sat.weekday(), chrono::Weekday::Sat);
+        assert_eq!(mon.weekday(), chrono::Weekday::Mon);
+        assert_eq!(tue.weekday(), chrono::Weekday::Tue);
+
+        let svc = CalendarService::new(pool.clone(), 1, 3, 30);
+
+        svc.create_booking(new_booking(sat)).await.unwrap();
+        svc.create_booking(new_booking(mon)).await.unwrap();
+        svc.create_booking(new_booking(tue)).await.unwrap();
+
+        let alternatives = svc.find_nearest_available(sat, 3).await.unwrap();
+        for alt in &alternatives {
+            assert_ne!(
+                alt.date.weekday(),
+                chrono::Weekday::Sun,
+                "alternative {} is a Sunday",
+                alt.date
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn get_schedule_returns_correct_range() {
+        let pool = test_db_pool().await;
+        let svc = CalendarService::new(pool.clone(), 3, 3, 30);
+
+        let from = NaiveDate::from_ymd_opt(2098, 7, 14).unwrap(); // Monday
+        let to = NaiveDate::from_ymd_opt(2098, 7, 16).unwrap(); // Wednesday
+
+        let schedule = svc.get_schedule(from, to).await.unwrap();
+        assert_eq!(schedule.len(), 3, "3-day window should produce 3 entries");
+        assert_eq!(schedule[0].date, from);
+        assert_eq!(schedule[1].date, NaiveDate::from_ymd_opt(2098, 7, 15).unwrap());
+        assert_eq!(schedule[2].date, to);
+    }
 }

@@ -1128,4 +1128,256 @@ mod tests {
             r#"<definedName name="_xlnm.Print_Area">Tabelle1!$A$1:$H$120</definedName>"#
         );
     }
+
+    // --- End-to-end XLSX generation tests ---
+
+    fn read_xlsx_sheet1(bytes: &[u8]) -> String {
+        use std::io::Read as _;
+        let cursor = std::io::Cursor::new(bytes);
+        let mut archive = zip::ZipArchive::new(cursor).expect("valid zip");
+        let mut file = archive
+            .by_name("xl/worksheets/sheet1.xml")
+            .expect("sheet1 exists");
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)
+            .expect("read sheet1");
+        contents
+    }
+
+    fn minimal_offer_data() -> OfferData {
+        OfferData {
+            offer_number: "TEST-001".to_string(),
+            date: chrono::NaiveDate::from_ymd_opt(2026, 4, 1).unwrap(),
+            valid_until: None,
+            customer_salutation: "Herrn".to_string(),
+            customer_name: "Max Mustermann".to_string(),
+            customer_street: "Musterstr. 1".to_string(),
+            customer_city: "31135 Hildesheim".to_string(),
+            customer_phone: "+491234567890".to_string(),
+            customer_email: "max@example.com".to_string(),
+            greeting: "Sehr geehrter Herr Mustermann,".to_string(),
+            moving_date: "01.04.2026".to_string(),
+            origin_street: "Auszugstr. 1".to_string(),
+            origin_city: "31135 Hildesheim".to_string(),
+            origin_floor_info: "3. Stock".to_string(),
+            dest_street: "Zielstr. 5".to_string(),
+            dest_city: "30159 Hannover".to_string(),
+            dest_floor_info: "EG".to_string(),
+            volume_m3: 20.0,
+            persons: 3,
+            estimated_hours: 4.0,
+            rate_per_person_hour: 30.0,
+            line_items: vec![],
+            detected_items: vec![],
+        }
+    }
+
+    #[test]
+    fn generate_returns_valid_zip() {
+        let data = minimal_offer_data();
+        let bytes = generate_offer_xlsx(&data).expect("generate should succeed");
+        assert!(bytes.len() > 0);
+        // ZIP magic bytes: PK (0x50, 0x4B)
+        assert_eq!(bytes[0], 0x50);
+        assert_eq!(bytes[1], 0x4B);
+    }
+
+    #[test]
+    fn j50_contains_persons_count() {
+        let mut data = minimal_offer_data();
+        data.persons = 4;
+        // Need a labor line item to trigger J50 write
+        data.line_items = vec![OfferLineItem {
+            description: "4 Umzugshelfer".to_string(),
+            quantity: 5.0,
+            unit_price: 30.0,
+            is_labor: true,
+            flat_total: None,
+            remark: None,
+        }];
+        let bytes = generate_offer_xlsx(&data).expect("generate should succeed");
+        let xml = read_xlsx_sheet1(&bytes);
+        // J50 should be present with value 4
+        assert!(xml.contains(r#"r="J50""#), "J50 cell should exist in XML");
+        assert!(xml.contains("<v>4</v>"), "J50 should contain value 4");
+    }
+
+    #[test]
+    fn flat_total_item_g_cell_has_value() {
+        let mut data = minimal_offer_data();
+        data.line_items = vec![OfferLineItem {
+            description: "Fahrkostenpauschale".to_string(),
+            quantity: 0.0,
+            unit_price: 0.0,
+            is_labor: false,
+            flat_total: Some(75.0),
+            remark: None,
+        }];
+        let bytes = generate_offer_xlsx(&data).expect("generate should succeed");
+        let xml = read_xlsx_sheet1(&bytes);
+        // G31 should contain flat total 75
+        assert!(xml.contains(r#"r="G31""#), "G31 cell should exist");
+        // The flat_total is written as StyledNumber, so it should be <v>75</v>
+        // Find the G31 cell and check it has the value
+        let g31_pos = xml.find(r#"r="G31""#).unwrap();
+        let g31_region = &xml[g31_pos..g31_pos + 200.min(xml.len() - g31_pos)];
+        assert!(
+            g31_region.contains("<v>75</v>"),
+            "G31 should contain flat_total value 75, got: {}",
+            g31_region
+        );
+        // E31 should be styled text (blank), not a number
+        let e31_pos = xml.find(r#"r="E31""#).unwrap();
+        let e31_region = &xml[e31_pos..e31_pos + 200.min(xml.len() - e31_pos)];
+        assert!(
+            e31_region.contains("t=\"inlineStr\""),
+            "E31 should be inlineStr (blank) for flat_total item, got: {}",
+            e31_region
+        );
+    }
+
+    #[test]
+    fn normal_item_e_f_cells_have_values() {
+        let mut data = minimal_offer_data();
+        data.line_items = vec![OfferLineItem {
+            description: "Halteverbotszone".to_string(),
+            quantity: 2.0,
+            unit_price: 100.0,
+            is_labor: false,
+            flat_total: None,
+            remark: None,
+        }];
+        let bytes = generate_offer_xlsx(&data).expect("generate should succeed");
+        let xml = read_xlsx_sheet1(&bytes);
+        // E31 should have quantity 2
+        let e31_pos = xml.find(r#"r="E31""#).unwrap();
+        let e31_region = &xml[e31_pos..e31_pos + 200.min(xml.len() - e31_pos)];
+        assert!(
+            e31_region.contains("<v>2</v>"),
+            "E31 should contain quantity 2, got: {}",
+            e31_region
+        );
+        // F31 should have unit price 100
+        let f31_pos = xml.find(r#"r="F31""#).unwrap();
+        let f31_region = &xml[f31_pos..f31_pos + 200.min(xml.len() - f31_pos)];
+        assert!(
+            f31_region.contains("<v>100</v>"),
+            "F31 should contain unit_price 100, got: {}",
+            f31_region
+        );
+    }
+
+    #[test]
+    fn versicherung_item_has_zero_total() {
+        let mut data = minimal_offer_data();
+        data.line_items = vec![OfferLineItem {
+            description: "Nürnbergerversicherung".to_string(),
+            quantity: 0.0,
+            unit_price: 0.0,
+            is_labor: false,
+            flat_total: Some(0.0),
+            remark: None,
+        }];
+        let bytes = generate_offer_xlsx(&data).expect("generate should succeed");
+        let xml = read_xlsx_sheet1(&bytes);
+        // G31 should contain 0 as a flat_total value
+        let g31_pos = xml.find(r#"r="G31""#).unwrap();
+        let g31_region = &xml[g31_pos..g31_pos + 200.min(xml.len() - g31_pos)];
+        assert!(
+            g31_region.contains("<v>0</v>"),
+            "G31 should contain flat_total value 0, got: {}",
+            g31_region
+        );
+        // Should be a number cell (t="n"), not a formula
+        assert!(
+            !g31_region.contains("<f>"),
+            "G31 should not contain a formula for flat_total item"
+        );
+    }
+
+    #[test]
+    fn generate_with_detected_items_creates_second_sheet() {
+        let mut data = minimal_offer_data();
+        data.detected_items = vec![DetectedItemRow {
+            name: "Sofa".to_string(),
+            volume_m3: 1.5,
+            dimensions: Some("200x90x85".to_string()),
+            confidence: 0.9,
+            german_name: None,
+            re_value: None,
+            volume_source: None,
+            crop_s3_key: None,
+            bbox: None,
+            bbox_image_index: None,
+            source_image_urls: None,
+        }];
+        let bytes = generate_offer_xlsx(&data).expect("generate should succeed");
+        let cursor = std::io::Cursor::new(&bytes);
+        let mut archive = zip::ZipArchive::new(cursor).expect("valid zip");
+        let names: Vec<String> = (0..archive.len())
+            .map(|i| {
+                let file = archive.by_index(i).unwrap();
+                file.name().to_string()
+            })
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "xl/worksheets/sheet2.xml"),
+            "sheet2.xml should exist when detected_items is non-empty, found: {:?}",
+            names
+        );
+    }
+
+    #[test]
+    fn generate_with_no_detected_items_has_no_second_sheet() {
+        let data = minimal_offer_data(); // detected_items is empty
+        let bytes = generate_offer_xlsx(&data).expect("generate should succeed");
+        let cursor = std::io::Cursor::new(&bytes);
+        let mut archive = zip::ZipArchive::new(cursor).expect("valid zip");
+        let has_sheet2 = (0..archive.len()).any(|i| {
+            let file = archive.by_index(i).unwrap();
+            file.name() == "xl/worksheets/sheet2.xml"
+        });
+        assert!(
+            !has_sheet2,
+            "sheet2.xml should NOT exist when detected_items is empty"
+        );
+    }
+
+    #[test]
+    fn multiple_line_items_fill_sequential_rows() {
+        let mut data = minimal_offer_data();
+        data.line_items = vec![
+            OfferLineItem {
+                description: "De/Montage".to_string(),
+                quantity: 1.0,
+                unit_price: 50.0,
+                is_labor: false,
+                flat_total: None,
+                remark: None,
+            },
+            OfferLineItem {
+                description: "Halteverbotszone".to_string(),
+                quantity: 2.0,
+                unit_price: 100.0,
+                is_labor: false,
+                flat_total: None,
+                remark: None,
+            },
+            OfferLineItem {
+                description: "Einpackservice".to_string(),
+                quantity: 1.0,
+                unit_price: 30.0,
+                is_labor: false,
+                flat_total: None,
+                remark: None,
+            },
+        ];
+        let bytes = generate_offer_xlsx(&data).expect("generate should succeed");
+        let xml = read_xlsx_sheet1(&bytes);
+        // Each line item should occupy rows 31, 32, 33 respectively
+        // Check G31, G32, G33 all have formula cells
+        assert!(xml.contains(r#"r="G31""#), "G31 should exist for item 1");
+        assert!(xml.contains(r#"r="G32""#), "G32 should exist for item 2");
+        assert!(xml.contains(r#"r="G33""#), "G33 should exist for item 3");
+    }
 }
