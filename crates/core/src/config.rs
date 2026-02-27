@@ -14,6 +14,8 @@ pub struct Config {
     pub calendar: CalendarConfig,
     #[serde(default)]
     pub vision_service: VisionServiceConfig,
+    #[serde(default)]
+    pub company: CompanyConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -138,6 +140,21 @@ impl Default for ServerConfig {
         Self {
             host: "0.0.0.0".to_string(),
             port: 8080,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CompanyConfig {
+    pub depot_address: String,
+    pub fahrt_rate_per_km: f64,
+}
+
+impl Default for CompanyConfig {
+    fn default() -> Self {
+        Self {
+            depot_address: "Borsigstr 6 31135 Hildesheim".to_string(),
+            fahrt_rate_per_km: 1.0,
         }
     }
 }

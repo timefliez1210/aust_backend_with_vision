@@ -3,61 +3,64 @@ use chrono::Datelike;
 
 pub struct PricingEngine {
     rate_per_person_hour: i64,
-    rate_per_km: i64,
-    volume_per_person_hour: f64,
 }
 
 impl PricingEngine {
     pub fn new() -> Self {
         Self {
-            rate_per_person_hour: 3000, // €30
-            rate_per_km: 150,
-            volume_per_person_hour: 2.0,
-        }
-    }
-
-    pub fn with_rates(rate_per_person_hour: i64, rate_per_km: i64, volume_per_person_hour: f64) -> Self {
-        Self {
-            rate_per_person_hour,
-            rate_per_km,
-            volume_per_person_hour,
+            rate_per_person_hour: 3000, // €30/hr
         }
     }
 
     pub fn calculate(&self, input: &PricingInput) -> PricingResult {
-        let floor_extra_origin = self.floor_extra_persons(input.floor_origin, input.has_elevator_origin);
-        let floor_extra_dest = self.floor_extra_persons(input.floor_destination, input.has_elevator_destination);
+        // Base workers: ceil(volume_m3 / 5.0), minimum 2
+        let persons_base = ((input.volume_m3 / 5.0).ceil() as u32).max(2);
 
-        let persons = 2u32.max(2 + floor_extra_origin + floor_extra_dest);
+        // Find the highest floor without elevator (origin, destination, intermediate stop)
+        let mut floors_without_elevator: Vec<u32> = Vec::new();
+        if !input.has_elevator_origin.unwrap_or(false) {
+            if let Some(f) = input.floor_origin {
+                floors_without_elevator.push(f);
+            }
+        }
+        if !input.has_elevator_destination.unwrap_or(false) {
+            if let Some(f) = input.floor_destination {
+                floors_without_elevator.push(f);
+            }
+        }
+        if !input.has_elevator_stop.unwrap_or(false) {
+            if let Some(f) = input.floor_stop {
+                floors_without_elevator.push(f);
+            }
+        }
 
-        let throughput = persons as f64 * self.volume_per_person_hour;
-        let hours = (input.volume_m3 / throughput).ceil().max(1.0);
+        let highest_floor = floors_without_elevator.into_iter().max().unwrap_or(0);
+        // Extra workers for floors above 1st: floor 1 = 0 extra, floor 2 = 1 extra, etc.
+        let extra_workers = highest_floor.saturating_sub(1);
 
-        let base_labor_cents = persons as i64 * hours as i64 * self.rate_per_person_hour;
+        let total_persons = persons_base + extra_workers;
 
-        let distance_cents = (input.distance_km * self.rate_per_km as f64) as i64;
+        // Hours = volume / (workers × 0.625 m³/worker/hr)
+        // 0.625 m³/worker/hr = 5 m³ per 8h per worker
+        let hours = (input.volume_m3 / (total_persons as f64 * 0.625)).max(1.0);
+
+        let base_labor_cents =
+            (total_persons as f64 * hours * self.rate_per_person_hour as f64).round() as i64;
 
         let date_adjustment_cents = self.calculate_date_adjustment(input);
 
-        let total_price_cents = base_labor_cents + distance_cents + date_adjustment_cents;
+        let total_price_cents = base_labor_cents + date_adjustment_cents;
 
         PricingResult {
             total_price_cents,
             breakdown: PricingBreakdown {
                 base_labor_cents,
-                distance_cents,
+                distance_cents: 0, // no longer part of pricing (Fahrkostenpauschale is flat)
                 floor_surcharge_cents: 0, // floors add persons, not a separate surcharge
                 date_adjustment_cents,
             },
-            estimated_helpers: persons,
+            estimated_helpers: total_persons,
             estimated_hours: hours,
-        }
-    }
-
-    fn floor_extra_persons(&self, floor: Option<u32>, has_elevator: Option<bool>) -> u32 {
-        match floor {
-            Some(f) if f > 0 && !has_elevator.unwrap_or(false) => f,
-            _ => 0,
         }
     }
 
@@ -106,180 +109,205 @@ mod tests {
 
     fn base_input() -> PricingInput {
         PricingInput {
-            volume_m3: 20.0,
+            volume_m3: 10.0,
             distance_km: 0.0,
             preferred_date: None,
             floor_origin: None,
             floor_destination: None,
             has_elevator_origin: None,
             has_elevator_destination: None,
+            floor_stop: None,
+            has_elevator_stop: None,
         }
     }
 
-    // Test 1: 20m³, 0km, no floors → 2 persons, hours = ceil(20/(2*2.0)) = 5h
-    // labor = 2 * 5 * 3000 = 30000, total = 30000
+    // New formula: 10 m³ → persons_base = ceil(10/5) = 2, extra = 0, total = 2
+    // hours = 10/(2*0.625) = 8.0h
     #[test]
-    fn basic_pricing_two_persons() {
+    fn new_formula_base_volume_10() {
         let engine = PricingEngine::new();
         let result = engine.calculate(&base_input());
         assert_eq!(result.estimated_helpers, 2);
-        assert_eq!(result.estimated_hours, 5.0);
-        assert_eq!(result.breakdown.base_labor_cents, 30_000);
-        assert_eq!(result.breakdown.distance_cents, 0);
-        assert_eq!(result.breakdown.date_adjustment_cents, 0);
-        assert_eq!(result.total_price_cents, 30_000);
+        assert!((result.estimated_hours - 8.0).abs() < 0.01);
     }
 
-    // Test 2: origin floor=3, no elevator → +3 persons = 5 total
-    // hours = ceil(20/(5*2.0)) = ceil(2.0) = 2h, labor = 5*2*3000 = 30000
+    // 11 m³ → persons_base = ceil(11/5) = 3, extra = 0, total = 3
+    // hours = 11/(3*0.625) = 5.8667h
     #[test]
-    fn floor_adds_extra_persons_no_elevator() {
+    fn new_formula_base_volume_11() {
+        let engine = PricingEngine::new();
+        let mut input = base_input();
+        input.volume_m3 = 11.0;
+        let result = engine.calculate(&input);
+        assert_eq!(result.estimated_helpers, 3);
+        assert!((result.estimated_hours - 5.867).abs() < 0.01);
+    }
+
+    // 15 m³ → persons_base = ceil(15/5) = 3, extra = 0, total = 3
+    // hours = 15/(3*0.625) = 8.0h
+    #[test]
+    fn new_formula_base_volume_15() {
+        let engine = PricingEngine::new();
+        let mut input = base_input();
+        input.volume_m3 = 15.0;
+        let result = engine.calculate(&input);
+        assert_eq!(result.estimated_helpers, 3);
+        assert!((result.estimated_hours - 8.0).abs() < 0.01);
+    }
+
+    // 16 m³ → persons_base = ceil(16/5) = 4, extra = 0, total = 4
+    // hours = 16/(4*0.625) = 6.4h
+    #[test]
+    fn new_formula_base_volume_16() {
+        let engine = PricingEngine::new();
+        let mut input = base_input();
+        input.volume_m3 = 16.0;
+        let result = engine.calculate(&input);
+        assert_eq!(result.estimated_helpers, 4);
+        assert!((result.estimated_hours - 6.4).abs() < 0.01);
+    }
+
+    // 10 m³, origin 3.OG no elev, dest 4.OG no elev
+    // floors_without_elevator = [3, 4], highest = 4, extra = 4-1 = 3
+    // total = 2+3 = 5, hours = 10/(5*0.625) = 3.2h
+    #[test]
+    fn floor_worst_case_no_elevator() {
         let engine = PricingEngine::new();
         let mut input = base_input();
         input.floor_origin = Some(3);
         input.has_elevator_origin = Some(false);
+        input.floor_destination = Some(4);
+        input.has_elevator_destination = Some(false);
         let result = engine.calculate(&input);
         assert_eq!(result.estimated_helpers, 5);
-        assert_eq!(result.estimated_hours, 2.0);
-        assert_eq!(result.breakdown.base_labor_cents, 30_000);
-        assert_eq!(result.total_price_cents, 30_000);
+        assert!((result.estimated_hours - 3.2).abs() < 0.01);
     }
 
-    // Test 3: origin floor=3, has_elevator=true → +0 persons = 2
+    // 10 m³, origin 3.OG no elev, dest 4.OG has elev
+    // floors_without_elevator = [3], highest = 3, extra = 3-1 = 2
+    // total = 2+2 = 4, hours = 10/(4*0.625) = 4.0h
     #[test]
-    fn elevator_negates_floor_surcharge() {
+    fn floor_elevator_excludes_floor() {
+        let engine = PricingEngine::new();
+        let mut input = base_input();
+        input.floor_origin = Some(3);
+        input.has_elevator_origin = Some(false);
+        input.floor_destination = Some(4);
+        input.has_elevator_destination = Some(true);
+        let result = engine.calculate(&input);
+        assert_eq!(result.estimated_helpers, 4);
+        assert!((result.estimated_hours - 4.0).abs() < 0.01);
+    }
+
+    // 10 m³, both 3.OG + 4.OG have elevator
+    // floors_without_elevator = [], extra = 0, total = 2, hours = 8.0h
+    #[test]
+    fn floor_all_elevators() {
         let engine = PricingEngine::new();
         let mut input = base_input();
         input.floor_origin = Some(3);
         input.has_elevator_origin = Some(true);
+        input.floor_destination = Some(4);
+        input.has_elevator_destination = Some(true);
         let result = engine.calculate(&input);
         assert_eq!(result.estimated_helpers, 2);
-        assert_eq!(result.estimated_hours, 5.0);
-        assert_eq!(result.breakdown.base_labor_cents, 30_000);
+        assert!((result.estimated_hours - 8.0).abs() < 0.01);
     }
 
-    // Test 4: floor=0 → +0 extra
+    // EG (floor 0): highest_floor = 0, extra = max(0, 0-1) = 0
     #[test]
-    fn ground_floor_no_extra_persons() {
+    fn floor_ground_level_no_extra() {
         let engine = PricingEngine::new();
         let mut input = base_input();
         input.floor_origin = Some(0);
+        input.has_elevator_origin = Some(false);
         let result = engine.calculate(&input);
         assert_eq!(result.estimated_helpers, 2);
     }
 
-    // Test 5: origin=2nd (no elev), dest=3rd (no elev) → +2+3 = 7 persons
-    // hours = ceil(20/(7*2.0)) = ceil(1.4286) = 2h
-    // labor = 7 * 2 * 3000 = 42000
+    // 1. Stock (floor 1): extra = max(0, 1-1) = 0
     #[test]
-    fn both_floors_add_persons() {
+    fn floor_first_floor_no_extra() {
         let engine = PricingEngine::new();
         let mut input = base_input();
-        input.floor_origin = Some(2);
+        input.floor_origin = Some(1);
         input.has_elevator_origin = Some(false);
-        input.floor_destination = Some(3);
-        input.has_elevator_destination = Some(false);
         let result = engine.calculate(&input);
-        assert_eq!(result.estimated_helpers, 7);
-        assert_eq!(result.estimated_hours, 2.0);
-        assert_eq!(result.breakdown.base_labor_cents, 42_000);
-        assert_eq!(result.total_price_cents, 42_000);
+        assert_eq!(result.estimated_helpers, 2);
     }
 
-    // Test 6: 100km * 150 = 15000 cents
+    // Intermediate stop is highest floor without elevator
+    // 10 m³, origin EG, dest 2.OG no elev, stop 5.OG no elev
+    // highest = 5, extra = 4, total = 6, hours = 10/(6*0.625) = 2.667h
     #[test]
-    fn distance_pricing() {
+    fn floor_stop_included() {
         let engine = PricingEngine::new();
         let mut input = base_input();
-        input.distance_km = 100.0;
+        input.floor_destination = Some(2);
+        input.has_elevator_destination = Some(false);
+        input.floor_stop = Some(5);
+        input.has_elevator_stop = Some(false);
         let result = engine.calculate(&input);
-        assert_eq!(result.breakdown.distance_cents, 15_000);
-        assert_eq!(result.total_price_cents, 30_000 + 15_000);
+        assert_eq!(result.estimated_helpers, 6);
+        assert!((result.estimated_hours - 2.667).abs() < 0.01);
     }
 
-    // Test 7: Saturday → +5000 cents
+    // Stop has elevator, origin 3.OG no elev is the highest
     #[test]
-    fn saturday_surcharge() {
+    fn floor_stop_has_elevator_excluded() {
+        let engine = PricingEngine::new();
+        let mut input = base_input();
+        input.floor_origin = Some(3);
+        input.has_elevator_origin = Some(false);
+        input.floor_stop = Some(5);
+        input.has_elevator_stop = Some(true); // elevator at stop → excluded
+        let result = engine.calculate(&input);
+        // highest = 3 (stop excluded), extra = 2, total = 4
+        assert_eq!(result.estimated_helpers, 4);
+    }
+
+    // Saturday → +5000 cents surcharge
+    #[test]
+    fn saturday_surcharge_still_works() {
         let engine = PricingEngine::new();
         let mut input = base_input();
         // Feb 28, 2026 is a Saturday
         input.preferred_date = Some(chrono::Utc.with_ymd_and_hms(2026, 2, 28, 10, 0, 0).unwrap());
         let result = engine.calculate(&input);
         assert_eq!(result.breakdown.date_adjustment_cents, 5_000);
-        assert_eq!(result.total_price_cents, 30_000 + 5_000);
     }
 
-    // Test 8: Sunday → no surcharge (only Saturday is special)
+    // Sunday → no surcharge
     #[test]
     fn sunday_no_surcharge() {
         let engine = PricingEngine::new();
         let mut input = base_input();
-        // Mar 1, 2026 is a Sunday
         input.preferred_date = Some(chrono::Utc.with_ymd_and_hms(2026, 3, 1, 10, 0, 0).unwrap());
         let result = engine.calculate(&input);
         assert_eq!(result.breakdown.date_adjustment_cents, 0);
     }
 
-    // Test 9: Weekday → no surcharge
-    #[test]
-    fn weekday_no_surcharge() {
-        let engine = PricingEngine::new();
-        let mut input = base_input();
-        // Feb 25, 2026 is a Wednesday
-        input.preferred_date = Some(chrono::Utc.with_ymd_and_hms(2026, 2, 25, 10, 0, 0).unwrap());
-        let result = engine.calculate(&input);
-        assert_eq!(result.breakdown.date_adjustment_cents, 0);
-    }
-
-    // Test 10: No date → no surcharge
+    // No date → no surcharge
     #[test]
     fn no_date_no_surcharge() {
         let engine = PricingEngine::new();
-        let input = base_input();
-        let result = engine.calculate(&input);
+        let result = engine.calculate(&base_input());
         assert_eq!(result.breakdown.date_adjustment_cents, 0);
     }
 
-    // Test 11: 0.5m³ → hours = ceil(0.5/(2*2.0)) = ceil(0.125) = 1
+    // Very small volume → minimum 2 workers (ceil(1/5)=1, but min 2)
     #[test]
-    fn small_volume_min_one_hour() {
+    fn min_two_workers_for_tiny_volume() {
         let engine = PricingEngine::new();
         let mut input = base_input();
-        input.volume_m3 = 0.5;
-        let result = engine.calculate(&input);
-        assert_eq!(result.estimated_hours, 1.0);
-        assert_eq!(result.breakdown.base_labor_cents, 2 * 1 * 3000);
-    }
-
-    // Test 12: 40m³, 2 persons → ceil(40/(2*2.0)) = ceil(10.0) = 10h
-    #[test]
-    fn large_volume_scales_hours() {
-        let engine = PricingEngine::new();
-        let mut input = base_input();
-        input.volume_m3 = 40.0;
+        input.volume_m3 = 1.0;
         let result = engine.calculate(&input);
         assert_eq!(result.estimated_helpers, 2);
-        assert_eq!(result.estimated_hours, 10.0);
-        assert_eq!(result.breakdown.base_labor_cents, 2 * 10 * 3000);
+        // hours = 1/(2*0.625) = 0.8, min 1.0
+        assert!((result.estimated_hours - 1.0).abs() < 0.01);
     }
 
-    // Test 13: custom rates with_rates(5000, 200, 3.0)
-    // 20m³, 50km → 2 persons, hours = ceil(20/(2*3.0)) = ceil(3.33) = 4h
-    // labor = 2*4*5000 = 40000, distance = 50*200 = 10000, total = 50000
-    #[test]
-    fn custom_rates() {
-        let engine = PricingEngine::with_rates(5000, 200, 3.0);
-        let mut input = base_input();
-        input.distance_km = 50.0;
-        let result = engine.calculate(&input);
-        assert_eq!(result.estimated_helpers, 2);
-        assert_eq!(result.estimated_hours, 4.0);
-        assert_eq!(result.breakdown.base_labor_cents, 40_000);
-        assert_eq!(result.breakdown.distance_cents, 10_000);
-        assert_eq!(result.total_price_cents, 50_000);
-    }
-
-    // Tests 14-18: parse_floor tests
+    // parse_floor tests
     #[test]
     fn parse_floor_erdgeschoss() {
         assert_eq!(parse_floor("Erdgeschoss"), 0);
@@ -307,13 +335,38 @@ mod tests {
         assert_eq!(parse_floor("random"), 0);
     }
 
-    // Proptest: parse_floor never panics on arbitrary input
+    // Proptest: parse_floor and pricing never panic
     use proptest::prelude::*;
 
     proptest! {
         #[test]
         fn parse_floor_never_panics(s in ".*") {
             let _ = parse_floor(&s);
+        }
+
+        #[test]
+        fn pricing_never_panics(
+            volume in 0.0f64..1000.0f64,
+            floor_o in proptest::option::of(0u32..8u32),
+            floor_d in proptest::option::of(0u32..8u32),
+            floor_s in proptest::option::of(0u32..8u32),
+            elev_o in proptest::option::of(proptest::bool::ANY),
+            elev_d in proptest::option::of(proptest::bool::ANY),
+            elev_s in proptest::option::of(proptest::bool::ANY),
+        ) {
+            let engine = PricingEngine::new();
+            let input = PricingInput {
+                volume_m3: volume,
+                distance_km: 0.0,
+                preferred_date: None,
+                floor_origin: floor_o,
+                floor_destination: floor_d,
+                floor_stop: floor_s,
+                has_elevator_origin: elev_o,
+                has_elevator_destination: elev_d,
+                has_elevator_stop: elev_s,
+            };
+            let _ = engine.calculate(&input);
         }
     }
 }

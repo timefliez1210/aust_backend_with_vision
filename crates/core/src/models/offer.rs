@@ -72,6 +72,8 @@ pub struct PricingInput {
     pub floor_destination: Option<u32>,
     pub has_elevator_origin: Option<bool>,
     pub has_elevator_destination: Option<bool>,
+    pub floor_stop: Option<u32>,
+    pub has_elevator_stop: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

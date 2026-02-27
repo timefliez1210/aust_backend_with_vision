@@ -10,7 +10,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use aust_core::models::TokenClaims;
-
+use aust_distance_calculator::{RouteCalculator, RouteRequest};
 use aust_offer_generator::OfferLineItem;
 use crate::orchestrator::parse_items_list_text;
 use crate::routes::offers::{build_offer_with_overrides, parse_detected_items, OfferOverrides, VolumeEstimationRow};
@@ -28,6 +28,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/offers", get(list_offers))
         .route("/offers/{id}", get(get_offer_detail).patch(update_offer))
         .route("/offers/{id}/regenerate", post(regenerate_offer))
+        .route("/offers/{id}/re-estimate", post(re_estimate_offer))
         .route("/offers/{id}/send", post(send_offer))
         .route("/offers/{id}/reject", post(reject_offer))
         .route("/addresses/{id}", patch(update_address))
@@ -665,6 +666,72 @@ struct QuoteDetailOffer {
     created_at: DateTime<Utc>,
 }
 
+/// One estimation batch — used by the frontend to render per-batch delete buttons.
+#[derive(Debug, Serialize)]
+struct EstimationSummary {
+    id: Uuid,
+    method: String,
+    status: String,
+    total_volume_m3: Option<f64>,
+    item_count: usize,
+    created_at: DateTime<Utc>,
+    /// Present for video estimations.
+    source_video_url: Option<String>,
+    /// Present for vision / depth-sensor estimations.
+    source_image_urls: Vec<String>,
+}
+
+/// Full estimation row fetched for admin views.
+#[derive(Debug, sqlx::FromRow)]
+struct AdminEstimationRow {
+    id: Uuid,
+    method: String,
+    status: String,
+    result_data: Option<serde_json::Value>,
+    source_data: serde_json::Value,
+    total_volume_m3: Option<f64>,
+    created_at: DateTime<Utc>,
+}
+
+impl AdminEstimationRow {
+    fn to_summary(&self) -> EstimationSummary {
+        let source_video_url = self.source_data.get("video_s3_key")
+            .and_then(|v| v.as_str())
+            .map(|k| format!("/api/v1/estimates/images/{k}"));
+
+        let source_image_urls: Vec<String> = self.source_data.get("s3_keys")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).map(|k| format!("/api/v1/estimates/images/{k}")).collect())
+            .unwrap_or_default();
+
+        let item_count = self.result_data.as_ref()
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.len())
+            .unwrap_or(0);
+
+        EstimationSummary {
+            id: self.id,
+            method: self.method.clone(),
+            status: self.status.clone(),
+            total_volume_m3: self.total_volume_m3,
+            item_count,
+            created_at: self.created_at,
+            source_video_url,
+            source_image_urls,
+        }
+    }
+
+    /// Convert to the subset that `parse_detected_items()` expects.
+    fn as_vol_estimation_row(&self) -> VolumeEstimationRow {
+        VolumeEstimationRow {
+            result_data: self.result_data.clone(),
+            source_data: Some(self.source_data.clone()),
+            total_volume_m3: self.total_volume_m3,
+            method: self.method.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct QuoteDetailResponse {
     id: Uuid,
@@ -680,6 +747,7 @@ struct QuoteDetailResponse {
     preferred_date: Option<String>,
     notes: Option<String>,
     offer: Option<QuoteDetailOffer>,
+    estimations: Vec<EstimationSummary>,
     items: Vec<OfferDetailItem>,
 }
 
@@ -794,16 +862,20 @@ async fn get_quote_detail(
                             .and_then(|d| d.as_str())
                             .unwrap_or("Sonstiges")
                             .to_string();
+                        let remark = item.get("remark").and_then(|v| v.as_str()).map(String::from);
                         let is_labor = item.get("is_labor").and_then(|b| b.as_bool()).unwrap_or(false);
                         let quantity = item.get("quantity").and_then(|q| q.as_f64()).unwrap_or(1.0);
                         let unit_price = item.get("unit_price").and_then(|p| p.as_f64()).unwrap_or(0.0);
                         let unit_price_cents = (unit_price * 100.0).round() as i64;
-                        let total_cents = if is_labor {
+                        let flat_total = item.get("flat_total").and_then(|v| v.as_f64());
+                        let total_cents = if let Some(ft) = flat_total {
+                            (ft * 100.0).round() as i64
+                        } else if is_labor {
                             (quantity * unit_price * persons as f64 * 100.0).round() as i64
                         } else {
                             (quantity * unit_price * 100.0).round() as i64
                         };
-                        OfferDetailLineItem { label, quantity, unit_price_cents, total_cents, is_labor }
+                        OfferDetailLineItem { label, remark, quantity, unit_price_cents, total_cents, is_labor }
                     })
                     .collect()
             })
@@ -829,12 +901,12 @@ async fn get_quote_detail(
         None
     };
 
-    // Fetch detected items from volume estimations
-    let estimations: Vec<VolumeEstimationRow> = sqlx::query_as(
+    // Fetch all volume estimations (all statuses — frontend needs to see processing/failed too)
+    let est_rows: Vec<AdminEstimationRow> = sqlx::query_as(
         r#"
-        SELECT result_data, source_data, total_volume_m3, method
+        SELECT id, result_data, source_data, total_volume_m3, method, status, created_at
         FROM volume_estimations
-        WHERE quote_id = $1 AND status = 'completed'
+        WHERE quote_id = $1
         ORDER BY created_at
         "#,
     )
@@ -842,14 +914,16 @@ async fn get_quote_detail(
     .fetch_all(&state.db)
     .await?;
 
+    let estimations: Vec<EstimationSummary> = est_rows.iter().map(|e| e.to_summary()).collect();
+
     let mut items: Vec<OfferDetailItem> = Vec::new();
-    for est in &estimations {
-        let detected = parse_detected_items(Some(est));
-        let source_s3_keys: Vec<String> = est
-            .source_data.as_ref()
-            .and_then(|sd| sd.get("s3_keys")?.as_array().map(|arr| {
-                arr.iter().filter_map(|v| v.as_str().map(String::from)).collect()
-            }))
+    for est in &est_rows {
+        if est.status != "completed" { continue; }
+        let vol_row = est.as_vol_estimation_row();
+        let detected = parse_detected_items(Some(&vol_row));
+        let source_s3_keys: Vec<String> = est.source_data.get("s3_keys")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
             .unwrap_or_default();
         for d in &detected {
             let crop_url = d.crop_s3_key.as_ref().map(|k| format!("/api/v1/estimates/images/{k}"));
@@ -881,6 +955,7 @@ async fn get_quote_detail(
         preferred_date,
         notes: row.notes,
         offer,
+        estimations,
         items,
     }))
 }
@@ -973,6 +1048,7 @@ struct OfferDetailResponse {
     valid_until: Option<NaiveDate>,
     pdf_url: Option<String>,
     created_at: DateTime<Utc>,
+    estimations: Vec<EstimationSummary>,
     items: Vec<OfferDetailItem>,
     email_subject: String,
     email_body: String,
@@ -981,6 +1057,7 @@ struct OfferDetailResponse {
 #[derive(Debug, Serialize)]
 struct OfferDetailLineItem {
     label: String,
+    remark: Option<String>,
     quantity: f64,
     unit_price_cents: i64,
     total_cents: i64,
@@ -1071,6 +1148,7 @@ async fn get_offer_detail(
                         .unwrap_or("Sonstiges")
                         .to_string();
                     let is_labor = item.get("is_labor").and_then(|b| b.as_bool()).unwrap_or(false);
+                    let remark = item.get("remark").and_then(|v| v.as_str()).map(String::from);
                     let quantity = item.get("quantity").and_then(|q| q.as_f64()).unwrap_or(1.0);
                     let unit_price = item.get("unit_price").and_then(|p| p.as_f64()).unwrap_or(0.0);
                     let unit_price_cents = (unit_price * 100.0).round() as i64;
@@ -1081,6 +1159,7 @@ async fn get_offer_detail(
                     };
                     OfferDetailLineItem {
                         label,
+                        remark,
                         quantity,
                         unit_price_cents,
                         total_cents,
@@ -1091,12 +1170,12 @@ async fn get_offer_detail(
         })
         .unwrap_or_default();
 
-    // Fetch detected items from all completed volume estimations
-    let estimations: Vec<VolumeEstimationRow> = sqlx::query_as(
+    // Fetch all volume estimations for this quote (all statuses)
+    let est_rows: Vec<AdminEstimationRow> = sqlx::query_as(
         r#"
-        SELECT result_data, source_data, total_volume_m3, method
+        SELECT id, result_data, source_data, total_volume_m3, method, status, created_at
         FROM volume_estimations
-        WHERE quote_id = $1 AND status = 'completed'
+        WHERE quote_id = $1
         ORDER BY created_at
         "#,
     )
@@ -1104,14 +1183,16 @@ async fn get_offer_detail(
     .fetch_all(&state.db)
     .await?;
 
+    let estimations: Vec<EstimationSummary> = est_rows.iter().map(|e| e.to_summary()).collect();
+
     let mut items: Vec<OfferDetailItem> = Vec::new();
-    for est in &estimations {
-        let detected = parse_detected_items(Some(est));
-        let source_s3_keys: Vec<String> = est
-            .source_data.as_ref()
-            .and_then(|sd| sd.get("s3_keys")?.as_array().map(|arr| {
-                arr.iter().filter_map(|v| v.as_str().map(String::from)).collect()
-            }))
+    for est in &est_rows {
+        if est.status != "completed" { continue; }
+        let vol_row = est.as_vol_estimation_row();
+        let detected = parse_detected_items(Some(&vol_row));
+        let source_s3_keys: Vec<String> = est.source_data.get("s3_keys")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
             .unwrap_or_default();
         for d in &detected {
             let crop_url = d.crop_s3_key.as_ref().map(|k| format!("/api/v1/estimates/images/{k}"));
@@ -1173,6 +1254,7 @@ async fn get_offer_detail(
         valid_until: row.valid_until,
         pdf_url,
         created_at: row.created_at,
+        estimations,
         items,
         email_subject,
         email_body,
@@ -1269,6 +1351,8 @@ struct RegenerateLineItem {
     description: String,
     quantity: f64,
     unit_price: f64,
+    #[serde(default)]
+    remark: Option<String>,
 }
 
 async fn regenerate_offer(
@@ -1286,16 +1370,6 @@ async fn regenerate_offer(
     let (quote_id,) =
         row.ok_or_else(|| ApiError::NotFound(format!("Angebot {id} nicht gefunden")))?;
 
-    sqlx::query("DELETE FROM offers WHERE id = $1")
-        .bind(id)
-        .execute(&state.db)
-        .await?;
-
-    sqlx::query("UPDATE quotes SET status = 'volume_estimated' WHERE id = $1")
-        .bind(quote_id)
-        .execute(&state.db)
-        .await?;
-
     let overrides = OfferOverrides {
         price_cents: request.price_cents,
         persons: request.persons,
@@ -1308,14 +1382,16 @@ async fn regenerate_offer(
                     description: li.description,
                     quantity: li.quantity,
                     unit_price: li.unit_price,
+                    remark: li.remark,
                     ..Default::default()
                 })
                 .collect()
         }),
+        existing_offer_id: Some(id),
     };
 
     let generated =
-        build_offer_with_overrides(&state.db, &*state.storage, quote_id, Some(30), &overrides)
+        build_offer_with_overrides(&state.db, &*state.storage, &state.config, quote_id, Some(30), &overrides)
             .await?;
 
     Ok(Json(serde_json::json!({
@@ -1324,6 +1400,96 @@ async fn regenerate_offer(
         "price_cents": generated.offer.price_cents,
         "status": "draft",
         "created_at": generated.offer.created_at,
+    })))
+}
+
+/// Re-estimate an offer: refresh distance from ORS, recalculate pricing, and regenerate the PDF
+/// while keeping the same offer ID and offer number.
+async fn re_estimate_offer(
+    State(state): State<Arc<AppState>>,
+    Extension(_claims): Extension<TokenClaims>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // 1. Fetch offer → quote_id
+    let row: Option<(Uuid,)> =
+        sqlx::query_as("SELECT quote_id FROM offers WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await?;
+    let (quote_id,) =
+        row.ok_or_else(|| ApiError::NotFound(format!("Angebot {id} nicht gefunden")))?;
+
+    // 2. Fetch quote origin and destination addresses for distance recalculation
+    let addr_row: Option<(Option<Uuid>, Option<Uuid>)> = sqlx::query_as(
+        "SELECT origin_address_id, destination_address_id FROM quotes WHERE id = $1",
+    )
+    .bind(quote_id)
+    .fetch_optional(&state.db)
+    .await?;
+
+    if let Some((Some(origin_id), Some(dest_id))) = addr_row {
+        #[derive(sqlx::FromRow)]
+        struct AddrRow { street: String, city: String, postal_code: Option<String> }
+
+        let origin: Option<AddrRow> = sqlx::query_as(
+            "SELECT street, city, postal_code FROM addresses WHERE id = $1",
+        )
+        .bind(origin_id)
+        .fetch_optional(&state.db)
+        .await?;
+
+        let dest: Option<AddrRow> = sqlx::query_as(
+            "SELECT street, city, postal_code FROM addresses WHERE id = $1",
+        )
+        .bind(dest_id)
+        .fetch_optional(&state.db)
+        .await?;
+
+        if let (Some(o), Some(d)) = (origin, dest) {
+            let fmt = |a: &AddrRow| -> String {
+                format!(
+                    "{}, {}{}",
+                    a.street,
+                    a.postal_code.as_deref().map(|p| format!("{p} ")).unwrap_or_default(),
+                    a.city
+                )
+            };
+            let origin_str = fmt(&o);
+            let dest_str = fmt(&d);
+
+            let calculator = RouteCalculator::new(state.config.maps.api_key.clone());
+            match calculator.calculate(&RouteRequest { addresses: vec![origin_str, dest_str] }).await {
+                Ok(result) => {
+                    sqlx::query("UPDATE quotes SET distance_km = $1, updated_at = $2 WHERE id = $3")
+                        .bind(result.total_distance_km)
+                        .bind(chrono::Utc::now())
+                        .bind(quote_id)
+                        .execute(&state.db)
+                        .await?;
+                }
+                Err(e) => {
+                    tracing::warn!(quote_id = %quote_id, error = %e, "re-estimate: distance calculation failed, keeping existing distance");
+                }
+            }
+        }
+    }
+
+    // 3. Regenerate offer in-place (keeps same ID, offer_number, recalculates everything else)
+    let overrides = OfferOverrides {
+        existing_offer_id: Some(id),
+        ..Default::default()
+    };
+
+    let generated =
+        build_offer_with_overrides(&state.db, &*state.storage, &state.config, quote_id, Some(30), &overrides)
+            .await?;
+
+    Ok(Json(serde_json::json!({
+        "id": generated.offer.id,
+        "quote_id": generated.offer.quote_id,
+        "price_cents": generated.offer.price_cents,
+        "status": "draft",
+        "offer_number": generated.offer.offer_number,
     })))
 }
 

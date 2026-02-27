@@ -18,17 +18,23 @@ struct FormSubmission {
     etage_auszug: Option<String>,
     #[serde(rename = "halteverbot-auszug")]
     halteverbot_auszug: Option<String>,
+    #[serde(rename = "aufzug-auszug")]
+    aufzug_auszug: Option<String>,
     einzugsadresse: Option<String>,
     #[serde(rename = "etage-einzug")]
     etage_einzug: Option<String>,
     #[serde(rename = "halteverbot-einzug")]
     halteverbot_einzug: Option<String>,
+    #[serde(rename = "aufzug-einzug")]
+    aufzug_einzug: Option<String>,
     #[serde(rename = "zwischenstopp-adresse")]
     zwischenstopp_adresse: Option<String>,
     #[serde(rename = "etage-zwischenstopp")]
     etage_zwischenstopp: Option<String>,
     #[serde(rename = "halteverbot-zwischenstopp")]
     halteverbot_zwischenstopp: Option<String>,
+    #[serde(rename = "aufzug-zwischenstopp")]
+    aufzug_zwischenstopp: Option<String>,
     #[serde(rename = "umzugsvolumen-m3")]
     umzugsvolumen_m3: Option<String>,
     #[serde(rename = "gegenstaende-liste")]
@@ -150,13 +156,16 @@ impl EmailParser {
             departure_address: form.auszugsadresse,
             departure_floor: form.etage_auszug,
             departure_parking_ban: Some(form.halteverbot_auszug.as_deref() == Some("on")),
+            departure_elevator: Some(form.aufzug_auszug.as_deref() == Some("on")),
             has_intermediate_stop: has_intermediate,
             intermediate_address: form.zwischenstopp_adresse,
             intermediate_floor: form.etage_zwischenstopp,
             intermediate_parking_ban: Some(form.halteverbot_zwischenstopp.as_deref() == Some("on")),
+            intermediate_elevator: Some(form.aufzug_zwischenstopp.as_deref() == Some("on")),
             arrival_address: form.einzugsadresse,
             arrival_floor: form.etage_einzug,
             arrival_parking_ban: Some(form.halteverbot_einzug.as_deref() == Some("on")),
+            arrival_elevator: Some(form.aufzug_einzug.as_deref() == Some("on")),
             volume_m3,
             items_list: form.gegenstaende_liste,
             has_photos,
@@ -273,13 +282,16 @@ impl EmailParser {
             departure_address,
             departure_floor,
             departure_parking_ban,
+            departure_elevator: None, // not captured in text-form emails
             has_intermediate_stop,
             intermediate_address,
             intermediate_floor,
             intermediate_parking_ban,
+            intermediate_elevator: None,
             arrival_address,
             arrival_floor,
             arrival_parking_ban,
+            arrival_elevator: None,
             volume_m3,
             items_list,
             has_photos,
