@@ -54,19 +54,76 @@ pub async fn try_auto_generate_offer(state: Arc<AppState>, quote_id: Uuid) {
         return;
     }
 
-    // Check that the quote has a volume estimate (minimum requirement)
-    let has_volume: Option<(Option<f64>,)> =
-        sqlx::query_as("SELECT estimated_volume_m3 FROM quotes WHERE id = $1")
-            .bind(quote_id)
-            .fetch_optional(&state.db)
-            .await
-            .unwrap_or(None);
+    // Check that the quote has a volume estimate (minimum requirement); also fetch distance/addresses
+    #[derive(sqlx::FromRow)]
+    struct QuoteReadiness {
+        estimated_volume_m3: Option<f64>,
+        distance_km: Option<f64>,
+        origin_address_id: Option<Uuid>,
+        destination_address_id: Option<Uuid>,
+        stop_address_id: Option<Uuid>,
+    }
+    let readiness: Option<QuoteReadiness> = sqlx::query_as(
+        "SELECT estimated_volume_m3, distance_km, origin_address_id, destination_address_id, stop_address_id FROM quotes WHERE id = $1",
+    )
+    .bind(quote_id)
+    .fetch_optional(&state.db)
+    .await
+    .unwrap_or(None);
 
-    match has_volume {
-        Some((Some(vol),)) if vol > 0.0 => {}
+    let q = match readiness {
+        Some(r) if r.estimated_volume_m3.unwrap_or(0.0) > 0.0 => r,
         _ => {
             info!("Quote {quote_id} not ready for offer (no volume estimate)");
             return;
+        }
+    };
+
+    // Auto-calculate distance if both addresses are present and distance is still 0/missing
+    if q.distance_km.unwrap_or(0.0) == 0.0 {
+        if let (Some(origin_id), Some(dest_id)) = (q.origin_address_id, q.destination_address_id) {
+            #[derive(sqlx::FromRow)]
+            struct AddrStr { street: String, city: String, postal_code: Option<String> }
+            let fetch_addr = |id: Uuid| {
+                let db = state.db.clone();
+                async move {
+                    sqlx::query_as::<_, AddrStr>("SELECT street, city, postal_code FROM addresses WHERE id = $1")
+                        .bind(id)
+                        .fetch_optional(&db)
+                        .await
+                        .ok()
+                        .flatten()
+                }
+            };
+            let fmt_addr = |a: &AddrStr| format!(
+                "{}, {}{}",
+                a.street,
+                a.postal_code.as_deref().map(|p| format!("{p} ")).unwrap_or_default(),
+                a.city
+            );
+
+            if let (Some(origin), Some(dest)) = (fetch_addr(origin_id).await, fetch_addr(dest_id).await) {
+                let mut route_addresses = vec![fmt_addr(&origin)];
+                if let Some(stop_id) = q.stop_address_id {
+                    if let Some(stop) = fetch_addr(stop_id).await {
+                        route_addresses.push(fmt_addr(&stop));
+                    }
+                }
+                route_addresses.push(fmt_addr(&dest));
+
+                let calculator = RouteCalculator::new(state.config.maps.api_key.clone());
+                match calculator.calculate(&RouteRequest { addresses: route_addresses }).await {
+                    Ok(result) => {
+                        info!("Distance calculated for quote {quote_id}: {:.1} km", result.total_distance_km);
+                        let _ = sqlx::query("UPDATE quotes SET distance_km = $1, updated_at = NOW() WHERE id = $2")
+                            .bind(result.total_distance_km)
+                            .bind(quote_id)
+                            .execute(&state.db)
+                            .await;
+                    }
+                    Err(e) => warn!("Distance calculation for quote {quote_id} failed: {e}"),
+                }
+            }
         }
     }
 
@@ -662,7 +719,7 @@ async fn handle_complete_inquiry(
         })
         .flatten();
 
-    let _ = sqlx::query(
+    if let Err(e) = sqlx::query(
         r#"
         INSERT INTO volume_estimations (id, quote_id, method, source_data, result_data, total_volume_m3, confidence_score, created_at)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
@@ -677,7 +734,10 @@ async fn handle_complete_inquiry(
     .bind(0.5f64) // lower confidence for rough estimate
     .bind(now)
     .execute(&state.db)
-    .await;
+    .await
+    {
+        warn!("Failed to insert volume_estimations for quote {quote_id}: {e}");
+    }
 
     info!(
         "Created quote {quote_id} for customer {} ({}) — {:.1} m³",
@@ -1097,13 +1157,15 @@ fn parse_edit_instructions(text: &str) -> EditOverrides {
         let segment = segment.trim();
 
         // Price: "preis auf 800", "800 euro", "800€", "preis: 800", "350 brutto"
+        // Bare prices ("800 euro", "800€", "preis 800") are always treated as brutto — consistent with LLM path.
+        // Only explicit "netto" keeps the value as-is.
         if segment.contains("preis") || segment.contains('€') || segment.contains("euro") || segment.contains("brutto") || segment.contains("netto") {
             if let Some(num) = extract_number(segment) {
-                let cents = if segment.contains("brutto") {
-                    // Convert brutto to netto (remove 19% USt)
-                    ((num / 1.19) * 100.0) as i64
-                } else {
+                let cents = if segment.contains("netto") {
                     (num * 100.0) as i64
+                } else {
+                    // Default: treat as brutto → convert to netto
+                    ((num / 1.19) * 100.0) as i64
                 };
                 overrides.price_cents = Some(cents);
             }

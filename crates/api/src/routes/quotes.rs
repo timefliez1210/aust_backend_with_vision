@@ -151,6 +151,7 @@ struct QuoteOffer {
 #[derive(Debug, Serialize)]
 struct OfferLineItemDetail {
     label: String,
+    remark: Option<String>,
     quantity: f64,
     unit_price_cents: i64,
     total_cents: i64,
@@ -375,16 +376,20 @@ async fn get_quote(
                 .map(|items| {
                     items.iter().map(|item| {
                         let label = item.get("description").and_then(|d| d.as_str()).unwrap_or("Sonstiges").to_string();
+                        let remark = item.get("remark").and_then(|r| r.as_str()).map(String::from);
                         let is_labor = item.get("is_labor").and_then(|b| b.as_bool()).unwrap_or(false);
                         let quantity = item.get("quantity").and_then(|q| q.as_f64()).unwrap_or(1.0);
                         let unit_price = item.get("unit_price").and_then(|p| p.as_f64()).unwrap_or(0.0);
                         let unit_price_cents = (unit_price * 100.0).round() as i64;
-                        let total_cents = if is_labor {
+                        let flat_total = item.get("flat_total").and_then(|v| v.as_f64());
+                        let total_cents = if let Some(ft) = flat_total {
+                            (ft * 100.0).round() as i64
+                        } else if is_labor {
                             (quantity * unit_price * persons as f64 * 100.0).round() as i64
                         } else {
                             (quantity * unit_price * 100.0).round() as i64
                         };
-                        OfferLineItemDetail { label, quantity, unit_price_cents, total_cents, is_labor }
+                        OfferLineItemDetail { label, remark, quantity, unit_price_cents, total_cents, is_labor }
                     }).collect()
                 })
                 .unwrap_or_default();

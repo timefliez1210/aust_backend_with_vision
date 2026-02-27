@@ -1419,17 +1419,31 @@ async fn re_estimate_offer(
     let (quote_id,) =
         row.ok_or_else(|| ApiError::NotFound(format!("Angebot {id} nicht gefunden")))?;
 
-    // 2. Fetch quote origin and destination addresses for distance recalculation
-    let addr_row: Option<(Option<Uuid>, Option<Uuid>)> = sqlx::query_as(
-        "SELECT origin_address_id, destination_address_id FROM quotes WHERE id = $1",
+    // 2. Fetch quote origin, destination and stop addresses for distance recalculation
+    #[derive(sqlx::FromRow)]
+    struct QuoteAddrIds {
+        origin_address_id: Option<Uuid>,
+        destination_address_id: Option<Uuid>,
+        stop_address_id: Option<Uuid>,
+    }
+    let addr_row: Option<QuoteAddrIds> = sqlx::query_as(
+        "SELECT origin_address_id, destination_address_id, stop_address_id FROM quotes WHERE id = $1",
     )
     .bind(quote_id)
     .fetch_optional(&state.db)
     .await?;
 
-    if let Some((Some(origin_id), Some(dest_id))) = addr_row {
+    if let Some(QuoteAddrIds { origin_address_id: Some(origin_id), destination_address_id: Some(dest_id), stop_address_id }) = addr_row {
         #[derive(sqlx::FromRow)]
         struct AddrRow { street: String, city: String, postal_code: Option<String> }
+        let fmt = |a: &AddrRow| -> String {
+            format!(
+                "{}, {}{}",
+                a.street,
+                a.postal_code.as_deref().map(|p| format!("{p} ")).unwrap_or_default(),
+                a.city
+            )
+        };
 
         let origin: Option<AddrRow> = sqlx::query_as(
             "SELECT street, city, postal_code FROM addresses WHERE id = $1",
@@ -1446,19 +1460,22 @@ async fn re_estimate_offer(
         .await?;
 
         if let (Some(o), Some(d)) = (origin, dest) {
-            let fmt = |a: &AddrRow| -> String {
-                format!(
-                    "{}, {}{}",
-                    a.street,
-                    a.postal_code.as_deref().map(|p| format!("{p} ")).unwrap_or_default(),
-                    a.city
+            let mut route_addresses = vec![fmt(&o)];
+            if let Some(stop_id) = stop_address_id {
+                let stop: Option<AddrRow> = sqlx::query_as(
+                    "SELECT street, city, postal_code FROM addresses WHERE id = $1",
                 )
-            };
-            let origin_str = fmt(&o);
-            let dest_str = fmt(&d);
+                .bind(stop_id)
+                .fetch_optional(&state.db)
+                .await?;
+                if let Some(s) = stop {
+                    route_addresses.push(fmt(&s));
+                }
+            }
+            route_addresses.push(fmt(&d));
 
             let calculator = RouteCalculator::new(state.config.maps.api_key.clone());
-            match calculator.calculate(&RouteRequest { addresses: vec![origin_str, dest_str] }).await {
+            match calculator.calculate(&RouteRequest { addresses: route_addresses }).await {
                 Ok(result) => {
                     sqlx::query("UPDATE quotes SET distance_km = $1, updated_at = $2 WHERE id = $3")
                         .bind(result.total_distance_km)
