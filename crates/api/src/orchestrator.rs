@@ -1698,4 +1698,110 @@ mod tests {
         assert!(notes.contains("Entsorgung"), "notes = {notes}");
         assert!(notes.contains("Klavier im 1. OG"), "notes = {notes}");
     }
+
+    // ========== parse_edit_instructions ==========
+    // These tests would have caught the brutto/netto bug: before the fix,
+    // "800 Euro" and "800€" were treated as netto (×100), not brutto (÷1.19×100).
+
+    fn brutto_to_netto_cents(brutto: f64) -> i64 {
+        ((brutto / 1.19) * 100.0) as i64
+    }
+
+    #[test]
+    fn edit_bare_euro_word_is_brutto() {
+        // "800 Euro" — no qualifier → must be treated as brutto
+        let o = parse_edit_instructions("800 Euro");
+        assert_eq!(o.price_cents, Some(brutto_to_netto_cents(800.0)),
+            "bare 'euro' must be brutto; before fix it returned 80000 (netto) instead of ~67226");
+    }
+
+    #[test]
+    fn edit_euro_symbol_is_brutto() {
+        let o = parse_edit_instructions("800€");
+        assert_eq!(o.price_cents, Some(brutto_to_netto_cents(800.0)));
+    }
+
+    #[test]
+    fn edit_preis_keyword_without_qualifier_is_brutto() {
+        let o = parse_edit_instructions("Preis 500");
+        assert_eq!(o.price_cents, Some(brutto_to_netto_cents(500.0)));
+    }
+
+    #[test]
+    fn edit_explicit_brutto_converts() {
+        let o = parse_edit_instructions("350 brutto");
+        assert_eq!(o.price_cents, Some(brutto_to_netto_cents(350.0)));
+    }
+
+    #[test]
+    fn edit_explicit_netto_keeps_value() {
+        // "800 netto" → 80000 cents exactly (no division)
+        let o = parse_edit_instructions("800 netto");
+        assert_eq!(o.price_cents, Some(80000));
+    }
+
+    #[test]
+    fn edit_persons_helfer() {
+        let o = parse_edit_instructions("4 Helfer");
+        assert_eq!(o.persons, Some(4));
+        assert!(o.price_cents.is_none(), "persons keyword must not set price");
+    }
+
+    #[test]
+    fn edit_persons_mann() {
+        let o = parse_edit_instructions("3 Mann");
+        assert_eq!(o.persons, Some(3));
+    }
+
+    #[test]
+    fn edit_hours_stunden() {
+        let o = parse_edit_instructions("6 Stunden");
+        assert!((o.hours.unwrap_or(0.0) - 6.0).abs() < 0.001);
+        assert!(o.price_cents.is_none());
+    }
+
+    #[test]
+    fn edit_rate_stundensatz() {
+        let o = parse_edit_instructions("Stundensatz 35");
+        assert!((o.rate.unwrap_or(0.0) - 35.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn edit_volume_m3() {
+        let o = parse_edit_instructions("15 m³");
+        assert!((o.volume_m3.unwrap_or(0.0) - 15.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn edit_combined_all_fields() {
+        let o = parse_edit_instructions("800 Euro, 4 Helfer, 6 Stunden");
+        assert_eq!(o.price_cents, Some(brutto_to_netto_cents(800.0)));
+        assert_eq!(o.persons, Some(4));
+        assert!((o.hours.unwrap_or(0.0) - 6.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn edit_empty_input_all_none() {
+        let o = parse_edit_instructions("");
+        assert!(o.price_cents.is_none());
+        assert!(o.persons.is_none());
+        assert!(o.hours.is_none());
+        assert!(o.rate.is_none());
+        assert!(o.volume_m3.is_none());
+    }
+
+    #[test]
+    fn edit_no_numbers_all_none() {
+        let o = parse_edit_instructions("mach es ein bisschen schöner bitte");
+        assert!(o.price_cents.is_none());
+        assert!(o.persons.is_none());
+    }
+
+    #[test]
+    fn edit_netto_and_brutto_in_same_segment_netto_wins() {
+        // Pathological but must not panic; "netto" check comes first
+        let o = parse_edit_instructions("800 brutto netto");
+        // "netto" is present → netto path
+        assert_eq!(o.price_cents, Some(80000));
+    }
 }

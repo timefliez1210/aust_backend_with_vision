@@ -374,23 +374,7 @@ async fn get_quote(
             let line_items: Vec<OfferLineItemDetail> = r.line_items_json
                 .and_then(|json| serde_json::from_value::<Vec<serde_json::Value>>(json).ok())
                 .map(|items| {
-                    items.iter().map(|item| {
-                        let label = item.get("description").and_then(|d| d.as_str()).unwrap_or("Sonstiges").to_string();
-                        let remark = item.get("remark").and_then(|r| r.as_str()).map(String::from);
-                        let is_labor = item.get("is_labor").and_then(|b| b.as_bool()).unwrap_or(false);
-                        let quantity = item.get("quantity").and_then(|q| q.as_f64()).unwrap_or(1.0);
-                        let unit_price = item.get("unit_price").and_then(|p| p.as_f64()).unwrap_or(0.0);
-                        let unit_price_cents = (unit_price * 100.0).round() as i64;
-                        let flat_total = item.get("flat_total").and_then(|v| v.as_f64());
-                        let total_cents = if let Some(ft) = flat_total {
-                            (ft * 100.0).round() as i64
-                        } else if is_labor {
-                            (quantity * unit_price * persons as f64 * 100.0).round() as i64
-                        } else {
-                            (quantity * unit_price * 100.0).round() as i64
-                        };
-                        OfferLineItemDetail { label, remark, quantity, unit_price_cents, total_cents, is_labor }
-                    }).collect()
+                    items.iter().map(|item| map_offer_line_item_detail(item, persons)).collect()
                 })
                 .unwrap_or_default();
             LatestOfferPricing {
@@ -676,4 +660,137 @@ async fn update_estimation_items(
         source_images,
         source_videos: Vec::new(),
     }))
+}
+
+/// Map a raw line_items_json entry into an `OfferLineItemDetail`.
+///
+/// Handles three pricing modes stored in the JSON:
+/// - `flat_total` present: total = flat_total (used for Fahrkostenpauschale)
+/// - `is_labor = true`:    total = quantity × unit_price × persons
+/// - otherwise:            total = quantity × unit_price
+pub(crate) fn map_offer_line_item_detail(item: &serde_json::Value, persons: i32) -> OfferLineItemDetail {
+    let label = item.get("description").and_then(|d| d.as_str()).unwrap_or("Sonstiges").to_string();
+    let remark = item.get("remark").and_then(|r| r.as_str()).map(String::from);
+    let is_labor = item.get("is_labor").and_then(|b| b.as_bool()).unwrap_or(false);
+    let quantity = item.get("quantity").and_then(|q| q.as_f64()).unwrap_or(1.0);
+    let unit_price = item.get("unit_price").and_then(|p| p.as_f64()).unwrap_or(0.0);
+    let unit_price_cents = (unit_price * 100.0).round() as i64;
+    let flat_total = item.get("flat_total").and_then(|v| v.as_f64());
+    let total_cents = if let Some(ft) = flat_total {
+        (ft * 100.0).round() as i64
+    } else if is_labor {
+        (quantity * unit_price * persons as f64 * 100.0).round() as i64
+    } else {
+        (quantity * unit_price * 100.0).round() as i64
+    };
+    OfferLineItemDetail { label, remark, quantity, unit_price_cents, total_cents, is_labor }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // --- map_offer_line_item_detail ---
+    // These tests would have caught the flat_total bug: before the fix,
+    // flat_total was ignored and Fahrkostenpauschale always showed total_cents = 0.
+
+    #[test]
+    fn flat_total_overrides_quantity_times_price() {
+        // Fahrkostenpauschale: quantity=0, unit_price=0, flat_total=45.0 → total=€45
+        let item = json!({
+            "description": "Fahrkostenpauschale",
+            "quantity": 0.0,
+            "unit_price": 0.0,
+            "is_labor": false,
+            "flat_total": 45.0
+        });
+        let detail = map_offer_line_item_detail(&item, 2);
+        assert_eq!(detail.total_cents, 4500, "flat_total 45.0 must yield 4500 cents, not quantity*unit_price");
+        assert_eq!(detail.unit_price_cents, 0, "unit_price_cents should remain 0 (raw storage)");
+        assert!((detail.quantity - 0.0).abs() < 0.001, "quantity should remain 0 (raw storage)");
+    }
+
+    #[test]
+    fn flat_total_zero_yields_zero_total_not_quantity_times_price() {
+        // Nürnbergerversicherung: quantity=1, unit_price=100, flat_total=0 → total=€0
+        // Before fix: total would have been 1 * 100 = €100 (wrong)
+        let item = json!({
+            "description": "Nürnbergerversicherung",
+            "quantity": 1.0,
+            "unit_price": 100.0,
+            "is_labor": false,
+            "flat_total": 0.0
+        });
+        let detail = map_offer_line_item_detail(&item, 2);
+        assert_eq!(detail.total_cents, 0, "flat_total 0.0 must be 0, not quantity*unit_price=10000");
+    }
+
+    #[test]
+    fn labor_item_multiplied_by_persons() {
+        // 3 workers × 8h × €35/h = €840
+        let item = json!({
+            "description": "3 Umzugshelfer",
+            "quantity": 8.0,
+            "unit_price": 35.0,
+            "is_labor": true
+        });
+        let detail = map_offer_line_item_detail(&item, 3);
+        assert_eq!(detail.total_cents, 84000, "labor: 8h × €35 × 3 persons = 84000 cents");
+    }
+
+    #[test]
+    fn regular_item_ignores_persons_count() {
+        // Halteverbotszone: 2 zones × €100 = €200, regardless of persons
+        let item = json!({
+            "description": "Halteverbotszone",
+            "quantity": 2.0,
+            "unit_price": 100.0,
+            "is_labor": false
+        });
+        let detail = map_offer_line_item_detail(&item, 5); // 5 persons — must NOT multiply
+        assert_eq!(detail.total_cents, 20000, "regular item: 2 × €100 = 20000, persons must not factor in");
+    }
+
+    #[test]
+    fn remark_is_preserved() {
+        let item = json!({
+            "description": "Halteverbotszone",
+            "quantity": 1.0,
+            "unit_price": 100.0,
+            "is_labor": false,
+            "remark": "Beladestelle + Entladestelle"
+        });
+        let detail = map_offer_line_item_detail(&item, 2);
+        assert_eq!(detail.remark.as_deref(), Some("Beladestelle + Entladestelle"));
+    }
+
+    #[test]
+    fn missing_remark_field_is_none() {
+        let item = json!({"description": "Demontage", "quantity": 1.0, "unit_price": 50.0, "is_labor": false});
+        let detail = map_offer_line_item_detail(&item, 2);
+        assert_eq!(detail.remark, None);
+    }
+
+    #[test]
+    fn no_flat_total_key_falls_back_to_labor_formula() {
+        // Ensure absence of flat_total key (not just null) uses the labor formula
+        let item = json!({"description": "2 Umzugshelfer", "quantity": 4.0, "unit_price": 30.0, "is_labor": true});
+        let detail = map_offer_line_item_detail(&item, 2);
+        assert_eq!(detail.total_cents, 24000, "4h × €30 × 2 persons = 24000 cents");
+    }
+
+    #[test]
+    fn flat_total_rounding() {
+        // 42.37 km × €1.00/km = €42.37 → 4237 cents (not 4236 due to float)
+        let item = json!({
+            "description": "Fahrkostenpauschale",
+            "quantity": 0.0,
+            "unit_price": 0.0,
+            "is_labor": false,
+            "flat_total": 42.37
+        });
+        let detail = map_offer_line_item_detail(&item, 2);
+        assert_eq!(detail.total_cents, 4237);
+    }
 }
