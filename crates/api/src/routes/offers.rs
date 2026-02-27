@@ -387,20 +387,29 @@ pub async fn build_offer_with_overrides(
         pricing_result.total_price_cents = price;
     }
 
-    // 7. Build line items: use overrides if provided, else derive from quote notes + route
-    let line_items = if let Some(ref items) = overrides.line_items {
-        items.clone()
-    } else {
-        // Compute Fahrkostenpauschale via ORS route: depot→origin→(stop)→dest→depot
-        let fahrt_item = build_fahrt_item(
-            config,
-            origin.as_ref(),
-            destination.as_ref(),
-            stop_address.as_ref(),
-            distance,
-        )
-        .await;
+    // 7. Build line items: Fahrkostenpauschale is ALWAYS re-computed via ORS (never stale),
+    //    then either the custom override items or the auto-generated notes items follow.
+    //    When the frontend sends a line_items override after an edit cycle, any stale
+    //    Fahrkostenpauschale in that list is stripped so the fresh one isn't doubled.
+    let fahrt_item = build_fahrt_item(
+        config,
+        origin.as_ref(),
+        destination.as_ref(),
+        stop_address.as_ref(),
+        distance,
+    )
+    .await;
 
+    let line_items = if let Some(ref items) = overrides.line_items {
+        let mut result = vec![fahrt_item];
+        result.extend(
+            items
+                .iter()
+                .filter(|li| li.description != "Fahrkostenpauschale")
+                .cloned(),
+        );
+        result
+    } else {
         let mut items = vec![fahrt_item];
         items.extend(build_line_items(quote.notes.as_deref()));
         items
