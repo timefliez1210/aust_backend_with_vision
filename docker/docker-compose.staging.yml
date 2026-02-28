@@ -180,11 +180,13 @@ services:
       - "host.docker.internal:host-gateway"
 
   # ── Frontend ───────────────────────────────────────────────────────────────
-  # Built from the alex_aust SvelteKit project sitting next to this repo.
-  # VITE_API_BASE points to the staging backend exposed on port 8099.
+  # Built from the frontend/ git submodule (timefliez1210/aust-umzuege).
+  # Context is the repo root so both frontend/ source and docker/nginx-staging.conf
+  # are accessible in a single build context.
+  # VITE_API_BASE points to the staging backend as seen from the browser.
   staging-frontend:
     build:
-      context: ../../alex_aust
+      context: ..
       dockerfile: docker/Dockerfile.frontend
       args:
         VITE_API_BASE: http://localhost:8099

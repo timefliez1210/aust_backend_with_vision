@@ -1,0 +1,28 @@
+# Overlay for VS Code dev container.
+# Adds the workspace container on top of docker-compose.staging.yml.
+# The staging services (postgres, redis, minio, backend, frontend)
+# are inherited from the base file unchanged.
+
+services:
+  devcontainer:
+    image: mcr.microsoft.com/devcontainers/rust:1-bookworm
+    volumes:
+      - ..:/workspace:cached
+      - cargo-cache:/usr/local/cargo/registry
+      - target-cache:/workspace/target
+    working_dir: /workspace
+    # Keep container alive
+    command: sleep infinity
+    environment:
+      # Point at the staging services (same Docker network)
+      DATABASE_URL: postgres://aust_staging:aust_staging_password@staging-postgres:5432/aust_staging
+      REDIS_URL: redis://staging-redis:6379
+    depends_on:
+      - staging-postgres
+      - staging-redis
+    networks:
+      - default
+
+volumes:
+  cargo-cache:
+  target-cache:

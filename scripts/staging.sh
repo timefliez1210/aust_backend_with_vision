@@ -23,8 +23,8 @@ STAGING_BACKEND_URL="http://localhost:8099"
 STAGING_FRONTEND_URL="http://localhost:4173"
 STAGING_POSTGRES_HOST="localhost"
 STAGING_POSTGRES_PORT="5435"
-STAGING_POSTGRES_USER="aust"
-STAGING_POSTGRES_PASSWORD="aust_staging"
+STAGING_POSTGRES_USER="aust_staging"
+STAGING_POSTGRES_PASSWORD="aust_staging_password"
 STAGING_POSTGRES_DB="aust_staging"
 STAGING_TEST_DB="aust_backend_test"
 STAGING_JWT_SECRET="staging-jwt-secret-do-not-use-in-production-min32chars"
@@ -53,6 +53,24 @@ info()    { printf "${YELLOW}[staging] %s${RESET}\n" "$*"; }
 success() { printf "${GREEN}[staging] %s${RESET}\n" "$*"; }
 error()   { printf "${RED}[staging] ERROR: %s${RESET}\n" "$*" >&2; }
 header()  { printf "\n${BOLD}%s${RESET}\n" "$*"; }
+
+# ---------------------------------------------------------------------------
+# Helper: sync frontend submodule to latest origin/main
+# Always called before `up` so staging always tests the current prod frontend.
+# ---------------------------------------------------------------------------
+sync_frontend() {
+    info "Syncing frontend submodule to latest origin/main..."
+    if [ ! -d "${PROJECT_ROOT}/frontend/.git" ] && [ ! -f "${PROJECT_ROOT}/frontend/.git" ]; then
+        info "  frontend/ submodule not initialised — running git submodule update --init"
+        git -C "${PROJECT_ROOT}" submodule update --init frontend
+    fi
+    git -C "${PROJECT_ROOT}/frontend" fetch origin
+    git -C "${PROJECT_ROOT}/frontend" checkout main
+    git -C "${PROJECT_ROOT}/frontend" pull origin main
+    local sha
+    sha=$(git -C "${PROJECT_ROOT}/frontend" rev-parse --short HEAD)
+    success "Frontend pinned to origin/main @ ${sha}"
+}
 
 # ---------------------------------------------------------------------------
 # Helper: docker compose wrapper
@@ -136,6 +154,7 @@ print_url_box() {
 # ---------------------------------------------------------------------------
 cmd_up() {
     header "=== AUST Staging: UP ==="
+    sync_frontend
     info "Building images and starting all containers..."
 
     dc up -d --build
@@ -199,6 +218,7 @@ cmd_test() {
     local backend_status="SKIP"
     local frontend_status="SKIP"
     local integration_status="SKIP"
+    local e2e_status="SKIP"
 
     # 1. Assert staging is running
     info "Checking staging backend health..."
@@ -271,7 +291,31 @@ cmd_test() {
         fi
     fi
 
-    # 6. Summary
+    # 6. Playwright E2E tests
+    header "--- E2E tests (Playwright) ---"
+    local e2e_dir="${PROJECT_ROOT}/tests/e2e"
+    if [ ! -f "${e2e_dir}/package.json" ]; then
+        info "No Playwright tests found at tests/e2e/ — skipping."
+        e2e_status="SKIP"
+    else
+        # Install Playwright deps if needed (browsers are cached)
+        (cd "${e2e_dir}" && npm ci --silent 2>&1)
+
+        local e2e_exit=0
+        STAGING_URL="${STAGING_BACKEND_URL}" \
+        FRONTEND_URL="${STAGING_FRONTEND_URL}" \
+            npx --prefix "${e2e_dir}" playwright test 2>&1 || e2e_exit=$?
+
+        if [ "${e2e_exit}" -eq 0 ]; then
+            e2e_status="PASS"
+            success "E2E tests: PASS"
+        else
+            e2e_status="FAIL"
+            error "E2E tests: FAIL (exit code ${e2e_exit})"
+        fi
+    fi
+
+    # 7. Summary
     header "=== Test Summary ==="
 
     local overall=0
@@ -289,6 +333,7 @@ cmd_test() {
     _print_result "Backend unit tests"     "${backend_status}"
     _print_result "Frontend unit tests"    "${frontend_status}"
     _print_result "API integration tests"  "${integration_status}"
+    _print_result "E2E tests (Playwright)" "${e2e_status}"
 
     echo ""
     if [ "${overall}" -eq 0 ]; then
@@ -307,7 +352,7 @@ usage() {
     printf "Subcommands:\n"
     printf "  up       Build images, start containers, wait for healthy, print URLs\n"
     printf "  down     Stop all containers (volumes preserved)\n"
-    printf "  test     Run full test suite: backend unit + frontend unit + API integration\n"
+    printf "  test     Run full test suite: backend unit + frontend unit + API integration + Playwright E2E\n"
     printf "  logs     Follow all container logs (Ctrl+C to stop)\n"
     printf "  status   Show container status\n"
     printf "  clean    Stop and DELETE all staging volumes (full reset)\n"

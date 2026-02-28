@@ -1,0 +1,69 @@
+{
+  // Dev container for AUST backend + frontend development.
+  // Provides: Rust toolchain, Node 22, cargo-watch, sqlx-cli,
+  //           and all staging infrastructure via Docker Compose.
+  //
+  // Open in VS Code: "Dev Containers: Reopen in Container"
+  "name": "AUST Backend",
+
+  // Bring up the full staging stack as companion services.
+  // The devcontainer itself is a separate workspace container;
+  // the staging services are accessible at their mapped host ports.
+  "dockerComposeFile": [
+    "../docker/docker-compose.staging.yml",
+    "docker-compose.devcontainer.yml"
+  ],
+  "service": "devcontainer",
+  "workspaceFolder": "/workspace",
+
+  // Forward all staging ports into the dev container
+  "forwardPorts": [8099, 4173, 5435, 6381, 9010, 9011, 8025],
+  "portsAttributes": {
+    "8099": { "label": "Backend API",      "onAutoForward": "notify" },
+    "4173": { "label": "Frontend",         "onAutoForward": "openBrowser" },
+    "8025": { "label": "Mailpit (email)",  "onAutoForward": "notify" },
+    "9011": { "label": "MinIO console",    "onAutoForward": "silent" }
+  },
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "serayuzgur.crates",
+        "svelte.svelte-vscode",
+        "bradlc.vscode-tailwindcss",
+        "ms-playwright.playwright",
+        "ckolkman.vscode-postgres",
+        "mtxr.sqltools",
+        "mtxr.sqltools-driver-pg",
+        "usernamehw.errorlens",
+        "eamodio.gitlens"
+      ],
+      "settings": {
+        "rust-analyzer.cargo.buildScripts.enable": true,
+        "rust-analyzer.checkOnSave.command": "clippy",
+        "editor.formatOnSave": true,
+        "[rust]": { "editor.defaultFormatter": "rust-lang.rust-analyzer" },
+        "[svelte]": { "editor.defaultFormatter": "svelte.svelte-vscode" },
+        "sqltools.connections": [
+          {
+            "name": "Staging Postgres",
+            "driver": "PostgreSQL",
+            "server": "staging-postgres",
+            "port": 5432,
+            "database": "aust_staging",
+            "username": "aust_staging",
+            "password": "aust_staging_password"
+          }
+        ]
+      }
+    }
+  },
+
+  // Run once after container is created
+  "postCreateCommand": "git submodule update --init --recursive && cargo fetch",
+
+  // Start staging services on container start (backend + frontend already up)
+  "postStartCommand": "echo 'Dev environment ready. Backend: http://localhost:8099  Frontend: http://localhost:4173  Mail: http://localhost:8025'"
+}
