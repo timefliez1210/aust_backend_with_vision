@@ -10,6 +10,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY src ./src
 COPY migrations ./migrations
+COPY templates ./templates
 
 # Build release binary
 RUN cargo build --release

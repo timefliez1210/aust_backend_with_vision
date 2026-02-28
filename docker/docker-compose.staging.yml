@@ -1,0 +1,202 @@
+name: aust-staging
+
+# Staging stack — fully isolated from production.
+# Port assignments avoid clashing with the production docker-compose.yml:
+#   PostgreSQL  5435 → 5432
+#   Redis       6381 → 6379
+#   MinIO API   9010 → 9000
+#   MinIO UI    9011 → 9001
+#   Mailpit SMTP 1025 → 1025
+#   Mailpit Web  8025 → 8025
+#   Backend     8099 → 8080
+#   Frontend    4173 → 80
+
+services:
+
+  # ── PostgreSQL ─────────────────────────────────────────────────────────────
+  # Isolated staging database — completely separate from the production volume.
+  staging-postgres:
+    image: postgres:16-alpine
+    container_name: aust_staging_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: aust_staging
+      POSTGRES_PASSWORD: aust_staging_password
+      POSTGRES_DB: aust_staging
+    ports:
+      - "5435:5432"
+    volumes:
+      - staging_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aust_staging -d aust_staging"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ── Redis ──────────────────────────────────────────────────────────────────
+  staging-redis:
+    image: redis:7-alpine
+    container_name: aust_staging_redis
+    restart: unless-stopped
+    ports:
+      - "6381:6379"
+    volumes:
+      - staging_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ── MinIO object storage ───────────────────────────────────────────────────
+  staging-minio:
+    image: minio/minio:latest
+    container_name: aust_staging_minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9010:9000"
+      - "9011:9001"
+    volumes:
+      - staging_minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ── MinIO bucket setup ─────────────────────────────────────────────────────
+  # One-shot container: creates the staging bucket then exits.
+  staging-minio-setup:
+    image: minio/mc:latest
+    container_name: aust_staging_minio_setup
+    depends_on:
+      staging-minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://staging-minio:9000 minioadmin minioadmin;
+      mc mb local/aust-staging-uploads --ignore-existing;
+      mc anonymous set download local/aust-staging-uploads;
+      exit 0;
+      "
+
+  # ── Mailpit — fake SMTP + web UI ──────────────────────────────────────────
+  # All outbound emails from the staging backend land here instead of being
+  # delivered to real addresses. Open http://localhost:8025 to inspect them.
+  staging-mailpit:
+    image: axllent/mailpit:latest
+    container_name: aust_staging_mailpit
+    restart: unless-stopped
+    ports:
+      - "1025:1025"   # SMTP (backend → mailpit)
+      - "8025:8025"   # Web UI
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8025"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ── Backend ────────────────────────────────────────────────────────────────
+  # Built from Dockerfile.backend (Debian + LibreOffice for PDF generation).
+  # Secrets that require user input (API keys, Telegram token, etc.) go in
+  # docker/.env.staging — see docker/.env.staging.example.
+  staging-backend:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.backend
+    container_name: aust_staging_backend
+    restart: unless-stopped
+    env_file:
+      - path: docker/.env.staging
+        required: false
+    environment:
+      RUN_MODE: staging
+
+      # Database
+      AUST__DATABASE__URL: postgres://aust_staging:aust_staging_password@staging-postgres:5432/aust_staging
+
+      # Redis
+      AUST__REDIS__URL: redis://staging-redis:6379
+
+      # Object storage — MinIO staging bucket
+      AUST__STORAGE__PROVIDER: s3
+      AUST__STORAGE__ENDPOINT: http://staging-minio:9000
+      AUST__STORAGE__BUCKET: aust-staging-uploads
+      AUST__STORAGE__REGION: us-east-1
+      AUST__STORAGE__ACCESS_KEY_ID: minioadmin
+      AUST__STORAGE__SECRET_ACCESS_KEY: minioadmin
+
+      # Email — SMTP goes to Mailpit; inbound IMAP is disabled in staging
+      AUST__EMAIL__SMTP_HOST: staging-mailpit
+      AUST__EMAIL__SMTP_PORT: "1025"
+      AUST__EMAIL__IMAP_HOST: imap.staging.invalid
+      AUST__EMAIL__IMAP_PORT: "993"
+      AUST__EMAIL__USERNAME: staging@aust-umzuege.de
+      AUST__EMAIL__PASSWORD: staging-email-password
+      AUST__EMAIL__FROM_ADDRESS: staging@aust-umzuege.de
+      AUST__EMAIL__FROM_NAME: "AUST Umzüge (Staging)"
+
+      # LLM — default to Ollama running on the host machine.
+      # Set AUST__LLM__DEFAULT_PROVIDER=claude or openai in .env.staging to override,
+      # and supply the corresponding API key there.
+      AUST__LLM__DEFAULT_PROVIDER: ollama
+      AUST__LLM__OLLAMA__BASE_URL: http://host.docker.internal:11434
+      AUST__LLM__OLLAMA__MODEL: qwen2.5:7b
+
+      # Telegram — fake token so the staging bot does not interfere with production.
+      # Replace in .env.staging if you want a real staging Telegram bot.
+      AUST__TELEGRAM__BOT_TOKEN: "0000000000:AAAAAAAAAAaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      AUST__TELEGRAM__ADMIN_CHAT_ID: "0"
+
+      # Auth
+      AUST__AUTH__JWT_SECRET: staging-jwt-secret-do-not-use-in-production-min32chars
+
+      # Vision service — disabled by default in staging (no GPU)
+      AUST__VISION_SERVICE__ENABLED: "false"
+
+      # Company config
+      AUST__COMPANY__DEPOT_ADDRESS: "Borsigstr 6 31135 Hildesheim"
+      AUST__COMPANY__FAHRT_RATE_PER_KM: "1.00"
+
+    ports:
+      - "8099:8080"
+    depends_on:
+      staging-postgres:
+        condition: service_healthy
+      staging-minio-setup:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    extra_hosts:
+      # Allow the container to reach Ollama (and other services) on the host
+      - "host.docker.internal:host-gateway"
+
+  # ── Frontend ───────────────────────────────────────────────────────────────
+  # Built from the alex_aust SvelteKit project sitting next to this repo.
+  # VITE_API_BASE points to the staging backend exposed on port 8099.
+  staging-frontend:
+    build:
+      context: ../../alex_aust
+      dockerfile: docker/Dockerfile.frontend
+      args:
+        VITE_API_BASE: http://localhost:8099
+    container_name: aust_staging_frontend
+    restart: unless-stopped
+    ports:
+      - "4173:80"
+    depends_on:
+      staging-backend:
+        condition: service_healthy
+
+volumes:
+  staging_postgres_data:
+  staging_redis_data:
+  staging_minio_data:

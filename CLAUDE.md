@@ -82,6 +82,45 @@ cargo run
 
 Server runs on `http://localhost:8080`
 
+## Staging Environment
+
+An isolated staging stack runs on different ports so it never conflicts with the production service.
+
+```bash
+# First time: copy secrets template
+cp docker/.env.staging.example docker/.env.staging
+# Edit docker/.env.staging — add LLM/maps keys if you need real ORS calls
+
+# Start all containers and wait for health
+./scripts/staging.sh up
+
+# Run all tests: backend unit tests + frontend vitest + HTTP integration tests
+./scripts/staging.sh test
+
+# Tail logs
+./scripts/staging.sh logs
+
+# Tear down (keep volumes)
+./scripts/staging.sh down
+
+# Full reset (destroy volumes)
+./scripts/staging.sh clean
+```
+
+### Staging ports
+
+| Service | Port |
+|---------|------|
+| Backend API | 8099 |
+| Frontend (nginx) | 4173 |
+| PostgreSQL | 5435 |
+| Redis | 6381 |
+| MinIO API | 9010 |
+| MinIO UI | 9011 |
+| Mailpit (web) | 8025 |
+
+Mailpit catches all outbound emails — check `http://localhost:8025` instead of a real inbox.
+
 ### Vision Service (Modal)
 
 ```bash
