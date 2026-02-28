@@ -129,8 +129,12 @@ git -C "${FRONTEND_DIR}" pull origin main
 FRONTEND_SHA=$(git -C "${FRONTEND_DIR}" rev-parse --short HEAD)
 ok "Frontend: origin/main @ ${FRONTEND_SHA}"
 
-# Commit updated submodule ref if it changed
-if [ -n "$(git -C "${PROJECT_DIR}" status --porcelain -- frontend)" ]; then
+# Commit updated submodule ref only if the recorded pointer changed
+# (git status --porcelain also fires for untracked content inside the submodule,
+#  which is not a pointer change and cannot be committed from here)
+RECORDED_SHA=$(git -C "${PROJECT_DIR}" ls-files -s frontend | awk '{print $2}')
+CURRENT_SHA=$(git -C "${FRONTEND_DIR}" rev-parse HEAD)
+if [ "${RECORDED_SHA}" != "${CURRENT_SHA}" ]; then
     git -C "${PROJECT_DIR}" add frontend
     git -C "${PROJECT_DIR}" commit -m "chore: update frontend submodule → ${FRONTEND_SHA}"
     ok "Submodule ref committed"
