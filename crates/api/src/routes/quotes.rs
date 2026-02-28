@@ -93,7 +93,10 @@ struct EnrichedQuote {
     customer: QuoteCustomer,
     origin_address: Option<QuoteAddress>,
     destination_address: Option<QuoteAddress>,
-    estimation: Option<EstimationInfo>,
+    /// Flat list of all detected items across all completed estimations (top-level for frontend)
+    items: Vec<EstimationItem>,
+    /// Per-estimation metadata entries (all statuses — completed, processing, failed)
+    estimations: Vec<EstimationSummary>,
     offers: Vec<QuoteOffer>,
     latest_offer: Option<LatestOfferPricing>,
 }
@@ -128,14 +131,34 @@ struct QuoteAddress {
     elevator: Option<bool>,
 }
 
+/// Full estimation detail returned by `PUT /api/v1/quotes/{id}/estimation-items`.
+/// Contains the full nested items list for the estimation editor response.
 #[derive(Debug, Serialize)]
-struct EstimationInfo {
+struct EstimationDetail {
     id: Uuid,
     method: String,
     total_volume_m3: f64,
     items: Vec<EstimationItem>,
     source_images: Vec<String>,
     source_videos: Vec<String>,
+}
+
+/// Per-estimation metadata returned in the `estimations` array of `GET /api/v1/quotes/{id}`.
+/// Matches the `EstimationEntry` TypeScript interface in the admin quote detail page.
+#[derive(Debug, Serialize)]
+struct EstimationSummary {
+    id: Uuid,
+    method: String,
+    /// "completed" | "processing" | "failed"
+    status: String,
+    total_volume_m3: Option<f64>,
+    /// Number of detected items (0 for non-completed estimations)
+    item_count: usize,
+    created_at: chrono::DateTime<chrono::Utc>,
+    /// URL of the source video for video estimations, None otherwise
+    source_video_url: Option<String>,
+    /// URLs of all source images for photo/depth estimations
+    source_image_urls: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -194,9 +217,11 @@ struct LatestOfferPricing {
 struct VolumeEstimationDbRow {
     id: Uuid,
     method: String,
+    status: String,
     total_volume_m3: Option<f64>,
     result_data: Option<serde_json::Value>,
     source_data: Option<serde_json::Value>,
+    created_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// `GET /api/v1/quotes/{id}` — Fetch a fully enriched quote with customer, addresses,
@@ -266,12 +291,13 @@ async fn get_quote(
             None
         };
 
-    // Fetch all completed volume estimations for this quote
+    // Fetch ALL volume estimations for this quote (all statuses — completed, processing, failed)
+    // so the frontend can show progress indicators for in-flight estimations.
     let est_rows: Vec<VolumeEstimationDbRow> = sqlx::query_as(
         r#"
-        SELECT id, method, total_volume_m3, result_data, source_data
+        SELECT id, method, status, total_volume_m3, result_data, source_data, created_at
         FROM volume_estimations
-        WHERE quote_id = $1 AND status = 'completed'
+        WHERE quote_id = $1
         ORDER BY created_at
         "#,
     )
@@ -279,30 +305,30 @@ async fn get_quote(
     .fetch_all(&state.db)
     .await?;
 
-    // Fetch original video URLs from ALL estimations (including processing/failed)
-    let all_video_rows: Vec<(Option<serde_json::Value>,)> = sqlx::query_as(
-        "SELECT source_data FROM volume_estimations WHERE quote_id = $1 AND method = 'video' ORDER BY created_at",
-    )
-    .bind(id)
-    .fetch_all(&state.db)
-    .await?;
-    let mut all_source_videos: Vec<String> = Vec::new();
-    for (sd,) in &all_video_rows {
-        if let Some(key) = sd.as_ref().and_then(|sd| sd.get("video_s3_key")?.as_str()) {
-            all_source_videos.push(format!("/api/v1/estimates/images/{key}"));
-        }
-    }
+    // Build per-estimation summaries and collect items from completed estimations.
+    let mut all_items: Vec<EstimationItem> = Vec::new();
+    let mut estimations: Vec<EstimationSummary> = Vec::new();
 
-    let estimation = if est_rows.is_empty() && all_source_videos.is_empty() {
-        None
-    } else {
-        let mut all_items: Vec<EstimationItem> = Vec::new();
-        let mut all_source_images: Vec<String> = Vec::new();
-        let mut total_volume = 0.0;
-        let first_id = est_rows.first().map(|r| r.id).unwrap_or_default();
-        let first_method = est_rows.first().map(|r| r.method.clone()).unwrap_or_else(|| "video".to_string());
+    for est in &est_rows {
+        let source_s3_keys: Vec<String> = est.source_data
+            .as_ref()
+            .and_then(|sd| sd.get("s3_keys")?.as_array().map(|arr| {
+                arr.iter().filter_map(|v| v.as_str().map(String::from)).collect()
+            }))
+            .unwrap_or_default();
 
-        for est in &est_rows {
+        let source_image_urls: Vec<String> = source_s3_keys
+            .iter()
+            .map(|k| format!("/api/v1/estimates/images/{k}"))
+            .collect();
+
+        let source_video_url = est.source_data
+            .as_ref()
+            .and_then(|sd| sd.get("video_s3_key")?.as_str())
+            .map(|k| format!("/api/v1/estimates/images/{k}"));
+
+        // Only collect detected items from completed estimations
+        let est_items: Vec<EstimationItem> = if est.status == "completed" {
             let vol_est = VolumeEstimationRow {
                 result_data: est.result_data.clone(),
                 source_data: est.source_data.clone(),
@@ -314,62 +340,56 @@ async fn get_quote(
                 .as_ref()
                 .and_then(|rd| serde_json::from_value::<Vec<serde_json::Value>>(rd.clone()).ok())
                 .unwrap_or_default();
-            let source_s3_keys: Vec<String> = est.source_data
-                .as_ref()
-                .and_then(|sd| sd.get("s3_keys")?.as_array().map(|arr| {
-                    arr.iter().filter_map(|v| v.as_str().map(String::from)).collect()
-                }))
-                .unwrap_or_default();
 
-            // Collect source images
-            for k in &source_s3_keys {
-                all_source_images.push(format!("/api/v1/estimates/images/{k}"));
-            }
+            detected
+                .iter()
+                .enumerate()
+                .map(|(idx, d)| {
+                    let crop_url = d.crop_s3_key.as_ref().map(|k| format!("/api/v1/estimates/images/{k}"));
+                    let source_image_url = d.bbox_image_index
+                        .and_then(|i| source_s3_keys.get(i))
+                        .map(|k| format!("/api/v1/estimates/images/{k}"));
+                    let raw = raw_items.get(idx);
+                    let seen_in_images = raw
+                        .and_then(|r| r.get("seen_in_images")?.as_array().map(|arr| {
+                            arr.iter().filter_map(|v| v.as_u64().map(|n| n as usize)).collect()
+                        }));
+                    let category = raw.and_then(|r| r.get("category")?.as_str().map(String::from));
+                    let dimensions = raw.and_then(|r| r.get("dimensions").cloned());
+                    EstimationItem {
+                        name: d.german_name.clone().unwrap_or_else(|| d.name.clone()),
+                        volume_m3: d.volume_m3,
+                        quantity: 1,
+                        confidence: d.confidence,
+                        crop_url,
+                        source_image_url,
+                        bbox: d.bbox.clone(),
+                        crop_s3_key: d.crop_s3_key.clone(),
+                        bbox_image_index: d.bbox_image_index,
+                        seen_in_images,
+                        category,
+                        dimensions,
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
-            // source_videos already collected above (all statuses)
+        let item_count = est_items.len();
+        all_items.extend(est_items);
 
-            total_volume += est.total_volume_m3.unwrap_or(0.0);
-
-            for (idx, d) in detected.iter().enumerate() {
-                let crop_url = d.crop_s3_key.as_ref().map(|k| format!("/api/v1/estimates/images/{k}"));
-                let source_image_url = d.bbox_image_index
-                    .and_then(|i| source_s3_keys.get(i))
-                    .map(|k| format!("/api/v1/estimates/images/{k}"));
-                let raw = raw_items.get(idx);
-                let seen_in_images = raw
-                    .and_then(|r| r.get("seen_in_images")?.as_array().map(|arr| {
-                        arr.iter().filter_map(|v| v.as_u64().map(|n| n as usize)).collect()
-                    }));
-                let category = raw
-                    .and_then(|r| r.get("category")?.as_str().map(String::from));
-                let dimensions = raw
-                    .and_then(|r| r.get("dimensions").cloned());
-                all_items.push(EstimationItem {
-                    name: d.german_name.clone().unwrap_or_else(|| d.name.clone()),
-                    volume_m3: d.volume_m3,
-                    quantity: 1,
-                    confidence: d.confidence,
-                    crop_url,
-                    source_image_url,
-                    bbox: d.bbox.clone(),
-                    crop_s3_key: d.crop_s3_key.clone(),
-                    bbox_image_index: d.bbox_image_index,
-                    seen_in_images,
-                    category,
-                    dimensions,
-                });
-            }
-        }
-
-        Some(EstimationInfo {
-            id: first_id,
-            method: first_method,
-            total_volume_m3: total_volume,
-            items: all_items,
-            source_images: all_source_images,
-            source_videos: all_source_videos,
-        })
-    };
+        estimations.push(EstimationSummary {
+            id: est.id,
+            method: est.method.clone(),
+            status: est.status.clone(),
+            total_volume_m3: est.total_volume_m3,
+            item_count,
+            created_at: est.created_at,
+            source_video_url,
+            source_image_urls,
+        });
+    }
 
     // Fetch linked offers
     let offers: Vec<QuoteOffer> = sqlx::query_as(
@@ -444,7 +464,8 @@ async fn get_quote(
         customer,
         origin_address,
         destination_address,
-        estimation,
+        items: all_items,
+        estimations,
         offers,
         latest_offer,
     }))
@@ -682,7 +703,7 @@ struct UpdateEstimationItem {
 ///   preserved vision metadata fields for round-trip fidelity)
 ///
 /// # Returns
-/// `200 OK` with updated `EstimationInfo` including new `total_volume_m3` and item list.
+/// `200 OK` with updated `EstimationDetail` including new `total_volume_m3` and item list.
 ///
 /// # Errors
 /// - `404` if no estimation exists for the given quote
@@ -691,7 +712,7 @@ async fn update_estimation_items(
     State(state): State<Arc<AppState>>,
     Path(quote_id): Path<Uuid>,
     Json(request): Json<UpdateEstimationItemsRequest>,
-) -> Result<Json<EstimationInfo>, ApiError> {
+) -> Result<Json<EstimationDetail>, ApiError> {
     // Get latest estimation for this quote
     let est: Option<(Uuid, String, Option<serde_json::Value>)> = sqlx::query_as(
         "SELECT id, method, source_data FROM volume_estimations WHERE quote_id = $1 ORDER BY created_at DESC LIMIT 1",
@@ -769,7 +790,7 @@ async fn update_estimation_items(
         }))
         .unwrap_or_default();
 
-    Ok(Json(EstimationInfo {
+    Ok(Json(EstimationDetail {
         id: estimation_id,
         method: estimation_method,
         total_volume_m3: total_volume,
