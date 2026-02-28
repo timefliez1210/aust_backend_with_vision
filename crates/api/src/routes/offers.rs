@@ -1074,6 +1074,17 @@ async fn generate_offer(
     State(state): State<Arc<AppState>>,
     Json(request): Json<GenerateOfferRequest>,
 ) -> Result<Json<Offer>, ApiError> {
+    // Reuse any existing active (non-rejected, non-cancelled) offer so we UPDATE in-place
+    // rather than INSERT, which would violate the unique partial index on (quote_id) for
+    // active offers. Regenerating from the quote detail page goes through this endpoint.
+    let existing_offer_id: Option<Uuid> = sqlx::query_as::<_, (Uuid,)>(
+        "SELECT id FROM offers WHERE quote_id = $1 AND status NOT IN ('rejected', 'cancelled') LIMIT 1"
+    )
+    .bind(request.quote_id)
+    .fetch_optional(&state.db)
+    .await?
+    .map(|(id,)| id);
+
     let overrides = OfferOverrides {
         price_cents: request.price_cents_netto,
         persons: request.persons,
@@ -1091,7 +1102,7 @@ async fn generate_offer(
                 })
                 .collect()
         }),
-        existing_offer_id: None,
+        existing_offer_id,
     };
     let result = build_offer_with_overrides(
         &state.db, &*state.storage, &state.config, request.quote_id, request.valid_days, &overrides
