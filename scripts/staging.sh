@@ -12,7 +12,7 @@ trap 'echo "${RED}[staging.sh] Error on line ${LINENO}${RESET}" >&2' ERR
 # Paths
 # ---------------------------------------------------------------------------
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-FRONTEND_DIR="/media/timefliez/FileSystem/projects/alex_aust"
+FRONTEND_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/frontend"
 COMPOSE_FILE="${PROJECT_ROOT}/docker/docker-compose.staging.yml"
 INTEGRATION_TESTS="${PROJECT_ROOT}/tests/integration/test_api.sh"
 

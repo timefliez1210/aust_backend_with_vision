@@ -66,6 +66,26 @@ services/
 - `docker/docker-compose.gpu.yml` - GPU override for vision service
 - `services/vision/modal_app.py` - Modal deployment for vision service
 
+## Repository Structure
+
+The frontend (SvelteKit admin dashboard) lives at `frontend/` as a git submodule pointing to
+`git@github.com:timefliez1210/aust-umzuege.git`.
+
+```bash
+# Clone everything in one go
+git clone --recursive git@github.com:timefliez1210/aust_backend.git
+
+# If you already cloned without --recursive
+git submodule update --init --recursive
+
+# Pull latest frontend commit and update the pinned ref
+git submodule update --remote frontend
+git add frontend && git commit -m "chore: update frontend submodule"
+```
+
+Frontend code lives at `frontend/` — all staging scripts, Playwright tests, and Docker builds
+reference this path.
+
 ## Running Locally
 
 ```bash
