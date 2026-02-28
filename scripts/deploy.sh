@@ -1,104 +1,146 @@
 #!/usr/bin/env bash
+# deploy.sh — Backend-only deploy (no frontend build/upload)
+#
+# Steps:
+#   1. Pre-flight checks
+#   2. Backup database
+#   3. Pull latest (git pull --ff-only)
+#   4. Build backend (cargo --release)
+#   5. Restart aust-backend systemd service
+#   6. Health check
+#
+# Requirements:
+#   - cargo on PATH
+#   - Docker running with aust_postgres healthy (for DB backup)
+#   - sudo rights for systemctl restart
+
 set -euo pipefail
 
-# Deploy script: backup DB → pull → build → restart → health check
-# Usage: ./scripts/deploy.sh
-
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-cd "${PROJECT_DIR}"
 
 HEALTH_URL="http://localhost:8080/health"
 SERVICE_NAME="aust-backend"
-MAX_RETRIES=3
-RETRY_DELAY=2
+HEALTH_RETRIES=5
+HEALTH_DELAY=3
 
-echo "========================================="
+# ---------------------------------------------------------------------------
+# Colors
+# ---------------------------------------------------------------------------
+if [ -t 1 ]; then
+    GREEN="\033[0;32m"; RED="\033[0;31m"; YELLOW="\033[0;33m"
+    BOLD="\033[1m"; RESET="\033[0m"
+else
+    GREEN=""; RED=""; YELLOW=""; BOLD=""; RESET=""
+fi
+
+step()    { echo -e "\n${BOLD}[${1}/${TOTAL_STEPS}] ${2}${RESET}"; }
+ok()      { echo -e "  ${GREEN}OK${RESET}  ${1}"; }
+warn()    { echo -e "  ${YELLOW}WARN${RESET} ${1}"; }
+fail()    { echo -e "  ${RED}FAIL${RESET} ${1}" >&2; exit 1; }
+
+TOTAL_STEPS=6
+
+echo -e "${BOLD}"
+echo "============================================="
 echo "  AUST Backend Deploy"
 echo "  $(date '+%Y-%m-%d %H:%M:%S')"
-echo "========================================="
-echo ""
+echo "=============================================${RESET}"
 
+# ---------------------------------------------------------------------------
 # 1. Pre-flight checks
-echo "[1/6] Pre-flight checks..."
+# ---------------------------------------------------------------------------
+step 1 "Pre-flight checks"
 
 if ! docker info >/dev/null 2>&1; then
-    echo "  ERROR: Docker is not running"
-    exit 1
+    fail "Docker is not running"
 fi
-echo "  Docker: OK"
+ok "Docker"
 
 if ! docker exec aust_postgres pg_isready -U aust -d aust_backend >/dev/null 2>&1; then
-    echo "  ERROR: PostgreSQL is not ready"
-    exit 1
+    fail "PostgreSQL is not ready (is docker/docker-compose up?)"
 fi
-echo "  PostgreSQL: OK"
+ok "PostgreSQL"
 
 if ! command -v cargo >/dev/null 2>&1; then
-    echo "  ERROR: cargo not found"
-    exit 1
+    fail "cargo not found"
 fi
-echo "  Cargo: OK"
+ok "Cargo $(cargo --version 2>/dev/null | awk '{print $2}')"
 
-# Check for uncommitted changes
-if [ -n "$(git status --porcelain)" ]; then
-    echo "  ERROR: Uncommitted local changes detected. Commit or stash first."
-    git status --short
-    exit 1
+# Exclude frontend submodule — untracked content inside it is not a backend change
+if [ -n "$(git -C "${PROJECT_DIR}" status --porcelain -- ':!frontend')" ]; then
+    fail "Uncommitted changes in backend. Commit or stash first."
 fi
-echo "  Working tree: clean"
-echo ""
+ok "Working tree clean"
 
+# ---------------------------------------------------------------------------
 # 2. Backup database
-echo "[2/6] Backing up database..."
+# ---------------------------------------------------------------------------
+step 2 "Backing up database"
 bash "${PROJECT_DIR}/scripts/backup-db.sh"
-echo ""
+ok "Database backed up"
 
-# 3. Git pull
-echo "[3/6] Pulling latest changes..."
-BEFORE=$(git rev-parse HEAD)
-git pull --ff-only
-AFTER=$(git rev-parse HEAD)
+# ---------------------------------------------------------------------------
+# 3. Pull latest
+# ---------------------------------------------------------------------------
+step 3 "Pulling latest changes"
+
+BEFORE=$(git -C "${PROJECT_DIR}" rev-parse HEAD)
+git -C "${PROJECT_DIR}" pull --ff-only
+AFTER=$(git -C "${PROJECT_DIR}" rev-parse HEAD)
 
 if [ "${BEFORE}" = "${AFTER}" ]; then
-    echo "  Already up to date (${BEFORE:0:7})"
+    ok "Already up to date (${BEFORE:0:7})"
 else
-    echo "  Updated: ${BEFORE:0:7} → ${AFTER:0:7}"
-    git log --oneline "${BEFORE}..${AFTER}"
+    ok "${BEFORE:0:7} → ${AFTER:0:7}"
+    git -C "${PROJECT_DIR}" log --oneline "${BEFORE}..${AFTER}"
 fi
-echo ""
 
-# 4. Build release
-echo "[4/6] Building release binary..."
-cargo build --release 2>&1
-echo "  Build: OK"
-echo ""
+# ---------------------------------------------------------------------------
+# 4. Build backend
+# ---------------------------------------------------------------------------
+step 4 "Building backend (cargo --release)"
 
-# 5. Restart service
-echo "[5/6] Restarting ${SERVICE_NAME}..."
+BUILD_LOG=$(mktemp /tmp/aust-backend-build.XXXX)
+cargo build --release --manifest-path "${PROJECT_DIR}/Cargo.toml" \
+    >"${BUILD_LOG}" 2>&1 || {
+    echo -e "${RED}Build failed:${RESET}"
+    tail -30 "${BUILD_LOG}"
+    rm -f "${BUILD_LOG}"
+    exit 1
+}
+rm -f "${BUILD_LOG}"
+ok "Backend build"
+
+# ---------------------------------------------------------------------------
+# 5. Restart backend service
+# ---------------------------------------------------------------------------
+step 5 "Restarting ${SERVICE_NAME}"
 sudo systemctl restart "${SERVICE_NAME}"
-echo "  Service restarted"
-echo ""
+ok "Service restarted"
 
+# ---------------------------------------------------------------------------
 # 6. Health check
-echo "[6/6] Health check..."
-for i in $(seq 1 "${MAX_RETRIES}"); do
-    sleep "${RETRY_DELAY}"
+# ---------------------------------------------------------------------------
+step 6 "Health check"
+for i in $(seq 1 "${HEALTH_RETRIES}"); do
+    sleep "${HEALTH_DELAY}"
     if curl -sf "${HEALTH_URL}" >/dev/null 2>&1; then
-        echo "  Health check passed (attempt ${i}/${MAX_RETRIES})"
+        ok "Backend healthy (attempt ${i}/${HEALTH_RETRIES})"
         break
     fi
-    if [ "${i}" -eq "${MAX_RETRIES}" ]; then
-        echo "  ERROR: Health check failed after ${MAX_RETRIES} attempts"
-        echo "  Check logs: journalctl -u ${SERVICE_NAME} -n 50"
-        exit 1
+    if [ "${i}" -eq "${HEALTH_RETRIES}" ]; then
+        fail "Health check failed after ${HEALTH_RETRIES} attempts — check: journalctl -u ${SERVICE_NAME} -n 50"
     fi
-    echo "  Attempt ${i}/${MAX_RETRIES} failed, retrying in ${RETRY_DELAY}s..."
+    warn "Attempt ${i}/${HEALTH_RETRIES} — retrying in ${HEALTH_DELAY}s..."
 done
 
-echo ""
-echo "========================================="
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
+echo -e "\n${GREEN}${BOLD}"
+echo "============================================="
 echo "  Deploy complete!"
-echo "  Commit:  $(git rev-parse --short HEAD)"
-echo "  Status:  $(systemctl is-active ${SERVICE_NAME})"
-echo "  Backup:  $(ls -1t backups/db/aust_backend_*.sql.gz 2>/dev/null | head -1)"
-echo "========================================="
+echo "  Commit:  $(git -C "${PROJECT_DIR}" rev-parse --short HEAD)"
+echo "  Service: $(systemctl is-active ${SERVICE_NAME})"
+echo "  Backup:  $(ls -1t "${PROJECT_DIR}/backups/db/"*.sql.gz 2>/dev/null | head -1 | xargs basename 2>/dev/null || echo 'n/a')"
+echo "=============================================${RESET}"
