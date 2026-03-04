@@ -45,6 +45,8 @@ pub fn router() -> Router<Arc<AppState>> {
         )
         .route("/{id}/pdf", get(get_inquiry_pdf))
         .route("/{id}/items", put(update_inquiry_items))
+        .route("/{id}/estimate/depth", post(trigger_estimate_upload))
+        .route("/{id}/estimate/video", post(trigger_estimate_upload))
         .route("/{id}/estimate/{method}", post(trigger_estimate))
         .route("/{id}/generate-offer", post(generate_inquiry_offer))
         .route("/{id}/emails", get(get_inquiry_emails))
@@ -815,6 +817,67 @@ async fn get_inquiry_emails(
     .await?;
 
     Ok(Json(threads))
+}
+
+/// `POST /api/v1/inquiries/{id}/estimate/depth` and `/estimate/video`
+///
+/// **Caller**: Admin dashboard — triggers vision pipeline on an existing inquiry.
+/// **Why**: Accepts multipart image/video upload, runs S3 upload + vision estimation
+///          in the background, and auto-generates an offer when complete.
+async fn trigger_estimate_upload(
+    State(state): State<Arc<AppState>>,
+    Path(inquiry_id): Path<Uuid>,
+    multipart: Multipart,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    // Verify inquiry exists
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM inquiries WHERE id = $1)")
+        .bind(inquiry_id)
+        .fetch_one(&state.db)
+        .await?;
+    if !exists {
+        return Err(ApiError::NotFound(format!("Inquiry {inquiry_id} not found")));
+    }
+
+    let parsed = parse_inquiry_form(multipart, false).await?;
+    if parsed.images.is_empty() {
+        return Err(ApiError::Validation("Mindestens ein Bild erforderlich".into()));
+    }
+
+    // Update status to estimating
+    let now = chrono::Utc::now();
+    sqlx::query("UPDATE inquiries SET status = 'estimating', updated_at = $1 WHERE id = $2")
+        .bind(now)
+        .bind(inquiry_id)
+        .execute(&state.db)
+        .await?;
+
+    // Spawn background processing (same pipeline as public submission)
+    let state_bg = Arc::clone(&state);
+    tokio::spawn(async move {
+        if let Err(e) = process_submission_background(
+            state_bg,
+            inquiry_id,
+            parsed.images,
+            parsed.depth_maps,
+            parsed.ar_metadata,
+            String::new(),
+            String::new(),
+            now,
+        )
+        .await
+        {
+            tracing::error!(inquiry_id = %inquiry_id, error = %e, "Background estimation failed");
+        }
+    });
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "inquiry_id": inquiry_id,
+            "status": "estimating",
+            "message": "Bilder werden analysiert. Schätzung wird im Hintergrund erstellt."
+        })),
+    ))
 }
 
 // ===========================================================================
