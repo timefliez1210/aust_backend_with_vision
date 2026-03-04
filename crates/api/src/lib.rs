@@ -25,6 +25,7 @@ pub fn create_router(state: AppState) -> Router {
         "https://www.aust-umzuege.de",
         "https://aust-umzuege.de",
         "http://localhost:5173",
+        "http://localhost:4173",
         "capacitor://localhost",
         "http://localhost",
     ]
