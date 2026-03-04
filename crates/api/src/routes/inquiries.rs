@@ -66,19 +66,25 @@ pub fn submit_router() -> Router<Arc<AppState>> {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
+struct AddressInput {
+    street: Option<String>,
+    city: Option<String>,
+    postal_code: Option<String>,
+    floor: Option<String>,
+    elevator: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
 struct CreateInquiryRequest {
-    customer_email: String,
-    customer_name: Option<String>,
-    customer_phone: Option<String>,
-    origin_address: Option<String>,
-    origin_floor: Option<String>,
-    origin_elevator: Option<bool>,
-    destination_address: Option<String>,
-    destination_floor: Option<String>,
-    destination_elevator: Option<bool>,
+    customer_id: Uuid,
+    origin: Option<AddressInput>,
+    destination: Option<AddressInput>,
     services: Option<Services>,
     notes: Option<String>,
     preferred_date: Option<String>,
+    distance_km: Option<f64>,
+    estimated_volume_m3: Option<f64>,
+    items_list: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -211,48 +217,31 @@ async fn create_inquiry(
     State(state): State<Arc<AppState>>,
     Json(request): Json<CreateInquiryRequest>,
 ) -> Result<(StatusCode, Json<InquiryResponseModel>), ApiError> {
-    let email = request.customer_email.trim().to_lowercase();
-    if email.is_empty() || !email.contains('@') {
-        return Err(ApiError::Validation(
-            "Gültige E-Mail-Adresse erforderlich".into(),
-        ));
-    }
-
     let now = chrono::Utc::now();
 
-    // Upsert customer
-    let (customer_id,): (Uuid,) = sqlx::query_as(
-        r#"
-        INSERT INTO customers (id, email, name, phone, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $5)
-        ON CONFLICT (email) DO UPDATE SET
-            name = COALESCE(EXCLUDED.name, customers.name),
-            phone = COALESCE(EXCLUDED.phone, customers.phone),
-            updated_at = $5
-        RETURNING id
-        "#,
-    )
-    .bind(Uuid::now_v7())
-    .bind(&email)
-    .bind(&request.customer_name)
-    .bind(&request.customer_phone)
-    .bind(now)
-    .fetch_one(&state.db)
-    .await?;
+    // Verify customer exists
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM customers WHERE id = $1)")
+        .bind(request.customer_id)
+        .fetch_one(&state.db)
+        .await?;
+    if !exists {
+        return Err(ApiError::Validation("Kunde nicht gefunden".into()));
+    }
 
     // Create origin address if provided
-    let origin_id = if let Some(ref addr) = request.origin_address {
-        if !addr.trim().is_empty() {
-            let (street, city, postal) = services::vision::parse_address(addr);
+    let origin_id = if let Some(ref addr) = request.origin {
+        let street = addr.street.as_deref().unwrap_or("").trim().to_string();
+        let city = addr.city.as_deref().unwrap_or("").trim().to_string();
+        if !street.is_empty() || !city.is_empty() {
             let (id,): (Uuid,) = sqlx::query_as(
                 "INSERT INTO addresses (id, street, city, postal_code, floor, elevator) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
             )
             .bind(Uuid::now_v7())
             .bind(&street)
             .bind(&city)
-            .bind(&postal)
-            .bind(&request.origin_floor)
-            .bind(request.origin_elevator)
+            .bind(&addr.postal_code)
+            .bind(&addr.floor)
+            .bind(addr.elevator)
             .fetch_one(&state.db)
             .await?;
             Some(id)
@@ -264,18 +253,19 @@ async fn create_inquiry(
     };
 
     // Create destination address if provided
-    let dest_id = if let Some(ref addr) = request.destination_address {
-        if !addr.trim().is_empty() {
-            let (street, city, postal) = services::vision::parse_address(addr);
+    let dest_id = if let Some(ref addr) = request.destination {
+        let street = addr.street.as_deref().unwrap_or("").trim().to_string();
+        let city = addr.city.as_deref().unwrap_or("").trim().to_string();
+        if !street.is_empty() || !city.is_empty() {
             let (id,): (Uuid,) = sqlx::query_as(
                 "INSERT INTO addresses (id, street, city, postal_code, floor, elevator) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
             )
             .bind(Uuid::now_v7())
             .bind(&street)
             .bind(&city)
-            .bind(&postal)
-            .bind(&request.destination_floor)
-            .bind(request.destination_elevator)
+            .bind(&addr.postal_code)
+            .bind(&addr.floor)
+            .bind(addr.elevator)
             .fetch_one(&state.db)
             .await?;
             Some(id)
@@ -286,7 +276,6 @@ async fn create_inquiry(
         None
     };
 
-    // Parse preferred date
     let preferred_date = request
         .preferred_date
         .as_deref()
@@ -294,32 +283,59 @@ async fn create_inquiry(
         .and_then(|d| d.and_hms_opt(10, 0, 0))
         .map(|dt| chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(dt, chrono::Utc));
 
-    // Build notes from services if not provided directly
-    let notes = request.notes.clone();
-
     let services_json = serde_json::to_value(request.services.unwrap_or_default())
         .unwrap_or(serde_json::json!({}));
+
+    // If volume is provided manually, start as estimated; otherwise pending
+    let initial_status = if request.estimated_volume_m3.is_some() {
+        InquiryStatus::Estimated
+    } else {
+        InquiryStatus::Pending
+    };
 
     let inquiry_id = Uuid::now_v7();
     sqlx::query(
         r#"
         INSERT INTO inquiries (id, customer_id, origin_address_id, destination_address_id,
-                           status, preferred_date, notes, services, source, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)
+                           status, preferred_date, notes, services, distance_km, source,
+                           created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11)
         "#,
     )
     .bind(inquiry_id)
-    .bind(customer_id)
+    .bind(request.customer_id)
     .bind(origin_id)
     .bind(dest_id)
-    .bind(InquiryStatus::Pending.as_str())
+    .bind(initial_status.as_str())
     .bind(preferred_date)
-    .bind(&notes)
+    .bind(&request.notes)
     .bind(&services_json)
+    .bind(request.distance_km)
     .bind("admin_dashboard")
     .bind(now)
     .execute(&state.db)
     .await?;
+
+    // Store manual volume estimation if provided
+    if let Some(volume) = request.estimated_volume_m3 {
+        let estimation_id = Uuid::now_v7();
+        let source_data = serde_json::json!({"source": "admin_dashboard"});
+        let items_text = request.items_list.as_deref().unwrap_or("");
+        let result_data = serde_json::json!({"items_text": items_text});
+        insert_estimation_no_return(
+            &state.db,
+            estimation_id,
+            inquiry_id,
+            "inventory",
+            &source_data,
+            Some(&result_data),
+            volume,
+            0.9,
+            now,
+        )
+        .await
+        .map_err(|e| ApiError::Internal(format!("Estimation insert failed: {e}")))?;
+    }
 
     let response = inquiry_builder::build_inquiry_response(&state.db, inquiry_id).await?;
     Ok((StatusCode::CREATED, Json(response)))
