@@ -16,7 +16,7 @@ use bytes::Bytes;
 ///
 /// # Key naming conventions
 /// - Offer PDFs: `offers/{offer_id}/Angebot_{offer_number}.pdf`
-/// - Estimation images: `estimates/{quote_id}/{estimation_id}/{index}.jpg`
+/// - Estimation images: `estimates/{inquiry_id}/{estimation_id}/{index}.jpg`
 #[async_trait]
 pub trait StorageProvider: Send + Sync {
     /// Upload bytes to object storage and return the storage key.

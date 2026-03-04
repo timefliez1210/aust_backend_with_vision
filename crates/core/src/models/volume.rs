@@ -45,7 +45,7 @@ pub struct VolumeEstimation {
     /// UUID v7 primary key.
     pub id: Uuid,
     /// The quote this estimation belongs to.
-    pub quote_id: Uuid,
+    pub inquiry_id: Uuid,
     /// Pipeline used to produce this estimation.
     pub method: EstimationMethod,
     /// Processing status: `"pending"`, `"completed"`, or `"failed"`.
@@ -68,7 +68,7 @@ pub struct VolumeEstimation {
 /// dispatching to the relevant pipeline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateVolumeEstimation {
-    pub quote_id: Uuid,
+    pub inquiry_id: Uuid,
     pub method: EstimationMethod,
     /// Serialised input data to be stored for auditing (e.g., image metadata or
     /// the raw items list string).

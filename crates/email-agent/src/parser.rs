@@ -194,7 +194,7 @@ impl EmailParser {
 
         Some(MovingInquiry {
             id: Uuid::now_v7(),
-            quote_id: None,
+            inquiry_id: None,
             source: InquirySource::QuoteForm,
             name: form.name,
             email: form.email.unwrap_or_else(|| email.from.clone()),
@@ -337,7 +337,7 @@ impl EmailParser {
 
         MovingInquiry {
             id: Uuid::now_v7(),
-            quote_id: None,
+            inquiry_id: None,
             source: InquirySource::QuoteForm,
             name,
             email: form_email.unwrap_or_else(|| email.from.clone()),

@@ -185,12 +185,12 @@ pub async fn insert_test_address(
     id
 }
 
-/// Insert a test quote with default status 'pending' and return its ID.
+/// Insert a test inquiry with default status 'pending' and return its ID.
 pub async fn insert_test_quote(pool: &PgPool) -> uuid::Uuid {
     insert_test_quote_with_status(pool, "pending").await
 }
 
-/// Insert a test quote with specified status and return its ID.
+/// Insert a test inquiry with specified status and return its ID.
 pub async fn insert_test_quote_with_status(pool: &PgPool, status: &str) -> uuid::Uuid {
     let id = uuid::Uuid::now_v7();
     let customer_id = insert_test_customer(pool).await;
@@ -201,9 +201,9 @@ pub async fn insert_test_quote_with_status(pool: &PgPool, status: &str) -> uuid:
         insert_test_address(pool, "Zielstr. 5", "Hannover", "30159", Some(0), Some(false)).await;
 
     sqlx::query(
-        "INSERT INTO quotes (id, customer_id, origin_address_id, destination_address_id,
-         status, preferred_date, estimated_volume_m3, notes, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, '2026-04-01', 20.0, 'Halteverbot Auszug', NOW(), NOW())",
+        "INSERT INTO inquiries (id, customer_id, origin_address_id, destination_address_id,
+         status, preferred_date, estimated_volume_m3, notes, services, source, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, '2026-04-01', 20.0, 'Halteverbot Auszug', '{}', 'direct_email', NOW(), NOW())",
     )
     .bind(id)
     .bind(customer_id)
@@ -212,25 +212,25 @@ pub async fn insert_test_quote_with_status(pool: &PgPool, status: &str) -> uuid:
     .bind(status)
     .execute(pool)
     .await
-    .expect("insert test quote");
+    .expect("insert test inquiry");
     id
 }
 
 /// Insert a test offer and return its ID.
 pub async fn insert_test_offer(
     pool: &PgPool,
-    quote_id: uuid::Uuid,
+    inquiry_id: uuid::Uuid,
     status: &str,
 ) -> uuid::Uuid {
     let id = uuid::Uuid::now_v7();
     sqlx::query(
-        "INSERT INTO offers (id, quote_id, status, price_cents, currency,
+        "INSERT INTO offers (id, inquiry_id, status, price_cents, currency,
          valid_until, persons, hours_estimated, rate_per_hour_cents, pdf_storage_key, created_at)
          VALUES ($1, $2, $3, 50000, 'EUR', NOW() + interval '14 days',
          2, 4.0, 3500, 'test.pdf', NOW())",
     )
     .bind(id)
-    .bind(quote_id)
+    .bind(inquiry_id)
     .bind(status)
     .execute(pool)
     .await
@@ -242,7 +242,7 @@ pub async fn insert_test_offer(
 /// Used to test LatestOfferPricing endpoint rendering (flat_total, labor, regular items).
 pub async fn insert_test_offer_with_line_items(
     pool: &PgPool,
-    quote_id: uuid::Uuid,
+    inquiry_id: uuid::Uuid,
     status: &str,
     persons: i32,
     price_cents: i64,
@@ -250,14 +250,14 @@ pub async fn insert_test_offer_with_line_items(
 ) -> uuid::Uuid {
     let id = uuid::Uuid::now_v7();
     sqlx::query(
-        "INSERT INTO offers (id, quote_id, status, price_cents, currency,
+        "INSERT INTO offers (id, inquiry_id, status, price_cents, currency,
          valid_until, persons, hours_estimated, rate_per_hour_cents, pdf_storage_key,
          line_items_json, created_at)
          VALUES ($1, $2, $3, $4, 'EUR', NOW() + interval '14 days',
          $5, 8.0, 3500, 'test.pdf', $6, NOW())",
     )
     .bind(id)
-    .bind(quote_id)
+    .bind(inquiry_id)
     .bind(status)
     .bind(price_cents)
     .bind(persons)
@@ -268,7 +268,7 @@ pub async fn insert_test_offer_with_line_items(
     id
 }
 
-/// Insert a test quote with addresses but with distance_km = 0 (the pre-calculation state).
+/// Insert a test inquiry with addresses but with distance_km = 0 (the pre-calculation state).
 /// Useful for testing distance auto-calculation logic.
 pub async fn insert_test_quote_no_distance(pool: &PgPool, volume_m3: f64) -> uuid::Uuid {
     let id = uuid::Uuid::now_v7();
@@ -279,9 +279,9 @@ pub async fn insert_test_quote_no_distance(pool: &PgPool, volume_m3: f64) -> uui
         insert_test_address(pool, "Zielstr. 5", "Hannover", "30159", Some(0), None).await;
 
     sqlx::query(
-        "INSERT INTO quotes (id, customer_id, origin_address_id, destination_address_id,
-         status, estimated_volume_m3, distance_km, notes, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, 'volume_estimated', $5, 0.0, NULL, NOW(), NOW())",
+        "INSERT INTO inquiries (id, customer_id, origin_address_id, destination_address_id,
+         status, estimated_volume_m3, distance_km, notes, services, source, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, 'estimated', $5, 0.0, NULL, '{}', 'direct_email', NOW(), NOW())",
     )
     .bind(id)
     .bind(customer_id)
@@ -290,26 +290,26 @@ pub async fn insert_test_quote_no_distance(pool: &PgPool, volume_m3: f64) -> uui
     .bind(volume_m3)
     .execute(pool)
     .await
-    .expect("insert test quote no distance");
+    .expect("insert test inquiry no distance");
     id
 }
 
 /// Insert a test booking and return its ID.
-/// Note: calendar_bookings has a unique partial index on (quote_id) WHERE status != 'cancelled',
-/// so only ONE active booking per quote is allowed.
+/// Note: calendar_bookings has a unique partial index on (inquiry_id) WHERE status != 'cancelled',
+/// so only ONE active booking per inquiry is allowed.
 pub async fn insert_test_booking(
     pool: &PgPool,
-    quote_id: uuid::Uuid,
+    inquiry_id: uuid::Uuid,
     status: &str,
 ) -> uuid::Uuid {
     let id = uuid::Uuid::now_v7();
     sqlx::query(
-        "INSERT INTO calendar_bookings (id, booking_date, quote_id, customer_name,
+        "INSERT INTO calendar_bookings (id, booking_date, inquiry_id, customer_name,
          customer_email, status, created_at, updated_at)
          VALUES ($1, '2026-04-01', $2, 'Test Kunde', 'test@example.com', $3, NOW(), NOW())",
     )
     .bind(id)
-    .bind(quote_id)
+    .bind(inquiry_id)
     .bind(status)
     .execute(pool)
     .await
@@ -320,18 +320,18 @@ pub async fn insert_test_booking(
 /// Insert a test volume estimation and return its ID.
 pub async fn insert_test_estimation(
     pool: &PgPool,
-    quote_id: uuid::Uuid,
+    inquiry_id: uuid::Uuid,
     method: &str,
     volume: f64,
 ) -> uuid::Uuid {
     let id = uuid::Uuid::now_v7();
     sqlx::query(
-        "INSERT INTO volume_estimations (id, quote_id, method, total_volume_m3,
+        "INSERT INTO volume_estimations (id, inquiry_id, method, total_volume_m3,
          confidence_score, result_data, created_at)
          VALUES ($1, $2, $3, $4, 0.85, '{\"items\": []}', NOW())",
     )
     .bind(id)
-    .bind(quote_id)
+    .bind(inquiry_id)
     .bind(method)
     .bind(volume)
     .execute(pool)
@@ -340,13 +340,13 @@ pub async fn insert_test_estimation(
     id
 }
 
-/// Helper to get a quote's status from DB.
-pub async fn get_quote_status(pool: &PgPool, quote_id: uuid::Uuid) -> String {
-    let row: (String,) = sqlx::query_as("SELECT status FROM quotes WHERE id = $1")
-        .bind(quote_id)
+/// Helper to get an inquiry's status from DB.
+pub async fn get_quote_status(pool: &PgPool, inquiry_id: uuid::Uuid) -> String {
+    let row: (String,) = sqlx::query_as("SELECT status FROM inquiries WHERE id = $1")
+        .bind(inquiry_id)
         .fetch_one(pool)
         .await
-        .expect("get quote status");
+        .expect("get inquiry status");
     row.0
 }
 
@@ -377,7 +377,7 @@ pub async fn clean_test_data(pool: &PgPool) {
         "calendar_bookings",
         "volume_estimations",
         "offers",
-        "quotes",
+        "inquiries",
         "addresses",
         "customers",
     ] {

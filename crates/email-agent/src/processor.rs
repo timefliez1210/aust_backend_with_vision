@@ -595,7 +595,7 @@ impl EmailProcessor {
                         // Force-create a booking for the approved date
                         let booking = aust_calendar::NewBooking {
                             booking_date: req.availability.requested_date,
-                            quote_id: req.inquiry.quote_id,
+                            inquiry_id: req.inquiry.inquiry_id,
                             customer_name: req.inquiry.name.clone(),
                             customer_email: Some(req.customer_email.clone()),
                             departure_address: req.inquiry.departure_address.clone(),

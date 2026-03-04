@@ -18,11 +18,11 @@ use crate::{ApiError, AppState};
 pub fn protected_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/me", get(get_profile))
-        .route("/quotes", get(list_quotes))
-        .route("/quotes/{id}", get(get_quote_detail))
-        .route("/offers/{id}/accept", post(accept_offer))
-        .route("/offers/{id}/reject", post(reject_offer))
-        .route("/offers/{id}/pdf", get(download_offer_pdf))
+        .route("/inquiries", get(list_inquiries))
+        .route("/inquiries/{id}", get(get_inquiry_detail))
+        .route("/inquiries/{id}/accept", post(accept_inquiry))
+        .route("/inquiries/{id}/reject", post(reject_inquiry))
+        .route("/inquiries/{id}/pdf", get(download_inquiry_pdf))
 }
 
 /// Public auth routes (no token required).
@@ -229,10 +229,10 @@ async fn get_profile(
     }))
 }
 
-// --- Quotes ---
+// --- Inquiries ---
 
 #[derive(Debug, Serialize)]
-struct QuoteSummary {
+struct InquirySummary {
     id: Uuid,
     status: String,
     preferred_date: Option<DateTime<Utc>>,
@@ -243,11 +243,11 @@ struct QuoteSummary {
     price_cents: Option<i64>,
 }
 
-/// GET /customer/quotes — list customer's quotes with latest offer price.
-async fn list_quotes(
+/// GET /customer/inquiries — list customer's inquiries with latest offer price.
+async fn list_inquiries(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<CustomerClaims>,
-) -> Result<Json<Vec<QuoteSummary>>, ApiError> {
+) -> Result<Json<Vec<InquirySummary>>, ApiError> {
     let rows: Vec<(
         Uuid,
         String,
@@ -264,8 +264,8 @@ async fn list_quotes(
             oa.city AS origin_city,
             da.city AS destination_city,
             q.estimated_volume_m3,
-            (SELECT o.price_cents FROM offers o WHERE o.quote_id = q.id ORDER BY o.created_at DESC LIMIT 1)
-        FROM quotes q
+            (SELECT o.price_cents FROM offers o WHERE o.inquiry_id = q.id ORDER BY o.created_at DESC LIMIT 1)
+        FROM inquiries q
         LEFT JOIN addresses oa ON q.origin_address_id = oa.id
         LEFT JOIN addresses da ON q.destination_address_id = da.id
         WHERE q.customer_id = $1
@@ -276,9 +276,9 @@ async fn list_quotes(
     .fetch_all(&state.db)
     .await?;
 
-    let quotes: Vec<QuoteSummary> = rows
+    let inquiries: Vec<InquirySummary> = rows
         .into_iter()
-        .map(|r| QuoteSummary {
+        .map(|r| InquirySummary {
             id: r.0,
             status: r.1,
             preferred_date: r.2,
@@ -290,13 +290,13 @@ async fn list_quotes(
         })
         .collect();
 
-    Ok(Json(quotes))
+    Ok(Json(inquiries))
 }
 
-// --- Quote Detail ---
+// --- Inquiry Detail ---
 
 #[derive(Debug, Serialize)]
-struct QuoteDetail {
+struct InquiryDetail {
     id: Uuid,
     status: String,
     estimated_volume_m3: Option<f64>,
@@ -340,15 +340,15 @@ struct OfferInfo {
     hours_estimated: Option<f64>,
 }
 
-/// GET /customer/quotes/{id} — quote detail with estimation + offers.
-/// Validates ownership (quote must belong to the authenticated customer).
-async fn get_quote_detail(
+/// GET /customer/inquiries/{id} — inquiry detail with estimation + offers.
+/// Validates ownership (inquiry must belong to the authenticated customer).
+async fn get_inquiry_detail(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<CustomerClaims>,
     Path(id): Path<Uuid>,
-) -> Result<Json<QuoteDetail>, ApiError> {
-    // Fetch quote with ownership check
-    let quote_row: Option<(
+) -> Result<Json<InquiryDetail>, ApiError> {
+    // Fetch inquiry with ownership check
+    let inquiry_row: Option<(
         Uuid,
         String,
         Option<f64>,
@@ -360,7 +360,7 @@ async fn get_quote_detail(
         r#"
         SELECT id, status, estimated_volume_m3, distance_km, preferred_date,
                origin_address_id, destination_address_id
-        FROM quotes
+        FROM inquiries
         WHERE id = $1 AND customer_id = $2
         "#,
     )
@@ -370,7 +370,7 @@ async fn get_quote_detail(
     .await?;
 
     let (qid, status, volume, distance, pdate, origin_id, dest_id) =
-        quote_row.ok_or_else(|| ApiError::NotFound("Anfrage nicht gefunden".into()))?;
+        inquiry_row.ok_or_else(|| ApiError::NotFound("Anfrage nicht gefunden".into()))?;
 
     // Fetch addresses
     let origin_address = if let Some(addr_id) = origin_id {
@@ -394,7 +394,7 @@ async fn get_quote_detail(
             r#"
             SELECT id, price_cents, status, valid_until, persons, hours_estimated
             FROM offers
-            WHERE quote_id = $1
+            WHERE inquiry_id = $1
             ORDER BY created_at DESC
             "#,
         )
@@ -414,7 +414,7 @@ async fn get_quote_detail(
         })
         .collect();
 
-    Ok(Json(QuoteDetail {
+    Ok(Json(InquiryDetail {
         id: qid,
         status,
         estimated_volume_m3: volume,
@@ -448,18 +448,18 @@ async fn fetch_address(
 
 async fn fetch_estimation(
     db: &sqlx::PgPool,
-    quote_id: Uuid,
+    inquiry_id: Uuid,
 ) -> Result<Option<EstimationInfo>, ApiError> {
     let row: Option<(f64, f64, Option<serde_json::Value>)> = sqlx::query_as(
         r#"
         SELECT total_volume_m3, confidence_score, result_data
         FROM volume_estimations
-        WHERE quote_id = $1
+        WHERE inquiry_id = $1
         ORDER BY created_at DESC
         LIMIT 1
         "#,
     )
-    .bind(quote_id)
+    .bind(inquiry_id)
     .fetch_optional(db)
     .await?;
 
@@ -534,31 +534,52 @@ fn parse_estimation_items(result_data: Option<serde_json::Value>) -> Vec<Estimat
         .collect()
 }
 
-// --- Accept / Reject Offers ---
+// --- Accept / Reject Inquiries ---
 
-/// POST /customer/offers/{id}/accept — accept offer, sync statuses, notify admin.
-async fn accept_offer(
+/// POST /customer/inquiries/{id}/accept — accept the active offer for this inquiry,
+/// sync statuses, notify admin.
+///
+/// Takes an `inquiry_id` from the path, finds the latest non-rejected/non-cancelled
+/// offer, validates ownership via `inquiry.customer_id`, then updates both the offer
+/// and inquiry status.
+async fn accept_inquiry(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<CustomerClaims>,
-    Path(offer_id): Path<Uuid>,
+    Path(inquiry_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // Validate ownership: offer → quote → customer
-    let row: Option<(Uuid, String, String)> = sqlx::query_as(
+    // Validate ownership: inquiry must belong to this customer
+    let inquiry_row: Option<(Uuid, String)> = sqlx::query_as(
         r#"
-        SELECT q.id, o.status, COALESCE(c.name, c.email)
-        FROM offers o
-        JOIN quotes q ON o.quote_id = q.id
+        SELECT q.id, COALESCE(c.name, c.email)
+        FROM inquiries q
         JOIN customers c ON q.customer_id = c.id
-        WHERE o.id = $1 AND q.customer_id = $2
+        WHERE q.id = $1 AND q.customer_id = $2
         "#,
     )
-    .bind(offer_id)
+    .bind(inquiry_id)
     .bind(claims.customer_id)
     .fetch_optional(&state.db)
     .await?;
 
-    let (quote_id, offer_status, customer_name) =
-        row.ok_or_else(|| ApiError::NotFound("Angebot nicht gefunden".into()))?;
+    let (_inq_id, customer_name) =
+        inquiry_row.ok_or_else(|| ApiError::NotFound("Anfrage nicht gefunden".into()))?;
+
+    // Find the active offer (latest non-rejected/non-cancelled) for this inquiry
+    let offer_row: Option<(Uuid, String)> = sqlx::query_as(
+        r#"
+        SELECT id, status
+        FROM offers
+        WHERE inquiry_id = $1 AND status NOT IN ('rejected', 'cancelled')
+        ORDER BY created_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(inquiry_id)
+    .fetch_optional(&state.db)
+    .await?;
+
+    let (offer_id, offer_status) =
+        offer_row.ok_or_else(|| ApiError::NotFound("Kein aktives Angebot gefunden".into()))?;
 
     if !["draft", "sent"].contains(&offer_status.as_str()) {
         return Err(ApiError::BadRequest(format!(
@@ -575,15 +596,15 @@ async fn accept_offer(
         .execute(&state.db)
         .await?;
 
-    // Update quote → accepted
-    sqlx::query("UPDATE quotes SET status = 'accepted', updated_at = $1 WHERE id = $2")
+    // Update inquiry → accepted
+    sqlx::query("UPDATE inquiries SET status = 'accepted', updated_at = $1 WHERE id = $2")
         .bind(now)
-        .bind(quote_id)
+        .bind(inquiry_id)
         .execute(&state.db)
         .await?;
 
     // Confirm booking if exists
-    if let Some(booking_id) = find_active_booking_id(&state.db, quote_id).await? {
+    if let Some(booking_id) = find_active_booking_id(&state.db, inquiry_id).await? {
         let _ = state.calendar.confirm_booking(booking_id).await;
     }
 
@@ -595,9 +616,10 @@ async fn accept_offer(
     .await;
 
     tracing::info!(
+        inquiry_id = %inquiry_id,
         offer_id = %offer_id,
         customer_id = %claims.customer_id,
-        "Customer accepted offer"
+        "Customer accepted offer via inquiry"
     );
 
     Ok(Json(serde_json::json!({
@@ -606,29 +628,50 @@ async fn accept_offer(
     })))
 }
 
-/// POST /customer/offers/{id}/reject — reject offer, sync statuses, notify admin.
-async fn reject_offer(
+/// POST /customer/inquiries/{id}/reject — reject the active offer for this inquiry,
+/// sync statuses, notify admin.
+///
+/// Takes an `inquiry_id` from the path, finds the latest non-rejected/non-cancelled
+/// offer, validates ownership via `inquiry.customer_id`, then updates both the offer
+/// and inquiry status.
+async fn reject_inquiry(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<CustomerClaims>,
-    Path(offer_id): Path<Uuid>,
+    Path(inquiry_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // Validate ownership
-    let row: Option<(Uuid, String, String)> = sqlx::query_as(
+    // Validate ownership: inquiry must belong to this customer
+    let inquiry_row: Option<(Uuid, String)> = sqlx::query_as(
         r#"
-        SELECT q.id, o.status, COALESCE(c.name, c.email)
-        FROM offers o
-        JOIN quotes q ON o.quote_id = q.id
+        SELECT q.id, COALESCE(c.name, c.email)
+        FROM inquiries q
         JOIN customers c ON q.customer_id = c.id
-        WHERE o.id = $1 AND q.customer_id = $2
+        WHERE q.id = $1 AND q.customer_id = $2
         "#,
     )
-    .bind(offer_id)
+    .bind(inquiry_id)
     .bind(claims.customer_id)
     .fetch_optional(&state.db)
     .await?;
 
-    let (quote_id, offer_status, customer_name) =
-        row.ok_or_else(|| ApiError::NotFound("Angebot nicht gefunden".into()))?;
+    let (_inq_id, customer_name) =
+        inquiry_row.ok_or_else(|| ApiError::NotFound("Anfrage nicht gefunden".into()))?;
+
+    // Find the active offer (latest non-rejected/non-cancelled) for this inquiry
+    let offer_row: Option<(Uuid, String)> = sqlx::query_as(
+        r#"
+        SELECT id, status
+        FROM offers
+        WHERE inquiry_id = $1 AND status NOT IN ('rejected', 'cancelled')
+        ORDER BY created_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(inquiry_id)
+    .fetch_optional(&state.db)
+    .await?;
+
+    let (offer_id, offer_status) =
+        offer_row.ok_or_else(|| ApiError::NotFound("Kein aktives Angebot gefunden".into()))?;
 
     if !["draft", "sent"].contains(&offer_status.as_str()) {
         return Err(ApiError::BadRequest(format!(
@@ -645,15 +688,15 @@ async fn reject_offer(
         .execute(&state.db)
         .await?;
 
-    // Update quote → rejected
-    sqlx::query("UPDATE quotes SET status = 'rejected', updated_at = $1 WHERE id = $2")
+    // Update inquiry → rejected
+    sqlx::query("UPDATE inquiries SET status = 'rejected', updated_at = $1 WHERE id = $2")
         .bind(now)
-        .bind(quote_id)
+        .bind(inquiry_id)
         .execute(&state.db)
         .await?;
 
     // Cancel booking if exists
-    if let Some(booking_id) = find_active_booking_id(&state.db, quote_id).await? {
+    if let Some(booking_id) = find_active_booking_id(&state.db, inquiry_id).await? {
         let _ = state.calendar.cancel_booking(booking_id).await;
     }
 
@@ -665,9 +708,10 @@ async fn reject_offer(
     .await;
 
     tracing::info!(
+        inquiry_id = %inquiry_id,
         offer_id = %offer_id,
         customer_id = %claims.customer_id,
-        "Customer rejected offer"
+        "Customer rejected offer via inquiry"
     );
 
     Ok(Json(serde_json::json!({
@@ -678,28 +722,42 @@ async fn reject_offer(
 
 // --- PDF Download ---
 
-/// GET /customer/offers/{id}/pdf — download offer PDF.
-async fn download_offer_pdf(
+/// GET /customer/inquiries/{id}/pdf — download the active offer PDF for this inquiry.
+///
+/// Takes an `inquiry_id` from the path, validates ownership, finds the latest
+/// non-rejected/non-cancelled offer with a PDF, and streams the PDF.
+async fn download_inquiry_pdf(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<CustomerClaims>,
-    Path(offer_id): Path<Uuid>,
+    Path(inquiry_id): Path<Uuid>,
 ) -> Result<axum::response::Response, ApiError> {
-    // Validate ownership
-    let row: Option<(Option<String>,)> = sqlx::query_as(
-        r#"
-        SELECT o.pdf_storage_key
-        FROM offers o
-        JOIN quotes q ON o.quote_id = q.id
-        WHERE o.id = $1 AND q.customer_id = $2
-        "#,
+    // Validate ownership: inquiry must belong to this customer
+    let inquiry_row: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM inquiries WHERE id = $1 AND customer_id = $2",
     )
-    .bind(offer_id)
+    .bind(inquiry_id)
     .bind(claims.customer_id)
     .fetch_optional(&state.db)
     .await?;
 
-    let (storage_key,) =
-        row.ok_or_else(|| ApiError::NotFound("Angebot nicht gefunden".into()))?;
+    inquiry_row.ok_or_else(|| ApiError::NotFound("Anfrage nicht gefunden".into()))?;
+
+    // Find the active offer's PDF storage key
+    let offer_row: Option<(Uuid, Option<String>)> = sqlx::query_as(
+        r#"
+        SELECT id, pdf_storage_key
+        FROM offers
+        WHERE inquiry_id = $1 AND status NOT IN ('rejected', 'cancelled')
+        ORDER BY created_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(inquiry_id)
+    .fetch_optional(&state.db)
+    .await?;
+
+    let (offer_id, storage_key) =
+        offer_row.ok_or_else(|| ApiError::NotFound("Kein aktives Angebot gefunden".into()))?;
 
     let storage_key =
         storage_key.ok_or_else(|| ApiError::BadRequest("Angebot hat kein PDF".into()))?;

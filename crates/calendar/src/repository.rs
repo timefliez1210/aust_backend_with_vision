@@ -42,7 +42,7 @@ pub async fn get_bookings_for_date(
 ) -> Result<Vec<Booking>, CalendarError> {
     let rows = sqlx::query_as::<_, Booking>(
         r#"
-        SELECT id, booking_date, quote_id, customer_name, customer_email,
+        SELECT id, booking_date, inquiry_id, customer_name, customer_email,
                departure_address, arrival_address, volume_m3, distance_km,
                description, status, created_at, updated_at
         FROM calendar_bookings
@@ -65,7 +65,7 @@ pub async fn get_bookings_in_range(
 ) -> Result<Vec<Booking>, CalendarError> {
     let rows = sqlx::query_as::<_, Booking>(
         r#"
-        SELECT id, booking_date, quote_id, customer_name, customer_email,
+        SELECT id, booking_date, inquiry_id, customer_name, customer_email,
                departure_address, arrival_address, volume_m3, distance_km,
                description, status, created_at, updated_at
         FROM calendar_bookings
@@ -112,18 +112,18 @@ pub async fn insert_booking(
     let row = sqlx::query_as::<_, Booking>(
         r#"
         INSERT INTO calendar_bookings
-            (id, booking_date, quote_id, customer_name, customer_email,
+            (id, booking_date, inquiry_id, customer_name, customer_email,
              departure_address, arrival_address, volume_m3, distance_km,
              description, status)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-        RETURNING id, booking_date, quote_id, customer_name, customer_email,
+        RETURNING id, booking_date, inquiry_id, customer_name, customer_email,
                   departure_address, arrival_address, volume_m3, distance_km,
                   description, status, created_at, updated_at
         "#,
     )
     .bind(id)
     .bind(booking.booking_date)
-    .bind(booking.quote_id)
+    .bind(booking.inquiry_id)
     .bind(&booking.customer_name)
     .bind(&booking.customer_email)
     .bind(&booking.departure_address)
@@ -148,7 +148,7 @@ pub async fn update_booking_status(
         r#"
         UPDATE calendar_bookings SET status = $2, updated_at = NOW()
         WHERE id = $1
-        RETURNING id, booking_date, quote_id, customer_name, customer_email,
+        RETURNING id, booking_date, inquiry_id, customer_name, customer_email,
                   departure_address, arrival_address, volume_m3, distance_km,
                   description, status, created_at, updated_at
         "#,
@@ -204,7 +204,7 @@ pub async fn get_booking_by_id(
 ) -> Result<Option<Booking>, CalendarError> {
     let row = sqlx::query_as::<_, Booking>(
         r#"
-        SELECT id, booking_date, quote_id, customer_name, customer_email,
+        SELECT id, booking_date, inquiry_id, customer_name, customer_email,
                departure_address, arrival_address, volume_m3, distance_km,
                description, status, created_at, updated_at
         FROM calendar_bookings

@@ -1,9 +1,9 @@
 use sqlx::FromRow;
 use uuid::Uuid;
-use aust_core::models::{Quote, QuoteStatus};
+use aust_core::models::{InquiryStatus, Quote, Services};
 
 #[derive(Debug, FromRow)]
-pub(crate) struct QuoteRow {
+pub(crate) struct InquiryRow {
     pub id: Uuid,
     pub customer_id: Uuid,
     pub origin_address_id: Option<Uuid>,
@@ -15,26 +15,40 @@ pub(crate) struct QuoteRow {
     pub distance_km: Option<f64>,
     pub preferred_date: Option<chrono::DateTime<chrono::Utc>>,
     pub notes: Option<String>,
+    #[sqlx(default)]
+    pub services: serde_json::Value,
+    #[sqlx(default)]
+    pub source: String,
+    #[sqlx(default)]
+    pub offer_sent_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[sqlx(default)]
+    pub accepted_at: Option<chrono::DateTime<chrono::Utc>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
-impl From<QuoteRow> for Quote {
-    fn from(row: QuoteRow) -> Self {
+impl From<InquiryRow> for Quote {
+    fn from(row: InquiryRow) -> Self {
         let status = match row.status.as_str() {
-            "pending" => QuoteStatus::Pending,
-            "info_requested" => QuoteStatus::InfoRequested,
-            "volume_estimated" => QuoteStatus::VolumeEstimated,
-            "offer_generated" => QuoteStatus::OfferGenerated,
-            "offer_sent" => QuoteStatus::OfferSent,
-            "accepted" => QuoteStatus::Accepted,
-            "rejected" => QuoteStatus::Rejected,
-            "expired" => QuoteStatus::Expired,
-            "cancelled" => QuoteStatus::Cancelled,
-            "done" => QuoteStatus::Done,
-            "paid" => QuoteStatus::Paid,
-            _ => QuoteStatus::Pending,
+            "pending" => InquiryStatus::Pending,
+            "info_requested" => InquiryStatus::InfoRequested,
+            "estimating" => InquiryStatus::Estimating,
+            "estimated" => InquiryStatus::Estimated,
+            "offer_ready" => InquiryStatus::OfferReady,
+            "offer_sent" => InquiryStatus::OfferSent,
+            "accepted" => InquiryStatus::Accepted,
+            "rejected" => InquiryStatus::Rejected,
+            "expired" => InquiryStatus::Expired,
+            "cancelled" => InquiryStatus::Cancelled,
+            "scheduled" => InquiryStatus::Scheduled,
+            "completed" => InquiryStatus::Completed,
+            "invoiced" => InquiryStatus::Invoiced,
+            "paid" => InquiryStatus::Paid,
+            _ => InquiryStatus::Pending,
         };
+
+        let services: Option<Services> =
+            serde_json::from_value(row.services).ok();
 
         Quote {
             id: row.id,
@@ -47,6 +61,10 @@ impl From<QuoteRow> for Quote {
             distance_km: row.distance_km,
             preferred_date: row.preferred_date,
             notes: row.notes,
+            source: Some(row.source),
+            services,
+            offer_sent_at: row.offer_sent_at,
+            accepted_at: row.accepted_at,
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
@@ -57,10 +75,10 @@ impl From<QuoteRow> for Quote {
 mod tests {
     use super::*;
 
-    fn make_test_quote_row(status: &str) -> QuoteRow {
+    fn make_test_inquiry_row(status: &str) -> InquiryRow {
         let dummy_id = Uuid::nil();
         let now = chrono::DateTime::from_timestamp(0, 0).unwrap();
-        QuoteRow {
+        InquiryRow {
             id: dummy_id,
             customer_id: dummy_id,
             origin_address_id: None,
@@ -71,30 +89,37 @@ mod tests {
             distance_km: None,
             preferred_date: None,
             notes: None,
+            services: serde_json::json!({}),
+            source: "direct_email".to_string(),
+            offer_sent_at: None,
+            accepted_at: None,
             created_at: now,
             updated_at: now,
         }
     }
 
     #[test]
-    fn quote_row_status_mapping() {
+    fn inquiry_row_status_mapping() {
         let cases = [
-            ("pending", QuoteStatus::Pending),
-            ("info_requested", QuoteStatus::InfoRequested),
-            ("volume_estimated", QuoteStatus::VolumeEstimated),
-            ("offer_generated", QuoteStatus::OfferGenerated),
-            ("offer_sent", QuoteStatus::OfferSent),
-            ("accepted", QuoteStatus::Accepted),
-            ("rejected", QuoteStatus::Rejected),
-            ("expired", QuoteStatus::Expired),
-            ("cancelled", QuoteStatus::Cancelled),
-            ("done", QuoteStatus::Done),
-            ("paid", QuoteStatus::Paid),
-            ("unknown_value", QuoteStatus::Pending),
+            ("pending", InquiryStatus::Pending),
+            ("info_requested", InquiryStatus::InfoRequested),
+            ("estimating", InquiryStatus::Estimating),
+            ("estimated", InquiryStatus::Estimated),
+            ("offer_ready", InquiryStatus::OfferReady),
+            ("offer_sent", InquiryStatus::OfferSent),
+            ("accepted", InquiryStatus::Accepted),
+            ("rejected", InquiryStatus::Rejected),
+            ("expired", InquiryStatus::Expired),
+            ("cancelled", InquiryStatus::Cancelled),
+            ("scheduled", InquiryStatus::Scheduled),
+            ("completed", InquiryStatus::Completed),
+            ("invoiced", InquiryStatus::Invoiced),
+            ("paid", InquiryStatus::Paid),
+            ("unknown_value", InquiryStatus::Pending),
         ];
 
         for (status_str, expected) in cases {
-            let row = make_test_quote_row(status_str);
+            let row = make_test_inquiry_row(status_str);
             let quote = Quote::from(row);
             assert_eq!(
                 quote.status, expected,

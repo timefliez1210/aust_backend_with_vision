@@ -24,7 +24,7 @@ pub struct EmailThread {
     /// The customer this conversation belongs to.
     pub customer_id: Uuid,
     /// The quote that was initiated by this conversation, if one exists.
-    pub quote_id: Option<Uuid>,
+    pub inquiry_id: Option<Uuid>,
     /// Email subject line of the first message in the thread.
     pub subject: Option<String>,
     pub created_at: DateTime<Utc>,

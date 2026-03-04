@@ -4,7 +4,7 @@ A modular Rust backend for automating moving company operations - from initial c
 
 ## Project Overview
 
-**Purpose**: Automate the quote-to-offer pipeline for a moving company (Austrian market, German language)
+**Purpose**: Automate the quote-to-offer pipeline for a moving company (German market, German language)
 
 **Architecture**: Modular monolith with 9 crates + 1 Python sidecar service, designed for future microservices extraction
 
@@ -221,18 +221,33 @@ curl http://localhost:8080/ready
 - `POST /api/v1/auth/login` - Login
 - `POST /api/v1/auth/refresh` - Refresh token
 
-### Quotes
-- `POST /api/v1/quotes` - Create quote
-- `GET /api/v1/quotes` - List quotes
-- `GET /api/v1/quotes/{id}` - Get quote
-- `PATCH /api/v1/quotes/{id}` - Update quote
+### Inquiries (main resource — replaces /quotes, /offers, /estimates)
+- `POST /api/v1/inquiries` - Create inquiry (customer_email + addresses)
+- `GET /api/v1/inquiries` - List inquiries (filters: status, search, has_offer, limit, offset)
+- `GET /api/v1/inquiries/{id}` - Full detail with customer, addresses, estimation, items, offer
+- `PATCH /api/v1/inquiries/{id}` - Update fields / transition status
+- `DELETE /api/v1/inquiries/{id}` - Soft-delete (→ cancelled)
+- `GET /api/v1/inquiries/{id}/pdf` - Download active offer PDF
+- `PUT /api/v1/inquiries/{id}/items` - Edit estimation items
+- `POST /api/v1/inquiries/{id}/estimate/{method}` - Trigger estimation (depth, video)
+- `POST /api/v1/inquiries/{id}/generate-offer` - Generate/regenerate offer
+- `GET /api/v1/inquiries/{id}/emails` - Email thread
 
-### Volume Estimation
+### Public Submissions (no auth)
+- `POST /api/v1/submit/photo` - Photo webapp multipart upload
+- `POST /api/v1/submit/mobile` - Mobile app multipart upload
+
+### Media (public, no auth)
+- `GET /api/v1/estimates/images/{key}` - Public image/video proxy
+- `GET /api/v1/media/{key}` - Public image/video proxy (alias)
+
+### Volume Estimation (protected, legacy — to be migrated into `/inquiries`)
 - `POST /api/v1/estimates/vision` - LLM image analysis (base64 JSON)
-- `POST /api/v1/estimates/depth-sensor` - 3D ML pipeline (multipart upload, falls back to LLM)
-- `POST /api/v1/estimates/video` - Video 3D reconstruction pipeline (multipart upload, 600s timeout)
+- `POST /api/v1/estimates/depth-sensor` - 3D ML pipeline (multipart upload)
+- `POST /api/v1/estimates/video` - Video 3D reconstruction (multipart upload)
 - `POST /api/v1/estimates/inventory` - Manual inventory form
-- `GET /api/v1/estimates/{id}` - Get estimation
+- `GET /api/v1/estimates/{id}` - Get estimation (used for polling)
+- `DELETE /api/v1/estimates/{id}` - Delete estimation + S3 cleanup
 
 ### Calendar
 - `GET /api/v1/calendar/availability?date=YYYY-MM-DD` - Check date + alternatives
@@ -242,13 +257,24 @@ curl http://localhost:8080/ready
 - `PATCH /api/v1/calendar/bookings/{id}` - Update status (confirm/cancel)
 - `PUT /api/v1/calendar/capacity/{date}` - Override daily capacity
 
-### Distance
-- `POST /api/v1/distance/calculate` - Multi-stop route calculation
+### Customer (OTP auth)
+- `POST /api/v1/customer/auth/request` - Request OTP code
+- `POST /api/v1/customer/auth/verify` - Verify OTP, get session token
+- `GET /api/v1/customer/me` - Customer profile
+- `GET /api/v1/customer/inquiries` - List customer's inquiries
+- `GET /api/v1/customer/inquiries/{id}` - Inquiry detail (ownership-validated)
+- `POST /api/v1/customer/inquiries/{id}/accept` - Accept offer
+- `POST /api/v1/customer/inquiries/{id}/reject` - Reject offer
+- `GET /api/v1/customer/inquiries/{id}/pdf` - Download offer PDF
 
-### Offers
-- `POST /api/v1/offers/generate` - Generate offer from quote
-- `GET /api/v1/offers/{id}` - Get offer
-- `GET /api/v1/offers/{id}/pdf` - Download offer PDF
+### Admin (dashboard, customers, emails, users)
+- `GET /api/v1/admin/dashboard` - KPIs and recent activity
+- `GET/POST /api/v1/admin/customers` - List / create customers
+- `GET/PATCH /api/v1/admin/customers/{id}` - Detail / update customer
+- `PATCH /api/v1/admin/addresses/{id}` - Update address
+- `GET /api/v1/admin/emails` - List email threads
+- `GET /api/v1/admin/emails/{id}` - Thread detail
+- `GET /api/v1/admin/users` - List users
 
 ## Data Flow — Quote-to-Offer Pipeline
 
@@ -258,8 +284,8 @@ Four input sources feed into the pipeline:
 |--------|------------|-------------|--------|
 | A. Kontakt form | Email → email agent | None (general inquiry) | Working |
 | B. Kostenloses Angebot form | Email → email agent (JSON attachment) | VolumeCalculator items list | Working |
-| C. Photo webapp | `POST /api/v1/inquiries/photo` | Vision pipeline (ML) | Implemented |
-| D. Mobile app | `POST /api/v1/inquiries/mobile` | Depth sensor + AR | Implemented |
+| C. Photo webapp | `POST /api/v1/submit/photo` | Vision pipeline (ML) | Implemented |
+| D. Mobile app | `POST /api/v1/submit/mobile` | Depth sensor + AR | Implemented |
 | E. Video upload | Admin dashboard → API | Video 3D reconstruction (MASt3R + SAM 2) | Implemented |
 
 ```
@@ -276,7 +302,7 @@ Input Sources ─────┤                                    ├─→ Mo
             Orchestrator (orchestrator.rs):
             → Create customer (by email, upsert)
             → Create origin/destination addresses
-            → Create quote with volume + notes
+            → Create inquiry with volume + services JSONB
             → Store volume estimation (parsed items)
             → Auto-generate offer
                                     ↓
@@ -317,10 +343,10 @@ The offer uses an XLSX template (`templates/Angebot_Vorlage.xlsx`). Line items a
 | Slot | Item | Notes |
 |------|------|-------|
 | 1 | **Fahrkostenpauschale** | Always first. `flat_total` set via ORS round-trip (depot→origin→[stop]→dest→depot). E/F blank, G = flat amount. |
-| 2 | Demontage | Only if notes contain "demontage" |
-| 3 | Montage | Only if notes contain "montage" |
-| 4 | Halteverbotszone | remark = Beladestelle / Entladestelle / both; qty = number of zones |
-| 5 | Umzugsmaterial | Only if notes contain "verpackungsservice" |
+| 2 | Demontage | Only if `services.disassembly` is true |
+| 3 | Montage | Only if `services.assembly` is true |
+| 4 | Halteverbotszone | remark = Beladestelle / Entladestelle / both; qty = number of zones from `services.parking_ban_origin/destination` |
+| 5 | Umzugsmaterial | Only if `services.packing` is true |
 | 6+ | Manual items | Möbellift, Kleiderboxen, Kartons — passed via `overrides.line_items` only |
 | Labor | N Umzugshelfer | `is_labor=true`. G = E × F × J50 (J50 holds persons count) |
 | Last | Nürnbergerversicherung | Always last; qty=1, price=0, total=0 |
@@ -402,13 +428,41 @@ See `migrations/` for full schema.
 Key tables:
 - `customers` - Contact information
 - `addresses` - Origin/destination with geocoding
-- `quotes` - Quote requests with status tracking
-- `volume_estimations` - Volume calculation results (method: vision/inventory/depth_sensor)
-- `offers` - Generated offers with pricing
-- `email_threads` / `email_messages` - Email conversation tracking
-- `calendar_bookings` - Moving date bookings with status
+- `inquiries` - Unified inquiry lifecycle (was `quotes`); status + services JSONB + lifecycle timestamps
+- `volume_estimations` - Volume calculation results (FK: `inquiry_id`)
+- `offers` - Generated offers with pricing (FK: `inquiry_id`)
+- `email_threads` / `email_messages` - Email conversation tracking (FK: `inquiry_id`)
+- `calendar_bookings` - Moving date bookings with status (FK: `inquiry_id`)
 - `calendar_capacity_overrides` - Date-specific capacity limits
 - `users` - Admin users
+
+### Inquiry Status State Machine
+
+```
+PRE-SALES:
+  pending → info_requested → estimating → estimated → offer_ready → offer_sent
+    → accepted | rejected | expired | cancelled
+
+OPERATIONS:
+  scheduled → completed → invoiced → paid
+```
+
+Enforced by `InquiryStatus::can_transition_to()` in `crates/core/src/models/inquiry.rs`.
+
+### Services JSONB
+
+Services stored as JSONB on `inquiries.services` (replaces comma-separated notes parsing):
+```rust
+pub struct Services {
+    pub packing: bool,                  // Einpackservice
+    pub assembly: bool,                 // Montage
+    pub disassembly: bool,              // Demontage
+    pub storage: bool,                  // Einlagerung
+    pub disposal: bool,                 // Entsorgung
+    pub parking_ban_origin: bool,       // Halteverbot Beladestelle
+    pub parking_ban_destination: bool,  // Halteverbot Entladestelle
+}
+```
 
 ## LLM Provider Notes
 
@@ -427,8 +481,8 @@ Switch providers via `AUST__LLM__DEFAULT_PROVIDER` (claude/openai/ollama)
 ## High Priority
 
 ### Direct API Endpoints (Sources C + D)
-- [x] `POST /api/v1/inquiries/photo` — multipart form + photos for webapp
-- [x] `POST /api/v1/inquiries/mobile` — multipart form + photos + depth maps for mobile app
+- [x] `POST /api/v1/submit/photo` — multipart form + photos for webapp
+- [x] `POST /api/v1/submit/mobile` — multipart form + photos + depth maps for mobile app
 - [x] Wire both into vision pipeline → offer generation → Telegram approval
 
 ### Missing Offer Data
@@ -453,7 +507,7 @@ Switch providers via `AUST__LLM__DEFAULT_PROVIDER` (claude/openai/ollama)
 ### Pricing Engine
 - [ ] Make pricing configurable via database (currently hardcoded rates)
 - [ ] Add seasonal/weekend/holiday pricing (Saturday surcharge exists: +€50)
-- [ ] Store services as JSONB on quotes instead of comma-separated text in `notes`
+- [x] Store services as JSONB on inquiries instead of comma-separated text in `notes`
 
 ### Distance Calculator
 - [ ] Add result caching in Redis
@@ -482,7 +536,13 @@ Switch providers via `AUST__LLM__DEFAULT_PROVIDER` (claude/openai/ollama)
 
 ## Technical Debt
 
-- [ ] Remove unused `patch` import in `quotes.rs`
-- [ ] Use `status` field in `ListQuotesQuery` for filtering
-- [ ] Extract duplicate `QuoteRow` to shared location
+- [x] Remove legacy `/quotes`, `/offers`, `/distance` route stubs (superseded by `/inquiries`)
+- [x] Delete old `crates/api/src/routes/quotes.rs` and `distance.rs`
+- [x] Delete orphaned frontend `/admin/offers` pages (offers embedded in inquiry detail)
 - [ ] Fix `run_agent.rs` example (missing 4th arg to `EmailProcessor::new()`)
+- [ ] Migrate `/estimates` protected handlers into inquiry-level endpoints (currently re-mounted for frontend polling + delete)
+- [ ] Add multipart upload support to `trigger_estimate` for vision/depth/video methods (currently only inventory works inline)
+- [ ] Restore `/distance/calculate` endpoint or embed route geometry in inquiry response (route map broken)
+- [ ] Wire `sync_quote_accepted/cancelled/downgraded` into inquiry status transitions in `inquiries.rs`
+- [ ] Rename `sync_quote_*` → `sync_inquiry_*` in `status_sync.rs`
+- [ ] Rename `update_quote_volume` → `update_inquiry_volume` in `services/db.rs`

@@ -6,7 +6,7 @@
 use crate::routes::offers::{build_offer, build_offer_with_overrides, GeneratedOffer, OfferOverrides};
 use crate::{services, AppState};
 use aust_core::config::TelegramConfig;
-use aust_core::models::MovingInquiry;
+use aust_core::models::{MovingInquiry, Services};
 use aust_distance_calculator::{RouteCalculator, RouteRequest};
 use aust_llm_providers::{LlmMessage, LlmProvider};
 use reqwest::{
@@ -64,21 +64,21 @@ fn format_address_line(address: &str, floor: &str, elevator: Option<bool>) -> St
 ///
 /// # Parameters
 /// - `state` — shared application state (DB, storage, config)
-/// - `quote_id` — the quote to check and potentially generate an offer for
+/// - `inquiry_id` — the quote to check and potentially generate an offer for
 ///
 /// # Returns
 /// Nothing. Errors are logged and, if critical, forwarded to the admin via Telegram.
-pub async fn try_auto_generate_offer(state: Arc<AppState>, quote_id: Uuid) {
+pub async fn try_auto_generate_offer(state: Arc<AppState>, inquiry_id: Uuid) {
     // Check if an offer already exists for this quote
     let existing: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM offers WHERE quote_id = $1 LIMIT 1")
-            .bind(quote_id)
+        sqlx::query_as("SELECT id FROM offers WHERE inquiry_id = $1 LIMIT 1")
+            .bind(inquiry_id)
             .fetch_optional(&state.db)
             .await
             .unwrap_or(None);
 
     if existing.is_some() {
-        info!("Offer already exists for quote {quote_id}, skipping auto-generation");
+        info!("Offer already exists for quote {inquiry_id}, skipping auto-generation");
         return;
     }
 
@@ -92,9 +92,9 @@ pub async fn try_auto_generate_offer(state: Arc<AppState>, quote_id: Uuid) {
         stop_address_id: Option<Uuid>,
     }
     let readiness: Option<QuoteReadiness> = sqlx::query_as(
-        "SELECT estimated_volume_m3, distance_km, origin_address_id, destination_address_id, stop_address_id FROM quotes WHERE id = $1",
+        "SELECT estimated_volume_m3, distance_km, origin_address_id, destination_address_id, stop_address_id FROM inquiries WHERE id = $1",
     )
-    .bind(quote_id)
+    .bind(inquiry_id)
     .fetch_optional(&state.db)
     .await
     .unwrap_or(None);
@@ -102,7 +102,7 @@ pub async fn try_auto_generate_offer(state: Arc<AppState>, quote_id: Uuid) {
     let q = match readiness {
         Some(r) if r.estimated_volume_m3.unwrap_or(0.0) > 0.0 => r,
         _ => {
-            info!("Quote {quote_id} not ready for offer (no volume estimate)");
+            info!("Quote {inquiry_id} not ready for offer (no volume estimate)");
             return;
         }
     };
@@ -142,25 +142,25 @@ pub async fn try_auto_generate_offer(state: Arc<AppState>, quote_id: Uuid) {
                 let calculator = RouteCalculator::new(state.config.maps.api_key.clone());
                 match calculator.calculate(&RouteRequest { addresses: route_addresses }).await {
                     Ok(result) => {
-                        info!("Distance calculated for quote {quote_id}: {:.1} km", result.total_distance_km);
-                        let _ = sqlx::query("UPDATE quotes SET distance_km = $1, updated_at = NOW() WHERE id = $2")
+                        info!("Distance calculated for quote {inquiry_id}: {:.1} km", result.total_distance_km);
+                        let _ = sqlx::query("UPDATE inquiries SET distance_km = $1, updated_at = NOW() WHERE id = $2")
                             .bind(result.total_distance_km)
-                            .bind(quote_id)
+                            .bind(inquiry_id)
                             .execute(&state.db)
                             .await;
                     }
-                    Err(e) => warn!("Distance calculation for quote {quote_id} failed: {e}"),
+                    Err(e) => warn!("Distance calculation for quote {inquiry_id} failed: {e}"),
                 }
             }
         }
     }
 
-    info!("Auto-generating offer for quote {quote_id}");
+    info!("Auto-generating offer for quote {inquiry_id}");
 
-    match build_offer(&state.db, &*state.storage, &state.config, quote_id, Some(30)).await {
+    match build_offer(&state.db, &*state.storage, &state.config, inquiry_id, Some(30)).await {
         Ok(generated) => {
             info!(
-                "Offer {} generated for quote {quote_id} (€{:.2})",
+                "Offer {} generated for quote {inquiry_id} (€{:.2})",
                 generated.offer.id,
                 generated.offer.price_cents as f64 / 100.0
             );
@@ -168,13 +168,13 @@ pub async fn try_auto_generate_offer(state: Arc<AppState>, quote_id: Uuid) {
             send_offer_to_telegram(&state.config.telegram, &generated).await;
 
             // Auto-create tentative booking if quote has a preferred_date
-            auto_create_booking(&state, quote_id).await;
+            auto_create_booking(&state, inquiry_id).await;
         }
         Err(e) => {
-            error!("Auto-offer generation failed for quote {quote_id}: {e}");
+            error!("Auto-offer generation failed for quote {inquiry_id}: {e}");
             notify_telegram_error(
                 &state.config.telegram,
-                &format!("Angebotserstellung fehlgeschlagen für Quote {quote_id}: {e}"),
+                &format!("Angebotserstellung fehlgeschlagen für Quote {inquiry_id}: {e}"),
             )
             .await;
         }
@@ -194,12 +194,12 @@ pub async fn try_auto_generate_offer(state: Arc<AppState>, quote_id: Uuid) {
 ///
 /// # Parameters
 /// - `state` — shared application state (DB, calendar service, config)
-/// - `quote_id` — the quote whose `preferred_date` is used as the booking date
-async fn auto_create_booking(state: &AppState, quote_id: Uuid) {
+/// - `inquiry_id` — the quote whose `preferred_date` is used as the booking date
+async fn auto_create_booking(state: &AppState, inquiry_id: Uuid) {
     // Fetch preferred_date from quote
     let row: Option<(Option<chrono::DateTime<chrono::Utc>>,)> =
-        sqlx::query_as("SELECT preferred_date FROM quotes WHERE id = $1")
-            .bind(quote_id)
+        sqlx::query_as("SELECT preferred_date FROM inquiries WHERE id = $1")
+            .bind(inquiry_id)
             .fetch_optional(&state.db)
             .await
             .unwrap_or(None);
@@ -207,22 +207,22 @@ async fn auto_create_booking(state: &AppState, quote_id: Uuid) {
     let booking_date = match row {
         Some((Some(dt),)) => dt.date_naive(),
         _ => {
-            info!("Quote {quote_id} has no preferred_date, skipping auto-booking");
+            info!("Quote {inquiry_id} has no preferred_date, skipping auto-booking");
             return;
         }
     };
 
     // Check if an active booking already exists for this quote (the unique index would catch this too)
     let existing: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT id FROM calendar_bookings WHERE quote_id = $1 AND status != 'cancelled' LIMIT 1",
+        "SELECT id FROM calendar_bookings WHERE inquiry_id = $1 AND status != 'cancelled' LIMIT 1",
     )
-    .bind(quote_id)
+    .bind(inquiry_id)
     .fetch_optional(&state.db)
     .await
     .unwrap_or(None);
 
     if existing.is_some() {
-        info!("Active booking already exists for quote {quote_id}, skipping");
+        info!("Active booking already exists for quote {inquiry_id}, skipping");
         return;
     }
 
@@ -230,12 +230,12 @@ async fn auto_create_booking(state: &AppState, quote_id: Uuid) {
     let info_row: Option<(Option<String>, Option<String>, Option<f64>, Option<f64>)> = sqlx::query_as(
         r#"
         SELECT c.name, c.email, q.estimated_volume_m3, q.distance_km
-        FROM quotes q
+        FROM inquiries q
         JOIN customers c ON q.customer_id = c.id
         WHERE q.id = $1
         "#,
     )
-    .bind(quote_id)
+    .bind(inquiry_id)
     .fetch_optional(&state.db)
     .await
     .unwrap_or(None);
@@ -249,10 +249,10 @@ async fn auto_create_booking(state: &AppState, quote_id: Uuid) {
         SELECT
             (SELECT street || ', ' || city FROM addresses WHERE id = q.origin_address_id),
             (SELECT street || ', ' || city FROM addresses WHERE id = q.destination_address_id)
-        FROM quotes q WHERE q.id = $1
+        FROM inquiries q WHERE q.id = $1
         "#,
     )
-    .bind(quote_id)
+    .bind(inquiry_id)
     .fetch_optional(&state.db)
     .await
     .unwrap_or(None);
@@ -261,7 +261,7 @@ async fn auto_create_booking(state: &AppState, quote_id: Uuid) {
 
     let new_booking = NewBooking {
         booking_date,
-        quote_id: Some(quote_id),
+        inquiry_id: Some(inquiry_id),
         customer_name,
         customer_email,
         departure_address: departure,
@@ -275,12 +275,12 @@ async fn auto_create_booking(state: &AppState, quote_id: Uuid) {
     match state.calendar.force_create_booking(new_booking).await {
         Ok(booking) => {
             info!(
-                "Auto-created tentative booking {} for quote {quote_id} on {}",
+                "Auto-created tentative booking {} for quote {inquiry_id} on {}",
                 booking.id, booking_date
             );
         }
         Err(e) => {
-            warn!("Failed to auto-create booking for quote {quote_id}: {e}");
+            warn!("Failed to auto-create booking for quote {inquiry_id}: {e}");
         }
     }
 }
@@ -456,7 +456,7 @@ use aust_email_agent::ApprovalDecision;
 /// State for the offer currently being edited.
 struct EditingOffer {
     offer_id: Uuid,
-    quote_id: Uuid,
+    inquiry_id: Uuid,
 }
 
 /// Long-running background task that processes offer lifecycle events from the Telegram poller.
@@ -504,17 +504,17 @@ pub async fn run_offer_event_handler(
             }
             ApprovalDecision::OfferEdit(id_str) => {
                 if let Ok(offer_id) = Uuid::parse_str(&id_str) {
-                    let quote_id: Option<(Uuid,)> =
-                        sqlx::query_as("SELECT quote_id FROM offers WHERE id = $1")
+                    let inquiry_id: Option<(Uuid,)> =
+                        sqlx::query_as("SELECT inquiry_id FROM offers WHERE id = $1")
                             .bind(offer_id)
                             .fetch_optional(&state.db)
                             .await
                             .unwrap_or(None);
 
-                    if let Some((qid,)) = quote_id {
+                    if let Some((qid,)) = inquiry_id {
                         editing = Some(EditingOffer {
                             offer_id,
-                            quote_id: qid,
+                            inquiry_id: qid,
                         });
                         send_telegram_message(
                             &client,
@@ -571,7 +571,7 @@ pub async fn run_offer_event_handler(
                     bot_token,
                     chat_id,
                     edit_state.offer_id,
-                    edit_state.quote_id,
+                    edit_state.inquiry_id,
                     &text,
                 )
                 .await;
@@ -596,8 +596,8 @@ pub async fn run_offer_event_handler(
 /// 5. Auto-calculate route distance if both addresses are present.
 /// 6. Determine volume — use `inquiry.volume_m3` if provided, otherwise apply
 ///    room-count heuristics from `inquiry.notes` (default 25 m³).
-/// 7. Build comma-separated service notes via `build_quote_notes` and insert quote
-///    with status `"volume_estimated"`.
+/// 7. Build `Services` struct via `build_services` and insert inquiry
+///    with status `"estimated"`.
 /// 8. Insert a `volume_estimations` row (method `"manual"`) carrying the parsed items list.
 /// 9. Link the most-recent open email thread to the new quote.
 /// 10. Delegate to `try_auto_generate_offer` → PDF → Telegram.
@@ -789,31 +789,40 @@ async fn handle_complete_inquiry(
     });
 
     // 5. Create quote
-    let quote_id = Uuid::now_v7();
+    let inquiry_id = Uuid::now_v7();
     let preferred_date_ts = inquiry
         .preferred_date
         .map(|d| d.and_hms_opt(10, 0, 0).unwrap())
         .map(|dt| chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(dt, chrono::Utc));
 
-    let notes = build_quote_notes(&inquiry);
+    let inquiry_services = build_services(&inquiry);
+    let services_json = serde_json::to_value(&inquiry_services).unwrap_or_default();
+    // notes now contains ONLY the customer's free-text message
+    let notes = inquiry.notes.clone();
+    let source = serde_json::to_value(&inquiry.source)
+        .ok()
+        .and_then(|v| v.as_str().map(String::from))
+        .unwrap_or_else(|| "direct_email".to_string());
 
     if let Err(e) = sqlx::query(
         r#"
-        INSERT INTO quotes (id, customer_id, origin_address_id, destination_address_id, stop_address_id,
-                           status, estimated_volume_m3, distance_km, preferred_date, notes, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11)
+        INSERT INTO inquiries (id, customer_id, origin_address_id, destination_address_id, stop_address_id,
+                           status, estimated_volume_m3, distance_km, preferred_date, notes, services, source, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $13)
         "#,
     )
-    .bind(quote_id)
+    .bind(inquiry_id)
     .bind(customer_id)
     .bind(origin_id)
     .bind(dest_id)
     .bind(stop_id)
-    .bind("volume_estimated")
+    .bind("estimated")
     .bind(volume_m3)
     .bind(distance_km)
     .bind(preferred_date_ts)
     .bind(&notes)
+    .bind(&services_json)
+    .bind(&source)
     .bind(now)
     .execute(&state.db)
     .await
@@ -842,12 +851,12 @@ async fn handle_complete_inquiry(
 
     if let Err(e) = sqlx::query(
         r#"
-        INSERT INTO volume_estimations (id, quote_id, method, source_data, result_data, total_volume_m3, confidence_score, created_at)
+        INSERT INTO volume_estimations (id, inquiry_id, method, source_data, result_data, total_volume_m3, confidence_score, created_at)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         "#,
     )
     .bind(estimation_id)
-    .bind(quote_id)
+    .bind(inquiry_id)
     .bind("manual")
     .bind(source_data)
     .bind(result_data)
@@ -857,11 +866,11 @@ async fn handle_complete_inquiry(
     .execute(&state.db)
     .await
     {
-        warn!("Failed to insert volume_estimations for quote {quote_id}: {e}");
+        warn!("Failed to insert volume_estimations for quote {inquiry_id}: {e}");
     }
 
     info!(
-        "Created quote {quote_id} for customer {} ({}) — {:.1} m³",
+        "Created quote {inquiry_id} for customer {} ({}) — {:.1} m³",
         inquiry.name.as_deref().unwrap_or("?"),
         inquiry.email,
         volume_m3
@@ -870,21 +879,21 @@ async fn handle_complete_inquiry(
     // Link email thread to quote (if thread exists for this customer)
     let _ = sqlx::query(
         r#"
-        UPDATE email_threads SET quote_id = $1
+        UPDATE email_threads SET inquiry_id = $1
         WHERE id = (
             SELECT id FROM email_threads
-            WHERE customer_id = $2 AND quote_id IS NULL
+            WHERE customer_id = $2 AND inquiry_id IS NULL
             ORDER BY created_at DESC LIMIT 1
         )
         "#,
     )
-    .bind(quote_id)
+    .bind(inquiry_id)
     .bind(customer_id)
     .execute(&state.db)
     .await;
 
     // 7. Generate offer → PDF → Telegram
-    try_auto_generate_offer(Arc::clone(state), quote_id).await;
+    try_auto_generate_offer(Arc::clone(state), inquiry_id).await;
 }
 
 /// Parsed item from the VolumeCalculator items_list text.
@@ -1015,61 +1024,29 @@ pub fn parse_items_list_text(text: &str) -> Vec<ParsedInventoryItem> {
     items
 }
 
-/// Build the comma-separated `quotes.notes` string from a `MovingInquiry`.
+/// Build a `Services` struct from a `MovingInquiry`.
 ///
 /// **Caller**: `handle_complete_inquiry`, step 7.
-/// **Why**: The pricing engine and line-item builder (`build_line_items` in `offers.rs`)
-/// parse `quotes.notes` to determine which surcharge rows to include in the XLSX offer
-/// (parking bans, packing service, assembly/disassembly, etc.). Storing services as a
-/// comma-separated string avoids schema changes for each new service type while keeping
-/// the data human-readable in the DB.
+/// **Why**: The line-item builder (`build_line_items` in `offers.rs`) uses the structured
+/// `Services` flags to determine which surcharge rows to include in the XLSX offer
+/// (parking bans, packing service, assembly/disassembly, etc.). Stored as JSONB in the
+/// `inquiries.services` column.
 ///
 /// # Parameters
-/// - `inquiry` — the fully-parsed `MovingInquiry` whose boolean service flags and floor
-///   strings are serialised into the notes
+/// - `inquiry` — the fully-parsed `MovingInquiry` whose boolean service flags are mapped
 ///
 /// # Returns
-/// A comma-separated string such as
-/// `"Auszug: 1. Stock, Einzug: 3. Stock, Halteverbot Auszug, Verpackungsservice, Montage"`.
-/// Returns an empty string when no flags are set and `inquiry.notes` is `None`.
-fn build_quote_notes(inquiry: &MovingInquiry) -> String {
-    let mut parts = Vec::new();
-
-    if let Some(ref floor) = inquiry.departure_floor {
-        parts.push(format!("Auszug: {floor}"));
+/// A `Services` struct with each field set from the corresponding inquiry flag.
+fn build_services(inquiry: &MovingInquiry) -> Services {
+    Services {
+        packing: inquiry.service_packing,
+        assembly: inquiry.service_assembly,
+        disassembly: inquiry.service_disassembly,
+        storage: inquiry.service_storage,
+        disposal: inquiry.service_disposal,
+        parking_ban_origin: inquiry.departure_parking_ban.unwrap_or(false),
+        parking_ban_destination: inquiry.arrival_parking_ban.unwrap_or(false),
     }
-    if let Some(ref floor) = inquiry.arrival_floor {
-        parts.push(format!("Einzug: {floor}"));
-    }
-    if inquiry.departure_parking_ban == Some(true) {
-        parts.push("Halteverbot Auszug".to_string());
-    }
-    if inquiry.arrival_parking_ban == Some(true) {
-        parts.push("Halteverbot Einzug".to_string());
-    }
-    if inquiry.intermediate_parking_ban == Some(true) {
-        parts.push("Halteverbot Zwischenstopp".to_string());
-    }
-    if inquiry.service_packing {
-        parts.push("Verpackungsservice".to_string());
-    }
-    if inquiry.service_assembly {
-        parts.push("Montage".to_string());
-    }
-    if inquiry.service_disassembly {
-        parts.push("Demontage".to_string());
-    }
-    if inquiry.service_storage {
-        parts.push("Einlagerung".to_string());
-    }
-    if inquiry.service_disposal {
-        parts.push("Entsorgung".to_string());
-    }
-    if let Some(ref notes) = inquiry.notes {
-        parts.push(notes.clone());
-    }
-
-    parts.join(", ")
 }
 
 /// Parse Alex's free-text edit instructions and regenerate the offer with the requested overrides.
@@ -1095,7 +1072,7 @@ fn build_quote_notes(inquiry: &MovingInquiry) -> String {
 /// - `bot_token` — Telegram bot token
 /// - `chat_id` — admin Telegram chat ID
 /// - `old_offer_id` — the offer being replaced (its ID is reused in the regenerated offer)
-/// - `quote_id` — the quote this offer belongs to
+/// - `inquiry_id` — the quote this offer belongs to
 /// - `instructions` — raw German free-text from Alex, e.g. `"800 Euro, 4 Helfer"`
 ///
 /// # Errors
@@ -1106,11 +1083,11 @@ async fn handle_offer_edit(
     bot_token: &str,
     chat_id: i64,
     old_offer_id: Uuid,
-    quote_id: Uuid,
+    inquiry_id: Uuid,
     instructions: &str,
 ) {
     // Fetch current offer details for LLM context
-    let current_offer = fetch_current_offer_summary(&state.db, old_offer_id, quote_id).await;
+    let current_offer = fetch_current_offer_summary(&state.db, old_offer_id, inquiry_id).await;
 
     // Use LLM to parse natural language edit instructions
     let overrides = match llm_parse_edit_instructions(
@@ -1129,9 +1106,9 @@ async fn handle_offer_edit(
 
     // Apply numeric overrides directly to the quote if needed
     if let Some(volume) = overrides.volume_m3 {
-        let _ = sqlx::query("UPDATE quotes SET estimated_volume_m3 = $1 WHERE id = $2")
+        let _ = sqlx::query("UPDATE inquiries SET estimated_volume_m3 = $1 WHERE id = $2")
             .bind(volume)
-            .bind(quote_id)
+            .bind(inquiry_id)
             .execute(&state.db)
             .await;
     }
@@ -1146,10 +1123,10 @@ async fn handle_offer_edit(
         existing_offer_id: Some(old_offer_id),
     };
 
-    match build_offer_with_overrides(&state.db, &*state.storage, &state.config, quote_id, Some(30), &offer_overrides).await {
+    match build_offer_with_overrides(&state.db, &*state.storage, &state.config, inquiry_id, Some(30), &offer_overrides).await {
         Ok(generated) => {
             info!(
-                "Offer {} regenerated for quote {quote_id} (€{:.2})",
+                "Offer {} regenerated for quote {inquiry_id} (€{:.2})",
                 generated.offer.id,
                 generated.offer.price_cents as f64 / 100.0
             );
@@ -1205,11 +1182,11 @@ impl std::fmt::Display for OfferSummary {
 /// # Parameters
 /// - `db` — database connection pool
 /// - `offer_id` — offer whose `price_cents` is fetched
-/// - `quote_id` — quote whose `estimated_volume_m3` and `distance_km` are fetched
+/// - `inquiry_id` — quote whose `estimated_volume_m3` and `distance_km` are fetched
 ///
 /// # Returns
 /// An `OfferSummary` with sensible defaults (`0` price, `25.0` m³) if the rows are missing.
-async fn fetch_current_offer_summary(db: &PgPool, offer_id: Uuid, quote_id: Uuid) -> OfferSummary {
+async fn fetch_current_offer_summary(db: &PgPool, offer_id: Uuid, inquiry_id: Uuid) -> OfferSummary {
     // Get offer price
     let price: Option<(i64,)> = sqlx::query_as("SELECT price_cents FROM offers WHERE id = $1")
         .bind(offer_id)
@@ -1219,9 +1196,9 @@ async fn fetch_current_offer_summary(db: &PgPool, offer_id: Uuid, quote_id: Uuid
 
     // Get quote details
     let quote: Option<(Option<f64>, Option<f64>)> = sqlx::query_as(
-        "SELECT estimated_volume_m3, distance_km FROM quotes WHERE id = $1",
+        "SELECT estimated_volume_m3, distance_km FROM inquiries WHERE id = $1",
     )
-    .bind(quote_id)
+    .bind(inquiry_id)
     .fetch_optional(db)
     .await
     .unwrap_or(None);
@@ -1521,9 +1498,9 @@ async fn handle_offer_approval(
 
     let row: Option<(String, Option<String>, Uuid)> = sqlx::query_as(
         r#"
-        SELECT c.email, o.pdf_storage_key, o.quote_id
+        SELECT c.email, o.pdf_storage_key, o.inquiry_id
         FROM offers o
-        JOIN quotes q ON o.quote_id = q.id
+        JOIN inquiries q ON o.inquiry_id = q.id
         JOIN customers c ON q.customer_id = c.id
         WHERE o.id = $1
         "#,
@@ -1533,7 +1510,7 @@ async fn handle_offer_approval(
     .await
     .unwrap_or(None);
 
-    let Some((customer_email, Some(storage_key), quote_id)) = row else {
+    let Some((customer_email, Some(storage_key), inquiry_id)) = row else {
         send_telegram_message(
             client,
             bot_token,
@@ -1569,9 +1546,9 @@ async fn handle_offer_approval(
                 .await;
 
             // Also update quote status to offer_sent
-            let _ = sqlx::query("UPDATE quotes SET status = 'offer_sent', updated_at = $1 WHERE id = $2")
+            let _ = sqlx::query("UPDATE inquiries SET status = 'offer_sent', updated_at = $1 WHERE id = $2")
                 .bind(now)
-                .bind(quote_id)
+                .bind(inquiry_id)
                 .execute(&state.db)
                 .await;
 
@@ -1579,12 +1556,12 @@ async fn handle_offer_approval(
             let thread_row: Option<(Uuid,)> = sqlx::query_as(
                 r#"
                 SELECT et.id FROM email_threads et
-                JOIN quotes q ON et.customer_id = q.customer_id
+                JOIN inquiries q ON et.customer_id = q.customer_id
                 WHERE q.id = $1
                 ORDER BY et.created_at DESC LIMIT 1
                 "#,
             )
-            .bind(quote_id)
+            .bind(inquiry_id)
             .fetch_optional(&state.db)
             .await
             .unwrap_or(None);
@@ -1654,9 +1631,9 @@ async fn handle_offer_denial(
 ) {
     info!("Offer {offer_id} denied");
 
-    // Fetch quote_id before updating
+    // Fetch inquiry_id before updating
     let quote_row: Option<(Uuid,)> =
-        sqlx::query_as("SELECT quote_id FROM offers WHERE id = $1")
+        sqlx::query_as("SELECT inquiry_id FROM offers WHERE id = $1")
             .bind(offer_id)
             .fetch_optional(&state.db)
             .await
@@ -1668,11 +1645,11 @@ async fn handle_offer_denial(
         .await;
 
     // Also update quote status to rejected
-    if let Some((quote_id,)) = quote_row {
+    if let Some((inquiry_id,)) = quote_row {
         let now = chrono::Utc::now();
-        let _ = sqlx::query("UPDATE quotes SET status = 'rejected', updated_at = $1 WHERE id = $2")
+        let _ = sqlx::query("UPDATE inquiries SET status = 'rejected', updated_at = $1 WHERE id = $2")
             .bind(now)
-            .bind(quote_id)
+            .bind(inquiry_id)
             .execute(&state.db)
             .await;
     }
@@ -1920,7 +1897,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // build_quote_notes tests
+    // build_services tests
     // ---------------------------------------------------------------
 
     fn minimal_inquiry() -> MovingInquiry {
@@ -1932,118 +1909,107 @@ mod tests {
     }
 
     #[test]
-    fn notes_empty_inquiry() {
+    fn services_empty_inquiry() {
         let inquiry = minimal_inquiry();
-        let notes = build_quote_notes(&inquiry);
-        assert_eq!(notes, "");
+        let services = build_services(&inquiry);
+        assert_eq!(services, Services::default());
     }
 
     #[test]
-    fn notes_departure_floor_only() {
-        let mut inquiry = minimal_inquiry();
-        inquiry.departure_floor = Some("3. Stock".to_string());
-        let notes = build_quote_notes(&inquiry);
-        assert!(notes.contains("Auszug: 3. Stock"), "notes = {notes}");
-    }
-
-    #[test]
-    fn notes_arrival_floor_only() {
-        let mut inquiry = minimal_inquiry();
-        inquiry.arrival_floor = Some("EG".to_string());
-        let notes = build_quote_notes(&inquiry);
-        assert!(notes.contains("Einzug: EG"), "notes = {notes}");
-    }
-
-    #[test]
-    fn notes_both_floors() {
-        let mut inquiry = minimal_inquiry();
-        inquiry.departure_floor = Some("2. Stock".to_string());
-        inquiry.arrival_floor = Some("EG".to_string());
-        let notes = build_quote_notes(&inquiry);
-        assert!(notes.contains("Auszug: 2. Stock"), "notes = {notes}");
-        assert!(notes.contains("Einzug: EG"), "notes = {notes}");
-        // Should be comma-separated
-        assert!(notes.contains(", "), "parts should be comma-separated: {notes}");
-    }
-
-    #[test]
-    fn notes_halteverbot_auszug() {
+    fn services_parking_ban_origin() {
         let mut inquiry = minimal_inquiry();
         inquiry.departure_parking_ban = Some(true);
-        let notes = build_quote_notes(&inquiry);
-        assert!(notes.contains("Halteverbot Auszug"), "notes = {notes}");
+        let services = build_services(&inquiry);
+        assert!(services.parking_ban_origin);
+        assert!(!services.parking_ban_destination);
     }
 
     #[test]
-    fn notes_halteverbot_einzug() {
+    fn services_parking_ban_destination() {
         let mut inquiry = minimal_inquiry();
         inquiry.arrival_parking_ban = Some(true);
-        let notes = build_quote_notes(&inquiry);
-        assert!(notes.contains("Halteverbot Einzug"), "notes = {notes}");
+        let services = build_services(&inquiry);
+        assert!(!services.parking_ban_origin);
+        assert!(services.parking_ban_destination);
     }
 
     #[test]
-    fn notes_halteverbot_zwischenstopp() {
-        let mut inquiry = minimal_inquiry();
-        inquiry.intermediate_parking_ban = Some(true);
-        let notes = build_quote_notes(&inquiry);
-        assert!(notes.contains("Halteverbot Zwischenstopp"), "notes = {notes}");
+    fn services_parking_ban_none_defaults_false() {
+        let inquiry = minimal_inquiry();
+        let services = build_services(&inquiry);
+        assert!(!services.parking_ban_origin);
+        assert!(!services.parking_ban_destination);
     }
 
     #[test]
-    fn notes_all_services() {
+    fn services_all_flags() {
         let mut inquiry = minimal_inquiry();
         inquiry.service_packing = true;
         inquiry.service_assembly = true;
         inquiry.service_disassembly = true;
         inquiry.service_storage = true;
         inquiry.service_disposal = true;
-        let notes = build_quote_notes(&inquiry);
-        assert!(notes.contains("Verpackungsservice"), "notes = {notes}");
-        assert!(notes.contains("Montage"), "notes = {notes}");
-        assert!(notes.contains("Demontage"), "notes = {notes}");
-        assert!(notes.contains("Einlagerung"), "notes = {notes}");
-        assert!(notes.contains("Entsorgung"), "notes = {notes}");
+        let services = build_services(&inquiry);
+        assert!(services.packing);
+        assert!(services.assembly);
+        assert!(services.disassembly);
+        assert!(services.storage);
+        assert!(services.disposal);
     }
 
     #[test]
-    fn notes_passthrough_notes_field() {
+    fn services_partial_flags() {
         let mut inquiry = minimal_inquiry();
-        inquiry.notes = Some("Bitte vorsichtig mit dem Klavier".to_string());
-        let notes = build_quote_notes(&inquiry);
-        assert!(
-            notes.contains("Bitte vorsichtig mit dem Klavier"),
-            "notes = {notes}"
-        );
+        inquiry.service_packing = true;
+        inquiry.service_disassembly = true;
+        let services = build_services(&inquiry);
+        assert!(services.packing);
+        assert!(!services.assembly);
+        assert!(services.disassembly);
+        assert!(!services.storage);
+        assert!(!services.disposal);
     }
 
     #[test]
-    fn notes_full_inquiry() {
+    fn services_full_inquiry() {
         let mut inquiry = minimal_inquiry();
-        inquiry.departure_floor = Some("1. Stock".to_string());
-        inquiry.arrival_floor = Some("3. Stock".to_string());
         inquiry.departure_parking_ban = Some(true);
         inquiry.arrival_parking_ban = Some(true);
-        inquiry.intermediate_parking_ban = Some(true);
         inquiry.service_packing = true;
         inquiry.service_assembly = true;
         inquiry.service_disassembly = true;
         inquiry.service_storage = true;
         inquiry.service_disposal = true;
+        let services = build_services(&inquiry);
+
+        assert!(services.packing);
+        assert!(services.assembly);
+        assert!(services.disassembly);
+        assert!(services.storage);
+        assert!(services.disposal);
+        assert!(services.parking_ban_origin);
+        assert!(services.parking_ban_destination);
+    }
+
+    #[test]
+    fn services_serializes_to_json() {
+        let mut inquiry = minimal_inquiry();
+        inquiry.service_packing = true;
+        inquiry.departure_parking_ban = Some(true);
+        let services = build_services(&inquiry);
+        let json = serde_json::to_value(&services).unwrap();
+        assert_eq!(json["packing"], true);
+        assert_eq!(json["parking_ban_origin"], true);
+        assert_eq!(json["assembly"], false);
+    }
+
+    #[test]
+    fn services_notes_not_included() {
+        // Notes should NOT affect services — notes is now purely free-text
+        let mut inquiry = minimal_inquiry();
         inquiry.notes = Some("Klavier im 1. OG".to_string());
-        let notes = build_quote_notes(&inquiry);
-
-        assert!(notes.contains("Auszug: 1. Stock"), "notes = {notes}");
-        assert!(notes.contains("Einzug: 3. Stock"), "notes = {notes}");
-        assert!(notes.contains("Halteverbot Auszug"), "notes = {notes}");
-        assert!(notes.contains("Halteverbot Einzug"), "notes = {notes}");
-        assert!(notes.contains("Halteverbot Zwischenstopp"), "notes = {notes}");
-        assert!(notes.contains("Verpackungsservice"), "notes = {notes}");
-        assert!(notes.contains("Montage"), "notes = {notes}");
-        assert!(notes.contains("Demontage"), "notes = {notes}");
-        assert!(notes.contains("Einlagerung"), "notes = {notes}");
-        assert!(notes.contains("Entsorgung"), "notes = {notes}");
-        assert!(notes.contains("Klavier im 1. OG"), "notes = {notes}");
+        let services = build_services(&inquiry);
+        assert_eq!(services, Services::default());
     }
 
     // ========== parse_edit_instructions ==========

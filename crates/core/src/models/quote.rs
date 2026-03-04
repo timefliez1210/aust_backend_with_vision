@@ -2,70 +2,22 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// Lifecycle status of a moving quote request.
+use super::inquiry::InquiryStatus;
+use super::snapshots::Services;
+
+/// Re-export InquiryStatus as QuoteStatus for backward compatibility.
 ///
-/// Transitions follow the pipeline:
-/// `Pending` → `InfoRequested` (if data missing) → `VolumeEstimated` →
-/// `OfferGenerated` → `OfferSent` → `Accepted` | `Rejected` | `Expired` →
-/// `Done` → `Paid`
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum QuoteStatus {
-    /// Initial state: inquiry received, no offer generated yet.
-    Pending,
-    /// The email agent sent a follow-up asking for missing fields.
-    InfoRequested,
-    /// Volume estimation pipeline completed successfully.
-    VolumeEstimated,
-    /// Offer PDF generated and awaiting Telegram approval.
-    OfferGenerated,
-    /// Offer approved by Alex and emailed to the customer.
-    OfferSent,
-    /// Customer accepted the offer.
-    Accepted,
-    /// Customer or Alex rejected the offer.
-    Rejected,
-    /// Quote timed out without a response.
-    Expired,
-    /// Quote was cancelled (e.g., customer withdrew).
-    Cancelled,
-    /// Move completed successfully.
-    Done,
-    /// Invoice paid by the customer.
-    Paid,
-}
+/// **Why**: Existing code throughout the codebase references `QuoteStatus`.
+/// This alias keeps that code compiling while the migration to `InquiryStatus`
+/// proceeds incrementally.
+pub type QuoteStatus = InquiryStatus;
 
-impl Default for QuoteStatus {
-    fn default() -> Self {
-        Self::Pending
-    }
-}
-
-impl QuoteStatus {
-    /// Returns the lowercase snake_case string stored in the `quotes.status` column.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::InfoRequested => "info_requested",
-            Self::VolumeEstimated => "volume_estimated",
-            Self::OfferGenerated => "offer_generated",
-            Self::OfferSent => "offer_sent",
-            Self::Accepted => "accepted",
-            Self::Rejected => "rejected",
-            Self::Expired => "expired",
-            Self::Cancelled => "cancelled",
-            Self::Done => "done",
-            Self::Paid => "paid",
-        }
-    }
-}
-
-/// A moving quote request — the central record linking customer, addresses,
+/// A moving quote request -- the central record linking customer, addresses,
 /// volume estimation, and generated offers.
 ///
 /// Created by the orchestrator when a complete or near-complete `MovingInquiry`
 /// is received. All downstream records (volume estimations, offers, bookings)
-/// reference this record via `quote_id`.
+/// reference this record via `inquiry_id`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Quote {
     /// UUID v7 primary key.
@@ -78,17 +30,24 @@ pub struct Quote {
     pub destination_address_id: Option<Uuid>,
     /// Optional intermediate stop (Zwischenstopp) address.
     pub stop_address_id: Option<Uuid>,
-    pub status: QuoteStatus,
+    pub status: InquiryStatus,
     /// Agreed total moving volume in cubic metres; set after volume estimation
     /// completes or when the inventory form is used.
     pub estimated_volume_m3: Option<f64>,
-    /// Total driving distance in kilometres for the full route (depot→origin→
-    /// [stop]→destination); `None` until the distance calculator runs.
+    /// Total driving distance in kilometres for the full route (depot->origin->
+    /// [stop]->destination); `None` until the distance calculator runs.
     pub distance_km: Option<f64>,
     pub preferred_date: Option<DateTime<Utc>>,
-    /// Free-text notes including comma-separated service flags parsed by
-    /// `build_line_items()` (e.g., `"einpackservice,montage"`).
+    /// Free-text customer message (e.g., `"Bitte vorsichtig mit dem Klavier"`).
     pub notes: Option<String>,
+    /// How this inquiry entered the system (email_form, contact_form, direct_email, photo_api, etc.).
+    pub source: Option<String>,
+    /// Structured service flags; replaces comma-separated notes parsing in the new schema.
+    pub services: Option<Services>,
+    /// Timestamp when the offer was emailed to the customer.
+    pub offer_sent_at: Option<DateTime<Utc>>,
+    /// Timestamp when the customer accepted the offer.
+    pub accepted_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -117,7 +76,7 @@ pub struct CreateQuote {
 pub struct UpdateQuote {
     pub origin_address_id: Option<Uuid>,
     pub destination_address_id: Option<Uuid>,
-    pub status: Option<QuoteStatus>,
+    pub status: Option<InquiryStatus>,
     pub estimated_volume_m3: Option<f64>,
     pub distance_km: Option<f64>,
     pub preferred_date: Option<DateTime<Utc>>,
@@ -131,35 +90,38 @@ mod tests {
     #[test]
     fn quote_status_as_str_roundtrip() {
         let variants = [
-            (QuoteStatus::Pending, "pending"),
-            (QuoteStatus::InfoRequested, "info_requested"),
-            (QuoteStatus::VolumeEstimated, "volume_estimated"),
-            (QuoteStatus::OfferGenerated, "offer_generated"),
-            (QuoteStatus::OfferSent, "offer_sent"),
-            (QuoteStatus::Accepted, "accepted"),
-            (QuoteStatus::Rejected, "rejected"),
-            (QuoteStatus::Expired, "expired"),
-            (QuoteStatus::Cancelled, "cancelled"),
-            (QuoteStatus::Done, "done"),
-            (QuoteStatus::Paid, "paid"),
+            (InquiryStatus::Pending, "pending"),
+            (InquiryStatus::InfoRequested, "info_requested"),
+            (InquiryStatus::Estimating, "estimating"),
+            (InquiryStatus::Estimated, "estimated"),
+            (InquiryStatus::OfferReady, "offer_ready"),
+            (InquiryStatus::OfferSent, "offer_sent"),
+            (InquiryStatus::Accepted, "accepted"),
+            (InquiryStatus::Rejected, "rejected"),
+            (InquiryStatus::Expired, "expired"),
+            (InquiryStatus::Cancelled, "cancelled"),
+            (InquiryStatus::Scheduled, "scheduled"),
+            (InquiryStatus::Completed, "completed"),
+            (InquiryStatus::Invoiced, "invoiced"),
+            (InquiryStatus::Paid, "paid"),
         ];
         for (status, expected_str) in variants {
             assert_eq!(status.as_str(), expected_str, "as_str for {:?}", status);
             // Roundtrip via serde
             let json = serde_json::to_string(&status).unwrap();
-            let deserialized: QuoteStatus = serde_json::from_str(&json).unwrap();
+            let deserialized: InquiryStatus = serde_json::from_str(&json).unwrap();
             assert_eq!(deserialized, status, "roundtrip for {:?}", status);
         }
     }
 
     #[test]
     fn quote_status_default() {
-        assert_eq!(QuoteStatus::default(), QuoteStatus::Pending);
+        assert_eq!(InquiryStatus::default(), InquiryStatus::Pending);
     }
 
     #[test]
     fn quote_status_serde_snake_case() {
-        let status: QuoteStatus = serde_json::from_str("\"offer_generated\"").unwrap();
-        assert_eq!(status, QuoteStatus::OfferGenerated);
+        let status: InquiryStatus = serde_json::from_str("\"offer_ready\"").unwrap();
+        assert_eq!(status, InquiryStatus::OfferReady);
     }
 }

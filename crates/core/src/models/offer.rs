@@ -54,7 +54,7 @@ pub struct Offer {
     /// UUID v7 primary key.
     pub id: Uuid,
     /// The quote this offer is based on.
-    pub quote_id: Uuid,
+    pub inquiry_id: Uuid,
     /// Total offer price in euro **cents** (e.g., `35000` = €350.00 brutto).
     /// Alex always thinks in brutto; netto is `price_cents / 1.19`.
     pub price_cents: i64,
@@ -92,7 +92,7 @@ pub struct Offer {
 /// uploading it to storage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateOffer {
-    pub quote_id: Uuid,
+    pub inquiry_id: Uuid,
     /// Total price in euro cents.
     pub price_cents: i64,
     /// Defaults to `"EUR"` when `None`.

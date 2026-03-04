@@ -1,20 +1,11 @@
-use axum::{
-    extract::{Path, State},
-    http::header,
-    response::IntoResponse,
-    routing::{get, post},
-    Json, Router,
-};
-use serde::Deserialize;
 use sqlx::{FromRow, PgPool};
-use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::{ApiError, AppState};
-use crate::routes::shared::QuoteRow;
+use crate::ApiError;
+use crate::routes::shared::InquiryRow;
 use aust_core::config::Config;
 use aust_core::models::{
-    DepthSensorResult, DetectedItem, Offer, OfferStatus, PricingInput, Quote,
+    DepthSensorResult, DetectedItem, Offer, OfferStatus, PricingInput, Quote, Services,
     VisionAnalysisResult,
 };
 use aust_distance_calculator::{RouteCalculator, RouteRequest};
@@ -25,47 +16,10 @@ use aust_offer_generator::{
 use aust_storage::StorageProvider;
 use tracing::warn;
 
-/// Register the public offer routes: generate, fetch, and download PDF.
-///
-/// **Caller**: `crates/api/src/routes/mod.rs` route tree assembly.
-/// **Why**: Exposes the offer lifecycle endpoints for both API consumers and the admin dashboard.
-pub fn router() -> Router<Arc<AppState>> {
-    Router::new()
-        .route("/generate", post(generate_offer))
-        .route("/{id}", get(get_offer))
-        .route("/{id}/pdf", get(get_offer_pdf))
-}
-
-#[derive(Debug, Deserialize)]
-struct GenerateOfferRequest {
-    quote_id: Uuid,
-    valid_days: Option<i64>,
-    #[serde(default)]
-    price_cents_netto: Option<i64>,
-    #[serde(default)]
-    persons: Option<u32>,
-    #[serde(default)]
-    hours: Option<f64>,
-    #[serde(default)]
-    rate: Option<f64>,
-    #[serde(default)]
-    line_items: Option<Vec<GenerateLineItem>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GenerateLineItem {
-    description: String,
-    quantity: f64,
-    unit_price: f64,
-    #[serde(default)]
-    remark: Option<String>,
-}
-
-
 #[derive(Debug, FromRow)]
 struct OfferRow {
     id: Uuid,
-    quote_id: Uuid,
+    inquiry_id: Uuid,
     price_cents: i64,
     currency: String,
     valid_until: Option<chrono::NaiveDate>,
@@ -94,7 +48,7 @@ impl From<OfferRow> for Offer {
 
         Offer {
             id: row.id,
-            quote_id: row.quote_id,
+            inquiry_id: row.inquiry_id,
             price_cents: row.price_cents,
             currency: row.currency,
             valid_until: row.valid_until,
@@ -214,7 +168,7 @@ pub struct OfferOverrides {
 /// - `db` — live PostgreSQL connection pool
 /// - `storage` — S3-compatible storage for uploading the PDF
 /// - `config` — application config (company depot address, rate per km, etc.)
-/// - `quote_id` — the quote to generate an offer for
+/// - `inquiry_id` — the quote to generate an offer for
 /// - `valid_days` — optional number of days until the offer expires
 ///
 /// # Returns
@@ -227,10 +181,10 @@ pub async fn build_offer(
     db: &PgPool,
     storage: &dyn StorageProvider,
     config: &Config,
-    quote_id: Uuid,
+    inquiry_id: Uuid,
     valid_days: Option<i64>,
 ) -> Result<GeneratedOffer, ApiError> {
-    build_offer_with_overrides(db, storage, config, quote_id, valid_days, &OfferOverrides::default()).await
+    build_offer_with_overrides(db, storage, config, inquiry_id, valid_days, &OfferOverrides::default()).await
 }
 
 /// Core offer generation pipeline with optional manual overrides.
@@ -245,7 +199,7 @@ pub async fn build_offer(
 /// - `db` — live PostgreSQL connection pool
 /// - `storage` — S3-compatible storage provider
 /// - `config` — application config including depot address, km rate, JWT secret, etc.
-/// - `quote_id` — the quote to generate an offer for; must have `estimated_volume_m3`
+/// - `inquiry_id` — the quote to generate an offer for; must have `estimated_volume_m3`
 /// - `valid_days` — optional offer validity period; stored in `offers.valid_until`
 /// - `overrides` — optional manual overrides for price, persons, hours, rate, or line items;
 ///   when `existing_offer_id` is set, the existing offer record is updated in-place
@@ -268,19 +222,20 @@ pub async fn build_offer_with_overrides(
     db: &PgPool,
     storage: &dyn StorageProvider,
     config: &Config,
-    quote_id: Uuid,
+    inquiry_id: Uuid,
     valid_days: Option<i64>,
     overrides: &OfferOverrides,
 ) -> Result<GeneratedOffer, ApiError> {
     // 1. Fetch quote
-    let quote_row: QuoteRow = sqlx::query_as(
+    let quote_row: InquiryRow = sqlx::query_as(
         r#"
         SELECT id, customer_id, origin_address_id, destination_address_id, stop_address_id,
-               status, estimated_volume_m3, distance_km, preferred_date, notes, created_at, updated_at
-        FROM quotes WHERE id = $1
+               status, estimated_volume_m3, distance_km, preferred_date, notes, services,
+               source, offer_sent_at, accepted_at, created_at, updated_at
+        FROM inquiries WHERE id = $1
         "#,
     )
-    .bind(quote_id)
+    .bind(inquiry_id)
     .fetch_optional(db)
     .await?
     .ok_or_else(|| ApiError::NotFound("Quote not found".into()))?;
@@ -334,12 +289,12 @@ pub async fn build_offer_with_overrides(
         r#"
         SELECT result_data, source_data, total_volume_m3, method
         FROM volume_estimations
-        WHERE quote_id = $1
+        WHERE inquiry_id = $1
         ORDER BY created_at DESC
         LIMIT 1
         "#,
     )
-    .bind(quote_id)
+    .bind(inquiry_id)
     .fetch_optional(db)
     .await?;
 
@@ -400,6 +355,8 @@ pub async fn build_offer_with_overrides(
     )
     .await;
 
+    let quote_services = quote.services.clone().unwrap_or_default();
+
     let line_items = if let Some(ref items) = overrides.line_items {
         let mut result = vec![fahrt_item];
         result.extend(
@@ -411,7 +368,7 @@ pub async fn build_offer_with_overrides(
         result
     } else {
         let mut items = vec![fahrt_item];
-        items.extend(build_line_items(quote.notes.as_deref()));
+        items.extend(build_line_items(&quote_services));
         items
     };
 
@@ -481,8 +438,9 @@ pub async fn build_offer_with_overrides(
         (Uuid::now_v7(), offer_number)
     };
 
-    // Extract services and customer message from notes
-    let (services_str, customer_message) = extract_services_and_message(quote.notes.as_deref());
+    // Build services display string from structured Services and use notes as customer message
+    let services_str = format_services_display(&quote_services);
+    let customer_message = quote.notes.clone().unwrap_or_default();
 
     let valid_until_date =
         valid_days.map(|days| (now + chrono::Duration::days(days)).date_naive());
@@ -578,7 +536,7 @@ pub async fn build_offer_with_overrides(
                 persons = $4, hours_estimated = $5, rate_per_hour_cents = $6,
                 line_items_json = $7
             WHERE id = $8
-            RETURNING id, quote_id, price_cents, currency, valid_until, pdf_storage_key, status,
+            RETURNING id, inquiry_id, price_cents, currency, valid_until, pdf_storage_key, status,
                       created_at, sent_at, offer_number, persons, hours_estimated,
                       rate_per_hour_cents, line_items_json
             "#,
@@ -596,15 +554,15 @@ pub async fn build_offer_with_overrides(
     } else {
         sqlx::query_as(
             r#"
-            INSERT INTO offers (id, quote_id, price_cents, currency, valid_until, pdf_storage_key, status, created_at,
+            INSERT INTO offers (id, inquiry_id, price_cents, currency, valid_until, pdf_storage_key, status, created_at,
                                 offer_number, persons, hours_estimated, rate_per_hour_cents, line_items_json)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-            RETURNING id, quote_id, price_cents, currency, valid_until, pdf_storage_key, status, created_at, sent_at,
+            RETURNING id, inquiry_id, price_cents, currency, valid_until, pdf_storage_key, status, created_at, sent_at,
                       offer_number, persons, hours_estimated, rate_per_hour_cents, line_items_json
             "#,
         )
         .bind(offer_id)
-        .bind(quote_id)
+        .bind(inquiry_id)
         .bind(actual_netto_cents)
         .bind("EUR")
         .bind(valid_until_date)
@@ -621,10 +579,10 @@ pub async fn build_offer_with_overrides(
     };
 
     // Update quote status
-    sqlx::query("UPDATE quotes SET status = $1, updated_at = $2 WHERE id = $3")
-        .bind("offer_generated")
+    sqlx::query("UPDATE inquiries SET status = $1, updated_at = $2 WHERE id = $3")
+        .bind("offer_ready")
         .bind(now)
-        .bind(quote_id)
+        .bind(inquiry_id)
         .execute(db)
         .await?;
 
@@ -669,52 +627,43 @@ pub async fn build_offer_with_overrides(
     })
 }
 
-/// Split quote notes into a recognized services string and a free-text customer message.
+/// Format a `Services` struct into a human-readable German string for Telegram display.
 ///
 /// **Caller**: `build_offer_with_overrides` — used to populate the `services` field in
-/// `TelegramSummary` and the `customer_message` field shown in the Telegram caption.
-/// **Why**: Notes are stored as a comma-separated mix of service keywords (e.g.
-/// "Halteverbot Auszug") and free-text remarks the customer typed. This function separates
-/// them so the two halves can be displayed independently.
+/// `TelegramSummary`.
+/// **Why**: The Telegram caption shows a summary of selected additional services so Alex
+/// can verify the offer includes the correct extras.
 ///
 /// # Parameters
-/// - `notes` — raw `quotes.notes` string, may be `None`
+/// - `services` — structured `Services` flags from the inquiry
 ///
 /// # Returns
-/// `(services_string, customer_message_string)` — both may be empty strings
-fn extract_services_and_message(notes: Option<&str>) -> (String, String) {
-    let Some(notes) = notes else {
-        return (String::new(), String::new());
-    };
-
-    let known_services = [
-        "halteverbot auszug",
-        "halteverbot einzug",
-        "verpackungsservice",
-        "einpackservice",
-        "montage",
-        "demontage",
-        "einlagerung",
-        "entsorgung",
-    ];
-
-    let known_prefixes = ["auszug:", "einzug:"];
-
-    let mut services = Vec::new();
-    let mut message_parts = Vec::new();
-
-    for part in notes.split(", ") {
-        let lower = part.trim().to_lowercase();
-        let is_service = known_services.iter().any(|s| lower == *s)
-            || known_prefixes.iter().any(|p| lower.starts_with(p));
-        if is_service {
-            services.push(part.trim().to_string());
-        } else if !part.trim().is_empty() {
-            message_parts.push(part.trim().to_string());
-        }
+/// Comma-separated string of active services in German, e.g.
+/// `"Verpackungsservice, Montage, Halteverbot Beladestelle"`. Empty string when no flags are set.
+fn format_services_display(services: &Services) -> String {
+    let mut parts = Vec::new();
+    if services.packing {
+        parts.push("Verpackungsservice".to_string());
     }
-
-    (services.join(", "), message_parts.join(", "))
+    if services.assembly {
+        parts.push("Montage".to_string());
+    }
+    if services.disassembly {
+        parts.push("Demontage".to_string());
+    }
+    if services.storage {
+        parts.push("Einlagerung".to_string());
+    }
+    if services.disposal {
+        parts.push("Entsorgung".to_string());
+    }
+    if services.parking_ban_origin {
+        parts.push("Halteverbot Beladestelle".to_string());
+    }
+    if services.parking_ban_destination {
+        parts.push("Halteverbot Entladestelle".to_string());
+    }
+    parts.join(", ")
 }
 
 /// Format a city string as "PLZ City" (or just "City" when postal code is absent).
@@ -901,35 +850,32 @@ async fn build_fahrt_item(
     }
 }
 
-/// Derive the non-labor XLSX line items from quote notes keywords.
+/// Derive the non-labor XLSX line items from structured `Services` flags.
 ///
 /// **Caller**: `build_offer_with_overrides` — called only when `overrides.line_items` is
 /// `None`; the result is appended after the labor item and the Fahrkostenpauschale.
 /// **Why**: Services requested by the customer (parking bans, packing, assembly) are stored
-/// as comma-separated keywords in `quotes.notes`. This function converts those keywords into
+/// as JSONB in `inquiries.services`. This function converts those boolean flags into
 /// typed `OfferLineItem` values that map to specific rows in the XLSX template.
 ///
 /// # Parameters
-/// - `notes` — raw `quotes.notes` string (lowercase comparison used internally)
+/// - `services` — structured `Services` flags from the inquiry
 ///
 /// # Returns
 /// `Vec<OfferLineItem>` in template row order:
-/// - Demontage (row 31, €50) — if "demontage" in notes
-/// - Montage (row 31, €50) — if "montage" in notes (after stripping "demontage")
-/// - Halteverbotszone (row 32, €100/zone) — 1–3 zones depending on flags
-/// - Umzugsmaterial (row 33, €30) — if packing service requested
+/// - Demontage (row 31, €50) — if `services.disassembly`
+/// - Montage (row 31, €50) — if `services.assembly`
+/// - Halteverbotszone (row 32, €100/zone) — 1–2 zones depending on flags
+/// - Umzugsmaterial (row 33, €30) — if `services.packing`
 /// - Nürnbergerversicherung (always last, €0, `flat_total = 0.0`)
 ///
 /// Does NOT include Fahrkostenpauschale (computed separately in `build_offer_with_overrides`)
 /// or the labor item (prepended separately before this list is appended).
-fn build_line_items(notes: Option<&str>) -> Vec<OfferLineItem> {
-    let notes_lower = notes
-        .map(|n| n.to_lowercase())
-        .unwrap_or_default();
+fn build_line_items(services: &Services) -> Vec<OfferLineItem> {
     let mut items = Vec::new();
 
     // Demontage — if disassembly service requested
-    if notes_lower.contains("demontage") {
+    if services.disassembly {
         items.push(OfferLineItem {
             description: "Demontage".to_string(),
             quantity: 1.0,
@@ -938,9 +884,8 @@ fn build_line_items(notes: Option<&str>) -> Vec<OfferLineItem> {
         });
     }
 
-    // Montage — if assembly requested (check after removing "demontage" to avoid false match)
-    let without_demontage = notes_lower.replace("demontage", "");
-    if without_demontage.contains("montage") {
+    // Montage — if assembly requested
+    if services.assembly {
         items.push(OfferLineItem {
             description: "Montage".to_string(),
             quantity: 1.0,
@@ -950,24 +895,16 @@ fn build_line_items(notes: Option<&str>) -> Vec<OfferLineItem> {
     }
 
     // Halteverbotszone — count parking ban locations
-    let has_auszug_ban = notes_lower.contains("halteverbot auszug");
-    let has_einzug_ban = notes_lower.contains("halteverbot einzug");
-    let has_zwischenstopp_ban = notes_lower.contains("halteverbot zwischenstopp");
+    let has_origin_ban = services.parking_ban_origin;
+    let has_dest_ban = services.parking_ban_destination;
 
-    let halteverbot_count =
-        has_auszug_ban as u32 + has_einzug_ban as u32 + has_zwischenstopp_ban as u32;
+    let halteverbot_count = has_origin_ban as u32 + has_dest_ban as u32;
 
     if halteverbot_count > 0 {
-        let remark = match (has_auszug_ban, has_einzug_ban, has_zwischenstopp_ban) {
-            (true, true, false) => Some("Beladestelle + Entladestelle".to_string()),
-            (true, false, false) => Some("Beladestelle".to_string()),
-            (false, true, false) => Some("Entladestelle".to_string()),
-            (true, true, true) => {
-                Some("Beladestelle + Entladestelle + Zwischenstopp".to_string())
-            }
-            (true, false, true) => Some("Beladestelle + Zwischenstopp".to_string()),
-            (false, true, true) => Some("Entladestelle + Zwischenstopp".to_string()),
-            (false, false, true) => Some("Zwischenstopp".to_string()),
+        let remark = match (has_origin_ban, has_dest_ban) {
+            (true, true) => Some("Beladestelle + Entladestelle".to_string()),
+            (true, false) => Some("Beladestelle".to_string()),
+            (false, true) => Some("Entladestelle".to_string()),
             _ => None,
         };
         items.push(OfferLineItem {
@@ -979,8 +916,8 @@ fn build_line_items(notes: Option<&str>) -> Vec<OfferLineItem> {
         });
     }
 
-    // Umzugsmaterial — if Verpackungsservice/Einpackservice
-    if notes_lower.contains("verpackungsservice") || notes_lower.contains("einpackservice") {
+    // Umzugsmaterial — if packing service requested
+    if services.packing {
         items.push(OfferLineItem {
             description: "Umzugsmaterial".to_string(),
             quantity: 1.0,
@@ -1050,164 +987,12 @@ fn calculate_rate_override(
     }
 }
 
-// --- API handlers ---
-
-/// `POST /api/v1/offers/generate` — Generate an offer from an existing quote.
-///
-/// **Caller**: Axum router / admin dashboard or external API consumers.
-/// **Why**: Entry point for the manual offer generation flow; delegates entirely to
-/// `build_offer_with_overrides` with any caller-supplied overrides.
-///
-/// # Parameters
-/// - `state` — shared AppState (DB pool, storage, config)
-/// - `request` — JSON body with `quote_id` and optional override fields
-///   (`price_cents_netto`, `persons`, `hours`, `rate`, `line_items`)
-///
-/// # Returns
-/// `200 OK` with the persisted `Offer` JSON on success.
-///
-/// # Errors
-/// - `400` if quote has no volume estimate
-/// - `404` if quote or customer not found
-/// - `500` on XLSX/PDF/S3/DB failures
-async fn generate_offer(
-    State(state): State<Arc<AppState>>,
-    Json(request): Json<GenerateOfferRequest>,
-) -> Result<Json<Offer>, ApiError> {
-    // Reuse any existing active (non-rejected, non-cancelled) offer so we UPDATE in-place
-    // rather than INSERT, which would violate the unique partial index on (quote_id) for
-    // active offers. Regenerating from the quote detail page goes through this endpoint.
-    let existing_offer_id: Option<Uuid> = sqlx::query_as::<_, (Uuid,)>(
-        "SELECT id FROM offers WHERE quote_id = $1 AND status NOT IN ('rejected', 'cancelled') LIMIT 1"
-    )
-    .bind(request.quote_id)
-    .fetch_optional(&state.db)
-    .await?
-    .map(|(id,)| id);
-
-    let overrides = OfferOverrides {
-        price_cents: request.price_cents_netto,
-        persons: request.persons,
-        hours: request.hours,
-        rate: request.rate,
-        line_items: request.line_items.map(|items| {
-            items
-                .into_iter()
-                .map(|li| OfferLineItem {
-                    description: li.description,
-                    quantity: li.quantity,
-                    unit_price: li.unit_price,
-                    remark: li.remark,
-                    ..Default::default()
-                })
-                .collect()
-        }),
-        existing_offer_id,
-    };
-    let result = build_offer_with_overrides(
-        &state.db, &*state.storage, &state.config, request.quote_id, request.valid_days, &overrides
-    ).await?;
-    Ok(Json(result.offer))
-}
-
-/// `GET /api/v1/offers/{id}` — Retrieve a single offer by ID.
-///
-/// **Caller**: Axum router / admin dashboard offer detail page.
-/// **Why**: Returns the raw `Offer` model (pricing, status, PDF key, line items JSON).
-///
-/// # Parameters
-/// - `state` — shared AppState (DB pool)
-/// - `id` — offer UUID path parameter
-///
-/// # Returns
-/// `200 OK` with `Offer` JSON.
-///
-/// # Errors
-/// - `404` if no offer with the given ID exists
-async fn get_offer(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<Uuid>,
-) -> Result<Json<Offer>, ApiError> {
-    let row: Option<OfferRow> = sqlx::query_as(
-        r#"
-        SELECT id, quote_id, price_cents, currency, valid_until, pdf_storage_key, status, created_at, sent_at,
-               offer_number, persons, hours_estimated, rate_per_hour_cents, line_items_json
-        FROM offers WHERE id = $1
-        "#,
-    )
-    .bind(id)
-    .fetch_optional(&state.db)
-    .await?;
-
-    let row = row.ok_or_else(|| ApiError::NotFound(format!("Offer {id} not found")))?;
-    Ok(Json(Offer::from(row)))
-}
-
-/// `GET /api/v1/offers/{id}/pdf` — Download the offer PDF (or XLSX fallback) from S3.
-///
-/// **Caller**: Axum router / admin dashboard "PDF herunterladen" button and Telegram bot
-/// approval flow.
-/// **Why**: Streams the offer file directly to the client with appropriate `Content-Type`
-/// and `Content-Disposition` headers for browser download.
-///
-/// # Parameters
-/// - `state` — shared AppState (DB pool, storage)
-/// - `id` — offer UUID path parameter
-///
-/// # Returns
-/// File bytes with `Content-Type: application/pdf` (or `application/vnd.openxmlformats…`
-/// for XLSX fallback) and `Content-Disposition: attachment; filename="Angebot-{id}.pdf"`.
-///
-/// # Errors
-/// - `404` if offer or its PDF key does not exist
-/// - `500` if S3 download fails
-async fn get_offer_pdf(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<Uuid>,
-) -> Result<impl IntoResponse, ApiError> {
-    let row: Option<OfferRow> = sqlx::query_as(
-        r#"
-        SELECT id, quote_id, price_cents, currency, valid_until, pdf_storage_key, status, created_at, sent_at,
-               offer_number, persons, hours_estimated, rate_per_hour_cents, line_items_json
-        FROM offers WHERE id = $1
-        "#,
-    )
-    .bind(id)
-    .fetch_optional(&state.db)
-    .await?;
-
-    let offer =
-        Offer::from(row.ok_or_else(|| ApiError::NotFound(format!("Offer {id} not found")))?);
-
-    let storage_key = offer
-        .pdf_storage_key
-        .ok_or_else(|| ApiError::NotFound("Offer has no generated file".into()))?;
-
-    let file_bytes = state
-        .storage
-        .download(&storage_key)
-        .await
-        .map_err(|e| ApiError::Internal(format!("Failed to download offer: {e}")))?;
-
-    let (content_type, ext) = if storage_key.ends_with(".pdf") {
-        ("application/pdf", "pdf")
-    } else {
-        ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "xlsx")
-    };
-    let filename = format!("Angebot-{}.{ext}", offer.id);
-
-    Ok((
-        [
-            (header::CONTENT_TYPE, content_type.to_string()),
-            (
-                header::CONTENT_DISPOSITION,
-                format!("attachment; filename=\"{filename}\""),
-            ),
-        ],
-        file_bytes,
-    ))
-}
-
+// Legacy handler functions removed — offer generation, retrieval, and PDF download
+// are now served via /api/v1/inquiries/{id}/generate-offer, /api/v1/inquiries/{id},
+// and /api/v1/inquiries/{id}/pdf respectively.
+//
+// Shared utility functions (build_offer, build_offer_with_overrides, build_line_items,
+// parse_detected_items, etc.) remain in this module.
 /// Inventory item parsed from the VolumeCalculator `items_list` text format.
 ///
 /// Matches the JSON schema stored by `orchestrator::parse_items_list_text()` in
@@ -1553,7 +1338,7 @@ mod tests {
 
     #[test]
     fn always_has_versicherung_last() {
-        let items = build_line_items(None);
+        let items = build_line_items(&Services::default());
         assert!(!items.is_empty(), "should have at least Versicherung");
         let last = items.last().unwrap();
         assert_eq!(last.description, "Nürnbergerversicherung");
@@ -1563,51 +1348,48 @@ mod tests {
 
     #[test]
     fn no_transporter_item() {
-        let items = build_line_items(None);
+        let items = build_line_items(&Services::default());
         assert!(!items.iter().any(|i| i.description.contains("Transporter")), "Transporter must not appear");
     }
 
     #[test]
     fn no_anfahrt_item() {
-        let items = build_line_items(None);
+        let items = build_line_items(&Services::default());
         assert!(!items.iter().any(|i| i.description.contains("Anfahrt")), "Anfahrt must not appear");
     }
 
     #[test]
     fn demontage_separate_from_montage() {
-        // Only "Demontage" in notes → only Demontage item, no Montage
-        let items = build_line_items(Some("Demontage"));
+        let items = build_line_items(&Services { disassembly: true, ..Default::default() });
         assert!(items.iter().any(|i| i.description == "Demontage"), "should have Demontage");
         assert!(!items.iter().any(|i| i.description == "Montage"), "should NOT have Montage");
     }
 
     #[test]
     fn montage_separate_from_demontage() {
-        // Only "Montage" (no "demontage") → only Montage item
-        let items = build_line_items(Some("Montage"));
+        let items = build_line_items(&Services { assembly: true, ..Default::default() });
         assert!(items.iter().any(|i| i.description == "Montage"), "should have Montage");
         assert!(!items.iter().any(|i| i.description == "Demontage"), "should NOT have Demontage");
     }
 
     #[test]
     fn both_services_both_items() {
-        // Both Demontage and Montage in notes → both items
-        let items = build_line_items(Some("Montage, Demontage"));
+        let items = build_line_items(&Services { assembly: true, disassembly: true, ..Default::default() });
         assert!(items.iter().any(|i| i.description == "Demontage"), "should have Demontage");
         assert!(items.iter().any(|i| i.description == "Montage"), "should have Montage");
     }
 
     #[test]
-    fn halteverbot_auszug_only() {
-        let items = build_line_items(Some("Halteverbot Auszug"));
+    fn halteverbot_origin_only() {
+        let items = build_line_items(&Services { parking_ban_origin: true, ..Default::default() });
         let hv = items.iter().find(|i| i.description == "Halteverbotszone").expect("should have halteverbot");
         assert_eq!(hv.quantity, 1.0);
         assert_eq!(hv.remark.as_deref(), Some("Beladestelle"));
     }
 
     #[test]
-    fn halteverbot_einzug_only() {
-        let items = build_line_items(Some("Halteverbot Einzug"));
+    fn halteverbot_destination_only() {
+        let items = build_line_items(&Services { parking_ban_destination: true, ..Default::default() });
         let hv = items.iter().find(|i| i.description == "Halteverbotszone").expect("should have halteverbot");
         assert_eq!(hv.quantity, 1.0);
         assert_eq!(hv.remark.as_deref(), Some("Entladestelle"));
@@ -1615,92 +1397,73 @@ mod tests {
 
     #[test]
     fn halteverbot_both() {
-        let items = build_line_items(Some("Halteverbot Auszug, Halteverbot Einzug"));
+        let items = build_line_items(&Services { parking_ban_origin: true, parking_ban_destination: true, ..Default::default() });
         let hv = items.iter().find(|i| i.description == "Halteverbotszone").expect("should have halteverbot");
         assert_eq!(hv.quantity, 2.0);
         assert_eq!(hv.remark.as_deref(), Some("Beladestelle + Entladestelle"));
     }
 
     #[test]
-    fn halteverbot_intermediate() {
-        let items = build_line_items(Some("Halteverbot Auszug, Halteverbot Einzug, Halteverbot Zwischenstopp"));
-        let hv = items.iter().find(|i| i.description == "Halteverbotszone").expect("should have halteverbot");
-        assert_eq!(hv.quantity, 3.0);
-    }
-
-    #[test]
     fn umzugsmaterial_remark() {
-        let items = build_line_items(Some("einpackservice"));
+        let items = build_line_items(&Services { packing: true, ..Default::default() });
         let um = items.iter().find(|i| i.description == "Umzugsmaterial").expect("should have umzugsmaterial");
         assert_eq!(um.unit_price, 30.0);
         assert_eq!(um.remark.as_deref(), Some("Stretchfolie, Decken, Gurte Einzelpreis 30,00 €"));
     }
 
     #[test]
-    fn verpackungsservice_triggers_umzugsmaterial() {
-        let items = build_line_items(Some("Verpackungsservice"));
+    fn packing_triggers_umzugsmaterial() {
+        let items = build_line_items(&Services { packing: true, ..Default::default() });
         assert!(items.iter().any(|i| i.description == "Umzugsmaterial"));
     }
 
     #[test]
     fn versicherung_zero_price() {
-        let items = build_line_items(None);
+        let items = build_line_items(&Services::default());
         let v = items.iter().find(|i| i.description == "Nürnbergerversicherung").unwrap();
         assert_eq!(v.quantity, 1.0);
         assert_eq!(v.unit_price, 0.0);
         assert_eq!(v.flat_total, Some(0.0));
     }
 
-    // --- extract_services_and_message tests ---
+    // --- format_services_display tests ---
 
     #[test]
-    fn extract_services_none() {
-        let (services, msg) = extract_services_and_message(None);
-        assert!(services.is_empty());
-        assert!(msg.is_empty());
+    fn display_services_empty() {
+        let s = format_services_display(&Services::default());
+        assert!(s.is_empty());
     }
 
     #[test]
-    fn extract_only_services() {
-        let (services, msg) = extract_services_and_message(Some("Halteverbot Auszug, Montage"));
-        assert!(services.contains("Halteverbot Auszug"));
-        assert!(services.contains("Montage"));
-        assert!(msg.is_empty());
+    fn display_services_all() {
+        let s = format_services_display(&Services {
+            packing: true,
+            assembly: true,
+            disassembly: true,
+            storage: true,
+            disposal: true,
+            parking_ban_origin: true,
+            parking_ban_destination: true,
+        });
+        assert!(s.contains("Verpackungsservice"));
+        assert!(s.contains("Montage"));
+        assert!(s.contains("Demontage"));
+        assert!(s.contains("Einlagerung"));
+        assert!(s.contains("Entsorgung"));
+        assert!(s.contains("Halteverbot Beladestelle"));
+        assert!(s.contains("Halteverbot Entladestelle"));
     }
 
     #[test]
-    fn extract_only_message() {
-        let (services, msg) = extract_services_and_message(Some("Bitte vorsichtig mit dem Klavier"));
-        assert!(services.is_empty());
-        assert_eq!(msg, "Bitte vorsichtig mit dem Klavier");
-    }
-
-    #[test]
-    fn extract_mixed() {
-        let (services, msg) = extract_services_and_message(
-            Some("Montage, Bitte vorsichtig, Halteverbot Auszug")
-        );
-        assert!(services.contains("Montage"));
-        assert!(services.contains("Halteverbot Auszug"));
-        assert_eq!(msg, "Bitte vorsichtig");
-    }
-
-    #[test]
-    fn extract_floor_prefixes() {
-        let (services, msg) = extract_services_and_message(
-            Some("Auszug: 3. Stock, Einzug: 1. Stock")
-        );
-        assert!(services.contains("Auszug: 3. Stock"));
-        assert!(services.contains("Einzug: 1. Stock"));
-        assert!(msg.is_empty());
-    }
-
-    #[test]
-    fn extract_case_insensitive() {
-        // Note: the function converts to lowercase for matching
-        let (services, _msg) = extract_services_and_message(Some("MONTAGE"));
-        // "MONTAGE" trimmed lowercase = "montage" which matches
-        assert!(!services.is_empty());
+    fn display_services_partial() {
+        let s = format_services_display(&Services {
+            assembly: true,
+            parking_ban_origin: true,
+            ..Default::default()
+        });
+        assert!(s.contains("Montage"));
+        assert!(s.contains("Halteverbot Beladestelle"));
+        assert!(!s.contains("Demontage"));
     }
 
     // --- detect_salutation_and_greeting tests ---
@@ -1838,17 +1601,25 @@ mod tests {
 
     proptest! {
         #[test]
-        fn build_line_items_never_panics(s in ".*") {
-            let items = build_line_items(Some(&s));
+        fn build_line_items_never_panics(
+            packing in proptest::bool::ANY,
+            assembly in proptest::bool::ANY,
+            disassembly in proptest::bool::ANY,
+            storage in proptest::bool::ANY,
+            disposal in proptest::bool::ANY,
+            ban_origin in proptest::bool::ANY,
+            ban_dest in proptest::bool::ANY,
+        ) {
+            let services = Services {
+                packing, assembly, disassembly, storage, disposal,
+                parking_ban_origin: ban_origin,
+                parking_ban_destination: ban_dest,
+            };
+            let items = build_line_items(&services);
             // Must always end with Nürnbergerversicherung
             assert!(!items.is_empty());
             let last = items.last().unwrap();
             assert_eq!(last.description, "Nürnbergerversicherung");
-        }
-
-        #[test]
-        fn extract_services_never_panics(s in ".*") {
-            let _ = extract_services_and_message(Some(&s));
         }
 
         #[test]

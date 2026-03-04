@@ -15,7 +15,7 @@ pub struct Booking {
     /// The calendar date on which the move is scheduled.
     pub booking_date: NaiveDate,
     /// The quote that this booking is associated with, if any.
-    pub quote_id: Option<Uuid>,
+    pub inquiry_id: Option<Uuid>,
     /// Customer's full name (denormalised for quick display in the schedule view).
     pub customer_name: Option<String>,
     pub customer_email: Option<String>,
@@ -41,7 +41,7 @@ pub struct Booking {
 pub struct NewBooking {
     /// The date on which the move should take place.
     pub booking_date: NaiveDate,
-    pub quote_id: Option<Uuid>,
+    pub inquiry_id: Option<Uuid>,
     pub customer_name: Option<String>,
     pub customer_email: Option<String>,
     pub departure_address: Option<String>,

@@ -123,19 +123,19 @@ async fn get_schedule(
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    // Collect all quote_ids from bookings to fetch offer prices in one query
-    let quote_ids: Vec<Uuid> = schedule
+    // Collect all inquiry_ids from bookings to fetch offer prices in one query
+    let inquiry_ids: Vec<Uuid> = schedule
         .iter()
         .flat_map(|entry| &entry.bookings)
-        .filter_map(|b| b.quote_id)
+        .filter_map(|b| b.inquiry_id)
         .collect();
 
     let mut price_map: HashMap<Uuid, i64> = HashMap::new();
-    if !quote_ids.is_empty() {
+    if !inquiry_ids.is_empty() {
         let rows: Vec<(Uuid, i64)> = sqlx::query_as(
-            "SELECT quote_id, price_cents FROM offers WHERE quote_id = ANY($1) AND status != 'rejected' ORDER BY created_at DESC",
+            "SELECT inquiry_id, price_cents FROM offers WHERE inquiry_id = ANY($1) AND status != 'rejected' ORDER BY created_at DESC",
         )
-        .bind(&quote_ids)
+        .bind(&inquiry_ids)
         .fetch_all(&state.db)
         .await
         .unwrap_or_default();
@@ -154,7 +154,7 @@ async fn get_schedule(
                 .bookings
                 .into_iter()
                 .map(|b| {
-                    let price = b.quote_id.and_then(|qid| price_map.get(&qid).copied());
+                    let price = b.inquiry_id.and_then(|qid| price_map.get(&qid).copied());
                     EnrichedBooking {
                         booking: b,
                         offer_price_cents: price,
@@ -175,7 +175,7 @@ async fn get_schedule(
 ///
 /// # Parameters
 /// - `state` — shared AppState (calendar service)
-/// - `request` — `NewBooking` JSON body (date, optional quote_id, notes)
+/// - `request` — `NewBooking` JSON body (date, optional inquiry_id, notes)
 ///
 /// # Returns
 /// `200 OK` with the created `Booking` JSON.
@@ -239,7 +239,7 @@ struct UpdateBookingRequest {
 ///
 /// **Caller**: Axum router / admin dashboard booking management.
 /// **Why**: Only "confirmed" and "cancelled" status transitions are accepted. When a
-/// booking with a linked `quote_id` is confirmed or cancelled, `status_sync` cascades the
+/// booking with a linked `inquiry_id` is confirmed or cancelled, `status_sync` cascades the
 /// change to the quote status so the pipeline state stays consistent.
 ///
 /// # Parameters
@@ -272,14 +272,14 @@ async fn update_booking(
         _ => ApiError::Internal(e.to_string()),
     })?;
 
-    // Sync linked quote status when booking has a quote_id
-    if let Some(quote_id) = booking.quote_id {
+    // Sync linked quote status when booking has a inquiry_id
+    if let Some(inquiry_id) = booking.inquiry_id {
         match booking.status.as_str() {
             "confirmed" => {
-                crate::services::status_sync::sync_booking_confirmed(&state.db, quote_id).await.ok();
+                crate::services::status_sync::sync_booking_confirmed(&state.db, inquiry_id).await.ok();
             }
             "cancelled" => {
-                crate::services::status_sync::sync_booking_cancelled(&state.db, quote_id).await.ok();
+                crate::services::status_sync::sync_booking_cancelled(&state.db, inquiry_id).await.ok();
             }
             _ => {}
         }

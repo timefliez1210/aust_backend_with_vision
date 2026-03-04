@@ -12,7 +12,7 @@ use aust_volume_estimator::VisionAnalyzer;
 /// Upload decoded images to S3, returning the list of S3 keys.
 pub async fn upload_images_to_s3(
     storage: &dyn StorageProvider,
-    quote_id: Uuid,
+    inquiry_id: Uuid,
     estimation_id: Uuid,
     images: &[(Vec<u8>, String)], // (data, mime_type)
 ) -> Result<Vec<String>, ApiError> {
@@ -23,7 +23,7 @@ pub async fn upload_images_to_s3(
             "image/webp" => "webp",
             _ => "jpg",
         };
-        let key = format!("estimates/{quote_id}/{estimation_id}/{idx}.{ext}");
+        let key = format!("estimates/{inquiry_id}/{estimation_id}/{idx}.{ext}");
         storage
             .upload(&key, Bytes::from(data.clone()), mime_type)
             .await
@@ -40,7 +40,7 @@ pub async fn try_vision_service(
     state: &AppState,
     images: &[(Vec<u8>, String)],
     job_id: Uuid,
-    quote_id: Uuid,
+    inquiry_id: Uuid,
     estimation_id: Uuid,
 ) -> Result<(f64, f64, Option<serde_json::Value>), ApiError> {
     let client = state
@@ -64,7 +64,7 @@ pub async fn try_vision_service(
                     let name = item_val.get("name").and_then(|v| v.as_str()).unwrap_or("item");
                     let safe_name = name.replace(' ', "_").to_lowercase();
                     let key = format!(
-                        "estimates/{quote_id}/{estimation_id}/crops/{safe_name}_{idx}.jpg"
+                        "estimates/{inquiry_id}/{estimation_id}/crops/{safe_name}_{idx}.jpg"
                     );
                     if let Ok(decoded) =
                         base64::engine::general_purpose::STANDARD.decode(crop_b64)

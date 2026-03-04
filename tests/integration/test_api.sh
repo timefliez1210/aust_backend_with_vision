@@ -220,7 +220,7 @@ fi
 
 # State shared across test groups
 TEST_CUSTOMER_ID=""
-TEST_QUOTE_ID=""
+TEST_INQUIRY_ID=""
 
 # ---------------------------------------------------------------------------
 # Group 1: Health
@@ -360,6 +360,35 @@ admin_post_no_body() {
     echo "${status}|${body}"
 }
 
+admin_patch() {
+    local url="$1"
+    local data="$2"
+    local response
+    response=$(curl -s -w "\n%{http_code}" -X PATCH \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer ${ADMIN_JWT}" \
+        -d "$data" \
+        "$url" 2>/dev/null)
+    local body
+    body=$(echo "$response" | head -n -1)
+    local status
+    status=$(echo "$response" | tail -n 1)
+    echo "${status}|${body}"
+}
+
+admin_delete() {
+    local url="$1"
+    local response
+    response=$(curl -s -w "\n%{http_code}" -X DELETE \
+        -H "Authorization: Bearer ${ADMIN_JWT}" \
+        "$url" 2>/dev/null)
+    local body
+    body=$(echo "$response" | head -n -1)
+    local status
+    status=$(echo "$response" | tail -n 1)
+    echo "${status}|${body}"
+}
+
 # Dashboard
 raw=$(admin_get "${STAGING_URL}/api/v1/admin/dashboard")
 split_response "$raw" hs hb
@@ -383,42 +412,41 @@ else
     [ -n "$hb" ] && echo "    Response: ${hb:0:200}"
 fi
 
-# Quotes list
-raw=$(admin_get "${STAGING_URL}/api/v1/admin/quotes")
+# Inquiries list
+raw=$(admin_get "${STAGING_URL}/api/v1/inquiries")
 split_response "$raw" hs hb
 if [ "$hs" -eq 200 ]; then
-    quotes_ok=true
+    inquiries_ok=true
     if command -v jq &>/dev/null; then
-        quotes_val=$(echo "$hb" | jq -r ".quotes" 2>/dev/null)
+        inquiries_val=$(echo "$hb" | jq -r ".inquiries" 2>/dev/null)
         total_val=$(echo "$hb" | jq -r ".total" 2>/dev/null)
-        if [ "$quotes_val" = "null" ] || [ -z "$quotes_val" ]; then
-            fail "GET /api/v1/admin/quotes: .quotes field missing"
-            quotes_ok=false
+        if [ "$inquiries_val" = "null" ] || [ -z "$inquiries_val" ]; then
+            fail "GET /api/v1/inquiries: .inquiries field missing"
+            inquiries_ok=false
         fi
         if [ "$total_val" = "null" ] || [ -z "$total_val" ]; then
-            fail "GET /api/v1/admin/quotes: .total field missing"
-            quotes_ok=false
+            fail "GET /api/v1/inquiries: .total field missing"
+            inquiries_ok=false
         fi
     fi
-    if [ "$quotes_ok" = true ]; then
-        pass "GET /api/v1/admin/quotes → 200 with quotes array and total"
+    if [ "$inquiries_ok" = true ]; then
+        pass "GET /api/v1/inquiries → 200 with inquiries array and total"
     fi
 else
-    fail "GET /api/v1/admin/quotes: expected HTTP 200, got $hs"
+    fail "GET /api/v1/inquiries: expected HTTP 200, got $hs"
     [ -n "$hb" ] && echo "    Response: ${hb:0:200}"
 fi
+
+# Inquiries with offer filter
+raw=$(admin_get "${STAGING_URL}/api/v1/inquiries?has_offer=true")
+split_response "$raw" hs hb
+check "GET /api/v1/inquiries?has_offer=true → 200" 200 "$hs" "$hb" ".inquiries"
 
 # Customers list
 raw=$(admin_get "${STAGING_URL}/api/v1/admin/customers")
 split_response "$raw" hs hb
 check "GET /api/v1/admin/customers → 200 with customers array" \
     200 "$hs" "$hb" ".customers"
-
-# Offers list
-raw=$(admin_get "${STAGING_URL}/api/v1/admin/offers")
-split_response "$raw" hs hb
-check "GET /api/v1/admin/offers → 200 with offers array" \
-    200 "$hs" "$hb" ".offers"
 
 # Create customer
 CUSTOMER_PAYLOAD="{\"email\":\"${TEST_EMAIL}\",\"name\":\"Integration Test\"}"
@@ -441,95 +469,106 @@ else
     [ -n "$hb" ] && echo "    Response: ${hb:0:200}"
 fi
 
-# Create quote (requires customer_id)
-if [ -z "$TEST_CUSTOMER_ID" ]; then
-    skip "POST /api/v1/admin/quotes" "no customer id available (customer creation failed)"
-    skip "GET /api/v1/admin/quotes/{id}" "no quote id available (customer creation failed)"
-else
-    QUOTE_PAYLOAD=$(cat <<JSONEOF
+# Create inquiry (uses customer_email, not customer_id)
+INQUIRY_PAYLOAD=$(cat <<JSONEOF
 {
-  "customer_id": "${TEST_CUSTOMER_ID}",
-  "origin": {
-    "street": "Borsigstr 6",
-    "city": "Hildesheim",
-    "postal_code": "31135",
-    "floor": "EG",
-    "elevator": false
-  },
-  "destination": {
-    "street": "Marktplatz 1",
-    "city": "Hannover",
-    "postal_code": "30159",
-    "floor": "1. OG",
-    "elevator": true
-  },
-  "estimated_volume_m3": 15.0,
-  "distance_km": 30.5,
-  "notes": "Integration test quote"
+  "customer_email": "${TEST_EMAIL}",
+  "customer_name": "Integration Test",
+  "origin_address": "Borsigstr 6, 31135 Hildesheim",
+  "origin_floor": "EG",
+  "origin_elevator": false,
+  "destination_address": "Marktplatz 1, 30159 Hannover",
+  "destination_floor": "1. OG",
+  "destination_elevator": true,
+  "notes": "Integration test inquiry"
 }
 JSONEOF
 )
 
-    raw=$(admin_post "${STAGING_URL}/api/v1/admin/quotes" "$QUOTE_PAYLOAD")
-    split_response "$raw" hs hb
-    if [ "$hs" -eq 201 ] || [ "$hs" -eq 200 ]; then
-        if command -v jq &>/dev/null; then
-            quote_id=$(echo "$hb" | jq -r ".id" 2>/dev/null)
-            if [ "$quote_id" = "null" ] || [ -z "$quote_id" ]; then
-                fail "POST /api/v1/admin/quotes: HTTP $hs but .id missing"
-            else
-                TEST_QUOTE_ID="$quote_id"
-                pass "POST /api/v1/admin/quotes → ${hs} with id=${quote_id:0:8}..."
-            fi
+raw=$(admin_post "${STAGING_URL}/api/v1/inquiries" "$INQUIRY_PAYLOAD")
+split_response "$raw" hs hb
+if [ "$hs" -eq 201 ] || [ "$hs" -eq 200 ]; then
+    if command -v jq &>/dev/null; then
+        inquiry_id=$(echo "$hb" | jq -r ".id" 2>/dev/null)
+        if [ "$inquiry_id" = "null" ] || [ -z "$inquiry_id" ]; then
+            fail "POST /api/v1/inquiries: HTTP $hs but .id missing"
         else
-            pass "POST /api/v1/admin/quotes → ${hs}"
+            TEST_INQUIRY_ID="$inquiry_id"
+            pass "POST /api/v1/inquiries → ${hs} with id=${inquiry_id:0:8}..."
         fi
     else
-        fail "POST /api/v1/admin/quotes: expected HTTP 201/200, got $hs"
+        pass "POST /api/v1/inquiries → ${hs}"
+    fi
+else
+    fail "POST /api/v1/inquiries: expected HTTP 201/200, got $hs"
+    [ -n "$hb" ] && echo "    Response: ${hb:0:200}"
+fi
+
+# Get inquiry detail
+if [ -z "$TEST_INQUIRY_ID" ]; then
+    skip "GET /api/v1/inquiries/{id}" "no inquiry id available (inquiry creation failed)"
+    skip "PATCH /api/v1/inquiries/{id}" "no inquiry id available"
+else
+    raw=$(admin_get "${STAGING_URL}/api/v1/inquiries/${TEST_INQUIRY_ID}")
+    split_response "$raw" hs hb
+    if [ "$hs" -eq 200 ]; then
+        inquiry_ok=true
+        if command -v jq &>/dev/null; then
+            # Check top-level fields
+            for field in ".status" ".source"; do
+                val=$(echo "$hb" | jq -r "$field" 2>/dev/null)
+                if [ "$val" = "null" ] || [ -z "$val" ]; then
+                    fail "GET /api/v1/inquiries/{id}: field $field missing"
+                    inquiry_ok=false
+                fi
+            done
+            # Check embedded customer
+            cust_email=$(echo "$hb" | jq -r ".customer.email" 2>/dev/null)
+            if [ "$cust_email" = "null" ] || [ -z "$cust_email" ]; then
+                fail "GET /api/v1/inquiries/{id}: .customer.email missing"
+                inquiry_ok=false
+            fi
+            # Check address snapshots
+            origin_val=$(echo "$hb" | jq -r ".origin_address" 2>/dev/null)
+            dest_val=$(echo "$hb"   | jq -r ".destination_address" 2>/dev/null)
+            if [ "$origin_val" = "null" ]; then
+                fail "GET /api/v1/inquiries/{id}: .origin_address is null"
+                inquiry_ok=false
+            fi
+            if [ "$dest_val" = "null" ]; then
+                fail "GET /api/v1/inquiries/{id}: .destination_address is null"
+                inquiry_ok=false
+            fi
+            # offer may be null — that is acceptable
+            latest_offer=$(echo "$hb" | jq -r ".offer" 2>/dev/null)
+            if [ "$latest_offer" = "null" ]; then
+                echo "    Note: .offer is null (no offer generated yet — OK)"
+            fi
+        fi
+        if [ "$inquiry_ok" = true ]; then
+            pass "GET /api/v1/inquiries/{id} → 200 with status, customer, addresses"
+        fi
+    else
+        fail "GET /api/v1/inquiries/{id}: expected HTTP 200, got $hs"
         [ -n "$hb" ] && echo "    Response: ${hb:0:200}"
     fi
 
-    # Get quote detail
-    if [ -z "$TEST_QUOTE_ID" ]; then
-        skip "GET /api/v1/admin/quotes/{id}" "no quote id available (quote creation failed)"
-    else
-        raw=$(admin_get "${STAGING_URL}/api/v1/admin/quotes/${TEST_QUOTE_ID}")
-        split_response "$raw" hs hb
-        if [ "$hs" -eq 200 ]; then
-            quote_ok=true
-            if command -v jq &>/dev/null; then
-                for field in ".status" ".customer_name" ".customer_email"; do
-                    val=$(echo "$hb" | jq -r "$field" 2>/dev/null)
-                    if [ "$val" = "null" ] || [ -z "$val" ]; then
-                        fail "GET /api/v1/admin/quotes/{id}: field $field missing"
-                        quote_ok=false
-                    fi
-                done
-                # origin and destination may be objects (not strings) — check they exist and are not null
-                origin_val=$(echo "$hb" | jq -r ".origin" 2>/dev/null)
-                dest_val=$(echo "$hb"   | jq -r ".destination" 2>/dev/null)
-                if [ "$origin_val" = "null" ]; then
-                    fail "GET /api/v1/admin/quotes/{id}: .origin is null"
-                    quote_ok=false
-                fi
-                if [ "$dest_val" = "null" ]; then
-                    fail "GET /api/v1/admin/quotes/{id}: .destination is null"
-                    quote_ok=false
-                fi
-                # latest_offer may be null — that is acceptable
-                latest_offer=$(echo "$hb" | jq -r ".offer" 2>/dev/null)
-                if [ "$latest_offer" = "null" ]; then
-                    echo "    Note: .offer is null (no offer generated yet — OK)"
-                fi
-            fi
-            if [ "$quote_ok" = true ]; then
-                pass "GET /api/v1/admin/quotes/{id} → 200 with status, customer_name, origin, destination"
-            fi
-        else
-            fail "GET /api/v1/admin/quotes/{id}: expected HTTP 200, got $hs"
-            [ -n "$hb" ] && echo "    Response: ${hb:0:200}"
-        fi
-    fi
+    # Status transition: pending → estimated (skip-ahead shortcut)
+    raw=$(admin_patch "${STAGING_URL}/api/v1/inquiries/${TEST_INQUIRY_ID}" \
+        '{"status": "estimated"}')
+    split_response "$raw" hs hb
+    check "PATCH /api/v1/inquiries/{id} (status → estimated) → 200" 200 "$hs" "$hb"
+
+    # Invalid status transition → 400
+    raw=$(admin_patch "${STAGING_URL}/api/v1/inquiries/${TEST_INQUIRY_ID}" \
+        '{"status": "flying_monkeys"}')
+    split_response "$raw" hs hb
+    check "PATCH /api/v1/inquiries/{id} (invalid status) → 400" 400 "$hs" "$hb"
+
+    # Soft delete (→ cancelled)
+    raw=$(admin_delete "${STAGING_URL}/api/v1/inquiries/${TEST_INQUIRY_ID}")
+    split_response "$raw" hs hb
+    check "DELETE /api/v1/inquiries/{id} → 200 (soft delete)" 200 "$hs" "$hb"
 fi
 
 echo ""
@@ -549,9 +588,9 @@ else
     if [ "$hs" -eq 200 ] || [ "$hs" -eq 204 ]; then
         pass "POST /api/v1/admin/customers/{id}/delete → ${hs}"
     elif [ "$hs" -ge 400 ] && [ "$hs" -lt 500 ]; then
-        # Foreign key constraint (customer has quotes) — acceptable
+        # Foreign key constraint (customer has inquiries) — acceptable
         skip "POST /api/v1/admin/customers/{id}/delete" \
-            "HTTP ${hs} — customer may have dependent quotes (foreign key constraint)"
+            "HTTP ${hs} — customer may have dependent inquiries (foreign key constraint)"
     else
         fail "POST /api/v1/admin/customers/{id}/delete: unexpected HTTP $hs"
         [ -n "$hb" ] && echo "    Response: ${hb:0:200}"

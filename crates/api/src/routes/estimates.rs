@@ -44,7 +44,7 @@ pub fn protected_router() -> Router<Arc<AppState>> {
 #[derive(Debug, FromRow)]
 struct VolumeEstimationRow {
     id: Uuid,
-    quote_id: Uuid,
+    inquiry_id: Uuid,
     method: String,
     status: String,
     source_data: serde_json::Value,
@@ -67,7 +67,7 @@ impl From<VolumeEstimationRow> for VolumeEstimation {
 
         VolumeEstimation {
             id: row.id,
-            quote_id: row.quote_id,
+            inquiry_id: row.inquiry_id,
             method,
             status: row.status,
             source_data: row.source_data,
@@ -92,7 +92,7 @@ impl From<crate::services::db::EstimationRow> for VolumeEstimation {
 
         VolumeEstimation {
             id: row.id,
-            quote_id: row.quote_id,
+            inquiry_id: row.inquiry_id,
             method,
             status: row.status,
             source_data: row.source_data,
@@ -106,7 +106,7 @@ impl From<crate::services::db::EstimationRow> for VolumeEstimation {
 
 #[derive(Debug, Deserialize)]
 struct VisionEstimateRequest {
-    quote_id: Uuid,
+    inquiry_id: Uuid,
     images: Vec<ImageData>,
 }
 
@@ -126,7 +126,7 @@ struct ImageData {
 ///
 /// # Parameters
 /// - `state` — shared AppState (DB pool, LLM provider, storage)
-/// - `request` — JSON body with `quote_id` and `images` (array of `{data, mime_type}`)
+/// - `request` — JSON body with `inquiry_id` and `images` (array of `{data, mime_type}`)
 ///
 /// # Returns
 /// `200 OK` with the newly created `VolumeEstimation` JSON (status = "completed").
@@ -157,7 +157,7 @@ async fn vision_estimate(
         .collect::<Result<Vec<_>, ApiError>>()?;
 
     // Upload images to S3 for future retrieval
-    let s3_keys = services::vision::upload_images_to_s3(&*state.storage, request.quote_id, id, &decoded).await;
+    let s3_keys = services::vision::upload_images_to_s3(&*state.storage, request.inquiry_id, id, &decoded).await;
     let s3_keys = match s3_keys {
         Ok(keys) => keys,
         Err(e) => {
@@ -193,7 +193,7 @@ async fn vision_estimate(
     let est = insert_estimation(
         &state.db,
         id,
-        request.quote_id,
+        request.inquiry_id,
         EstimationMethod::Vision.as_str(),
         &source_data,
         result_data.as_ref(),
@@ -203,11 +203,11 @@ async fn vision_estimate(
     )
     .await?;
 
-    update_quote_volume(&state.db, request.quote_id, total_volume, "volume_estimated", now).await?;
+    update_quote_volume(&state.db, request.inquiry_id, total_volume, "volume_estimated", now).await?;
 
     // Auto-generate offer in background
     let state_clone = state.clone();
-    let qid = request.quote_id;
+    let qid = request.inquiry_id;
     tokio::spawn(async move { orchestrator::try_auto_generate_offer(state_clone, qid).await });
 
     Ok(Json(VolumeEstimation::from(est)))
@@ -216,30 +216,30 @@ async fn vision_estimate(
 /// `POST /api/v1/estimates/depth-sensor` — Run the 3D ML pipeline on multipart-uploaded images.
 ///
 /// **Caller**: Axum router / mobile app depth-sensor flow (source D pipeline).
-/// **Why**: Receives `multipart/form-data` with `quote_id` and one or more image files,
+/// **Why**: Receives `multipart/form-data` with `inquiry_id` and one or more image files,
 /// uploads images to S3, calls the Modal vision service (Grounding DINO + SAM 2 + depth),
 /// and falls back to LLM vision analysis if the vision service is unavailable.
 /// After storing results, auto-generates an offer in the background.
 ///
 /// # Parameters
 /// - `state` — shared AppState (DB pool, LLM provider, vision service client, storage)
-/// - `multipart` — multipart form with `quote_id` field + image file fields
+/// - `multipart` — multipart form with `inquiry_id` field + image file fields
 ///
 /// # Returns
 /// `200 OK` with the newly created `VolumeEstimation` JSON.
 /// The `method` field reflects whether the ML pipeline or LLM fallback was used.
 ///
 /// # Errors
-/// - `400` if multipart parsing fails, `quote_id` is missing/invalid, or no images provided
+/// - `400` if multipart parsing fails, `inquiry_id` is missing/invalid, or no images provided
 /// - `500` on S3 upload, vision service, or DB failures
 async fn depth_sensor_estimate(
     State(state): State<Arc<AppState>>,
     mut multipart: Multipart,
 ) -> Result<Json<VolumeEstimation>, ApiError> {
-    let mut quote_id: Option<Uuid> = None;
+    let mut inquiry_id: Option<Uuid> = None;
     let mut images: Vec<(Vec<u8>, String)> = Vec::new();
 
-    // Parse multipart form: extract quote_id and image files
+    // Parse multipart form: extract inquiry_id and image files
     while let Some(field) = multipart
         .next_field()
         .await
@@ -247,14 +247,14 @@ async fn depth_sensor_estimate(
     {
         let name = field.name().unwrap_or("").to_string();
         match name.as_str() {
-            "quote_id" => {
+            "inquiry_id" => {
                 let text = field
                     .text()
                     .await
-                    .map_err(|e| ApiError::BadRequest(format!("Failed to read quote_id: {e}")))?;
-                quote_id = Some(
+                    .map_err(|e| ApiError::BadRequest(format!("Failed to read inquiry_id: {e}")))?;
+                inquiry_id = Some(
                     text.parse::<Uuid>()
-                        .map_err(|e| ApiError::Validation(format!("Invalid quote_id: {e}")))?,
+                        .map_err(|e| ApiError::Validation(format!("Invalid inquiry_id: {e}")))?,
                 );
             }
             _ => {
@@ -275,8 +275,8 @@ async fn depth_sensor_estimate(
         }
     }
 
-    let quote_id =
-        quote_id.ok_or_else(|| ApiError::Validation("quote_id field is required".into()))?;
+    let inquiry_id =
+        inquiry_id.ok_or_else(|| ApiError::Validation("inquiry_id field is required".into()))?;
     if images.is_empty() {
         return Err(ApiError::Validation(
             "At least one image file is required".into(),
@@ -286,11 +286,11 @@ async fn depth_sensor_estimate(
     let id = Uuid::now_v7();
 
     // Upload images to S3
-    let s3_keys = services::vision::upload_images_to_s3(&*state.storage, quote_id, id, &images).await?;
+    let s3_keys = services::vision::upload_images_to_s3(&*state.storage, inquiry_id, id, &images).await?;
 
     // Try the vision service first, fall back to LLM analysis
     let (total_volume, confidence, result_data, method) =
-        match services::vision::try_vision_service(&state, &images, id, quote_id, id).await {
+        match services::vision::try_vision_service(&state, &images, id, inquiry_id, id).await {
             Ok((vol, conf, data)) => (vol, conf, data, EstimationMethod::DepthSensor),
             Err(e) => {
                 tracing::warn!("Vision service failed, falling back to LLM analysis: {e}");
@@ -307,7 +307,7 @@ async fn depth_sensor_estimate(
     let est = insert_estimation(
         &state.db,
         id,
-        quote_id,
+        inquiry_id,
         method.as_str(),
         &source_data,
         result_data.as_ref(),
@@ -317,11 +317,11 @@ async fn depth_sensor_estimate(
     )
     .await?;
 
-    update_quote_volume(&state.db, quote_id, total_volume, "volume_estimated", now).await?;
+    update_quote_volume(&state.db, inquiry_id, total_volume, "volume_estimated", now).await?;
 
     // Auto-generate offer in background
     let state_clone = state.clone();
-    tokio::spawn(async move { orchestrator::try_auto_generate_offer(state_clone, quote_id).await });
+    tokio::spawn(async move { orchestrator::try_auto_generate_offer(state_clone, inquiry_id).await });
 
     Ok(Json(VolumeEstimation::from(est)))
 }
@@ -336,7 +336,7 @@ async fn depth_sensor_estimate(
 ///
 /// # Parameters
 /// - `state` — shared AppState (DB pool, storage, vision service client — must be configured)
-/// - `multipart` — form with `quote_id`, `video` file(s), and optional `max_keyframes` /
+/// - `multipart` — form with `inquiry_id`, `video` file(s), and optional `max_keyframes` /
 ///   `detection_threshold` tuning parameters
 ///
 /// # Returns
@@ -344,18 +344,18 @@ async fn depth_sensor_estimate(
 /// The actual results are written by `process_video_background` when Modal finishes.
 ///
 /// # Errors
-/// - `400` if multipart parsing fails, `quote_id` missing, or no videos provided
+/// - `400` if multipart parsing fails, `inquiry_id` missing, or no videos provided
 /// - `500` if vision service is not configured or S3/DB fails
 async fn video_estimate(
     State(state): State<Arc<AppState>>,
     mut multipart: Multipart,
 ) -> Result<Json<Vec<VolumeEstimation>>, ApiError> {
-    let mut quote_id: Option<Uuid> = None;
+    let mut inquiry_id: Option<Uuid> = None;
     let mut videos: Vec<(Vec<u8>, String)> = Vec::new();
     let mut max_keyframes: Option<u32> = None;
     let mut detection_threshold: Option<f64> = None;
 
-    // Parse multipart form: quote_id + video file(s) + optional params
+    // Parse multipart form: inquiry_id + video file(s) + optional params
     while let Some(field) = multipart
         .next_field()
         .await
@@ -363,14 +363,14 @@ async fn video_estimate(
     {
         let name = field.name().unwrap_or("").to_string();
         match name.as_str() {
-            "quote_id" => {
+            "inquiry_id" => {
                 let text = field
                     .text()
                     .await
-                    .map_err(|e| ApiError::BadRequest(format!("Failed to read quote_id: {e}")))?;
-                quote_id = Some(
+                    .map_err(|e| ApiError::BadRequest(format!("Failed to read inquiry_id: {e}")))?;
+                inquiry_id = Some(
                     text.parse::<Uuid>()
-                        .map_err(|e| ApiError::Validation(format!("Invalid quote_id: {e}")))?,
+                        .map_err(|e| ApiError::Validation(format!("Invalid inquiry_id: {e}")))?,
                 );
             }
             "max_keyframes" => {
@@ -417,8 +417,8 @@ async fn video_estimate(
         }
     }
 
-    let quote_id =
-        quote_id.ok_or_else(|| ApiError::Validation("quote_id field is required".into()))?;
+    let inquiry_id =
+        inquiry_id.ok_or_else(|| ApiError::Validation("inquiry_id field is required".into()))?;
     if videos.is_empty() {
         return Err(ApiError::Validation("At least one video file is required".into()));
     }
@@ -441,7 +441,7 @@ async fn video_estimate(
             "video/x-matroska" => "mkv",
             _ => "mp4",
         };
-        let video_s3_key = format!("estimates/{quote_id}/{id}/video.{ext}");
+        let video_s3_key = format!("estimates/{inquiry_id}/{id}/video.{ext}");
         state
             .storage
             .upload(&video_s3_key, Bytes::from(video_bytes.clone()), &video_mime)
@@ -456,13 +456,13 @@ async fn video_estimate(
 
         let row: VolumeEstimationRow = sqlx::query_as(
             r#"
-            INSERT INTO volume_estimations (id, quote_id, method, status, source_data, total_volume_m3, confidence_score, created_at)
+            INSERT INTO volume_estimations (id, inquiry_id, method, status, source_data, total_volume_m3, confidence_score, created_at)
             VALUES ($1, $2, $3, 'processing', $4, NULL, NULL, $5)
-            RETURNING id, quote_id, method, status, source_data, result_data, total_volume_m3, confidence_score, created_at
+            RETURNING id, inquiry_id, method, status, source_data, result_data, total_volume_m3, confidence_score, created_at
             "#
         )
         .bind(id)
-        .bind(quote_id)
+        .bind(inquiry_id)
         .bind(EstimationMethod::Video.as_str())
         .bind(&source_data)
         .bind(now)
@@ -470,7 +470,7 @@ async fn video_estimate(
         .await?;
 
         tracing::info!(
-            %quote_id,
+            %inquiry_id,
             %id,
             video_size_mb = video_bytes.len() / (1024 * 1024),
             "Video uploaded, starting background processing..."
@@ -479,16 +479,16 @@ async fn video_estimate(
         // Spawn background task for the long-running Modal call
         let state_bg = state.clone();
         tokio::spawn(async move {
-            process_video_background(state_bg, id, quote_id, video_bytes, video_mime, max_keyframes, detection_threshold).await;
+            process_video_background(state_bg, id, inquiry_id, video_bytes, video_mime, max_keyframes, detection_threshold).await;
         });
 
         estimations.push(VolumeEstimation::from(row));
     }
 
     // Update quote status to show processing is underway (once for all videos)
-    sqlx::query("UPDATE quotes SET status = 'processing', updated_at = $1 WHERE id = $2")
+    sqlx::query("UPDATE inquiries SET status = 'processing', updated_at = $1 WHERE id = $2")
         .bind(now)
-        .bind(quote_id)
+        .bind(inquiry_id)
         .execute(&state.db)
         .await?;
 
@@ -510,7 +510,7 @@ async fn video_estimate(
 /// # Parameters
 /// - `state` — shared AppState (DB pool, storage, vision service client)
 /// - `estimation_id` — the `volume_estimations` row to update
-/// - `quote_id` — the parent quote
+/// - `inquiry_id` — the parent quote
 /// - `video_bytes` — raw video data sent to Modal
 /// - `video_mime` — MIME type string (e.g. "video/mp4")
 /// - `max_keyframes` — optional cap on extracted keyframes passed to Modal
@@ -521,7 +521,7 @@ async fn video_estimate(
 async fn process_video_background(
     state: Arc<AppState>,
     estimation_id: Uuid,
-    quote_id: Uuid,
+    inquiry_id: Uuid,
     video_bytes: Vec<u8>,
     video_mime: String,
     max_keyframes: Option<u32>,
@@ -540,7 +540,7 @@ async fn process_video_background(
     };
 
     tracing::info!(
-        %quote_id,
+        %inquiry_id,
         %estimation_id,
         video_size_mb = video_bytes.len() / (1024 * 1024),
         "Background: calling vision service video endpoint..."
@@ -558,7 +558,7 @@ async fn process_video_background(
     {
         Ok(r) => r,
         Err(e) => {
-            tracing::error!(%quote_id, %estimation_id, error = %e, "Background: vision service video call failed");
+            tracing::error!(%inquiry_id, %estimation_id, error = %e, "Background: vision service video call failed");
             let _ = sqlx::query("UPDATE volume_estimations SET status = 'failed' WHERE id = $1")
                 .bind(estimation_id)
                 .execute(&state.db)
@@ -568,7 +568,7 @@ async fn process_video_background(
     };
 
     tracing::info!(
-        %quote_id,
+        %inquiry_id,
         %estimation_id,
         items = response.detected_items.len(),
         total_volume = response.total_volume_m3,
@@ -595,7 +595,7 @@ async fn process_video_background(
                 if !crop_b64.is_empty() {
                     let name = item_val.get("name").and_then(|v| v.as_str()).unwrap_or("item");
                     let safe_name = name.replace(' ', "_").to_lowercase();
-                    let key = format!("estimates/{quote_id}/{estimation_id}/crops/{safe_name}_{idx}.jpg");
+                    let key = format!("estimates/{inquiry_id}/{estimation_id}/crops/{safe_name}_{idx}.jpg");
                     if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(crop_b64)
                     {
                         if state
@@ -637,22 +637,22 @@ async fn process_video_background(
 
     // Check if other videos for this quote are still processing
     let still_processing: (i64,) = match sqlx::query_as(
-        "SELECT COUNT(*) FROM volume_estimations WHERE quote_id = $1 AND status = 'processing'",
+        "SELECT COUNT(*) FROM volume_estimations WHERE inquiry_id = $1 AND status = 'processing'",
     )
-    .bind(quote_id)
+    .bind(inquiry_id)
     .fetch_one(&state.db)
     .await
     {
         Ok(row) => row,
         Err(e) => {
-            tracing::error!(%quote_id, error = %e, "Background: failed to check processing count");
+            tracing::error!(%inquiry_id, error = %e, "Background: failed to check processing count");
             (0,)
         }
     };
 
     if still_processing.0 > 0 {
         tracing::info!(
-            %quote_id,
+            %inquiry_id,
             %estimation_id,
             still_processing = still_processing.0,
             "Background: other videos still processing, skipping offer generation"
@@ -662,9 +662,9 @@ async fn process_video_background(
 
     // All videos done — sum volumes from all completed estimations
     let total_volume: (Option<f64>,) = sqlx::query_as(
-        "SELECT SUM(total_volume_m3) FROM volume_estimations WHERE quote_id = $1 AND status = 'completed'",
+        "SELECT SUM(total_volume_m3) FROM volume_estimations WHERE inquiry_id = $1 AND status = 'completed'",
     )
-    .bind(quote_id)
+    .bind(inquiry_id)
     .fetch_one(&state.db)
     .await
     .unwrap_or((None,));
@@ -672,18 +672,18 @@ async fn process_video_background(
     let combined_volume = total_volume.0.unwrap_or(0.0);
 
     // Update quote with combined estimated volume
-    let _ = update_quote_volume(&state.db, quote_id, combined_volume, "volume_estimated", now).await;
+    let _ = update_quote_volume(&state.db, inquiry_id, combined_volume, "volume_estimated", now).await;
 
-    tracing::info!(%quote_id, %estimation_id, combined_volume, "Background: all video estimations completed, triggering offer generation");
+    tracing::info!(%inquiry_id, %estimation_id, combined_volume, "Background: all video estimations completed, triggering offer generation");
 
     // Auto-generate offer
-    orchestrator::try_auto_generate_offer(state, quote_id).await;
+    orchestrator::try_auto_generate_offer(state, inquiry_id).await;
 }
 
 
 #[derive(Debug, Deserialize)]
 struct InventoryRequest {
-    quote_id: Uuid,
+    inquiry_id: Uuid,
     inventory: InventoryForm,
 }
 
@@ -697,7 +697,7 @@ struct InventoryRequest {
 ///
 /// # Parameters
 /// - `state` — shared AppState (DB pool)
-/// - `request` — JSON body with `quote_id` and `inventory` form data
+/// - `request` — JSON body with `inquiry_id` and `inventory` form data
 ///
 /// # Returns
 /// `200 OK` with the newly created `VolumeEstimation` JSON (status = "completed").
@@ -720,7 +720,7 @@ async fn inventory_estimate(
     let est = insert_estimation(
         &state.db,
         id,
-        request.quote_id,
+        request.inquiry_id,
         EstimationMethod::Inventory.as_str(),
         &source_data,
         None,
@@ -730,11 +730,11 @@ async fn inventory_estimate(
     )
     .await?;
 
-    update_quote_volume(&state.db, request.quote_id, total_volume, "volume_estimated", now).await?;
+    update_quote_volume(&state.db, request.inquiry_id, total_volume, "volume_estimated", now).await?;
 
     // Auto-generate offer in background
     let state_clone = state.clone();
-    let qid = request.quote_id;
+    let qid = request.inquiry_id;
     tokio::spawn(async move { orchestrator::try_auto_generate_offer(state_clone, qid).await });
 
     Ok(Json(VolumeEstimation::from(est)))
@@ -761,7 +761,7 @@ async fn get_estimate(
 ) -> Result<Json<VolumeEstimation>, ApiError> {
     let row: Option<VolumeEstimationRow> = sqlx::query_as(
         r#"
-        SELECT id, quote_id, method, status, source_data, result_data, total_volume_m3, confidence_score, created_at
+        SELECT id, inquiry_id, method, status, source_data, result_data, total_volume_m3, confidence_score, created_at
         FROM volume_estimations WHERE id = $1
         "#
     )
@@ -842,10 +842,10 @@ async fn delete_estimate(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
-    // Fetch the estimation to collect S3 keys and quote_id
+    // Fetch the estimation to collect S3 keys and inquiry_id
     let row: Option<VolumeEstimationRow> = sqlx::query_as(
         r#"
-        SELECT id, quote_id, method, status, source_data, result_data, total_volume_m3, confidence_score, created_at
+        SELECT id, inquiry_id, method, status, source_data, result_data, total_volume_m3, confidence_score, created_at
         FROM volume_estimations WHERE id = $1
         "#,
     )
@@ -854,7 +854,7 @@ async fn delete_estimate(
     .await?;
 
     let row = row.ok_or_else(|| ApiError::NotFound(format!("Estimation {id} not found")))?;
-    let quote_id = row.quote_id;
+    let inquiry_id = row.inquiry_id;
 
     // Collect S3 keys and delete objects (best-effort — don't fail the request on storage errors)
     let s3_keys = collect_estimation_s3_keys(&row.source_data, row.result_data.as_ref());
@@ -872,9 +872,9 @@ async fn delete_estimate(
 
     // Recalculate quote volume from remaining completed estimations and update quote
     let total: (Option<f64>,) = sqlx::query_as(
-        "SELECT SUM(total_volume_m3) FROM volume_estimations WHERE quote_id = $1 AND status = 'completed'",
+        "SELECT SUM(total_volume_m3) FROM volume_estimations WHERE inquiry_id = $1 AND status = 'completed'",
     )
-    .bind(quote_id)
+    .bind(inquiry_id)
     .fetch_one(&state.db)
     .await
     .unwrap_or((None,));
@@ -884,11 +884,11 @@ async fn delete_estimate(
 
     // Only update volume/status if there are still estimations; otherwise reset to new
     let new_status = if combined_volume > 0.0 { "volume_estimated" } else { "new" };
-    sqlx::query("UPDATE quotes SET estimated_volume_m3 = $1, status = $2, updated_at = $3 WHERE id = $4")
+    sqlx::query("UPDATE inquiries SET estimated_volume_m3 = $1, status = $2, updated_at = $3 WHERE id = $4")
         .bind(combined_volume)
         .bind(new_status)
         .bind(now)
-        .bind(quote_id)
+        .bind(inquiry_id)
         .execute(&state.db)
         .await?;
 

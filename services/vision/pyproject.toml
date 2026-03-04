@@ -21,6 +21,7 @@ dependencies = [
     "scikit-learn>=1.6,<2",
     "structlog>=24.4,<26",
     "httpx>=0.28,<1",
+    "python-multipart>=0.0.9,<1",
 ]
 
 [project.optional-dependencies]

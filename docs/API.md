@@ -13,7 +13,7 @@ Pass it as:
 Authorization: Bearer <access_token>
 ```
 
-Public endpoints (health, `GET /api/v1/estimates/images/*`) require no token.
+Public endpoints (health, `GET /api/v1/estimates/images/*`, `POST /api/v1/submit/*`) require no token.
 
 ---
 
@@ -201,235 +201,327 @@ Change the current user's password.
 
 ---
 
-## Quotes
+## Inquiries
 
-### POST /api/v1/quotes
+An inquiry represents a single moving request from initial contact through to completion and payment. It replaces the former "quote" concept and unifies the entire lifecycle under one resource.
 
-Create a new quote record. Typically created automatically by the orchestrator from incoming emails; use directly to create quotes manually.
+`InquiryStatus` values: `pending` | `info_requested` | `estimating` | `estimated` | `offer_ready` | `offer_sent` | `accepted` | `rejected` | `expired` | `cancelled` | `scheduled` | `completed` | `invoiced` | `paid`
+
+Status transitions are validated server-side by `InquiryStatus::can_transition_to()`.
+
+### InquiryResponse type
+
+```typescript
+{
+  id: string;
+  status: InquiryStatus;
+  source: string;       // "direct_email" | "admin_dashboard" | "photo_webapp" | "mobile_app"
+  services: Services;   // { packing, assembly, disassembly, storage, disposal, parking_ban_origin, parking_ban_destination }
+  volume_m3: number | null;
+  distance_km: number | null;
+  preferred_date: string | null;
+  notes: string | null;
+  customer_message: string | null;
+  created_at: string;
+  updated_at: string;
+  offer_sent_at: string | null;
+  accepted_at: string | null;
+  customer: CustomerSnapshot | null;
+  origin_address: AddressSnapshot | null;
+  destination_address: AddressSnapshot | null;
+  stop_address: AddressSnapshot | null;
+  estimation: EstimationSnapshot | null;
+  items: ItemSnapshot[];
+  offer: OfferSnapshot | null;
+}
+```
+
+`CustomerSnapshot`:
+```typescript
+{
+  id: string;
+  email: string;
+  name: string | null;
+  phone: string | null;
+}
+```
+
+`AddressSnapshot`:
+```typescript
+{
+  id: string;
+  street: string;
+  city: string;
+  postal_code: string | null;
+  floor: string | null;
+  elevator: boolean | null;
+}
+```
+
+`EstimationSnapshot`:
+```typescript
+{
+  id: string;
+  method: "vision" | "inventory" | "depth_sensor" | "video" | "manual";
+  total_volume_m3: number;
+  source_images: string[];
+  source_videos: string[];
+}
+```
+
+`ItemSnapshot`:
+```typescript
+{
+  name: string;
+  volume_m3: number;
+  quantity: number;
+  confidence: number;
+  crop_url: string | null;
+  source_image_url: string | null;
+  bbox: number[] | null;
+}
+```
+
+`OfferSnapshot`:
+```typescript
+{
+  id: string;
+  offer_number: string | null;
+  persons: number | null;
+  hours_estimated: number | null;
+  rate_per_hour_cents: number | null;
+  total_netto_cents: number;
+  total_brutto_cents: number;
+  status: string;
+  valid_until: string | null;
+  pdf_storage_key: string | null;
+  line_items: {
+    label: string;
+    remark: string | null;
+    quantity: number;
+    unit_price_cents: number;
+    total_cents: number;
+    is_labor: boolean;
+  }[];
+  created_at: string;
+}
+```
+
+`Services`:
+```typescript
+{
+  packing: boolean;
+  assembly: boolean;
+  disassembly: boolean;
+  storage: boolean;
+  disposal: boolean;
+  parking_ban_origin: boolean;
+  parking_ban_destination: boolean;
+}
+```
+
+---
+
+### POST /api/v1/inquiries
+
+Create a new inquiry. Automatically creates or upserts the customer (by email) and origin/destination addresses.
 
 **Auth**: Bearer JWT
 
 **Request body**
 ```typescript
 {
-  customer_id: string;                   // UUID of an existing customer
-  origin_address_id?: string;            // UUID of an existing address
-  destination_address_id?: string;       // UUID of an existing address
-  preferred_date?: string;               // ISO 8601 datetime, e.g. "2026-03-15T09:00:00Z"
-  notes?: string;                        // comma-separated services / free text
+  customer_email: string;                 // required — used to upsert customer
+  customer_name?: string;
+  customer_phone?: string;
+  origin_address?: string;                // free-text address string
+  origin_floor?: string;
+  origin_elevator?: boolean;
+  destination_address?: string;           // free-text address string
+  destination_floor?: string;
+  destination_elevator?: boolean;
+  services?: Services;                    // defaults to all false
+  notes?: string;
+  preferred_date?: string;                // ISO 8601, e.g. "2026-03-15T09:00:00Z"
 }
 ```
 
-**Response** `200 OK`
-```typescript
-{
-  id: string;
-  customer_id: string;
-  origin_address_id: string | null;
-  destination_address_id: string | null;
-  stop_address_id: string | null;
-  status: QuoteStatus;
-  estimated_volume_m3: number | null;
-  distance_km: number | null;
-  preferred_date: string | null;
-  notes: string | null;
-  created_at: string;
-  updated_at: string;
-}
-```
+**Response** `201 Created` — `InquiryResponse` object.
 
-`QuoteStatus` values: `pending` | `info_requested` | `volume_estimated` | `offer_generated` | `offer_sent` | `accepted` | `rejected` | `expired` | `cancelled` | `done` | `paid`
+**Status codes**
+| Code | Meaning |
+|---|---|
+| 201 | Inquiry created |
+| 400 | Missing customer_email or invalid input |
+| 422 | Validation error |
 
 **Example**
 ```bash
-curl -X POST http://localhost:8080/api/v1/quotes \
+curl -X POST http://localhost:8080/api/v1/inquiries \
   -H "Authorization: Bearer <token>" \
   -H "Content-Type: application/json" \
   -d '{
-    "customer_id": "019500000000000000000000",
+    "customer_email": "max@example.com",
+    "customer_name": "Max Mustermann",
+    "customer_phone": "+43 660 1234567",
+    "origin_address": "Musterstr. 1, 1010 Wien",
+    "origin_floor": "3. OG",
+    "origin_elevator": false,
+    "destination_address": "Neugasse 5, 1020 Wien",
+    "destination_floor": "EG",
+    "destination_elevator": true,
+    "services": { "packing": true, "disassembly": true, "assembly": true, "parking_ban_origin": true },
     "preferred_date": "2026-04-01T08:00:00Z",
-    "notes": "Halteverbot Auszug, Verpackungsservice"
+    "notes": "Sehr schweres Klavier im Wohnzimmer"
   }'
 ```
 
 ---
 
-### GET /api/v1/quotes
+### GET /api/v1/inquiries
 
-List quotes with optional filters and pagination.
+List inquiries with optional filters and pagination.
 
 **Auth**: Bearer JWT
 
 **Query parameters**
 | Parameter | Type | Description |
 |---|---|---|
-| `status` | string | Filter by quote status |
-| `customer_id` | UUID | Filter by customer |
+| `status` | string | Filter by `InquiryStatus` value |
+| `search` | string | Substring search on customer name, email, addresses, notes |
+| `has_offer` | boolean | `true` = only inquiries with an active offer; `false` = only without |
 | `limit` | integer | Max results (default 50, max 100) |
 | `offset` | integer | Pagination offset (default 0) |
 
 **Response** `200 OK`
 ```typescript
 {
-  quotes: Quote[];   // array of Quote objects (same shape as POST response)
+  inquiries: InquiryListItem[];
   total: number;
   limit: number;
   offset: number;
 }
 ```
 
+`InquiryListItem` is a summary projection of the full `InquiryResponse` (same top-level fields, with customer/address/offer snapshots included for display).
+
 **Example**
 ```bash
-curl "http://localhost:8080/api/v1/quotes?status=pending&limit=20" \
+curl "http://localhost:8080/api/v1/inquiries?status=pending&has_offer=false&limit=20" \
   -H "Authorization: Bearer <token>"
 ```
 
 ---
 
-### GET /api/v1/quotes/{id}
+### GET /api/v1/inquiries/{id}
 
-Get a single quote enriched with customer, addresses, estimation, and linked offers.
+Get the full detail for a single inquiry including embedded customer, addresses, estimation, items, and active offer.
 
 **Auth**: Bearer JWT
 
-**Response** `200 OK`
-```typescript
-{
-  quote: {
-    id: string;
-    volume_m3: number | null;
-    distance_km: number;
-    notes: string | null;
-    status: string;
-    customer_message: string | null;   // non-service portion of notes
-    created_at: string;
-  };
-  customer: {
-    id: string;
-    email: string;
-    name: string | null;
-    phone: string | null;
-  };
-  origin_address: {
-    id: string;
-    street: string;
-    city: string;
-    postal_code: string | null;
-    floor: string | null;
-    elevator: boolean | null;
-  } | null;
-  destination_address: { /* same shape */ } | null;
-  estimation: {
-    id: string;
-    method: "vision" | "inventory" | "depth_sensor" | "video" | "manual";
-    total_volume_m3: number;
-    items: {
-      name: string;
-      volume_m3: number;
-      quantity: number;
-      confidence: number;
-      crop_url: string | null;
-      source_image_url: string | null;
-      bbox: number[] | null;
-    }[];
-    source_images: string[];   // relative URLs: /api/v1/estimates/images/<key>
-    source_videos: string[];
-  } | null;
-  offers: {
-    id: string;
-    total_brutto_cents: number | null;
-    status: string;
-    created_at: string;
-  }[];
-  latest_offer: {
-    offer_id: string;
-    persons: number;
-    hours: number;
-    rate_cents: number;
-    total_netto_cents: number;
-    total_brutto_cents: number;
-    line_items: {
-      label: string;
-      remark: string | null;
-      quantity: number;
-      unit_price_cents: number;
-      total_cents: number;
-      is_labor: boolean;
-    }[];
-  } | null;
-}
-```
+**Response** `200 OK` — `InquiryResponse` object.
 
 **Status codes**
 | Code | Meaning |
 |---|---|
 | 200 | Found |
-| 404 | Quote not found |
+| 404 | Inquiry not found |
 
 **Example**
 ```bash
-curl http://localhost:8080/api/v1/quotes/019500000000000000000000 \
+curl http://localhost:8080/api/v1/inquiries/019500000000000000000000 \
   -H "Authorization: Bearer <token>"
 ```
 
 ---
 
-### PATCH /api/v1/quotes/{id}
+### PATCH /api/v1/inquiries/{id}
 
-Partially update a quote. All fields are optional; only provided fields are updated.
+Partially update an inquiry. All fields are optional; only provided fields are updated. Status transitions are validated by `InquiryStatus::can_transition_to()`.
 
 **Auth**: Bearer JWT
 
 **Request body**
 ```typescript
 {
-  origin_address_id?: string;
-  destination_address_id?: string;
-  status?: QuoteStatus;
+  status?: InquiryStatus;
+  notes?: string;
+  services?: Services;
   estimated_volume_m3?: number;
   distance_km?: number;
   preferred_date?: string;
-  notes?: string;
+  origin_address_id?: string;
+  destination_address_id?: string;
 }
 ```
 
-**Response** `200 OK` — updated `Quote` object.
+**Response** `200 OK` — updated `InquiryResponse` object.
 
 **Status codes**
 | Code | Meaning |
 |---|---|
 | 200 | Updated |
-| 404 | Quote not found |
+| 400 | Invalid status transition |
+| 404 | Inquiry not found |
 
 **Example**
 ```bash
-curl -X PATCH http://localhost:8080/api/v1/quotes/019500000000000000000000 \
+curl -X PATCH http://localhost:8080/api/v1/inquiries/019500000000000000000000 \
   -H "Authorization: Bearer <token>" \
   -H "Content-Type: application/json" \
-  -d '{"estimated_volume_m3": 18.5, "status": "volume_estimated"}'
+  -d '{"estimated_volume_m3": 18.5, "status": "estimated"}'
 ```
 
 ---
 
-### DELETE /api/v1/quotes/{id}
+### DELETE /api/v1/inquiries/{id}
 
-Soft-delete a quote (sets status to `cancelled`).
+Soft-delete an inquiry (sets status to `cancelled`).
 
 **Auth**: Bearer JWT
 
-**Response** `200 OK` — updated `Quote` object with `status: "cancelled"`.
+**Response** `200 OK` — updated `InquiryResponse` object with `status: "cancelled"`.
 
 **Status codes**
 | Code | Meaning |
 |---|---|
 | 200 | Cancelled |
-| 404 | Quote not found |
+| 404 | Inquiry not found |
+
+**Example**
+```bash
+curl -X DELETE http://localhost:8080/api/v1/inquiries/019500000000000000000000 \
+  -H "Authorization: Bearer <token>"
+```
 
 ---
 
-### PUT /api/v1/quotes/{id}/estimation-items
+### GET /api/v1/inquiries/{id}/pdf
 
-Replace the detected items list on the latest volume estimation for this quote and recalculate the total volume. Used by the admin UI to correct ML detection results.
+Download the latest active offer PDF for this inquiry.
+
+**Auth**: Bearer JWT
+
+**Response** `200 OK` with `Content-Type: application/pdf` and `Content-Disposition: attachment; filename="Angebot_<number>.pdf"`.
+
+**Status codes**
+| Code | Meaning |
+|---|---|
+| 200 | PDF returned |
+| 404 | Inquiry not found or no active offer with a generated PDF |
+
+**Example**
+```bash
+curl http://localhost:8080/api/v1/inquiries/019500000000000000000000/pdf \
+  -H "Authorization: Bearer <token>" \
+  -o Angebot.pdf
+```
+
+---
+
+### PUT /api/v1/inquiries/{id}/items
+
+Replace the detected items list on the latest volume estimation for this inquiry and recalculate the total volume. Used by the admin UI to correct ML detection results.
 
 **Auth**: Bearer JWT
 
@@ -457,19 +549,19 @@ Replace the detected items list on the latest volume estimation for this quote a
   id: string;
   method: string;
   total_volume_m3: number;   // sum of item.volume_m3 * item.quantity
-  items: EstimationItem[];
+  items: ItemSnapshot[];
   source_images: string[];
   source_videos: string[];
 }
 ```
 
 **Business rules**
-- Updates both `volume_estimations.result_data` and `quotes.estimated_volume_m3`.
-- Fails with 404 if no estimation exists for this quote.
+- Updates both the estimation's items and the inquiry's `volume_m3`.
+- Fails with 404 if no estimation exists for this inquiry.
 
 **Example**
 ```bash
-curl -X PUT http://localhost:8080/api/v1/quotes/019500000000000000000000/estimation-items \
+curl -X PUT http://localhost:8080/api/v1/inquiries/019500000000000000000000/items \
   -H "Authorization: Bearer <token>" \
   -H "Content-Type: application/json" \
   -d '{
@@ -478,6 +570,259 @@ curl -X PUT http://localhost:8080/api/v1/quotes/019500000000000000000000/estimat
       {"name": "Schreibtisch", "volume_m3": 0.5, "quantity": 1, "confidence": 0.88}
     ]
   }'
+```
+
+---
+
+### POST /api/v1/inquiries/{id}/estimate/{method}
+
+Trigger a volume estimation for this inquiry using the specified method.
+
+**Auth**: Bearer JWT
+
+**Path parameters**
+| Parameter | Values | Description |
+|---|---|---|
+| `id` | UUID | Inquiry ID |
+| `method` | `depth` or `video` | Estimation method to use |
+
+For `depth`, images are uploaded as `multipart/form-data`:
+
+**Request** (`multipart/form-data`)
+| Field | Type | Description |
+|---|---|---|
+| `<any name>` | file | Image files (JPEG, PNG); one field per image |
+
+For `video`, a single video is uploaded as `multipart/form-data`:
+
+**Request** (`multipart/form-data`)
+| Field | Type | Description |
+|---|---|---|
+| `video` | file | Video file (MP4, MOV, WebM, MKV) |
+| `max_keyframes` | text (optional) | Override number of keyframes to extract |
+| `detection_threshold` | text (optional) | Override detection confidence threshold |
+
+**Response** `200 OK` — estimation result. For `video`, the estimation has `status: "processing"` and completes asynchronously.
+
+**Status codes**
+| Code | Meaning |
+|---|---|
+| 200 | Estimation triggered/completed |
+| 404 | Inquiry not found |
+| 422 | No files provided or invalid method |
+| 500 | Vision service unavailable |
+
+**Example**
+```bash
+# Depth estimation with photos
+curl -X POST http://localhost:8080/api/v1/inquiries/019500000000000000000000/estimate/depth \
+  -H "Authorization: Bearer <token>" \
+  -F "image1=@living_room.jpg" \
+  -F "image2=@bedroom.jpg"
+
+# Video estimation
+curl -X POST http://localhost:8080/api/v1/inquiries/019500000000000000000000/estimate/video \
+  -H "Authorization: Bearer <token>" \
+  -F "video=@walkthrough.mp4"
+```
+
+---
+
+### POST /api/v1/inquiries/{id}/generate-offer
+
+Generate or regenerate an offer for this inquiry. Runs the pricing engine, fills the XLSX template, converts to PDF via LibreOffice, and stores the result. Upserts into the existing active offer if one exists.
+
+**Auth**: Bearer JWT
+
+**Request body** (`application/json`, optional — all fields are overrides)
+```typescript
+{
+  valid_days?: number;            // offer validity in days (default: 30)
+  price_cents_netto?: number;     // override computed netto price
+  persons?: number;               // override number of movers
+  hours?: number;                 // override estimated hours
+  rate?: number;                  // override hourly rate in euros (e.g. 35.0)
+  line_items?: {                  // override line items entirely
+    description: string;
+    quantity: number;
+    unit_price: number;
+    remark?: string;
+  }[];
+}
+```
+
+**Response** `200 OK` — `OfferSnapshot` object.
+
+**Business rules**
+- The inquiry must have `volume_m3` set or the request fails with 400.
+- Default pricing: computed from volume, distance, floor levels, and date (Saturday surcharge).
+- When `price_cents_netto` is provided together with existing `persons` and `hours`, the `rate` is back-calculated as `(netto - non_labor_items) / (persons * hours)`.
+- LibreOffice must be installed and `soffice` available on PATH.
+
+**Status codes**
+| Code | Meaning |
+|---|---|
+| 200 | Offer generated |
+| 400 | Inquiry has no volume estimate |
+| 404 | Inquiry or customer not found |
+| 500 | PDF generation failed (LibreOffice error) |
+
+**Example**
+```bash
+curl -X POST http://localhost:8080/api/v1/inquiries/019500000000000000000000/generate-offer \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"valid_days": 14, "persons": 3, "hours": 6}'
+```
+
+---
+
+### GET /api/v1/inquiries/{id}/emails
+
+Get the email thread associated with this inquiry.
+
+**Auth**: Bearer JWT
+
+**Response** `200 OK`
+```typescript
+{
+  thread: {
+    id: string;
+    subject: string;
+    messages: {
+      id: string;
+      from: string;
+      to: string;
+      subject: string;
+      body: string;
+      direction: "inbound" | "outbound";
+      status: string;
+      created_at: string;
+    }[];
+  } | null;
+}
+```
+
+**Status codes**
+| Code | Meaning |
+|---|---|
+| 200 | OK (thread may be null if no emails exist) |
+| 404 | Inquiry not found |
+
+**Example**
+```bash
+curl http://localhost:8080/api/v1/inquiries/019500000000000000000000/emails \
+  -H "Authorization: Bearer <token>"
+```
+
+---
+
+## Public Submissions
+
+These endpoints accept multipart form data from public-facing applications (photo webapp, mobile app). They do not require authentication. Each submission creates a new inquiry, customer, and triggers the estimation pipeline automatically.
+
+### POST /api/v1/submit/photo
+
+Upload photos from the photo webapp for volume estimation. Creates an inquiry with `source: "photo_webapp"`.
+
+**Auth**: None (public route)
+
+**Request** (`multipart/form-data`)
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `email` | text | Yes | Customer email address |
+| `name` | text | No | Customer name |
+| `phone` | text | No | Customer phone |
+| `origin_address` | text | No | Origin address (free text) |
+| `destination_address` | text | No | Destination address (free text) |
+| `preferred_date` | text | No | ISO 8601 date |
+| `notes` | text | No | Additional notes |
+| `<any name>` | file | Yes | One or more image files (JPEG, PNG) |
+
+**Response** `200 OK`
+```typescript
+{
+  id: string;          // inquiry ID
+  status: string;      // "estimating"
+  message: string;     // confirmation message
+}
+```
+
+**Business rules**
+- At least one image file must be included.
+- Customer is upserted by email.
+- Volume estimation runs asynchronously after the response is returned.
+
+**Status codes**
+| Code | Meaning |
+|---|---|
+| 200 | Submission accepted |
+| 400 | Missing email or no images |
+| 422 | Invalid input |
+
+**Example**
+```bash
+curl -X POST http://localhost:8080/api/v1/submit/photo \
+  -F "email=kunde@example.com" \
+  -F "name=Max Mustermann" \
+  -F "origin_address=Musterstr. 1, 1010 Wien" \
+  -F "destination_address=Neugasse 5, 1020 Wien" \
+  -F "image1=@living_room.jpg" \
+  -F "image2=@bedroom.jpg"
+```
+
+---
+
+### POST /api/v1/submit/mobile
+
+Upload photos and optional depth maps from the mobile app. Creates an inquiry with `source: "mobile_app"`.
+
+**Auth**: None (public route)
+
+**Request** (`multipart/form-data`)
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `email` | text | Yes | Customer email address |
+| `name` | text | No | Customer name |
+| `phone` | text | No | Customer phone |
+| `origin_address` | text | No | Origin address (free text) |
+| `destination_address` | text | No | Destination address (free text) |
+| `preferred_date` | text | No | ISO 8601 date |
+| `notes` | text | No | Additional notes |
+| `<any name>` | file | Yes | Image files and/or depth map files |
+
+**Response** `200 OK`
+```typescript
+{
+  id: string;          // inquiry ID
+  status: string;      // "estimating"
+  message: string;     // confirmation message
+}
+```
+
+**Business rules**
+- At least one image file must be included.
+- Depth maps (if provided) trigger the 3D ML pipeline; otherwise falls back to LLM vision.
+- Customer is upserted by email.
+
+**Status codes**
+| Code | Meaning |
+|---|---|
+| 200 | Submission accepted |
+| 400 | Missing email or no images |
+| 422 | Invalid input |
+
+**Example**
+```bash
+curl -X POST http://localhost:8080/api/v1/submit/mobile \
+  -F "email=kunde@example.com" \
+  -F "name=Max Mustermann" \
+  -F "phone=+43 660 1234567" \
+  -F "origin_address=Musterstr. 1, 1010 Wien" \
+  -F "destination_address=Neugasse 5, 1020 Wien" \
+  -F "image1=@room1.jpg" \
+  -F "depth1=@room1_depth.png" \
+  -F "image2=@room2.jpg"
 ```
 
 ---
@@ -498,14 +843,14 @@ Serve an image or video from storage. Used as `<img src>` or `<video src>` in th
 
 ### POST /api/v1/estimates/vision
 
-Analyze one or more room photos using the LLM vision model. Images are submitted as base64-encoded JSON. Stores results and updates the quote's volume. Triggers auto offer generation in the background.
+Analyze one or more room photos using the LLM vision model. Images are submitted as base64-encoded JSON. Stores results and updates the inquiry's volume. Triggers auto offer generation in the background.
 
 **Auth**: Bearer JWT
 
 **Request body** (`application/json`)
 ```typescript
 {
-  quote_id: string;   // UUID
+  quote_id: string;   // UUID (inquiry ID)
   images: {
     data: string;       // base64-encoded image bytes
     mime_type: string;  // e.g. "image/jpeg", "image/png"
@@ -584,7 +929,7 @@ Upload photos for 3D ML volume estimation (depth-sensor / photogrammetry pipelin
 **Request** (`multipart/form-data`)
 | Field | Type | Description |
 |---|---|---|
-| `quote_id` | text | UUID of the quote |
+| `quote_id` | text | UUID of the inquiry |
 | `<any name>` | file | Image files (JPEG, PNG, etc.); one field per image |
 
 **Response** `200 OK` — `VolumeEstimation` object (same shape as vision estimate).
@@ -592,7 +937,7 @@ Upload photos for 3D ML volume estimation (depth-sensor / photogrammetry pipelin
 **Business rules**
 - Images are stored in S3 before analysis.
 - If the Modal vision service fails, the system automatically retries with the LLM.
-- On completion, `quotes.estimated_volume_m3` is updated and an offer is generated in the background.
+- On completion, the inquiry's `volume_m3` is updated and an offer is generated in the background.
 
 **Example**
 ```bash
@@ -614,7 +959,7 @@ Upload a video for 3D reconstruction using MASt3R + SAM 2 on Modal (serverless G
 **Request** (`multipart/form-data`)
 | Field | Type | Description |
 |---|---|---|
-| `quote_id` | text | UUID of the quote |
+| `quote_id` | text | UUID of the inquiry |
 | `video` | file | Video file (MP4, MOV, WebM, MKV) — one per request |
 | `max_keyframes` | text (optional) | Override number of keyframes to extract |
 | `detection_threshold` | text (optional) | Override object detection confidence threshold |
@@ -625,8 +970,7 @@ The returned estimation has `status: "processing"`. Poll `GET /api/v1/estimates/
 
 **Business rules**
 - Requires the Modal vision service to be configured (`AUST__VISION_SERVICE__ENABLED=true`). Returns 500 if not configured.
-- Quote status is set to `processing` immediately.
-- When all videos for a quote finish processing, volumes are summed and offer generation is triggered.
+- When all videos for an inquiry finish processing, volumes are summed and offer generation is triggered.
 - Default timeout: 600 seconds.
 
 **Example**
@@ -717,121 +1061,6 @@ Delete a volume estimation record and clean up its associated S3 objects (images
 |---|---|
 | 204 | Deleted |
 | 404 | Estimation not found |
-
----
-
-## Offers
-
-### POST /api/v1/offers/generate
-
-Generate a PDF offer from a quote. Runs the pricing engine, fills the XLSX template, converts to PDF via LibreOffice, and stores the result in S3. The offer is stored in the database with `status: "draft"`.
-
-**Auth**: Bearer JWT
-
-**Request body** (`application/json`)
-```typescript
-{
-  quote_id: string;               // UUID — quote must have an estimated_volume_m3
-  valid_days?: number;            // offer validity in days (default: 30)
-  price_cents_netto?: number;     // override computed netto price
-  persons?: number;               // override number of movers
-  hours?: number;                 // override estimated hours
-  rate?: number;                  // override hourly rate in euros (e.g. 35.0)
-  line_items?: {                  // override line items entirely
-    description: string;
-    quantity: number;
-    unit_price: number;
-    remark?: string;
-  }[];
-}
-```
-
-**Response** `200 OK`
-```typescript
-{
-  id: string;
-  quote_id: string;
-  price_cents: number;                // netto price in cents
-  currency: string;                   // "EUR"
-  valid_until: string | null;         // date string "YYYY-MM-DD"
-  pdf_storage_key: string | null;
-  status: "draft" | "sent" | "viewed" | "accepted" | "rejected" | "expired";
-  created_at: string;
-  sent_at: string | null;
-  offer_number: string | null;
-  persons: number | null;
-  hours_estimated: number | null;
-  rate_per_hour_cents: number | null;
-  line_items_json: object[] | null;
-}
-```
-
-**Business rules**
-- The quote must have `estimated_volume_m3` set or the request fails with 400.
-- Default pricing: computed from volume, distance, floor levels, and date (Saturday surcharge).
-- When `price_cents_netto` is provided together with existing `persons` and `hours`, the `rate` is back-calculated as `(netto - non_labor_items) / (persons * hours)`.
-- LibreOffice must be installed and `soffice` available on PATH.
-
-**Status codes**
-| Code | Meaning |
-|---|---|
-| 200 | Offer generated |
-| 400 | Quote has no volume estimate |
-| 404 | Quote or customer not found |
-| 500 | PDF generation failed (LibreOffice error) |
-
-**Example**
-```bash
-curl -X POST http://localhost:8080/api/v1/offers/generate \
-  -H "Authorization: Bearer <token>" \
-  -H "Content-Type: application/json" \
-  -d '{"quote_id":"019500000000000000000000","valid_days":14}'
-```
-
----
-
-### GET /api/v1/offers/{id}
-
-Retrieve an offer by ID.
-
-**Auth**: Bearer JWT
-
-**Response** `200 OK` — `Offer` object (same shape as generate response).
-
-**Status codes**
-| Code | Meaning |
-|---|---|
-| 200 | Found |
-| 404 | Offer not found |
-
-**Example**
-```bash
-curl http://localhost:8080/api/v1/offers/019500000000000000000002 \
-  -H "Authorization: Bearer <token>"
-```
-
----
-
-### GET /api/v1/offers/{id}/pdf
-
-Download the offer PDF as an octet-stream.
-
-**Auth**: Bearer JWT
-
-**Response** `200 OK` with `Content-Type: application/pdf` and `Content-Disposition: attachment; filename="Angebot_<number>.pdf"`.
-
-**Status codes**
-| Code | Meaning |
-|---|---|
-| 200 | PDF returned |
-| 404 | Offer not found or PDF not yet generated |
-
-**Example**
-```bash
-curl http://localhost:8080/api/v1/offers/019500000000000000000002/pdf \
-  -H "Authorization: Bearer <token>" \
-  -o Angebot.pdf
-```
 
 ---
 
@@ -938,7 +1167,7 @@ Create a new calendar booking. Fails if the date is already at capacity.
 ```typescript
 {
   booking_date: string;             // "YYYY-MM-DD"
-  quote_id?: string;                // UUID — link to an existing quote
+  quote_id?: string;                // UUID — link to an existing inquiry
   customer_name?: string;
   customer_email?: string;
   departure_address?: string;
@@ -992,7 +1221,7 @@ Get a single booking by ID.
 
 ### PATCH /api/v1/calendar/bookings/{id}
 
-Update booking status. Accepted values are `confirmed` and `cancelled`. When a booking linked to a quote is confirmed, the quote status is also updated to `accepted`. When cancelled, the quote status reverts to `offer_sent`.
+Update booking status. Accepted values are `confirmed` and `cancelled`. When a booking linked to an inquiry is confirmed, the inquiry status is also updated to `scheduled`. When cancelled, the inquiry status reverts to `offer_sent`.
 
 **Auth**: Bearer JWT
 
@@ -1153,8 +1382,8 @@ Returns aggregate counts and recent activity for the dashboard overview.
 **Response** `200 OK`
 ```typescript
 {
-  open_quotes: number;      // status in (pending, info_requested, volume_estimated)
-  pending_offers: number;   // status = draft
+  open_inquiries: number;     // status in (pending, info_requested, estimating, estimated)
+  pending_offers: number;     // status = offer_ready (not yet sent)
   todays_bookings: number;
   total_customers: number;
   recent_activity: {
@@ -1200,7 +1429,7 @@ List customers with optional search and pagination.
     name: string | null;
     phone: string | null;
     created_at: string;
-    quote_count: number;
+    inquiry_count: number;
   }[];
   total: number;
 }
@@ -1229,11 +1458,11 @@ Create a new customer record.
 
 ### GET /api/v1/admin/customers/{id}
 
-Get a single customer with their complete quote history.
+Get a single customer with their complete inquiry history.
 
 **Auth**: Bearer JWT
 
-**Response** `200 OK` — customer object with nested quotes.
+**Response** `200 OK` — customer object with nested inquiries.
 
 ---
 
@@ -1255,146 +1484,13 @@ Update customer name or phone.
 
 ---
 
-### GET /api/v1/admin/quotes
+### POST /api/v1/admin/customers/{id}/delete
 
-List all quotes with full customer and address data. Supports filtering and pagination.
-
-**Auth**: Bearer JWT
-
-**Query parameters**: `status`, `customer_id`, `limit`, `offset` (same as `GET /api/v1/quotes`).
-
-**Response** `200 OK` — paginated list with enriched quote objects (includes customer name/email).
-
----
-
-### POST /api/v1/admin/quotes
-
-Create a quote (admin path, same functionality as `POST /api/v1/quotes`).
-
----
-
-### GET /api/v1/admin/quotes/{id}
-
-Get a quote with full detail including all linked offers, estimation, and addresses.
-
----
-
-### GET /api/v1/admin/offers
-
-List all offers, ordered by creation date (newest first).
+Delete a customer and all linked data.
 
 **Auth**: Bearer JWT
-
-**Query parameters**: `limit`, `offset`
-
-**Response** `200 OK` — array of offer detail objects.
-
----
-
-### GET /api/v1/admin/offers/{id}
-
-Get a full offer detail record including line items and linked quote/customer data.
-
-**Auth**: Bearer JWT
-
-**Response** `200 OK` — enriched offer object with:
-- Quote + customer information
-- Full line item breakdown
-- PDF download URL
-
----
-
-### PATCH /api/v1/admin/offers/{id}
-
-Update an offer's metadata (e.g. subject or body of the draft email).
-
-**Auth**: Bearer JWT
-
-**Request body** — partial update of editable offer fields.
-
-**Response** `200 OK` — updated offer.
-
----
-
-### POST /api/v1/admin/offers/{id}/regenerate
-
-Regenerate the offer PDF with new pricing overrides. Updates the existing offer record in-place (preserves offer number and creation date).
-
-**Auth**: Bearer JWT
-
-**Request body**
-```typescript
-{
-  price_cents_netto?: number;
-  persons?: number;
-  hours?: number;
-  rate?: number;
-  line_items?: {
-    description: string;
-    quantity: number;
-    unit_price: number;
-    remark?: string;
-  }[];
-}
-```
-
-**Response** `200 OK` — updated `Offer` object.
-
-**Example**
-```bash
-curl -X POST http://localhost:8080/api/v1/admin/offers/019500000000000000000002/regenerate \
-  -H "Authorization: Bearer <token>" \
-  -H "Content-Type: application/json" \
-  -d '{"persons": 3, "hours": 6}'
-```
-
----
-
-### POST /api/v1/admin/offers/{id}/send
-
-Send the offer PDF to the customer via SMTP email. Updates offer status to `sent`.
-
-**Auth**: Bearer JWT
-
-**Request body** (optional)
-```typescript
-{
-  subject?: string;   // custom email subject
-  body?: string;      // custom email body (HTML or plain text)
-}
-```
 
 **Response** `200 OK`
-```json
-{ "ok": true }
-```
-
-**Status codes**
-| Code | Meaning |
-|---|---|
-| 200 | Email sent |
-| 404 | Offer not found |
-| 500 | SMTP delivery failed |
-
----
-
-### POST /api/v1/admin/offers/{id}/reject
-
-Mark an offer as rejected.
-
-**Auth**: Bearer JWT
-
-**Response** `200 OK` — updated `Offer` object with `status: "rejected"`.
-
----
-
-### POST /api/v1/admin/offers/{id}/re-estimate
-
-Re-run volume estimation for the offer's quote using updated data, then regenerate the offer.
-
-**Auth**: Bearer JWT
-
-**Response** `200 OK` — regenerated `Offer` object.
 
 ---
 
@@ -1441,56 +1537,6 @@ Get a single email thread with all messages.
 
 ---
 
-### PATCH /api/v1/admin/emails/messages/{id}
-
-Update a draft email message (e.g. edit subject or body before sending).
-
-**Auth**: Bearer JWT
-
-**Request body** — partial message fields.
-
-**Response** `200 OK` — updated message.
-
----
-
-### POST /api/v1/admin/emails/messages/{id}/send
-
-Send a draft email message.
-
-**Auth**: Bearer JWT
-
-**Response** `200 OK`
-
----
-
-### POST /api/v1/admin/emails/messages/{id}/discard
-
-Discard (delete) a draft message.
-
-**Auth**: Bearer JWT
-
-**Response** `200 OK`
-
----
-
-### POST /api/v1/admin/emails/{id}/reply
-
-Send a reply to an existing email thread.
-
-**Auth**: Bearer JWT
-
-**Request body**
-```typescript
-{
-  body: string;
-  subject?: string;
-}
-```
-
-**Response** `200 OK`
-
----
-
 ### POST /api/v1/admin/emails/compose
 
 Compose and send a new outbound email (not a reply).
@@ -1530,56 +1576,9 @@ Delete an admin user.
 
 ---
 
-### POST /api/v1/admin/offers/{id}/delete
-
-Hard delete an offer record and its associated PDF from storage.
-
-**Auth**: Bearer JWT
-
-**Response** `200 OK`
-
----
-
-### POST /api/v1/admin/quotes/{id}/delete
-
-Hard delete a quote and all its linked estimations, offers, and storage objects.
-
-**Auth**: Bearer JWT
-
-**Response** `200 OK`
-
----
-
-### POST /api/v1/admin/customers/{id}/delete
-
-Delete a customer and all linked data.
-
-**Auth**: Bearer JWT
-
-**Response** `200 OK`
-
----
-
-### POST /api/v1/admin/quotes/{id}/status
-
-Manually set a quote's status.
-
-**Auth**: Bearer JWT
-
-**Request body**
-```typescript
-{
-  status: QuoteStatus;
-}
-```
-
-**Response** `200 OK` — updated quote.
-
----
-
 ### GET /api/v1/admin/orders
 
-List completed/confirmed orders (quotes with status `done` or `paid`, or confirmed bookings).
+List completed/confirmed orders (inquiries with status `completed`, `invoiced`, or `paid`, or confirmed bookings).
 
 **Auth**: Bearer JWT
 

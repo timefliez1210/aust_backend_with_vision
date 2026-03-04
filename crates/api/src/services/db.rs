@@ -7,29 +7,29 @@ use uuid::Uuid;
 /// Update a quote's estimated volume and status after estimation completes.
 pub async fn update_quote_volume(
     pool: &PgPool,
-    quote_id: Uuid,
+    inquiry_id: Uuid,
     volume: f64,
     status: &str,
     now: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "UPDATE quotes SET estimated_volume_m3 = $1, status = $2, updated_at = $3 WHERE id = $4",
+        "UPDATE inquiries SET estimated_volume_m3 = $1, status = $2, updated_at = $3 WHERE id = $4",
     )
     .bind(volume)
     .bind(status)
     .bind(now)
-    .bind(quote_id)
+    .bind(inquiry_id)
     .execute(pool)
     .await?;
     Ok(())
 }
 
 /// Check if a quote has any non-cancelled calendar booking.
-pub async fn has_active_booking(pool: &PgPool, quote_id: Uuid) -> Result<bool, sqlx::Error> {
+pub async fn has_active_booking(pool: &PgPool, inquiry_id: Uuid) -> Result<bool, sqlx::Error> {
     let row: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT id FROM calendar_bookings WHERE quote_id = $1 AND status != 'cancelled' LIMIT 1",
+        "SELECT id FROM calendar_bookings WHERE inquiry_id = $1 AND status != 'cancelled' LIMIT 1",
     )
-    .bind(quote_id)
+    .bind(inquiry_id)
     .fetch_optional(pool)
     .await?;
     Ok(row.is_some())
@@ -38,12 +38,12 @@ pub async fn has_active_booking(pool: &PgPool, quote_id: Uuid) -> Result<bool, s
 /// Return the booking ID for the first non-cancelled booking of a quote, if any.
 pub async fn find_active_booking_id(
     pool: &PgPool,
-    quote_id: Uuid,
+    inquiry_id: Uuid,
 ) -> Result<Option<Uuid>, sqlx::Error> {
     let row: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT id FROM calendar_bookings WHERE quote_id = $1 AND status != 'cancelled' LIMIT 1",
+        "SELECT id FROM calendar_bookings WHERE inquiry_id = $1 AND status != 'cancelled' LIMIT 1",
     )
-    .bind(quote_id)
+    .bind(inquiry_id)
     .fetch_optional(pool)
     .await?;
     Ok(row.map(|(id,)| id))
@@ -53,7 +53,7 @@ pub async fn find_active_booking_id(
 #[derive(Debug, FromRow)]
 pub struct EstimationRow {
     pub id: Uuid,
-    pub quote_id: Uuid,
+    pub inquiry_id: Uuid,
     pub method: String,
     pub status: String,
     pub source_data: serde_json::Value,
@@ -67,7 +67,7 @@ pub struct EstimationRow {
 pub async fn insert_estimation(
     pool: &PgPool,
     id: Uuid,
-    quote_id: Uuid,
+    inquiry_id: Uuid,
     method: &str,
     source_data: &serde_json::Value,
     result_data: Option<&serde_json::Value>,
@@ -78,13 +78,13 @@ pub async fn insert_estimation(
     let row: EstimationRow = sqlx::query_as(
         r#"
         INSERT INTO volume_estimations
-            (id, quote_id, method, source_data, result_data, total_volume_m3, confidence_score, created_at)
+            (id, inquiry_id, method, source_data, result_data, total_volume_m3, confidence_score, created_at)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        RETURNING id, quote_id, method, status, source_data, result_data, total_volume_m3, confidence_score, created_at
+        RETURNING id, inquiry_id, method, status, source_data, result_data, total_volume_m3, confidence_score, created_at
         "#,
     )
     .bind(id)
-    .bind(quote_id)
+    .bind(inquiry_id)
     .bind(method)
     .bind(source_data)
     .bind(result_data)
@@ -100,7 +100,7 @@ pub async fn insert_estimation(
 pub async fn insert_estimation_no_return(
     pool: &PgPool,
     id: Uuid,
-    quote_id: Uuid,
+    inquiry_id: Uuid,
     method: &str,
     source_data: &serde_json::Value,
     result_data: Option<&serde_json::Value>,
@@ -111,12 +111,12 @@ pub async fn insert_estimation_no_return(
     sqlx::query(
         r#"
         INSERT INTO volume_estimations
-            (id, quote_id, method, source_data, result_data, total_volume_m3, confidence_score, created_at)
+            (id, inquiry_id, method, source_data, result_data, total_volume_m3, confidence_score, created_at)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         "#,
     )
     .bind(id)
-    .bind(quote_id)
+    .bind(inquiry_id)
     .bind(method)
     .bind(source_data)
     .bind(result_data)
@@ -137,9 +137,9 @@ mod tests {
     async fn test_has_active_booking_ignores_cancelled() {
         let pool = test_db_pool().await;
 
-        let quote_id = insert_test_quote(&pool).await;
-        insert_test_booking(&pool, quote_id, "cancelled").await;
-        let result = has_active_booking(&pool, quote_id).await.unwrap();
+        let inquiry_id = insert_test_quote(&pool).await;
+        insert_test_booking(&pool, inquiry_id, "cancelled").await;
+        let result = has_active_booking(&pool, inquiry_id).await.unwrap();
         assert!(!result);
     }
 
@@ -147,9 +147,9 @@ mod tests {
     async fn test_has_active_booking_finds_confirmed() {
         let pool = test_db_pool().await;
 
-        let quote_id = insert_test_quote(&pool).await;
-        insert_test_booking(&pool, quote_id, "confirmed").await;
-        let result = has_active_booking(&pool, quote_id).await.unwrap();
+        let inquiry_id = insert_test_quote(&pool).await;
+        insert_test_booking(&pool, inquiry_id, "confirmed").await;
+        let result = has_active_booking(&pool, inquiry_id).await.unwrap();
         assert!(result);
     }
 
@@ -157,9 +157,9 @@ mod tests {
     async fn test_has_active_booking_finds_tentative() {
         let pool = test_db_pool().await;
 
-        let quote_id = insert_test_quote(&pool).await;
-        insert_test_booking(&pool, quote_id, "tentative").await;
-        let result = has_active_booking(&pool, quote_id).await.unwrap();
+        let inquiry_id = insert_test_quote(&pool).await;
+        insert_test_booking(&pool, inquiry_id, "tentative").await;
+        let result = has_active_booking(&pool, inquiry_id).await.unwrap();
         assert!(result);
     }
 
@@ -167,8 +167,8 @@ mod tests {
     async fn test_has_active_booking_no_booking() {
         let pool = test_db_pool().await;
 
-        let quote_id = insert_test_quote(&pool).await;
-        let result = has_active_booking(&pool, quote_id).await.unwrap();
+        let inquiry_id = insert_test_quote(&pool).await;
+        let result = has_active_booking(&pool, inquiry_id).await.unwrap();
         assert!(!result);
     }
 
@@ -176,9 +176,9 @@ mod tests {
     async fn test_find_active_booking_id_returns_id() {
         let pool = test_db_pool().await;
 
-        let quote_id = insert_test_quote(&pool).await;
-        let booking_id = insert_test_booking(&pool, quote_id, "confirmed").await;
-        let result = find_active_booking_id(&pool, quote_id).await.unwrap();
+        let inquiry_id = insert_test_quote(&pool).await;
+        let booking_id = insert_test_booking(&pool, inquiry_id, "confirmed").await;
+        let result = find_active_booking_id(&pool, inquiry_id).await.unwrap();
         assert_eq!(result, Some(booking_id));
     }
 
@@ -186,9 +186,9 @@ mod tests {
     async fn test_find_active_booking_id_returns_none_for_cancelled() {
         let pool = test_db_pool().await;
 
-        let quote_id = insert_test_quote(&pool).await;
-        insert_test_booking(&pool, quote_id, "cancelled").await;
-        let result = find_active_booking_id(&pool, quote_id).await.unwrap();
+        let inquiry_id = insert_test_quote(&pool).await;
+        insert_test_booking(&pool, inquiry_id, "cancelled").await;
+        let result = find_active_booking_id(&pool, inquiry_id).await.unwrap();
         assert_eq!(result, None);
     }
 
@@ -196,12 +196,12 @@ mod tests {
     async fn test_update_quote_volume_sets_status() {
         let pool = test_db_pool().await;
 
-        let quote_id = insert_test_quote(&pool).await;
+        let inquiry_id = insert_test_quote(&pool).await;
         let now = Utc::now();
-        update_quote_volume(&pool, quote_id, 15.5, "volume_estimated", now)
+        update_quote_volume(&pool, inquiry_id, 15.5, "volume_estimated", now)
             .await
             .unwrap();
-        let status = get_quote_status(&pool, quote_id).await;
+        let status = get_quote_status(&pool, inquiry_id).await;
         assert_eq!(status, "volume_estimated");
     }
 }
