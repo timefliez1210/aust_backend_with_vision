@@ -54,7 +54,6 @@ A modular Rust backend that automates the quote-to-offer pipeline for a moving c
 |---|---|---|
 | Rust | 1.82 (stable) | `rustup update stable` |
 | PostgreSQL | 16 | Any 16.x release |
-| Redis | 7 | Used for cache/queue |
 | Docker + Compose | Docker 24+ | For local dev infrastructure |
 | LibreOffice | 7.x | Required for XLSX-to-PDF conversion (`soffice` must be on PATH) |
 
@@ -67,7 +66,7 @@ A modular Rust backend that automates the quote-to-offer pipeline for a moving c
    cd aust_backend
    ```
 
-2. **Start infrastructure** (PostgreSQL 16, Redis 7, MinIO)
+2. **Start infrastructure** (PostgreSQL 16, MinIO)
 
    ```bash
    cd docker && docker-compose up -d
@@ -117,7 +116,6 @@ All variables follow the pattern `AUST__SECTION__KEY` (double underscore as sepa
 |---|---|---|
 | `AUST__DATABASE__URL` | PostgreSQL connection string | `postgres://aust:pass@localhost/aust_backend` |
 | `AUST__DATABASE__MAX_CONNECTIONS` | Connection pool size | `10` |
-| `AUST__REDIS__URL` | Redis URL | `redis://localhost:6379` |
 | `AUST__STORAGE__PROVIDER` | Storage backend: `s3` or `local` | `s3` |
 | `AUST__STORAGE__BUCKET` | S3 bucket name | `aust-uploads` |
 | `AUST__STORAGE__ENDPOINT` | S3-compatible endpoint (MinIO) | `http://localhost:9000` |

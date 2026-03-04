@@ -17,20 +17,6 @@ services:
       timeout: 5s
       retries: 5
 
-  redis:
-    image: redis:7-alpine
-    container_name: aust_redis
-    restart: always
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
   minio:
     image: minio/minio:latest
     container_name: aust_minio
@@ -88,6 +74,5 @@ services:
 
 volumes:
   postgres_data:
-  redis_data:
   minio_data:
   vision_weights:

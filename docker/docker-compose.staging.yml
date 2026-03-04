@@ -3,7 +3,6 @@ name: aust-staging
 # Staging stack — fully isolated from production.
 # Port assignments avoid clashing with the production docker-compose.yml:
 #   PostgreSQL  5435 → 5432
-#   Redis       6381 → 6379
 #   MinIO API   9010 → 9000
 #   MinIO UI    9011 → 9001
 #   Mailpit SMTP 1025 → 1025
@@ -29,21 +28,6 @@ services:
       - staging_postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U aust_staging -d aust_staging"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
-  # ── Redis ──────────────────────────────────────────────────────────────────
-  staging-redis:
-    image: redis:7-alpine
-    container_name: aust_staging_redis
-    restart: unless-stopped
-    ports:
-      - "6381:6379"
-    volumes:
-      - staging_redis_data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -118,9 +102,6 @@ services:
 
       # Database
       AUST__DATABASE__URL: postgres://aust_staging:aust_staging_password@staging-postgres:5432/aust_staging
-
-      # Redis
-      AUST__REDIS__URL: redis://staging-redis:6379
 
       # Object storage — MinIO staging bucket
       AUST__STORAGE__PROVIDER: s3
@@ -200,5 +181,4 @@ services:
 
 volumes:
   staging_postgres_data:
-  staging_redis_data:
   staging_minio_data:

@@ -1,6 +1,6 @@
 # Overlay for VS Code dev container.
 # Adds the workspace container on top of docker-compose.staging.yml.
-# The staging services (postgres, redis, minio, backend, frontend)
+# The staging services (postgres, minio, backend, frontend)
 # are inherited from the base file unchanged.
 
 services:
@@ -16,10 +16,8 @@ services:
     environment:
       # Point at the staging services (same Docker network)
       DATABASE_URL: postgres://aust_staging:aust_staging_password@staging-postgres:5432/aust_staging
-      REDIS_URL: redis://staging-redis:6379
     depends_on:
       - staging-postgres
-      - staging-redis
     networks:
       - default
 

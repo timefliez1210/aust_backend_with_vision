@@ -26,7 +26,6 @@ Full user-facing docs live in the repository root:
 | Language | Rust 2021 |
 | Web Framework | Axum 0.8 |
 | Database | PostgreSQL 16 + SQLx |
-| Cache/Queue | Redis |
 | Object Storage | S3-compatible (MinIO for dev) |
 | LLM | Pluggable: Claude, OpenAI, Ollama |
 | Vision ML | Grounding DINO + SAM 2 + Depth Anything V2 + MASt3R + Open3D |
@@ -62,7 +61,7 @@ services/
 - `config/default.toml` - Default configuration
 - `migrations/*.sql` - Database schema (initial + calendar + address_floor)
 - `templates/Angebot_Vorlage.xlsx` - XLSX offer template (embedded at compile time)
-- `docker/docker-compose.yml` - Local dev infrastructure (Postgres, Redis, MinIO, Vision)
+- `docker/docker-compose.yml` - Local dev infrastructure (Postgres, MinIO, Vision)
 - `docker/docker-compose.gpu.yml` - GPU override for vision service
 - `services/vision/modal_app.py` - Modal deployment for vision service
 
@@ -134,7 +133,6 @@ cp docker/.env.staging.example docker/.env.staging
 | Backend API | 8099 |
 | Frontend (nginx) | 4173 |
 | PostgreSQL | 5435 |
-| Redis | 6381 |
 | MinIO API | 9010 |
 | MinIO UI | 9011 |
 | Mailpit (web) | 8025 |
@@ -372,7 +370,6 @@ Environment variables override config files. Format: `AUST__SECTION__KEY`
 Key sections in `config/default.toml`:
 - `[server]` - host, port
 - `[database]` - PostgreSQL URL
-- `[redis]` - Redis URL
 - `[storage]` - S3/MinIO settings
 - `[email]` - IMAP/SMTP settings
 - `[llm]` - Provider selection + API keys
@@ -510,7 +507,6 @@ Switch providers via `AUST__LLM__DEFAULT_PROVIDER` (claude/openai/ollama)
 - [x] Store services as JSONB on inquiries instead of comma-separated text in `notes`
 
 ### Distance Calculator
-- [ ] Add result caching in Redis
 - [ ] Add travel time estimation
 
 ## Low Priority
