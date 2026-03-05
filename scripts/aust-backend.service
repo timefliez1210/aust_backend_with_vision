@@ -1,0 +1,23 @@
+[Unit]
+Description=AUST Backend - Moving Company Automation
+After=network.target media-timefliez-FileSystem.mount
+Requires=media-timefliez-FileSystem.mount
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=timefliez
+WorkingDirectory=/media/timefliez/FileSystem/projects/aust_backend
+EnvironmentFile=/media/timefliez/FileSystem/projects/aust_backend/.env
+ExecStart=/media/timefliez/FileSystem/projects/aust_backend/target/release/aust_backend
+Restart=on-failure
+RestartSec=5
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=aust-backend
+
+[Install]
+WantedBy=multi-user.target
