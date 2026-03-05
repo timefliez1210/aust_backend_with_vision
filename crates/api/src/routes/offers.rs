@@ -72,7 +72,51 @@ pub(crate) struct CustomerRow {
     pub id: Uuid,
     pub email: String,
     pub name: Option<String>,
+    pub salutation: Option<String>,
+    pub first_name: Option<String>,
+    pub last_name: Option<String>,
     pub phone: Option<String>,
+}
+
+impl CustomerRow {
+    /// Formal greeting line using stored salutation + last name.
+    /// Falls back to the `detect_salutation_and_greeting` heuristic for legacy
+    /// customers who pre-date the structured name fields.
+    pub fn formal_greeting(&self) -> String {
+        match (self.salutation.as_deref(), self.last_name.as_deref()) {
+            (Some("Herr"), Some(ln)) => format!("Sehr geehrter Herr {ln},"),
+            (Some("Frau"), Some(ln)) => format!("Sehr geehrte Frau {ln},"),
+            (Some("D"),    Some(ln)) => format!("Sehr geehrte Person {ln},"),
+            _ => {
+                // Legacy fallback: derive from name string
+                let name = self.name.as_deref().unwrap_or(&self.email);
+                detect_salutation_and_greeting(name).1
+            }
+        }
+    }
+
+    /// Address-block salutation for XLSX cell A8 ("Herrn", "Frau", "Divers", or "").
+    pub fn address_salutation(&self) -> String {
+        match self.salutation.as_deref() {
+            Some("Herr") => "Herrn".to_string(),
+            Some("Frau") => "Frau".to_string(),
+            Some("D")    => "Divers".to_string(),
+            _ => {
+                let name = self.name.as_deref().unwrap_or(&self.email);
+                detect_salutation_and_greeting(name).0
+            }
+        }
+    }
+
+    /// Full display name: first + last, or the legacy `name` field, or email.
+    pub fn display_name(&self) -> String {
+        match (self.first_name.as_deref(), self.last_name.as_deref()) {
+            (Some(f), Some(l)) => format!("{f} {l}"),
+            (Some(f), None)    => f.to_string(),
+            (None,    Some(l)) => l.to_string(),
+            _ => self.name.clone().unwrap_or_else(|| self.email.clone()),
+        }
+    }
 }
 
 /// SQLx projection row for the `addresses` table used within offer generation.
@@ -250,7 +294,7 @@ pub async fn build_offer_with_overrides(
 
     // 2. Fetch customer
     let customer: CustomerRow =
-        sqlx::query_as("SELECT id, email, name, phone FROM customers WHERE id = $1")
+        sqlx::query_as("SELECT id, email, name, salutation, first_name, last_name, phone FROM customers WHERE id = $1")
             .bind(quote.customer_id)
             .fetch_optional(db)
             .await?
@@ -384,13 +428,9 @@ pub async fn build_offer_with_overrides(
     let now = chrono::Utc::now();
     let today = now.date_naive();
 
-    let customer_name = customer
-        .name
-        .clone()
-        .unwrap_or_else(|| customer.email.clone());
-
-    // Detect salutation (Herr/Frau) and greeting from customer name
-    let (customer_salutation, greeting) = detect_salutation_and_greeting(&customer_name);
+    let customer_name = customer.display_name();
+    let customer_salutation = customer.address_salutation();
+    let greeting = customer.formal_greeting();
 
     let moving_date = quote
         .preferred_date

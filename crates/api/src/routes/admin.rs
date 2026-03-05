@@ -198,6 +198,9 @@ struct CustomerListItem {
     id: Uuid,
     email: String,
     name: Option<String>,
+    salutation: Option<String>,
+    first_name: Option<String>,
+    last_name: Option<String>,
     phone: Option<String>,
     created_at: DateTime<Utc>,
 }
@@ -233,7 +236,7 @@ async fn list_customers(
 
     let customers: Vec<CustomerListItem> = sqlx::query_as(
         r#"
-        SELECT id, email, name, phone, created_at
+        SELECT id, email, name, salutation, first_name, last_name, phone, created_at
         FROM customers
         WHERE name ILIKE $1 OR email ILIKE $1
         ORDER BY created_at DESC
@@ -261,6 +264,9 @@ struct CustomerDetailResponse {
     id: Uuid,
     email: String,
     name: Option<String>,
+    salutation: Option<String>,
+    first_name: Option<String>,
+    last_name: Option<String>,
     phone: Option<String>,
     created_at: DateTime<Utc>,
     quotes: Vec<CustomerQuote>,
@@ -307,7 +313,7 @@ async fn get_customer(
     Path(id): Path<Uuid>,
 ) -> Result<Json<CustomerDetailResponse>, ApiError> {
     let customer: Option<CustomerListItem> = sqlx::query_as(
-        "SELECT id, email, name, phone, created_at FROM customers WHERE id = $1",
+        "SELECT id, email, name, salutation, first_name, last_name, phone, created_at FROM customers WHERE id = $1",
     )
     .bind(id)
     .fetch_optional(&state.db)
@@ -344,6 +350,9 @@ async fn get_customer(
         id: customer.id,
         email: customer.email,
         name: customer.name,
+        salutation: customer.salutation,
+        first_name: customer.first_name,
+        last_name: customer.last_name,
         phone: customer.phone,
         created_at: customer.created_at,
         quotes,
@@ -354,6 +363,9 @@ async fn get_customer(
 #[derive(Debug, Deserialize)]
 struct UpdateCustomerRequest {
     name: Option<String>,
+    salutation: Option<String>,
+    first_name: Option<String>,
+    last_name: Option<String>,
     phone: Option<String>,
     email: Option<String>,
 }
@@ -384,14 +396,20 @@ async fn update_customer(
         r#"
         UPDATE customers SET
             name = COALESCE($2, name),
-            phone = COALESCE($3, phone),
-            email = COALESCE($4, email)
+            salutation = COALESCE($3, salutation),
+            first_name = COALESCE($4, first_name),
+            last_name = COALESCE($5, last_name),
+            phone = COALESCE($6, phone),
+            email = COALESCE($7, email)
         WHERE id = $1
-        RETURNING id, email, name, phone, created_at
+        RETURNING id, email, name, salutation, first_name, last_name, phone, created_at
         "#,
     )
     .bind(id)
     .bind(&request.name)
+    .bind(&request.salutation)
+    .bind(&request.first_name)
+    .bind(&request.last_name)
     .bind(&request.phone)
     .bind(&request.email)
     .fetch_optional(&state.db)
@@ -407,6 +425,9 @@ async fn update_customer(
 struct CreateCustomerRequest {
     email: String,
     name: Option<String>,
+    salutation: Option<String>,
+    first_name: Option<String>,
+    last_name: Option<String>,
     phone: Option<String>,
 }
 
@@ -436,14 +457,17 @@ async fn create_customer(
 
     let row: Option<CustomerListItem> = sqlx::query_as(
         r#"
-        INSERT INTO customers (id, email, name, phone, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $5)
-        RETURNING id, email, name, phone, created_at
+        INSERT INTO customers (id, email, name, salutation, first_name, last_name, phone, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
+        RETURNING id, email, name, salutation, first_name, last_name, phone, created_at
         "#,
     )
     .bind(id)
     .bind(&request.email)
     .bind(&request.name)
+    .bind(&request.salutation)
+    .bind(&request.first_name)
+    .bind(&request.last_name)
     .bind(&request.phone)
     .bind(now)
     .fetch_optional(&state.db)
@@ -1006,32 +1030,85 @@ async fn send_draft_email(
     Extension(_claims): Extension<TokenClaims>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // Fetch draft message + real customer email from thread→customer join
-    let row: Option<(Option<String>, Option<String>, String)> = sqlx::query_as(
-        r#"
-        SELECT em.subject, em.body_text, c.email AS customer_email
-        FROM email_messages em
-        JOIN email_threads et ON em.thread_id = et.id
-        JOIN customers c ON et.customer_id = c.id
-        WHERE em.id = $1 AND em.status = 'draft'
-        "#,
-    )
-    .bind(id)
-    .fetch_optional(&state.db)
-    .await?;
+    // Fetch draft + customer email + optional offer PDF key (when thread belongs to an inquiry with an active offer)
+    let row: Option<(Option<String>, Option<String>, String, Option<String>, Option<Uuid>, Option<Uuid>)> =
+        sqlx::query_as(
+            r#"
+            SELECT em.subject, em.body_text, c.email,
+                   o.pdf_storage_key, o.id AS offer_id, et.inquiry_id
+            FROM email_messages em
+            JOIN email_threads et ON em.thread_id = et.id
+            JOIN customers c ON et.customer_id = c.id
+            LEFT JOIN offers o ON o.inquiry_id = et.inquiry_id
+                AND o.status NOT IN ('rejected', 'cancelled')
+            WHERE em.id = $1 AND em.status = 'draft'
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await?;
 
-    let (subject, body_text, customer_email) =
+    let (subject, body_text, customer_email, pdf_key, offer_id, inquiry_id) =
         row.ok_or_else(|| ApiError::NotFound("Entwurf nicht gefunden oder bereits gesendet".into()))?;
 
-    let subject = subject.unwrap_or_else(|| "Ihre Anfrage — AUST Umzuege".into());
+    let subject = subject.unwrap_or_else(|| "Ihr Umzugsangebot — AUST Umzüge".into());
     let body = body_text.unwrap_or_default();
 
-    // Send via SMTP to the actual customer email
-    send_plain_email(&state.config.email, &customer_email, &subject, &body)
+    // If the thread is tied to an inquiry with a PDF offer, send with attachment
+    if let (Some(key), Some(oid), Some(iid)) = (&pdf_key, offer_id, inquiry_id) {
+        use crate::services::email::{build_email_with_attachment, send_email};
+
+        let pdf_bytes = state
+            .storage
+            .download(key)
+            .await
+            .map_err(|e| ApiError::Internal(format!("PDF-Download fehlgeschlagen: {e}")))?;
+
+        let email_cfg = &state.config.email;
+        let message = build_email_with_attachment(
+            &email_cfg.from_address,
+            &email_cfg.from_name,
+            &customer_email,
+            &subject,
+            &body,
+            &pdf_bytes,
+            &format!("Angebot-{oid}.pdf"),
+            "application/pdf",
+        )
+        .map_err(|e| ApiError::Internal(format!("E-Mail-Aufbau fehlgeschlagen: {e}")))?;
+
+        send_email(
+            &email_cfg.smtp_host,
+            email_cfg.smtp_port,
+            &email_cfg.username,
+            &email_cfg.password,
+            message,
+        )
         .await
         .map_err(|e| ApiError::Internal(format!("E-Mail-Versand fehlgeschlagen: {e}")))?;
 
-    // Update status + fix to_address to the real customer email
+        let now = chrono::Utc::now();
+
+        // Update offer and inquiry status
+        sqlx::query("UPDATE offers SET status = 'sent', sent_at = $1 WHERE id = $2")
+            .bind(now)
+            .bind(oid)
+            .execute(&state.db)
+            .await?;
+
+        sqlx::query("UPDATE inquiries SET status = 'offer_sent', updated_at = $1 WHERE id = $2")
+            .bind(now)
+            .bind(iid)
+            .execute(&state.db)
+            .await?;
+    } else {
+        // Plain email — no offer PDF attached (e.g. general inquiry reply)
+        send_plain_email(&state.config.email, &customer_email, &subject, &body)
+            .await
+            .map_err(|e| ApiError::Internal(format!("E-Mail-Versand fehlgeschlagen: {e}")))?;
+    }
+
+    // Mark draft as sent + fix to_address
     sqlx::query("UPDATE email_messages SET status = 'sent', to_address = $2 WHERE id = $1")
         .bind(id)
         .bind(&customer_email)

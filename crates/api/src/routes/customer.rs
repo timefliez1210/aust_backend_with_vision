@@ -122,6 +122,9 @@ struct CustomerInfo {
     id: Uuid,
     email: String,
     name: Option<String>,
+    salutation: Option<String>,
+    first_name: Option<String>,
+    last_name: Option<String>,
     phone: Option<String>,
 }
 
@@ -165,19 +168,20 @@ async fn verify_otp(
     let now = Utc::now();
 
     // Upsert customer by email
-    let customer: (Uuid, String, Option<String>, Option<String>) = sqlx::query_as(
-        r#"
+    let customer: (Uuid, String, Option<String>, Option<String>, Option<String>, Option<String>) =
+        sqlx::query_as(
+            r#"
         INSERT INTO customers (id, email, created_at, updated_at)
         VALUES ($1, $2, $3, $3)
         ON CONFLICT (email) DO UPDATE SET updated_at = $3
-        RETURNING id, email, name, phone
+        RETURNING id, email, name, salutation, first_name, last_name
         "#,
-    )
-    .bind(Uuid::now_v7())
-    .bind(&email)
-    .bind(now)
-    .fetch_one(&state.db)
-    .await?;
+        )
+        .bind(Uuid::now_v7())
+        .bind(&email)
+        .bind(now)
+        .fetch_one(&state.db)
+        .await?;
 
     // Generate session token (64 random hex chars)
     let token = generate_session_token();
@@ -200,7 +204,10 @@ async fn verify_otp(
             id: customer.0,
             email: customer.1,
             name: customer.2,
-            phone: customer.3,
+            salutation: customer.3,
+            first_name: customer.4,
+            last_name: customer.5,
+            phone: None,
         },
     }))
 }
@@ -212,19 +219,22 @@ async fn get_profile(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<CustomerClaims>,
 ) -> Result<Json<CustomerInfo>, ApiError> {
-    let row: Option<(Uuid, String, Option<String>, Option<String>)> =
-        sqlx::query_as("SELECT id, email, name, phone FROM customers WHERE id = $1")
+    let row: Option<(Uuid, String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT id, email, name, salutation, first_name, last_name, phone FROM customers WHERE id = $1")
             .bind(claims.customer_id)
             .fetch_optional(&state.db)
             .await?;
 
-    let (id, email, name, phone) =
+    let (id, email, name, salutation, first_name, last_name, phone) =
         row.ok_or_else(|| ApiError::NotFound("Kunde nicht gefunden".into()))?;
 
     Ok(Json(CustomerInfo {
         id,
         email,
         name,
+        salutation,
+        first_name,
+        last_name,
         phone,
     }))
 }

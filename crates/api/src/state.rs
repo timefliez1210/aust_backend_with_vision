@@ -5,6 +5,7 @@ use aust_storage::StorageProvider;
 use aust_volume_estimator::VisionServiceClient;
 use sqlx::PgPool;
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -14,6 +15,10 @@ pub struct AppState {
     pub storage: Arc<dyn StorageProvider>,
     pub calendar: Arc<CalendarService>,
     pub vision_service: Option<VisionServiceClient>,
+    /// Semaphore that limits concurrent Modal vision calls to 1.
+    /// All background workers acquire this before calling the GPU service,
+    /// so jobs are serialized and the L4 never sees two pipelines at once.
+    pub vision_semaphore: Arc<Semaphore>,
 }
 
 impl AppState {
@@ -32,6 +37,7 @@ impl AppState {
             storage,
             calendar,
             vision_service,
+            vision_semaphore: Arc::new(Semaphore::new(1)),
         }
     }
 }

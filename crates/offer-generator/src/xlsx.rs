@@ -403,7 +403,7 @@ fn build_cell_modifications(
     let max_items = 12.min(data.line_items.len()); // template has 12 slots (31-42)
     for (i, item) in data.line_items.iter().take(max_items).enumerate() {
         let row = 31 + i as u32;
-        let color = i % 2; // 0 = white (first row), 1 = blue
+        let color = 1 - i % 2; // 1 = blue (first row), 0 = white
 
         // Un-hide this row
         unhidden_rows.push(row);

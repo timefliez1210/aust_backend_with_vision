@@ -49,6 +49,9 @@ struct CustomerDbRow {
     id: Uuid,
     email: String,
     name: Option<String>,
+    salutation: Option<String>,
+    first_name: Option<String>,
+    last_name: Option<String>,
     phone: Option<String>,
 }
 
@@ -158,7 +161,7 @@ pub async fn build_inquiry_response(
 
     // 2. Fetch customer
     let customer: CustomerDbRow = sqlx::query_as(
-        "SELECT id, email, name, phone FROM customers WHERE id = $1",
+        "SELECT id, email, name, salutation, first_name, last_name, phone FROM customers WHERE id = $1",
     )
     .bind(row.customer_id)
     .fetch_optional(pool)
@@ -309,6 +312,9 @@ pub async fn build_inquiry_response(
         customer: Some(CustomerSnapshot {
             id: customer.id,
             name: customer.name,
+            salutation: customer.salutation,
+            first_name: customer.first_name,
+            last_name: customer.last_name,
             email: customer.email,
             phone: customer.phone,
         }),

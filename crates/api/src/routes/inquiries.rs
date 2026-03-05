@@ -24,6 +24,7 @@ use aust_core::models::{
     EstimationMethod, InquiryListItem, InquiryResponse as InquiryResponseModel,
     InquiryStatus, Offer, Services,
 };
+use aust_llm_providers::LlmMessage;
 use aust_offer_generator::OfferLineItem;
 use aust_storage::StorageProvider;
 
@@ -46,7 +47,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/{id}/pdf", get(get_inquiry_pdf))
         .route("/{id}/items", put(update_inquiry_items))
         .route("/{id}/estimate/depth", post(trigger_estimate_upload))
-        .route("/{id}/estimate/video", post(trigger_estimate_upload))
+        .route("/{id}/estimate/video", post(trigger_video_upload))
         .route("/{id}/estimate/{method}", post(trigger_estimate))
         .route("/{id}/generate-offer", post(generate_inquiry_offer))
         .route("/{id}/emails", get(get_inquiry_emails))
@@ -61,6 +62,7 @@ pub fn submit_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/photo", post(photo_inquiry))
         .route("/mobile", post(mobile_inquiry))
+        .route("/video", post(video_inquiry))
 }
 
 // ---------------------------------------------------------------------------
@@ -736,6 +738,8 @@ async fn trigger_estimate(
 /// **Caller**: Admin dashboard "Angebot erstellen" button.
 /// **Why**: Central offer generation entry point from the inquiry detail page.
 ///          Reuses existing active offer (UPDATE in-place) to avoid unique constraint violation.
+///          Also spawns a background task to generate a personalised LLM email draft so the
+///          admin can send the offer with one click from the email thread section.
 async fn generate_inquiry_offer(
     State(state): State<Arc<AppState>>,
     Path(inquiry_id): Path<Uuid>,
@@ -789,7 +793,152 @@ async fn generate_inquiry_offer(
     )
     .await?;
 
+    // Generate personalised email draft in the background (non-blocking)
+    {
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            generate_offer_email_draft(&state, inquiry_id).await;
+        });
+    }
+
     Ok(Json(result.offer))
+}
+
+/// Generate a personalised LLM offer email draft and store it as a `draft` `email_message`.
+///
+/// **Caller**: `generate_inquiry_offer` — spawned as a background task after PDF generation.
+/// **Why**: Prepares a ready-to-send email body so Alex can review and dispatch with one click
+///          via the existing draft send mechanism. Re-runs on every offer regeneration,
+///          discarding any previous LLM draft for the same thread to avoid stale copies.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB, LLM, email config)
+/// - `inquiry_id` — the inquiry whose offer was just generated
+async fn generate_offer_email_draft(state: &AppState, inquiry_id: Uuid) {
+    // Fetch customer name, email, origin/destination city for the LLM prompt
+    let row: Option<(String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+        r#"
+        SELECT c.name, c.email, a_orig.city, a_dest.city
+        FROM inquiries q
+        JOIN customers c ON q.customer_id = c.id
+        LEFT JOIN addresses a_orig ON q.origin_address_id = a_orig.id
+        LEFT JOIN addresses a_dest ON q.destination_address_id = a_dest.id
+        WHERE q.id = $1
+        "#,
+    )
+    .bind(inquiry_id)
+    .fetch_optional(&state.db)
+    .await
+    .unwrap_or(None);
+
+    let Some((name, Some(email), origin_city, dest_city)) = row else {
+        return;
+    };
+
+    let origin = origin_city.as_deref().unwrap_or("dem Abholort");
+    let dest = dest_city.as_deref().unwrap_or("dem Zielort");
+
+    // Ask LLM for a personalised German email body; fall back to a static template on error
+    let prompt = format!(
+        "Schreibe eine professionelle, freundliche E-Mail auf Deutsch für einen Umzugskunden. \
+         Anrede: Sehr geehrte(r) {name}. Umzug von {origin} nach {dest}. \
+         Die E-Mail soll das beigefügte Angebot kurz vorstellen, Professionalität und \
+         Zuverlässigkeit betonen und zur Kontaktaufnahme einladen. \
+         Nur den Textkörper, keinen Betreff. Maximal 5 Sätze. \
+         Unterschrift: 'Mit freundlichen Grüßen,\\nIhr AUST-Umzüge-Team'"
+    );
+    let body = match state.llm.complete(&[LlmMessage::user(prompt)]).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!("LLM offer email generation failed ({e}), using fallback");
+            format!(
+                "Sehr geehrte(r) {name},\n\n\
+                 anbei erhalten Sie unser Angebot für Ihren Umzug von {origin} nach {dest}.\n\n\
+                 Bei Fragen stehen wir Ihnen gerne zur Verfügung.\n\n\
+                 Mit freundlichen Grüßen,\nIhr AUST-Umzüge-Team"
+            )
+        }
+    };
+
+    // Find or create the email thread for this inquiry
+    let thread_id = find_or_create_inquiry_thread(state, inquiry_id).await;
+    if thread_id.is_nil() {
+        return;
+    }
+
+    // Discard any previous LLM offer draft in this thread (stale after regeneration)
+    let _ = sqlx::query(
+        "UPDATE email_messages SET status = 'discarded' \
+         WHERE thread_id = $1 AND status = 'draft' AND llm_generated = true",
+    )
+    .bind(thread_id)
+    .execute(&state.db)
+    .await;
+
+    // Insert the new draft
+    let _ = sqlx::query(
+        r#"
+        INSERT INTO email_messages
+            (id, thread_id, direction, from_address, to_address, subject, body_text, llm_generated, status, created_at)
+        VALUES ($1, $2, 'outbound', $3, $4, 'Ihr Umzugsangebot', $5, true, 'draft', NOW())
+        "#,
+    )
+    .bind(Uuid::now_v7())
+    .bind(thread_id)
+    .bind(&state.config.email.from_address)
+    .bind(&email)
+    .bind(&body)
+    .execute(&state.db)
+    .await;
+}
+
+/// Find the most recent email thread for an inquiry, or create a new one if none exists.
+///
+/// **Caller**: `generate_offer_email_draft`
+/// **Why**: Offer email drafts must belong to a thread; this ensures one always exists
+///          without creating duplicates when multiple offers are generated.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool, email config)
+/// - `inquiry_id` — inquiry to find/create the thread for
+///
+/// # Returns
+/// The thread UUID, or `Uuid::nil()` if the inquiry record cannot be found.
+async fn find_or_create_inquiry_thread(state: &AppState, inquiry_id: Uuid) -> Uuid {
+    // Return existing thread if one already exists
+    if let Ok(Some((id,))) = sqlx::query_as::<_, (Uuid,)>(
+        "SELECT id FROM email_threads WHERE inquiry_id = $1 ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(inquiry_id)
+    .fetch_optional(&state.db)
+    .await
+    {
+        return id;
+    }
+
+    // Look up customer_id from the inquiry
+    let Ok(Some((customer_id,))) = sqlx::query_as::<_, (Uuid,)>(
+        "SELECT customer_id FROM inquiries WHERE id = $1",
+    )
+    .bind(inquiry_id)
+    .fetch_optional(&state.db)
+    .await
+    else {
+        return Uuid::nil();
+    };
+
+    let thread_id = Uuid::now_v7();
+    let _ = sqlx::query(
+        "INSERT INTO email_threads (id, customer_id, inquiry_id, subject, created_at, updated_at) \
+         VALUES ($1, $2, $3, 'Ihr Umzugsangebot', NOW(), NOW())",
+    )
+    .bind(thread_id)
+    .bind(customer_id)
+    .bind(inquiry_id)
+    .execute(&state.db)
+    .await;
+
+    thread_id
 }
 
 /// `GET /api/v1/inquiries/{id}/emails` -- Fetch email thread for this inquiry.
@@ -851,12 +1000,24 @@ async fn trigger_estimate_upload(
         .execute(&state.db)
         .await?;
 
+    // Pre-create the estimation row so the frontend can poll it immediately
+    let estimation_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO volume_estimations (id, inquiry_id, method, status, source_data, created_at) \
+         VALUES ($1, $2, 'depth_sensor', 'processing', '{}', NOW())",
+    )
+    .bind(estimation_id)
+    .bind(inquiry_id)
+    .execute(&state.db)
+    .await?;
+
     // Spawn background processing (same pipeline as public submission)
     let state_bg = Arc::clone(&state);
     tokio::spawn(async move {
         if let Err(e) = process_submission_background(
-            state_bg,
+            Arc::clone(&state_bg),
             inquiry_id,
+            estimation_id,
             parsed.images,
             parsed.depth_maps,
             parsed.ar_metadata,
@@ -867,17 +1028,212 @@ async fn trigger_estimate_upload(
         .await
         {
             tracing::error!(inquiry_id = %inquiry_id, error = %e, "Background estimation failed");
+            let _ = sqlx::query(
+                "UPDATE volume_estimations SET status = 'failed' WHERE id = $1 AND status = 'processing'",
+            )
+            .bind(estimation_id)
+            .execute(&state_bg.db)
+            .await;
+        }
+    });
+
+    // Return an array of { id, status } so the frontend can poll each estimation
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!([{
+            "id": estimation_id,
+            "status": "processing"
+        }])),
+    ))
+}
+
+// ===========================================================================
+// Video estimation handler
+// ===========================================================================
+
+/// `POST /api/v1/inquiries/{id}/estimate/video`
+///
+/// **Caller**: Admin dashboard — triggers video 3D pipeline on an existing inquiry.
+/// **Why**: Accepts multipart video upload, saves the file to S3, then queues it for
+///          processing on the Modal video endpoint (MASt3R + SAM 2 pipeline).
+///          Returns immediately with a processing estimation ID for polling.
+async fn trigger_video_upload(
+    State(state): State<Arc<AppState>>,
+    Path(inquiry_id): Path<Uuid>,
+    mut multipart: Multipart,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM inquiries WHERE id = $1)")
+        .bind(inquiry_id)
+        .fetch_one(&state.db)
+        .await?;
+    if !exists {
+        return Err(ApiError::NotFound(format!("Inquiry {inquiry_id} not found")));
+    }
+
+    // Read the video field from the multipart body
+    let mut video_data: Option<(Vec<u8>, String)> = None;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| ApiError::BadRequest(format!("Ungültige Formulardaten: {e}")))?
+    {
+        let field_name = field.name().unwrap_or("").to_string();
+        if field_name == "video" {
+            let content_type = field
+                .content_type()
+                .unwrap_or("video/mp4")
+                .to_string();
+            if !content_type.starts_with("video/") {
+                return Err(ApiError::Validation(format!(
+                    "Ungültiger Dateityp '{content_type}'. Erwartet: video/*"
+                )));
+            }
+            let data = field
+                .bytes()
+                .await
+                .map_err(|e| ApiError::BadRequest(format!("Video konnte nicht gelesen werden: {e}")))?;
+            video_data = Some((data.to_vec(), content_type));
+        }
+    }
+
+    let (video_bytes, mime_type) = video_data
+        .ok_or_else(|| ApiError::Validation("Kein Video-Feld in der Anfrage gefunden".into()))?;
+
+    if video_bytes.is_empty() {
+        return Err(ApiError::Validation("Video-Datei ist leer".into()));
+    }
+
+    let now = chrono::Utc::now();
+    sqlx::query("UPDATE inquiries SET status = 'estimating', updated_at = $1 WHERE id = $2")
+        .bind(now)
+        .bind(inquiry_id)
+        .execute(&state.db)
+        .await?;
+
+    let estimation_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO volume_estimations (id, inquiry_id, method, status, source_data, created_at) \
+         VALUES ($1, $2, 'video', 'processing', '{}', NOW())",
+    )
+    .bind(estimation_id)
+    .bind(inquiry_id)
+    .execute(&state.db)
+    .await?;
+
+    let state_bg = Arc::clone(&state);
+    tokio::spawn(async move {
+        if let Err(e) =
+            process_video_background(state_bg.clone(), inquiry_id, estimation_id, video_bytes, mime_type).await
+        {
+            tracing::error!(inquiry_id = %inquiry_id, error = %e, "Background video estimation failed");
+            let _ = sqlx::query(
+                "UPDATE volume_estimations SET status = 'failed' WHERE id = $1 AND status = 'processing'",
+            )
+            .bind(estimation_id)
+            .execute(&state_bg.db)
+            .await;
         }
     });
 
     Ok((
         StatusCode::ACCEPTED,
-        Json(serde_json::json!({
-            "inquiry_id": inquiry_id,
-            "status": "estimating",
-            "message": "Bilder werden analysiert. Schätzung wird im Hintergrund erstellt."
-        })),
+        Json(serde_json::json!([{"id": estimation_id, "status": "processing"}])),
     ))
+}
+
+/// Background task: S3 upload → semaphore acquire → Modal video endpoint → store results → generate offer.
+async fn process_video_background(
+    state: Arc<AppState>,
+    inquiry_id: Uuid,
+    estimation_id: Uuid,
+    video_bytes: Vec<u8>,
+    mime_type: String,
+) -> Result<(), String> {
+    // 1. Upload video to S3
+    let s3_key = format!("estimates/{inquiry_id}/{estimation_id}/video.mp4");
+    state
+        .storage
+        .upload(
+            &s3_key,
+            bytes::Bytes::from(video_bytes.clone()),
+            &mime_type,
+        )
+        .await
+        .map_err(|e| format!("S3 video upload failed: {e}"))?;
+
+    tracing::info!(inquiry_id = %inquiry_id, s3_key = %s3_key, "Video uploaded to S3");
+
+    // 2. Acquire vision semaphore — waits if a photo or video job is already running on Modal
+    let _vision_permit = state
+        .vision_semaphore
+        .acquire()
+        .await
+        .map_err(|e| format!("Vision semaphore closed: {e}"))?;
+    tracing::info!(estimation_id = %estimation_id, "Vision semaphore acquired, submitting video to Modal");
+
+    // 3. Call Modal video endpoint
+    let client = state
+        .vision_service
+        .as_ref()
+        .ok_or("Vision service not configured")?;
+
+    let response = client
+        .estimate_video(&estimation_id.to_string(), &video_bytes, &mime_type, None, None)
+        .await
+        .map_err(|e| format!("Video estimation failed: {e}"))?;
+
+    tracing::info!(
+        estimation_id = %estimation_id,
+        volume = response.total_volume_m3,
+        items = response.detected_items.len(),
+        "Video estimation succeeded"
+    );
+
+    // 4. Store results
+    let source_data = serde_json::json!({
+        "source": "video",
+        "s3_key": s3_key,
+        "mime_type": mime_type,
+    });
+    let result_data = serde_json::to_value(&response.detected_items)
+        .map_err(|e| format!("Failed to serialize items: {e}"))?;
+
+    sqlx::query(r#"
+        INSERT INTO volume_estimations
+            (id, inquiry_id, method, status, source_data, result_data, total_volume_m3, confidence_score, created_at)
+        VALUES ($1, $2, 'video', 'completed', $3, $4, $5, $6, $7)
+        ON CONFLICT (id) DO UPDATE SET
+            status            = 'completed',
+            source_data       = EXCLUDED.source_data,
+            result_data       = EXCLUDED.result_data,
+            total_volume_m3   = EXCLUDED.total_volume_m3,
+            confidence_score  = EXCLUDED.confidence_score
+    "#)
+    .bind(estimation_id)
+    .bind(inquiry_id)
+    .bind(source_data)
+    .bind(result_data)
+    .bind(response.total_volume_m3)
+    .bind(response.confidence_score)
+    .bind(chrono::Utc::now())
+    .execute(&state.db)
+    .await
+    .map_err(|e| format!("Failed to store video estimation: {e}"))?;
+
+    // 5. Update inquiry status and trigger offer generation
+    sqlx::query(
+        "UPDATE inquiries SET status = 'estimated', volume_m3 = $1, updated_at = $2 WHERE id = $3",
+    )
+    .bind(response.total_volume_m3)
+    .bind(chrono::Utc::now())
+    .bind(inquiry_id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| format!("Failed to update inquiry: {e}"))?;
+
+    orchestrator::try_auto_generate_offer(Arc::clone(&state), inquiry_id).await;
+
+    Ok(())
 }
 
 // ===========================================================================
@@ -911,9 +1267,220 @@ async fn mobile_inquiry(
     handle_submission(state, parsed).await
 }
 
+/// `POST /api/v1/submit/video` — Public video inquiry (Source E).
+///
+/// **Caller**: Public-facing `/angebot` page (video mode).
+/// **Why**: Lets customers submit a room walkthrough video without authentication.
+///          Creates customer + inquiry records immediately, then queues video
+///          processing via Modal (MASt3R + SAM 2) in the background.
+async fn video_inquiry(
+    State(state): State<Arc<AppState>>,
+    mut multipart: Multipart,
+) -> Result<(StatusCode, Json<SubmitInquiryResponse>), ApiError> {
+    // Parse contact + address fields and the video file from the same multipart body
+    let mut name: Option<String> = None;
+    let mut salutation: Option<String> = None;
+    let mut first_name: Option<String> = None;
+    let mut last_name: Option<String> = None;
+    let mut email: Option<String> = None;
+    let mut phone: Option<String> = None;
+    let mut departure_address: Option<String> = None;
+    let mut departure_floor: Option<String> = None;
+    let mut departure_elevator: Option<bool> = None;
+    let mut departure_parking_ban: Option<bool> = None;
+    let mut arrival_address: Option<String> = None;
+    let mut arrival_floor: Option<String> = None;
+    let mut arrival_elevator: Option<bool> = None;
+    let mut arrival_parking_ban: Option<bool> = None;
+    let mut preferred_date: Option<String> = None;
+    let mut services_text: Option<String> = None;
+    let mut message: Option<String> = None;
+    let mut video_data: Option<(Vec<u8>, String)> = None;
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| ApiError::BadRequest(format!("Ungültige Formulardaten: {e}")))?
+    {
+        let field_name = field.name().unwrap_or("").to_string();
+        match field_name.as_str() {
+            "name" => name = Some(read_text_field(field).await?),
+            "salutation" | "anrede" => salutation = Some(read_text_field(field).await?),
+            "first_name" | "vorname" => first_name = Some(read_text_field(field).await?),
+            "last_name" | "nachname" => last_name = Some(read_text_field(field).await?),
+            "email" => email = Some(read_text_field(field).await?),
+            "phone" => phone = Some(read_text_field(field).await?),
+            "auszugsadresse" | "departure_address" => departure_address = Some(read_text_field(field).await?),
+            "etage_auszug" | "departure_floor" => departure_floor = Some(read_text_field(field).await?),
+            "aufzug_auszug" | "departure_elevator" => {
+                let t = read_text_field(field).await?;
+                departure_elevator = Some(parse_bool_field(&t));
+            }
+            "halteverbot_auszug" | "departure_parking_ban" => {
+                let t = read_text_field(field).await?;
+                departure_parking_ban = Some(parse_bool_field(&t));
+            }
+            "einzugsadresse" | "arrival_address" => arrival_address = Some(read_text_field(field).await?),
+            "etage_einzug" | "arrival_floor" => arrival_floor = Some(read_text_field(field).await?),
+            "aufzug_einzug" | "arrival_elevator" => {
+                let t = read_text_field(field).await?;
+                arrival_elevator = Some(parse_bool_field(&t));
+            }
+            "halteverbot_einzug" | "arrival_parking_ban" => {
+                let t = read_text_field(field).await?;
+                arrival_parking_ban = Some(parse_bool_field(&t));
+            }
+            "wunschtermin" | "preferred_date" => preferred_date = Some(read_text_field(field).await?),
+            "zusatzleistungen" | "services" => services_text = Some(read_text_field(field).await?),
+            "nachricht" | "message" => message = Some(read_text_field(field).await?),
+            "video" => {
+                let content_type = field.content_type().unwrap_or("video/mp4").to_string();
+                if !content_type.starts_with("video/") {
+                    return Err(ApiError::Validation(format!(
+                        "Ungültiger Dateityp '{content_type}'. Erwartet: video/*"
+                    )));
+                }
+                let data = field.bytes().await.map_err(|e| {
+                    ApiError::BadRequest(format!("Video konnte nicht gelesen werden: {e}"))
+                })?;
+                video_data = Some((data.to_vec(), content_type));
+            }
+            _ => continue,
+        }
+    }
+
+    let name = name.filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| ApiError::Validation("Name ist erforderlich".into()))?;
+    let email = email.filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| ApiError::Validation("E-Mail ist erforderlich".into()))?;
+    let departure_address = departure_address.filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| ApiError::Validation("Auszugsadresse ist erforderlich".into()))?;
+    let arrival_address = arrival_address.filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| ApiError::Validation("Einzugsadresse ist erforderlich".into()))?;
+    let (video_bytes, mime_type) = video_data
+        .ok_or_else(|| ApiError::Validation("Kein Video-Feld in der Anfrage gefunden".into()))?;
+    if video_bytes.is_empty() {
+        return Err(ApiError::Validation("Video-Datei ist leer".into()));
+    }
+
+    let now = chrono::Utc::now();
+
+    // Upsert customer
+    let customer_id: Uuid = sqlx::query_as::<_, (Uuid,)>(
+        r#"INSERT INTO customers (id, email, name, salutation, first_name, last_name, phone, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
+           ON CONFLICT (email) DO UPDATE SET
+               name = COALESCE(EXCLUDED.name, customers.name),
+               salutation = COALESCE(EXCLUDED.salutation, customers.salutation),
+               first_name = COALESCE(EXCLUDED.first_name, customers.first_name),
+               last_name = COALESCE(EXCLUDED.last_name, customers.last_name),
+               phone = COALESCE(EXCLUDED.phone, customers.phone),
+               updated_at = $8
+           RETURNING id"#,
+    )
+    .bind(Uuid::now_v7()).bind(&email).bind(&name).bind(&salutation).bind(&first_name).bind(&last_name).bind(&phone).bind(now)
+    .fetch_one(&state.db).await.map(|(id,)| id)
+    .map_err(|e| ApiError::Internal(format!("Kunde konnte nicht erstellt werden: {e}")))?;
+
+    // Create addresses
+    let (dep_street, dep_city, dep_postal) = services::vision::parse_address(&departure_address);
+    let origin_id: Uuid = sqlx::query_as::<_, (Uuid,)>(
+        "INSERT INTO addresses (id, street, city, postal_code, floor, elevator) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id",
+    )
+    .bind(Uuid::now_v7()).bind(&dep_street).bind(&dep_city).bind(&dep_postal)
+    .bind(&departure_floor).bind(departure_elevator)
+    .fetch_one(&state.db).await.map(|(id,)| id)
+    .map_err(|e| ApiError::Internal(format!("Auszugsadresse konnte nicht erstellt werden: {e}")))?;
+
+    let (arr_street, arr_city, arr_postal) = services::vision::parse_address(&arrival_address);
+    let dest_id: Uuid = sqlx::query_as::<_, (Uuid,)>(
+        "INSERT INTO addresses (id, street, city, postal_code, floor, elevator) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id",
+    )
+    .bind(Uuid::now_v7()).bind(&arr_street).bind(&arr_city).bind(&arr_postal)
+    .bind(&arrival_floor).bind(arrival_elevator)
+    .fetch_one(&state.db).await.map(|(id,)| id)
+    .map_err(|e| ApiError::Internal(format!("Einzugsadresse konnte nicht erstellt werden: {e}")))?;
+
+    let preferred_date_ts = preferred_date.as_deref()
+        .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+        .and_then(|d| d.and_hms_opt(10, 0, 0))
+        .map(|dt| chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(dt, chrono::Utc));
+
+    let notes = build_notes(
+        services_text.as_deref(),
+        departure_parking_ban,
+        arrival_parking_ban,
+        message.as_deref(),
+    );
+
+    // Create inquiry
+    let inquiry_id = Uuid::now_v7();
+    sqlx::query(
+        r#"INSERT INTO inquiries (id, customer_id, origin_address_id, destination_address_id,
+                               status, preferred_date, notes, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)"#,
+    )
+    .bind(inquiry_id).bind(customer_id).bind(Some(origin_id)).bind(Some(dest_id))
+    .bind("pending").bind(preferred_date_ts).bind(&notes).bind(now)
+    .execute(&state.db).await
+    .map_err(|e| ApiError::Internal(format!("Anfrage konnte nicht erstellt werden: {e}")))?;
+
+    // Pre-create estimation row for polling
+    let estimation_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO volume_estimations (id, inquiry_id, method, status, source_data, created_at) \
+         VALUES ($1, $2, 'video', 'processing', '{}', NOW())",
+    )
+    .bind(estimation_id).bind(inquiry_id).execute(&state.db).await
+    .map_err(|e| ApiError::Internal(format!("Schätzung konnte nicht erstellt werden: {e}")))?;
+
+    tracing::info!(inquiry_id = %inquiry_id, "Video inquiry created, spawning background processing");
+
+    // Spawn background: distance calc → S3 → semaphore → Modal video → offer
+    let state_bg = Arc::clone(&state);
+    let dep_addr = departure_address.clone();
+    let arr_addr = arrival_address.clone();
+    tokio::spawn(async move {
+        // Distance calculation
+        let api_key = &state_bg.config.maps.api_key;
+        if !api_key.is_empty() {
+            let calc = aust_distance_calculator::RouteCalculator::new(api_key.clone());
+            let req = aust_distance_calculator::RouteRequest { addresses: vec![dep_addr, arr_addr] };
+            match calc.calculate(&req).await {
+                Ok(r) => {
+                    let _ = sqlx::query("UPDATE inquiries SET distance_km = $1, updated_at = $2 WHERE id = $3")
+                        .bind(r.total_distance_km).bind(chrono::Utc::now()).bind(inquiry_id)
+                        .execute(&state_bg.db).await;
+                }
+                Err(e) => tracing::warn!(inquiry_id = %inquiry_id, error = %e, "Distance calculation failed"),
+            }
+        }
+        if let Err(e) = process_video_background(state_bg.clone(), inquiry_id, estimation_id, video_bytes, mime_type).await {
+            tracing::error!(inquiry_id = %inquiry_id, error = %e, "Background video estimation failed");
+            let _ = sqlx::query(
+                "UPDATE volume_estimations SET status = 'failed' WHERE id = $1 AND status = 'processing'",
+            )
+            .bind(estimation_id).execute(&state_bg.db).await;
+        }
+    });
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(SubmitInquiryResponse {
+            inquiry_id,
+            customer_id,
+            status: "processing".to_string(),
+            message: "Anfrage erhalten. Video wird analysiert und Angebot wird erstellt.".to_string(),
+        }),
+    ))
+}
+
 /// All parsed fields from the multipart form.
 struct ParsedInquiryForm {
     name: Option<String>,
+    salutation: Option<String>,
+    first_name: Option<String>,
+    last_name: Option<String>,
     email: Option<String>,
     phone: Option<String>,
     departure_address: Option<String>,
@@ -939,6 +1506,9 @@ async fn parse_inquiry_form(
 ) -> Result<ParsedInquiryForm, ApiError> {
     let mut form = ParsedInquiryForm {
         name: None,
+        salutation: None,
+        first_name: None,
+        last_name: None,
         email: None,
         phone: None,
         departure_address: None,
@@ -965,6 +1535,9 @@ async fn parse_inquiry_form(
         let name = field.name().unwrap_or("").to_string();
         match name.as_str() {
             "name" => form.name = Some(read_text_field(field).await?),
+            "salutation" | "anrede" => form.salutation = Some(read_text_field(field).await?),
+            "first_name" | "vorname" => form.first_name = Some(read_text_field(field).await?),
+            "last_name" | "nachname" => form.last_name = Some(read_text_field(field).await?),
             "email" => form.email = Some(read_text_field(field).await?),
             "phone" => form.phone = Some(read_text_field(field).await?),
             "departure_address" | "auszugsadresse" => {
@@ -1082,18 +1655,24 @@ async fn handle_submission(
     // 1. Create or update customer by email
     let customer_id: Uuid = sqlx::query_as::<_, (Uuid,)>(
         r#"
-        INSERT INTO customers (id, email, name, phone, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $5)
+        INSERT INTO customers (id, email, name, salutation, first_name, last_name, phone, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
         ON CONFLICT (email) DO UPDATE SET
             name = COALESCE(EXCLUDED.name, customers.name),
+            salutation = COALESCE(EXCLUDED.salutation, customers.salutation),
+            first_name = COALESCE(EXCLUDED.first_name, customers.first_name),
+            last_name = COALESCE(EXCLUDED.last_name, customers.last_name),
             phone = COALESCE(EXCLUDED.phone, customers.phone),
-            updated_at = $5
+            updated_at = $8
         RETURNING id
         "#,
     )
     .bind(Uuid::now_v7())
     .bind(&email)
     .bind(&name)
+    .bind(&form.salutation)
+    .bind(&form.first_name)
+    .bind(&form.last_name)
     .bind(&form.phone)
     .bind(now)
     .fetch_one(&state.db)
@@ -1181,6 +1760,7 @@ async fn handle_submission(
     tracing::info!(inquiry_id = %inquiry_id, "Inquiry created for submission");
 
     // 7. Return 202 immediately -- spawn background processing
+    let estimation_id = Uuid::now_v7();
     let state_bg = Arc::clone(&state);
     let dep_addr = departure_address.clone();
     let arr_addr = arrival_address.clone();
@@ -1188,6 +1768,7 @@ async fn handle_submission(
         if let Err(e) = process_submission_background(
             state_bg,
             inquiry_id,
+            estimation_id,
             form.images,
             form.depth_maps,
             form.ar_metadata,
@@ -1217,6 +1798,7 @@ async fn handle_submission(
 async fn process_submission_background(
     state: Arc<AppState>,
     inquiry_id: Uuid,
+    estimation_id: Uuid,
     images: Vec<(Vec<u8>, String)>,
     depth_maps: Vec<(Vec<u8>, String)>,
     ar_metadata: Option<String>,
@@ -1255,8 +1837,6 @@ async fn process_submission_background(
         tracing::warn!("Maps API key not configured, skipping distance calculation");
     }
 
-    let estimation_id = Uuid::now_v7();
-
     // 1. Upload images to S3
     let s3_keys =
         services::vision::upload_images_to_s3(&*state.storage, inquiry_id, estimation_id, &images)
@@ -1279,6 +1859,15 @@ async fn process_submission_background(
     }
 
     // 2. Run volume estimation (vision service -> LLM fallback)
+    // Acquire the vision semaphore so only one job runs on Modal at a time.
+    // Other workers will wait here until the current GPU job completes.
+    let _vision_permit = state
+        .vision_semaphore
+        .acquire()
+        .await
+        .map_err(|e| format!("Vision semaphore closed: {e}"))?;
+    tracing::info!(estimation_id = %estimation_id, "Vision semaphore acquired, submitting to Modal");
+
     let (total_volume, confidence, result_data, method) = match services::vision::try_vision_service(
         &state,
         &images,
@@ -1314,19 +1903,32 @@ async fn process_submission_background(
             .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()),
     });
 
-    // 4. Create volume_estimation record
+    // 4. Store volume_estimation record — UPSERT so it works whether the row was
+    //    pre-created as 'processing' (admin trigger) or is brand-new (public submission).
     let now_update = chrono::Utc::now();
-    insert_estimation_no_return(
-        &state.db,
-        estimation_id,
-        inquiry_id,
-        method.as_str(),
-        &source_data,
-        result_data.as_ref(),
-        total_volume,
-        confidence,
-        now,
+    sqlx::query(
+        r#"
+        INSERT INTO volume_estimations
+            (id, inquiry_id, method, status, source_data, result_data, total_volume_m3, confidence_score, created_at)
+        VALUES ($1, $2, $3, 'completed', $4, $5, $6, $7, $8)
+        ON CONFLICT (id) DO UPDATE SET
+            method            = EXCLUDED.method,
+            status            = 'completed',
+            source_data       = EXCLUDED.source_data,
+            result_data       = EXCLUDED.result_data,
+            total_volume_m3   = EXCLUDED.total_volume_m3,
+            confidence_score  = EXCLUDED.confidence_score
+        "#,
     )
+    .bind(estimation_id)
+    .bind(inquiry_id)
+    .bind(method.as_str())
+    .bind(&source_data)
+    .bind(result_data.as_ref())
+    .bind(total_volume)
+    .bind(confidence)
+    .bind(now)
+    .execute(&state.db)
     .await
     .map_err(|e| format!("Failed to store estimation: {e}"))?;
 

@@ -1,7 +1,7 @@
 """Modal deployment for the AUST Vision Service.
 
 Deploys the vision pipeline as serverless GPU endpoints on Modal:
-- Photo endpoint: Grounding DINO + SAM 2 + Depth Anything V2 (max_inputs=4)
+- Photo endpoint: Grounding DINO + SAM 2 + Depth Anything V2 (max_inputs=1)
 - Video endpoint: + MASt3R 3D reconstruction (max_inputs=1, long-running)
 
 GPU: L4 (24GB VRAM) for both — MASt3R needs ~12-15GB during reconstruction.

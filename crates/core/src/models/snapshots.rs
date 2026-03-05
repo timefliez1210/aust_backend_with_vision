@@ -86,6 +86,9 @@ pub struct InquiryListItem {
 pub struct CustomerSnapshot {
     pub id: Uuid,
     pub name: Option<String>,
+    pub salutation: Option<String>,
+    pub first_name: Option<String>,
+    pub last_name: Option<String>,
     pub email: String,
     pub phone: Option<String>,
 }
