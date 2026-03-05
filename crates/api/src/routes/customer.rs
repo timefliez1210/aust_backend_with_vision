@@ -168,13 +168,13 @@ async fn verify_otp(
     let now = Utc::now();
 
     // Upsert customer by email
-    let customer: (Uuid, String, Option<String>, Option<String>, Option<String>, Option<String>) =
+    let customer: (Uuid, String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>) =
         sqlx::query_as(
             r#"
         INSERT INTO customers (id, email, created_at, updated_at)
         VALUES ($1, $2, $3, $3)
         ON CONFLICT (email) DO UPDATE SET updated_at = $3
-        RETURNING id, email, name, salutation, first_name, last_name
+        RETURNING id, email, name, salutation, first_name, last_name, phone
         "#,
         )
         .bind(Uuid::now_v7())
@@ -207,7 +207,7 @@ async fn verify_otp(
             salutation: customer.3,
             first_name: customer.4,
             last_name: customer.5,
-            phone: None,
+            phone: customer.6,
         },
     }))
 }

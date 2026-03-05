@@ -1145,6 +1145,9 @@ fn merge_inquiry(target: &mut MovingInquiry, source: &MovingInquiry) {
     if target.name.is_none() {
         target.name = source.name.clone();
     }
+    if target.salutation.is_none() {
+        target.salutation = source.salutation.clone();
+    }
     if target.phone.is_none() {
         target.phone = source.phone.clone();
     }

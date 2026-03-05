@@ -1250,7 +1250,7 @@ async fn photo_inquiry(
     multipart: Multipart,
 ) -> Result<(StatusCode, Json<SubmitInquiryResponse>), ApiError> {
     let parsed = parse_inquiry_form(multipart, false).await?;
-    handle_submission(state, parsed).await
+    handle_submission(state, parsed, "photo_webapp").await
 }
 
 /// POST /submit/mobile -- Mobile app inquiry (Source D).
@@ -1259,7 +1259,7 @@ async fn mobile_inquiry(
     multipart: Multipart,
 ) -> Result<(StatusCode, Json<SubmitInquiryResponse>), ApiError> {
     let parsed = parse_inquiry_form(multipart, true).await?;
-    handle_submission(state, parsed).await
+    handle_submission(state, parsed, "mobile_app").await
 }
 
 /// `POST /api/v1/submit/video` — Public video inquiry (Source E).
@@ -1620,6 +1620,7 @@ fn parse_bool_field(value: &str) -> bool {
 async fn handle_submission(
     state: Arc<AppState>,
     form: ParsedInquiryForm,
+    source: &str,
 ) -> Result<(StatusCode, Json<SubmitInquiryResponse>), ApiError> {
     // Validate required fields
     let name = form
@@ -1731,13 +1732,21 @@ async fn handle_submission(
         form.message.as_deref(),
     );
 
+    // 5b. Parse services string into JSONB struct
+    let services_struct = parse_services_string(
+        form.services.as_deref(),
+        form.departure_parking_ban,
+        form.arrival_parking_ban,
+    );
+    let services_json = serde_json::to_value(&services_struct).unwrap_or(serde_json::json!({}));
+
     // 6. Create inquiry
     let inquiry_id = Uuid::now_v7();
     sqlx::query(
         r#"
         INSERT INTO inquiries (id, customer_id, origin_address_id, destination_address_id,
-                           status, preferred_date, notes, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
+                           status, preferred_date, notes, services, source, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)
         "#,
     )
     .bind(inquiry_id)
@@ -1747,6 +1756,8 @@ async fn handle_submission(
     .bind("pending")
     .bind(preferred_date_ts)
     .bind(&notes)
+    .bind(&services_json)
+    .bind(source)
     .bind(now)
     .execute(&state.db)
     .await
@@ -1977,6 +1988,26 @@ async fn upload_depth_maps_to_s3(
 }
 
 /// Build notes string from services, parking bans, and optional message.
+/// Convert a comma-separated services string (from multipart form) + parking ban flags
+/// into a typed `Services` struct for JSONB storage.
+fn parse_services_string(
+    services: Option<&str>,
+    departure_parking_ban: Option<bool>,
+    arrival_parking_ban: Option<bool>,
+) -> Services {
+    let s = services.unwrap_or("").to_lowercase();
+    let without_dis = s.replace("disassembly", "").replace("demontage", "");
+    Services {
+        packing: s.contains("packing") || s.contains("einpack") || s.contains("verpackung"),
+        assembly: without_dis.contains("assembly") || without_dis.contains("montage"),
+        disassembly: s.contains("disassembly") || s.contains("demontage"),
+        storage: s.contains("storage") || s.contains("einlagerung"),
+        disposal: s.contains("disposal") || s.contains("entsorgung"),
+        parking_ban_origin: departure_parking_ban.unwrap_or(false),
+        parking_ban_destination: arrival_parking_ban.unwrap_or(false),
+    }
+}
+
 fn build_notes(
     services: Option<&str>,
     departure_parking_ban: Option<bool>,

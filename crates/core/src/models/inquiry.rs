@@ -178,6 +178,8 @@ pub struct MovingInquiry {
     // Contact
     /// Customer's full name; extracted from the form or email body.
     pub name: Option<String>,
+    /// Customer's salutation (Anrede): "Herr", "Frau", or "Divers".
+    pub salutation: Option<String>,
     /// Customer's email address. For form submissions, this comes from the JSON
     /// attachment — *not* from the IMAP `From:` header which is always the
     /// company inbox (`angebot@aust-umzuege.de`).

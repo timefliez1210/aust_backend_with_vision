@@ -14,7 +14,14 @@ struct FormSubmission {
     /// HTML form `name` attribute value (e.g., `"kostenloses-angebot"`).
     #[serde(rename = "form-name")]
     form_name: Option<String>,
+    /// Combined full name (old-style forms). New forms send vorname + nachname separately.
     name: Option<String>,
+    /// Customer's salutation ("Herr", "Frau", "Divers"). German: Anrede.
+    anrede: Option<String>,
+    /// Customer's first name (Vorname). New-style forms only.
+    vorname: Option<String>,
+    /// Customer's last name (Nachname). New-style forms only.
+    nachname: Option<String>,
     /// Customer's real email address (distinct from the IMAP sender which is
     /// always `angebot@aust-umzuege.de`).
     email: Option<String>,
@@ -25,21 +32,24 @@ struct FormSubmission {
     /// Departure street address (Auszugsadresse).
     auszugsadresse: Option<String>,
     /// Floor at departure (e.g., `"2. Stock"`, `"Erdgeschoss"`).
-    #[serde(rename = "etage-auszug")]
+    /// Accepts both "etage-auszug" (kostenloses-angebot) and "etage_auszug" (manuell-angebot).
+    #[serde(rename = "etage-auszug", alias = "etage_auszug")]
     etage_auszug: Option<String>,
-    /// Parking ban needed at departure; `"on"` = true, absent = false.
-    #[serde(rename = "halteverbot-auszug")]
+    /// Parking ban needed at departure; `"on"` or `"true"` = true, absent = false.
+    /// Accepts both "halteverbot-auszug" and "halteverbot_auszug".
+    #[serde(rename = "halteverbot-auszug", alias = "halteverbot_auszug")]
     halteverbot_auszug: Option<String>,
-    /// Elevator at departure; `"on"` = true, absent = false.
-    #[serde(rename = "aufzug-auszug")]
+    /// Elevator at departure; `"on"` or `"true"` = true, absent = false.
+    /// Accepts both "aufzug-auszug" and "aufzug_auszug".
+    #[serde(rename = "aufzug-auszug", alias = "aufzug_auszug")]
     aufzug_auszug: Option<String>,
     /// Arrival street address (Einzugsadresse).
     einzugsadresse: Option<String>,
-    #[serde(rename = "etage-einzug")]
+    #[serde(rename = "etage-einzug", alias = "etage_einzug")]
     etage_einzug: Option<String>,
-    #[serde(rename = "halteverbot-einzug")]
+    #[serde(rename = "halteverbot-einzug", alias = "halteverbot_einzug")]
     halteverbot_einzug: Option<String>,
-    #[serde(rename = "aufzug-einzug")]
+    #[serde(rename = "aufzug-einzug", alias = "aufzug_einzug")]
     aufzug_einzug: Option<String>,
     /// Optional intermediate stop address (Zwischenstopp).
     #[serde(rename = "zwischenstopp-adresse")]
@@ -192,27 +202,45 @@ impl EmailParser {
 
         let has_intermediate = form.zwischenstopp_adresse.is_some();
 
+        // Combine name from vorname + nachname if top-level `name` is absent (new forms).
+        let combined_name = form.name.or_else(|| {
+            let vorname = form.vorname.clone().unwrap_or_default();
+            let nachname = form.nachname.clone()?;
+            let full = if !vorname.is_empty()
+                && nachname.to_lowercase().starts_with(&vorname.to_lowercase())
+            {
+                nachname
+            } else {
+                format!("{} {}", vorname, nachname).trim().to_string()
+            };
+            if full.is_empty() { None } else { Some(full) }
+        });
+
+        // Accept "on" (checkbox) or "true" (JS boolean string) for parking/elevator.
+        let is_truthy = |v: Option<&str>| matches!(v, Some("on") | Some("true"));
+
         Some(MovingInquiry {
             id: Uuid::now_v7(),
             inquiry_id: None,
             source: InquirySource::QuoteForm,
-            name: form.name,
+            name: combined_name,
+            salutation: form.anrede,
             email: form.email.unwrap_or_else(|| email.from.clone()),
             phone: form.phone,
             preferred_date,
             departure_address: form.auszugsadresse,
             departure_floor: form.etage_auszug,
-            departure_parking_ban: Some(form.halteverbot_auszug.as_deref() == Some("on")),
-            departure_elevator: Some(form.aufzug_auszug.as_deref() == Some("on")),
+            departure_parking_ban: Some(is_truthy(form.halteverbot_auszug.as_deref())),
+            departure_elevator: Some(is_truthy(form.aufzug_auszug.as_deref())),
             has_intermediate_stop: has_intermediate,
             intermediate_address: form.zwischenstopp_adresse,
             intermediate_floor: form.etage_zwischenstopp,
-            intermediate_parking_ban: Some(form.halteverbot_zwischenstopp.as_deref() == Some("on")),
-            intermediate_elevator: Some(form.aufzug_zwischenstopp.as_deref() == Some("on")),
+            intermediate_parking_ban: Some(is_truthy(form.halteverbot_zwischenstopp.as_deref())),
+            intermediate_elevator: Some(is_truthy(form.aufzug_zwischenstopp.as_deref())),
             arrival_address: form.einzugsadresse,
             arrival_floor: form.etage_einzug,
-            arrival_parking_ban: Some(form.halteverbot_einzug.as_deref() == Some("on")),
-            arrival_elevator: Some(form.aufzug_einzug.as_deref() == Some("on")),
+            arrival_parking_ban: Some(is_truthy(form.halteverbot_einzug.as_deref())),
+            arrival_elevator: Some(is_truthy(form.aufzug_einzug.as_deref())),
             volume_m3,
             items_list: form.gegenstaende_liste,
             has_photos,
@@ -272,6 +300,8 @@ impl EmailParser {
         photo_count: u32,
     ) -> MovingInquiry {
         let body = &email.body_text;
+
+        let salutation = extract_field(body, "Anrede");
 
         let name = extract_field(body, "Name").or_else(|| {
             // New form format sends Vorname + Nachname separately instead of a single Name field
@@ -357,6 +387,7 @@ impl EmailParser {
             inquiry_id: None,
             source: InquirySource::QuoteForm,
             name,
+            salutation,
             email: form_email.unwrap_or_else(|| email.from.clone()),
             phone,
             preferred_date,
@@ -405,7 +436,19 @@ impl EmailParser {
     ) -> MovingInquiry {
         let body = &email.body_text;
 
-        let name = extract_field(body, "Name");
+        let salutation = extract_field(body, "Anrede");
+        let name = extract_field(body, "Name").or_else(|| {
+            let vorname = extract_field(body, "Vorname").unwrap_or_default();
+            let nachname = extract_field(body, "Nachname")?;
+            let full = if !vorname.is_empty()
+                && nachname.to_lowercase().starts_with(&vorname.to_lowercase())
+            {
+                nachname
+            } else {
+                format!("{} {}", vorname, nachname).trim().to_string()
+            };
+            if full.is_empty() { None } else { Some(full) }
+        });
         let form_email = extract_field(body, "E-Mail");
         let phone = extract_field(body, "Telefon");
         let notes = extract_field(body, "Nachricht");
@@ -414,6 +457,7 @@ impl EmailParser {
             id: Uuid::now_v7(),
             source: InquirySource::ContactForm,
             name,
+            salutation,
             email: form_email.unwrap_or_else(|| email.from.clone()),
             phone,
             has_photos,
