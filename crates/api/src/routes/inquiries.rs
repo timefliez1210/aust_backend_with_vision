@@ -1589,17 +1589,21 @@ async fn parse_inquiry_form(
             }
             "message" | "nachricht" => form.message = Some(read_text_field(field).await?),
             "images" => {
-                let content_type = field.content_type().unwrap_or("image/jpeg").to_string();
-                if !content_type.starts_with("image/") {
-                    continue;
-                }
+                // Accept any file type — images go to vision pipeline, other types
+                // (videos, docs) are stored in S3 and attached to the inquiry.
+                let content_type = field
+                    .content_type()
+                    .map(|ct| ct.to_string())
+                    .unwrap_or_else(|| "application/octet-stream".to_string());
                 let data = field
                     .bytes()
                     .await
                     .map_err(|e| {
-                        ApiError::BadRequest(format!("Bild konnte nicht gelesen werden: {e}"))
+                        ApiError::BadRequest(format!("Datei konnte nicht gelesen werden: {e}"))
                     })?;
-                form.images.push((data.to_vec(), content_type));
+                if !data.is_empty() {
+                    form.images.push((data.to_vec(), content_type));
+                }
             }
             "depth_maps" if accept_depth => {
                 let content_type = field.content_type().unwrap_or("image/png").to_string();
@@ -1658,11 +1662,6 @@ async fn handle_submission(
         .filter(|s| !s.trim().is_empty())
         .ok_or_else(|| ApiError::Validation("Einzugsadresse ist erforderlich".into()))?;
 
-    if form.images.is_empty() {
-        return Err(ApiError::Validation(
-            "Mindestens ein Bild ist erforderlich".into(),
-        ));
-    }
 
     let now = chrono::Utc::now();
 
