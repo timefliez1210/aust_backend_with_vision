@@ -301,9 +301,9 @@ async fn create_inquiry(
     sqlx::query(
         r#"
         INSERT INTO inquiries (id, customer_id, origin_address_id, destination_address_id,
-                           status, preferred_date, notes, services, distance_km, source,
-                           created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11)
+                           status, estimated_volume_m3, preferred_date, notes, services,
+                           distance_km, source, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12)
         "#,
     )
     .bind(inquiry_id)
@@ -311,6 +311,7 @@ async fn create_inquiry(
     .bind(origin_id)
     .bind(dest_id)
     .bind(initial_status.as_str())
+    .bind(request.estimated_volume_m3)
     .bind(preferred_date)
     .bind(&request.notes)
     .bind(&services_json)
