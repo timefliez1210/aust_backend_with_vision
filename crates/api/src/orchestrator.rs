@@ -626,20 +626,39 @@ async fn handle_complete_inquiry(
     let now = chrono::Utc::now();
 
     // 1. Create or find customer by email
+    // Split "Vorname Nachname" into structured fields for the PDF greeting logic.
+    let (inq_first_name, inq_last_name) = inquiry
+        .name
+        .as_deref()
+        .map(|n| {
+            let mut parts = n.splitn(2, ' ');
+            let first = parts.next().unwrap_or("").to_string();
+            let last = parts.next().unwrap_or("").to_string();
+            (
+                if first.is_empty() { None } else { Some(first) },
+                if last.is_empty() { None } else { Some(last) },
+            )
+        })
+        .unwrap_or((None, None));
+
     let customer_id: Uuid = match sqlx::query_as::<_, (Uuid,)>(
         r#"
-        INSERT INTO customers (id, email, name, phone, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $5)
+        INSERT INTO customers (id, email, name, first_name, last_name, phone, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
         ON CONFLICT (email) DO UPDATE SET
-            name = COALESCE(EXCLUDED.name, customers.name),
-            phone = COALESCE(EXCLUDED.phone, customers.phone),
-            updated_at = $5
+            name       = COALESCE(EXCLUDED.name,       customers.name),
+            first_name = COALESCE(EXCLUDED.first_name, customers.first_name),
+            last_name  = COALESCE(EXCLUDED.last_name,  customers.last_name),
+            phone      = COALESCE(EXCLUDED.phone,      customers.phone),
+            updated_at = $7
         RETURNING id
         "#,
     )
     .bind(Uuid::now_v7())
     .bind(&inquiry.email)
     .bind(&inquiry.name)
+    .bind(&inq_first_name)
+    .bind(&inq_last_name)
     .bind(&inquiry.phone)
     .bind(now)
     .fetch_one(&state.db)

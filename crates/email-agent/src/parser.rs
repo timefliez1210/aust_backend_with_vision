@@ -277,7 +277,18 @@ impl EmailParser {
             // New form format sends Vorname + Nachname separately instead of a single Name field
             let vorname = extract_field(body, "Vorname").unwrap_or_default();
             let nachname = extract_field(body, "Nachname")?;
-            let full = format!("{} {}", vorname, nachname).trim().to_string();
+            // If the user put their full name in Nachname (e.g. "Clemens Fabig" instead of just
+            // "Fabig"), avoid doubling the first name by checking if Nachname already starts with
+            // Vorname.
+            let full = if !vorname.is_empty()
+                && nachname
+                    .to_lowercase()
+                    .starts_with(&vorname.to_lowercase())
+            {
+                nachname
+            } else {
+                format!("{} {}", vorname, nachname).trim().to_string()
+            };
             Some(full)
         });
         let form_email = extract_field(body, "E-Mail")
