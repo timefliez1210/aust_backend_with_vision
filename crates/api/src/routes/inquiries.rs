@@ -1075,15 +1075,20 @@ async fn trigger_video_upload(
     {
         let field_name = field.name().unwrap_or("").to_string();
         if field_name == "video" {
+            // Accept any content-type that starts with "video/", or fall back to
+            // "video/mp4" for generic types (application/octet-stream, empty) that
+            // some browsers/OS combos send for valid video files (.mov, .mkv, etc.).
+            // The frontend already validates by file extension before queuing.
             let content_type = field
                 .content_type()
-                .unwrap_or("video/mp4")
-                .to_string();
-            if !content_type.starts_with("video/") {
-                return Err(ApiError::Validation(format!(
-                    "Ungültiger Dateityp '{content_type}'. Erwartet: video/*"
-                )));
-            }
+                .map(|ct| {
+                    if ct.starts_with("video/") {
+                        ct.to_string()
+                    } else {
+                        "video/mp4".to_string()
+                    }
+                })
+                .unwrap_or_else(|| "video/mp4".to_string());
             let data = field
                 .bytes()
                 .await
