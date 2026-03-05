@@ -1296,7 +1296,7 @@ async fn video_inquiry(
     let mut preferred_date: Option<String> = None;
     let mut services_text: Option<String> = None;
     let mut message: Option<String> = None;
-    let mut video_data: Option<(Vec<u8>, String)> = None;
+    let mut video_files: Vec<(Vec<u8>, String)> = Vec::new();
 
     while let Some(field) = multipart
         .next_field()
@@ -1335,16 +1335,20 @@ async fn video_inquiry(
             "zusatzleistungen" | "services" => services_text = Some(read_text_field(field).await?),
             "nachricht" | "message" => message = Some(read_text_field(field).await?),
             "video" => {
-                let content_type = field.content_type().unwrap_or("video/mp4").to_string();
-                if !content_type.starts_with("video/") {
-                    return Err(ApiError::Validation(format!(
-                        "Ungültiger Dateityp '{content_type}'. Erwartet: video/*"
-                    )));
-                }
+                // Accept any video/* MIME type; fall back to video/mp4 for generic types
+                // (application/octet-stream, empty) that browsers send for .mov, .mkv, etc.
+                let content_type = field
+                    .content_type()
+                    .map(|ct| {
+                        if ct.starts_with("video/") { ct.to_string() } else { "video/mp4".to_string() }
+                    })
+                    .unwrap_or_else(|| "video/mp4".to_string());
                 let data = field.bytes().await.map_err(|e| {
                     ApiError::BadRequest(format!("Video konnte nicht gelesen werden: {e}"))
                 })?;
-                video_data = Some((data.to_vec(), content_type));
+                if !data.is_empty() {
+                    video_files.push((data.to_vec(), content_type));
+                }
             }
             _ => continue,
         }
@@ -1358,10 +1362,8 @@ async fn video_inquiry(
         .ok_or_else(|| ApiError::Validation("Auszugsadresse ist erforderlich".into()))?;
     let arrival_address = arrival_address.filter(|s| !s.trim().is_empty())
         .ok_or_else(|| ApiError::Validation("Einzugsadresse ist erforderlich".into()))?;
-    let (video_bytes, mime_type) = video_data
-        .ok_or_else(|| ApiError::Validation("Kein Video-Feld in der Anfrage gefunden".into()))?;
-    if video_bytes.is_empty() {
-        return Err(ApiError::Validation("Video-Datei ist leer".into()));
+    if video_files.is_empty() {
+        return Err(ApiError::Validation("Kein Video-Feld in der Anfrage gefunden".into()));
     }
 
     let now = chrono::Utc::now();
@@ -1426,23 +1428,31 @@ async fn video_inquiry(
     .execute(&state.db).await
     .map_err(|e| ApiError::Internal(format!("Anfrage konnte nicht erstellt werden: {e}")))?;
 
-    // Pre-create estimation row for polling
-    let estimation_id = Uuid::now_v7();
-    sqlx::query(
-        "INSERT INTO volume_estimations (id, inquiry_id, method, status, source_data, created_at) \
-         VALUES ($1, $2, 'video', 'processing', '{}', NOW())",
-    )
-    .bind(estimation_id).bind(inquiry_id).execute(&state.db).await
-    .map_err(|e| ApiError::Internal(format!("Schätzung konnte nicht erstellt werden: {e}")))?;
+    // Pre-create one estimation row per uploaded video
+    let mut estimation_ids: Vec<Uuid> = Vec::new();
+    for _ in &video_files {
+        let eid = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO volume_estimations (id, inquiry_id, method, status, source_data, created_at) \
+             VALUES ($1, $2, 'video', 'processing', '{}', NOW())",
+        )
+        .bind(eid).bind(inquiry_id).execute(&state.db).await
+        .map_err(|e| ApiError::Internal(format!("Schätzung konnte nicht erstellt werden: {e}")))?;
+        estimation_ids.push(eid);
+    }
 
-    tracing::info!(inquiry_id = %inquiry_id, "Video inquiry created, spawning background processing");
+    tracing::info!(
+        inquiry_id = %inquiry_id,
+        video_count = video_files.len(),
+        "Video inquiry created, spawning background processing"
+    );
 
-    // Spawn background: distance calc → S3 → semaphore → Modal video → offer
+    // Spawn background: distance calc → for each video: S3 → semaphore → Modal → offer
     let state_bg = Arc::clone(&state);
     let dep_addr = departure_address.clone();
     let arr_addr = arrival_address.clone();
     tokio::spawn(async move {
-        // Distance calculation
+        // Distance calculation (once, shared across all videos)
         let api_key = &state_bg.config.maps.api_key;
         if !api_key.is_empty() {
             let calc = aust_distance_calculator::RouteCalculator::new(api_key.clone());
@@ -1456,12 +1466,14 @@ async fn video_inquiry(
                 Err(e) => tracing::warn!(inquiry_id = %inquiry_id, error = %e, "Distance calculation failed"),
             }
         }
-        if let Err(e) = process_video_background(state_bg.clone(), inquiry_id, estimation_id, video_bytes, mime_type).await {
-            tracing::error!(inquiry_id = %inquiry_id, error = %e, "Background video estimation failed");
-            let _ = sqlx::query(
-                "UPDATE volume_estimations SET status = 'failed' WHERE id = $1 AND status = 'processing'",
-            )
-            .bind(estimation_id).execute(&state_bg.db).await;
+        for ((video_bytes, mime_type), estimation_id) in video_files.into_iter().zip(estimation_ids.into_iter()) {
+            if let Err(e) = process_video_background(state_bg.clone(), inquiry_id, estimation_id, video_bytes, mime_type).await {
+                tracing::error!(inquiry_id = %inquiry_id, estimation_id = %estimation_id, error = %e, "Background video estimation failed");
+                let _ = sqlx::query(
+                    "UPDATE volume_estimations SET status = 'failed' WHERE id = $1 AND status = 'processing'",
+                )
+                .bind(estimation_id).execute(&state_bg.db).await;
+            }
         }
     });
 
