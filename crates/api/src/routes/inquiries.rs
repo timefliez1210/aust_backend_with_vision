@@ -466,31 +466,26 @@ async fn update_inquiry(
     Ok(Json(response))
 }
 
-/// `DELETE /api/v1/inquiries/{id}` -- Soft-delete by setting status to cancelled.
+/// `DELETE /api/v1/inquiries/{id}` -- Hard-delete inquiry and all related records.
 ///
-/// **Caller**: Admin dashboard.
-/// **Why**: Inquiries are never physically deleted for audit trail.
+/// **Caller**: Admin dashboard trash-bin button.
+/// **Why**: Permanently removes the inquiry. FK constraints with CASCADE DELETE
+/// handle offers, estimations, items, email threads, and bookings automatically.
 async fn delete_inquiry(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
-) -> Result<Json<InquiryResponseModel>, ApiError> {
-    let now = chrono::Utc::now();
-
-    let rows_affected = sqlx::query(
-        "UPDATE inquiries SET status = 'cancelled', updated_at = $2 WHERE id = $1",
-    )
-    .bind(id)
-    .bind(now)
-    .execute(&state.db)
-    .await?
-    .rows_affected();
+) -> Result<StatusCode, ApiError> {
+    let rows_affected = sqlx::query("DELETE FROM inquiries WHERE id = $1")
+        .bind(id)
+        .execute(&state.db)
+        .await?
+        .rows_affected();
 
     if rows_affected == 0 {
         return Err(ApiError::NotFound(format!("Inquiry {id} not found")));
     }
 
-    let response = inquiry_builder::build_inquiry_response(&state.db, id).await?;
-    Ok(Json(response))
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `GET /api/v1/inquiries/{id}/pdf` -- Download latest active offer PDF.
