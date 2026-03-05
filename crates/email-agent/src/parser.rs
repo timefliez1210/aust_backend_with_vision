@@ -273,7 +273,13 @@ impl EmailParser {
     ) -> MovingInquiry {
         let body = &email.body_text;
 
-        let name = extract_field(body, "Name");
+        let name = extract_field(body, "Name").or_else(|| {
+            // New form format sends Vorname + Nachname separately instead of a single Name field
+            let vorname = extract_field(body, "Vorname").unwrap_or_default();
+            let nachname = extract_field(body, "Nachname")?;
+            let full = format!("{} {}", vorname, nachname).trim().to_string();
+            Some(full)
+        });
         let form_email = extract_field(body, "E-Mail")
             .or_else(|| extract_field(body, "Email"))
             .or_else(|| extract_section_field(body, "Kontaktdaten", "E-Mail"))
