@@ -1801,8 +1801,8 @@ async fn employee_hours_summary(
         LEFT JOIN addresses da ON i.destination_address_id = da.id
         LEFT JOIN calendar_bookings cb ON cb.inquiry_id = i.id AND cb.status != 'cancelled'
         WHERE ie.employee_id = $1
-          AND COALESCE(cb.booking_date, i.preferred_date::date) BETWEEN $2 AND $3
-        ORDER BY COALESCE(cb.booking_date, i.preferred_date::date)
+          AND COALESCE(cb.booking_date, i.preferred_date::date, ie.created_at::date) BETWEEN $2 AND $3
+        ORDER BY COALESCE(cb.booking_date, i.preferred_date::date, ie.created_at::date)
         "#,
     )
     .bind(id)
@@ -1884,7 +1884,7 @@ async fn fetch_employee_month_hours(
         JOIN inquiries i ON ie.inquiry_id = i.id
         LEFT JOIN calendar_bookings cb ON cb.inquiry_id = i.id AND cb.status != 'cancelled'
         WHERE ie.employee_id = $1
-          AND COALESCE(cb.booking_date, i.preferred_date::date) BETWEEN $2 AND $3
+          AND COALESCE(cb.booking_date, i.preferred_date::date, ie.created_at::date) BETWEEN $2 AND $3
         "#,
     )
     .bind(employee_id)
