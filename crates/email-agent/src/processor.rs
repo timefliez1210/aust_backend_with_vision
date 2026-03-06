@@ -107,17 +107,44 @@ impl EmailProcessor {
         &self,
         customer_email: &str,
         subject: &str,
+        inquiry: &MovingInquiry,
     ) -> Option<Uuid> {
-        // Upsert customer by email → get customer_id
+        // Split combined name into first/last for structured DB fields.
+        let (first_name, last_name) = inquiry
+            .name
+            .as_deref()
+            .map(|n| {
+                let mut parts = n.splitn(2, ' ');
+                let first = parts.next().unwrap_or("").to_string();
+                let last = parts.next().unwrap_or("").to_string();
+                (
+                    if first.is_empty() { None } else { Some(first) },
+                    if last.is_empty() { None } else { Some(last) },
+                )
+            })
+            .unwrap_or((None, None));
+
+        // Upsert customer by email — store name/salutation/phone if available.
         let _ = sqlx::query(
             r#"
-            INSERT INTO customers (id, email, created_at, updated_at)
-            VALUES ($1, $2, NOW(), NOW())
-            ON CONFLICT (email) DO NOTHING
+            INSERT INTO customers (id, email, name, salutation, first_name, last_name, phone, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+            ON CONFLICT (email) DO UPDATE SET
+                name       = COALESCE(EXCLUDED.name,       customers.name),
+                salutation = COALESCE(EXCLUDED.salutation, customers.salutation),
+                first_name = COALESCE(EXCLUDED.first_name, customers.first_name),
+                last_name  = COALESCE(EXCLUDED.last_name,  customers.last_name),
+                phone      = COALESCE(EXCLUDED.phone,      customers.phone),
+                updated_at = NOW()
             "#,
         )
         .bind(Uuid::now_v7())
         .bind(customer_email)
+        .bind(&inquiry.name)
+        .bind(&inquiry.salutation)
+        .bind(&first_name)
+        .bind(&last_name)
+        .bind(&inquiry.phone)
         .execute(&self.db)
         .await
         .map_err(|e| warn!("Failed to upsert customer for email tracking: {e}"));
@@ -351,7 +378,7 @@ impl EmailProcessor {
 
         // Store inbound email in database (after inquiry borrow is released)
         let thread_id = self
-            .find_or_create_thread(&customer_email_final, &email.subject)
+            .find_or_create_thread(&customer_email_final, &email.subject, &inquiry_snapshot)
             .await;
         if let Some(tid) = thread_id {
             self.store_inbound_email(
