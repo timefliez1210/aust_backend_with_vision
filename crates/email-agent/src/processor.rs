@@ -394,29 +394,33 @@ impl EmailProcessor {
             }
         }
 
-        // Generate draft response (with availability context)
-        match self
-            .responder
-            .generate_response(&inquiry_snapshot, &email.body_text, availability.as_ref())
-            .await
-        {
-            Ok(response) => {
-                self.submit_draft_for_approval(
-                    &customer_email,
-                    response,
-                    email.message_id.clone(),
-                    inquiry_snapshot,
-                    thread_id,
-                )
-                .await;
-            }
-            Err(e) => {
-                error!("Failed to generate response for {customer_email}: {e}");
-                let tg = self.telegram.lock().await;
-                tg.send_status_message(&format!(
-                    "Fehler bei Antwort-Generierung für {customer_email}: {e}"
-                ))
-                .await;
+        // Generate draft response only for incomplete inquiries.
+        // When complete, the offer pipeline creates the customer-facing email draft instead —
+        // no "wird erstellt" confirmation needed, the offer email IS the response.
+        if !inquiry_snapshot.is_complete() {
+            match self
+                .responder
+                .generate_response(&inquiry_snapshot, &email.body_text, availability.as_ref())
+                .await
+            {
+                Ok(response) => {
+                    self.submit_draft_for_approval(
+                        &customer_email,
+                        response,
+                        email.message_id.clone(),
+                        inquiry_snapshot,
+                        thread_id,
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    error!("Failed to generate response for {customer_email}: {e}");
+                    let tg = self.telegram.lock().await;
+                    tg.send_status_message(&format!(
+                        "Fehler bei Antwort-Generierung für {customer_email}: {e}"
+                    ))
+                    .await;
+                }
             }
         }
 

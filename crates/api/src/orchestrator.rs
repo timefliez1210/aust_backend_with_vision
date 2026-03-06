@@ -1488,26 +1488,28 @@ fn extract_number(s: &str) -> Option<f64> {
     num_str.parse::<f64>().ok()
 }
 
-/// Download the approved offer PDF from S3 and email it to the customer.
+/// Create an editable email draft in the admin dashboard when an offer is approved in Telegram.
 ///
 /// **Caller**: `run_offer_event_handler` on `ApprovalDecision::OfferApprove`.
-/// **Why**: Alex presses ✅ in Telegram after reviewing the PDF. At that point the offer
-/// should be delivered to the customer without further manual steps.
+/// **Why**: Alex presses ✅ in Telegram after reviewing the PDF. Instead of auto-sending the
+/// offer email to the customer, we create a draft in the email thread so Alex can review and
+/// edit the cover letter in the admin dashboard before explicitly sending it with the PDF.
 ///
 /// # Flow
-/// 1. Look up `customer.email` and `offer.pdf_storage_key` by joining `offers → quotes → customers`.
-/// 2. Download PDF bytes from S3/MinIO via the storage provider.
-/// 3. Send the PDF as an email attachment via SMTP (`send_offer_email`).
-/// 4. On success: mark offer `status = 'sent'`, quote `status = 'offer_sent'`, and store the
-///    outbound email in the `email_messages` table for the customer's thread.
-/// 5. Confirm success or report error back to Alex via Telegram.
+/// 1. Look up `customer.email` and `inquiry_id` from the approved offer.
+/// 2. Find or create an email thread for the inquiry.
+/// 3. Insert a draft `email_message` (status='draft') with a cover letter template.
+/// 4. Notify Alex via Telegram that the draft is ready in the dashboard.
+///
+/// The draft is sent (with PDF attached) via `POST /api/v1/admin/emails/messages/{id}/send`
+/// from the admin frontend once Alex is satisfied with the cover letter.
 ///
 /// # Parameters
-/// - `state` — shared application state (DB, storage, email config)
+/// - `state` — shared application state (DB, email config)
 /// - `client` — HTTP client for Telegram API calls
 /// - `bot_token` — Telegram bot token
 /// - `chat_id` — admin Telegram chat ID
-/// - `offer_id` — the offer to approve and send
+/// - `offer_id` — the offer that was approved
 async fn handle_offer_approval(
     state: &AppState,
     client: &Client,
@@ -1515,11 +1517,11 @@ async fn handle_offer_approval(
     chat_id: i64,
     offer_id: Uuid,
 ) {
-    info!("Offer {offer_id} approved, sending to customer");
+    info!("Offer {offer_id} approved — creating email draft for admin to review and send");
 
-    let row: Option<(String, Option<String>, Uuid)> = sqlx::query_as(
+    let row: Option<(String, Uuid)> = sqlx::query_as(
         r#"
-        SELECT c.email, o.pdf_storage_key, o.inquiry_id
+        SELECT c.email, o.inquiry_id
         FROM offers o
         JOIN inquiries q ON o.inquiry_id = q.id
         JOIN customers c ON q.customer_id = c.id
@@ -1531,101 +1533,149 @@ async fn handle_offer_approval(
     .await
     .unwrap_or(None);
 
-    let Some((customer_email, Some(storage_key), inquiry_id)) = row else {
+    let Some((customer_email, inquiry_id)) = row else {
         send_telegram_message(
             client,
             bot_token,
             chat_id,
-            "Fehler: Angebot oder PDF nicht gefunden.",
+            "Fehler: Angebot nicht gefunden.",
         )
         .await;
         return;
     };
 
-    let pdf_bytes = match state.storage.download(&storage_key).await {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            error!("Failed to download offer PDF: {e}");
-            send_telegram_message(
-                client,
-                bot_token,
-                chat_id,
-                &format!("Fehler beim PDF-Download: {e}"),
-            )
-            .await;
-            return;
-        }
+    // Find or create an email thread for this inquiry so the draft is visible in the dashboard.
+    let thread_id = find_or_create_offer_thread(state, inquiry_id, &customer_email).await;
+
+    let Some(thread_id) = thread_id else {
+        send_telegram_message(
+            client,
+            bot_token,
+            chat_id,
+            &format!("Fehler: E-Mail-Thread für {customer_email} konnte nicht erstellt werden."),
+        )
+        .await;
+        return;
     };
 
-    match send_offer_email(state, &customer_email, &pdf_bytes, offer_id).await {
-        Ok(()) => {
-            let now = chrono::Utc::now();
-            let _ = sqlx::query("UPDATE offers SET status = 'sent', sent_at = $1 WHERE id = $2")
-                .bind(now)
-                .bind(offer_id)
-                .execute(&state.db)
-                .await;
+    let body = "Sehr geehrte/r [Name],\n\n\
+        anbei erhalten Sie Ihr persönliches Umzugsangebot.\n\n\
+        Bei Rückfragen stehen wir Ihnen gerne unter 05121 – 7558379 zur Verfügung.\n\n\
+        Mit freundlichen Grüßen,\n\
+        Ihr AUST Umzüge Team";
 
-            // Also update quote status to offer_sent
-            let _ = sqlx::query("UPDATE inquiries SET status = 'offer_sent', updated_at = $1 WHERE id = $2")
-                .bind(now)
-                .bind(inquiry_id)
-                .execute(&state.db)
-                .await;
+    let _ = sqlx::query(
+        r#"
+        INSERT INTO email_messages (id, thread_id, direction, from_address, to_address, subject, body_text, llm_generated, status, created_at)
+        VALUES ($1, $2, 'outbound', $3, $4, $5, $6, false, 'draft', NOW())
+        "#,
+    )
+    .bind(Uuid::now_v7())
+    .bind(thread_id)
+    .bind(&state.config.email.from_address)
+    .bind(&customer_email)
+    .bind("Ihr Umzugsangebot — AUST Umzüge")
+    .bind(body)
+    .execute(&state.db)
+    .await;
 
-            // Store offer email in thread (if a thread exists for this quote's customer)
-            let thread_row: Option<(Uuid,)> = sqlx::query_as(
-                r#"
-                SELECT et.id FROM email_threads et
-                JOIN inquiries q ON et.customer_id = q.customer_id
-                WHERE q.id = $1
-                ORDER BY et.created_at DESC LIMIT 1
-                "#,
-            )
-            .bind(inquiry_id)
+    send_telegram_message(
+        client,
+        bot_token,
+        chat_id,
+        &format!(
+            "✅ Angebot freigegeben! Entwurf für {customer_email} im Dashboard bereit — bitte prüfen und senden."
+        ),
+    )
+    .await;
+}
+
+/// Find an existing email thread for an inquiry, or create a new one linked to it.
+///
+/// **Caller**: `handle_offer_approval` — needs a thread to store the outbound offer email draft.
+/// **Why**: The offer email draft must live in a thread so it appears in the admin email view
+/// and can be sent via the frontend. This covers three cases: thread already linked by `inquiry_id`,
+/// thread linked by `customer_id`, or no thread yet (creates one).
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool, no SMTP needed here)
+/// - `inquiry_id` — the inquiry whose offer was approved
+/// - `customer_email` — customer email address (used to look up customer_id for new threads)
+///
+/// # Returns
+/// The thread UUID to insert the draft into, or `None` if creation failed.
+async fn find_or_create_offer_thread(
+    state: &AppState,
+    inquiry_id: Uuid,
+    customer_email: &str,
+) -> Option<Uuid> {
+    // 1. Thread already directly linked to this inquiry
+    let existing: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM email_threads WHERE inquiry_id = $1 ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(inquiry_id)
+    .fetch_optional(&state.db)
+    .await
+    .unwrap_or(None);
+
+    if let Some((tid,)) = existing {
+        return Some(tid);
+    }
+
+    // 2. Thread linked by customer (not yet linked to this inquiry)
+    let existing: Option<(Uuid,)> = sqlx::query_as(
+        r#"
+        SELECT et.id FROM email_threads et
+        JOIN inquiries q ON et.customer_id = q.customer_id
+        WHERE q.id = $1
+        ORDER BY et.created_at DESC LIMIT 1
+        "#,
+    )
+    .bind(inquiry_id)
+    .fetch_optional(&state.db)
+    .await
+    .unwrap_or(None);
+
+    if let Some((tid,)) = existing {
+        // Link thread to inquiry while we're here
+        let _ = sqlx::query(
+            "UPDATE email_threads SET inquiry_id = $1, updated_at = NOW() WHERE id = $2",
+        )
+        .bind(inquiry_id)
+        .bind(tid)
+        .execute(&state.db)
+        .await;
+        return Some(tid);
+    }
+
+    // 3. No thread exists — create one (e.g. manually-created admin inquiry)
+    let customer_id: Option<(Uuid,)> =
+        sqlx::query_as("SELECT id FROM customers WHERE email = $1")
+            .bind(customer_email)
             .fetch_optional(&state.db)
             .await
             .unwrap_or(None);
 
-            if let Some((thread_id,)) = thread_row {
-                let body = "Sehr geehrte Damen und Herren,\n\n\
-                    anbei erhalten Sie unser Angebot für Ihren Umzug.\n\n\
-                    Bei Fragen stehen wir Ihnen gerne zur Verfügung.\n\n\
-                    Mit freundlichen Grüßen,\nIhr Umzugsteam";
+    let Some((customer_id,)) = customer_id else {
+        warn!("Cannot create email thread: customer not found for {customer_email}");
+        return None;
+    };
 
-                let _ = sqlx::query(
-                    r#"
-                    INSERT INTO email_messages (id, thread_id, direction, from_address, to_address, subject, body_text, llm_generated, created_at)
-                    VALUES ($1, $2, 'outbound', $3, $4, $5, $6, false, NOW())
-                    "#,
-                )
-                .bind(Uuid::now_v7())
-                .bind(thread_id)
-                .bind(&state.config.email.from_address)
-                .bind(&customer_email)
-                .bind("Ihr Umzugsangebot")
-                .bind(body)
-                .execute(&state.db)
-                .await;
-            }
-
-            send_telegram_message(
-                client,
-                bot_token,
-                chat_id,
-                &format!("✅ Angebot an {customer_email} gesendet!"),
-            )
-            .await;
-        }
+    let thread_id = Uuid::now_v7();
+    match sqlx::query(
+        "INSERT INTO email_threads (id, customer_id, inquiry_id, subject, created_at, updated_at) VALUES ($1, $2, $3, $4, NOW(), NOW())",
+    )
+    .bind(thread_id)
+    .bind(customer_id)
+    .bind(inquiry_id)
+    .bind("Ihr Umzugsangebot — AUST Umzüge")
+    .execute(&state.db)
+    .await
+    {
+        Ok(_) => Some(thread_id),
         Err(e) => {
-            error!("Failed to send offer email: {e}");
-            send_telegram_message(
-                client,
-                bot_token,
-                chat_id,
-                &format!("Fehler beim E-Mail-Versand: {e}"),
-            )
-            .await;
+            error!("Failed to create email thread for offer draft: {e}");
+            None
         }
     }
 }
