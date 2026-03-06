@@ -386,31 +386,47 @@ pub async fn build_offer_with_overrides(
         pricing_result.total_price_cents = price;
     }
 
-    // 7. Build line items: Fahrkostenpauschale is ALWAYS re-computed via ORS (never stale),
-    //    then either the custom override items or the auto-generated notes items follow.
-    //    When the frontend sends a line_items override after an edit cycle, any stale
-    //    Fahrkostenpauschale in that list is stripped so the fresh one isn't doubled.
-    let fahrt_item = build_fahrt_item(
-        config,
-        origin.as_ref(),
-        destination.as_ref(),
-        stop_address.as_ref(),
-        distance,
-    )
-    .await;
-
+    // 7. Build line items.
+    //    Fahrkostenpauschale: if the admin explicitly provided one in the override, use that value
+    //    (converting qty×price → flat_total for correct XLSX rendering). Otherwise re-compute via ORS.
     let quote_services = quote.services.clone().unwrap_or_default();
 
     let line_items = if let Some(ref items) = overrides.line_items {
+        // Check whether the admin sent a Fahrkostenpauschale override
+        let fahrt_item = if let Some(admin_fahrt) = items.iter().find(|li| li.description == "Fahrkostenpauschale") {
+            // Admin overrode the value — normalise to flat_total for XLSX
+            let total = admin_fahrt.flat_total.unwrap_or(admin_fahrt.quantity * admin_fahrt.unit_price);
+            OfferLineItem {
+                description: "Fahrkostenpauschale".to_string(),
+                quantity: 0.0,
+                unit_price: 0.0,
+                is_labor: false,
+                flat_total: Some(total),
+                remark: admin_fahrt.remark.clone(),
+            }
+        } else {
+            // No override — re-compute from ORS
+            build_fahrt_item(config, origin.as_ref(), destination.as_ref(), stop_address.as_ref(), distance).await
+        };
         let mut result = vec![fahrt_item];
         result.extend(
             items
                 .iter()
-                .filter(|li| li.description != "Fahrkostenpauschale")
+                .filter(|li| li.description != "Fahrkostenpauschale" && li.description != "Nürnbergerversicherung")
                 .cloned(),
         );
+        // Always append Nürnbergerversicherung last — non-editable fixed item
+        result.push(OfferLineItem {
+            description: "Nürnbergerversicherung".to_string(),
+            quantity: 1.0,
+            unit_price: 0.0,
+            flat_total: Some(0.0),
+            remark: Some("Deckungssumme: 620,00 Euro / m³".to_string()),
+            ..Default::default()
+        });
         result
     } else {
+        let fahrt_item = build_fahrt_item(config, origin.as_ref(), destination.as_ref(), stop_address.as_ref(), distance).await;
         let mut items = vec![fahrt_item];
         items.extend(build_line_items(&quote_services));
         items
@@ -973,6 +989,7 @@ fn build_line_items(services: &Services) -> Vec<OfferLineItem> {
         quantity: 1.0,
         unit_price: 0.0,
         flat_total: Some(0.0),
+        remark: Some("Deckungssumme: 620,00 Euro / m³".to_string()),
         ..Default::default()
     });
 
