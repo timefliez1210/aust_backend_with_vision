@@ -265,14 +265,24 @@ curl http://localhost:8080/ready
 - `POST /api/v1/customer/inquiries/{id}/reject` - Reject offer
 - `GET /api/v1/customer/inquiries/{id}/pdf` - Download offer PDF
 
-### Admin (dashboard, customers, emails, users)
+### Admin (dashboard, customers, employees, emails, users)
 - `GET /api/v1/admin/dashboard` - KPIs and recent activity
 - `GET/POST /api/v1/admin/customers` - List / create customers
 - `GET/PATCH /api/v1/admin/customers/{id}` - Detail / update customer
 - `PATCH /api/v1/admin/addresses/{id}` - Update address
+- `GET/POST /api/v1/admin/employees` - List / create employees
+- `GET/PATCH /api/v1/admin/employees/{id}` - Detail / update employee
+- `POST /api/v1/admin/employees/{id}/delete` - Soft-delete (active=false)
+- `GET /api/v1/admin/employees/{id}/hours` - Monthly hours summary
 - `GET /api/v1/admin/emails` - List email threads
 - `GET /api/v1/admin/emails/{id}` - Thread detail
 - `GET /api/v1/admin/users` - List users
+
+### Inquiry Employee Assignments
+- `GET /api/v1/inquiries/{id}/employees` - List assigned employees
+- `POST /api/v1/inquiries/{id}/employees` - Assign employee
+- `PATCH /api/v1/inquiries/{id}/employees/{emp_id}` - Update hours/notes
+- `DELETE /api/v1/inquiries/{id}/employees/{emp_id}` - Remove assignment
 
 ## Data Flow — Quote-to-Offer Pipeline
 
@@ -432,6 +442,8 @@ Key tables:
 - `calendar_bookings` - Moving date bookings with status (FK: `inquiry_id`)
 - `calendar_capacity_overrides` - Date-specific capacity limits
 - `users` - Admin users
+- `employees` - Employee profiles (salutation, name, email, phone, monthly_hours_target, active)
+- `inquiry_employees` - Junction: employee ↔ inquiry assignment (planned_hours, actual_hours, notes)
 
 ### Inquiry Status State Machine
 

@@ -7,9 +7,9 @@ use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
 use aust_core::models::{
-    AddressSnapshot, CustomerSnapshot, EstimationSnapshot, InquiryListItem,
-    InquiryResponse, InquiryStatus, ItemSnapshot, LineItemSnapshot, OfferSnapshot,
-    Services,
+    AddressSnapshot, CustomerSnapshot, EmployeeAssignmentSnapshot, EstimationSnapshot,
+    InquiryListItem, InquiryResponse, InquiryStatus, ItemSnapshot, LineItemSnapshot,
+    OfferSnapshot, Services,
 };
 
 use crate::routes::offers::{parse_detected_items, VolumeEstimationRow};
@@ -287,10 +287,13 @@ pub async fn build_inquiry_response(
 
     let offer = offer_row.map(|r| build_offer_snapshot(&r));
 
-    // 6. Extract customer message from notes
+    // 6. Fetch employee assignments
+    let employees = fetch_employee_assignments(pool, inquiry_id).await?;
+
+    // 7. Extract customer message from notes
     let customer_message = extract_customer_message(row.notes.as_deref());
 
-    // 7. Assemble response
+    // 8. Assemble response
     Ok(InquiryResponse {
         id: row.id,
         status,
@@ -324,6 +327,7 @@ pub async fn build_inquiry_response(
         estimation,
         items,
         offer,
+        employees,
     })
 }
 
@@ -562,6 +566,53 @@ fn extract_s3_keys(source_data: Option<&serde_json::Value>) -> Vec<String> {
                 .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         })
         .unwrap_or_default()
+}
+
+/// Fetch employee assignments for an inquiry.
+///
+/// **Caller**: `build_inquiry_response`
+/// **Why**: Embeds assigned employees in the canonical inquiry detail response.
+async fn fetch_employee_assignments(
+    pool: &PgPool,
+    inquiry_id: Uuid,
+) -> Result<Vec<EmployeeAssignmentSnapshot>, crate::ApiError> {
+    #[derive(Debug, FromRow)]
+    struct Row {
+        employee_id: Uuid,
+        first_name: String,
+        last_name: String,
+        planned_hours: f64,
+        actual_hours: Option<f64>,
+        notes: Option<String>,
+    }
+
+    let rows: Vec<Row> = sqlx::query_as(
+        r#"
+        SELECT ie.employee_id, e.first_name, e.last_name,
+               ie.planned_hours::float8 AS planned_hours,
+               ie.actual_hours::float8 AS actual_hours,
+               ie.notes
+        FROM inquiry_employees ie
+        JOIN employees e ON ie.employee_id = e.id
+        WHERE ie.inquiry_id = $1
+        ORDER BY e.last_name, e.first_name
+        "#,
+    )
+    .bind(inquiry_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| EmployeeAssignmentSnapshot {
+            employee_id: r.employee_id,
+            first_name: r.first_name,
+            last_name: r.last_name,
+            planned_hours: r.planned_hours,
+            actual_hours: r.actual_hours,
+            notes: r.notes,
+        })
+        .collect())
 }
 
 /// Extract free-text customer remarks from notes, stripping known service keywords.

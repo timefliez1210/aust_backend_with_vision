@@ -20,6 +20,9 @@ pub enum ApiError {
     #[error("Forbidden: {0}")]
     Forbidden(String),
 
+    #[error("Conflict: {0}")]
+    Conflict(String),
+
     #[error("Internal error: {0}")]
     Internal(String),
 
@@ -43,6 +46,7 @@ impl IntoResponse for ApiError {
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, "bad_request", msg.clone()),
             ApiError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, "unauthorized", msg.clone()),
             ApiError::Forbidden(msg) => (StatusCode::FORBIDDEN, "forbidden", msg.clone()),
+            ApiError::Conflict(msg) => (StatusCode::CONFLICT, "conflict", msg.clone()),
             ApiError::Internal(msg) => {
                 tracing::error!("Internal error: {}", msg);
                 (

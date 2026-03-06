@@ -64,6 +64,8 @@ pub struct InquiryResponse {
     pub items: Vec<ItemSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub offer: Option<OfferSnapshot>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub employees: Vec<EmployeeAssignmentSnapshot>,
 }
 
 /// Summary item for list endpoints.
@@ -179,6 +181,20 @@ pub struct LineItemSnapshot {
     pub is_labor: bool,
     #[serde(default)]
     pub is_flat_total: bool,
+}
+
+/// Snapshot of an employee assignment on an inquiry.
+///
+/// **Caller**: `build_inquiry_response()` in `inquiry_builder.rs`
+/// **Why**: Embeds assigned employee info in the canonical inquiry detail response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmployeeAssignmentSnapshot {
+    pub employee_id: Uuid,
+    pub first_name: String,
+    pub last_name: String,
+    pub planned_hours: f64,
+    pub actual_hours: Option<f64>,
+    pub notes: Option<String>,
 }
 
 #[cfg(test)]

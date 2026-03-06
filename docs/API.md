@@ -233,6 +233,19 @@ Status transitions are validated server-side by `InquiryStatus::can_transition_t
   estimation: EstimationSnapshot | null;
   items: ItemSnapshot[];
   offer: OfferSnapshot | null;
+  employees: EmployeeAssignmentSnapshot[];  // empty array if none assigned
+}
+```
+
+`EmployeeAssignmentSnapshot`:
+```typescript
+{
+  employee_id: string;
+  first_name: string;
+  last_name: string;
+  planned_hours: number;
+  actual_hours: number | null;
+  notes: string | null;
 }
 ```
 
@@ -1586,6 +1599,205 @@ List completed/confirmed orders (inquiries with status `completed`, `invoiced`, 
 
 ---
 
+## Employees
+
+### GET /api/v1/admin/employees
+
+List employees with optional search, active filter, and monthly hours aggregation.
+
+**Auth**: Bearer JWT
+
+**Query parameters**:
+| Param | Type | Description |
+|---|---|---|
+| `search` | string | ILIKE filter on first_name, last_name, email |
+| `active` | bool | Filter by active status |
+| `month` | string | `YYYY-MM` — includes `planned_hours_month` and `actual_hours_month` |
+| `limit` | int | Max results (default 50, max 100) |
+| `offset` | int | Pagination offset |
+
+**Response** `200 OK`
+```json
+{
+  "employees": [
+    {
+      "id": "uuid",
+      "salutation": "Herr",
+      "first_name": "Max",
+      "last_name": "Mustermann",
+      "email": "max@example.com",
+      "phone": "+43 123 456",
+      "monthly_hours_target": 160.0,
+      "active": true,
+      "planned_hours_month": 32.0,
+      "actual_hours_month": null,
+      "created_at": "2026-03-06T..."
+    }
+  ],
+  "total": 5
+}
+```
+
+---
+
+### POST /api/v1/admin/employees
+
+Create a new employee.
+
+**Auth**: Bearer JWT
+
+**Request body**:
+```json
+{
+  "salutation": "Herr",
+  "first_name": "Max",
+  "last_name": "Mustermann",
+  "email": "max@example.com",
+  "phone": "+43 123 456",
+  "monthly_hours_target": 160.0
+}
+```
+
+**Response** `201 Created` — the new employee object.
+
+---
+
+### GET /api/v1/admin/employees/{id}
+
+Get employee detail with recent assignments.
+
+**Auth**: Bearer JWT
+
+**Response** `200 OK` — employee object with `assignments` array.
+
+---
+
+### PATCH /api/v1/admin/employees/{id}
+
+Update employee fields (all optional).
+
+**Auth**: Bearer JWT
+
+**Request body**: any subset of `{ salutation, first_name, last_name, email, phone, monthly_hours_target, active }`.
+
+**Response** `200 OK` — updated employee object.
+
+---
+
+### POST /api/v1/admin/employees/{id}/delete
+
+Soft-delete (set `active=false`).
+
+**Auth**: Bearer JWT
+
+**Response** `204 No Content`.
+
+---
+
+### GET /api/v1/admin/employees/{id}/hours
+
+Monthly hours summary with per-assignment breakdown.
+
+**Auth**: Bearer JWT
+
+**Query parameters**:
+| Param | Type | Description |
+|---|---|---|
+| `month` | string | `YYYY-MM` (defaults to current month) |
+
+**Response** `200 OK`
+```json
+{
+  "month": "2026-03",
+  "target_hours": 160.0,
+  "planned_hours": 32.0,
+  "actual_hours": 0.0,
+  "assignment_count": 4,
+  "assignments": [
+    {
+      "inquiry_id": "uuid",
+      "customer_name": "...",
+      "origin_city": "Wien",
+      "destination_city": "Graz",
+      "booking_date": "2026-03-15",
+      "planned_hours": 8.0,
+      "actual_hours": null,
+      "status": "scheduled"
+    }
+  ]
+}
+```
+
+---
+
+### Inquiry Employee Assignments
+
+#### GET /api/v1/inquiries/{id}/employees
+
+List employees assigned to this inquiry.
+
+**Auth**: Bearer JWT
+
+**Response** `200 OK`
+```json
+{
+  "assignments": [
+    {
+      "employee_id": "uuid",
+      "first_name": "Max",
+      "last_name": "Mustermann",
+      "email": "max@example.com",
+      "planned_hours": 8.0,
+      "actual_hours": null,
+      "notes": null
+    }
+  ]
+}
+```
+
+---
+
+#### POST /api/v1/inquiries/{id}/employees
+
+Assign an employee to this inquiry.
+
+**Auth**: Bearer JWT
+
+**Request body**:
+```json
+{
+  "employee_id": "uuid",
+  "planned_hours": 8.0,
+  "notes": "Teamleiter"
+}
+```
+
+**Response** `201 Created`.
+
+---
+
+#### PATCH /api/v1/inquiries/{id}/employees/{emp_id}
+
+Update assignment hours/notes.
+
+**Auth**: Bearer JWT
+
+**Request body**: any subset of `{ planned_hours, actual_hours, notes }`.
+
+**Response** `200 OK` — updated assignment.
+
+---
+
+#### DELETE /api/v1/inquiries/{id}/employees/{emp_id}
+
+Remove employee from inquiry.
+
+**Auth**: Bearer JWT
+
+**Response** `204 No Content`.
+
+---
+
 ## Error Responses
 
 All errors follow a consistent JSON shape:
@@ -1602,6 +1814,7 @@ All errors follow a consistent JSON shape:
 | 401 Unauthorized | Missing or invalid/expired JWT |
 | 403 Forbidden | Authenticated but insufficient role |
 | 404 Not Found | Resource does not exist |
+| 409 Conflict | Duplicate resource (e.g. employee already assigned) |
 | 422 Unprocessable Entity | Validation error (missing required field, invalid format) |
 | 500 Internal Server Error | Unexpected server-side error |
 

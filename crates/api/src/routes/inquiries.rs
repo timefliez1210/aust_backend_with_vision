@@ -51,6 +51,15 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/{id}/estimate/{method}", post(trigger_estimate))
         .route("/{id}/generate-offer", post(generate_inquiry_offer))
         .route("/{id}/emails", get(get_inquiry_emails))
+        .route(
+            "/{id}/employees",
+            get(list_inquiry_employees).post(assign_employee),
+        )
+        .route(
+            "/{id}/employees/{emp_id}",
+            axum::routing::patch(update_assignment)
+                .delete(remove_assignment),
+        )
 }
 
 /// Public submission routes (no auth required).
@@ -2070,4 +2079,209 @@ fn build_notes(
     }
 
     parts.join(", ")
+}
+
+// ---------------------------------------------------------------------------
+// Employee assignment endpoints
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+struct EmployeeAssignmentRow {
+    employee_id: Uuid,
+    first_name: String,
+    last_name: String,
+    email: String,
+    planned_hours: f64,
+    actual_hours: Option<f64>,
+    notes: Option<String>,
+}
+
+/// `GET /api/v1/inquiries/{id}/employees` — List employees assigned to this inquiry.
+///
+/// **Caller**: Inquiry detail Mitarbeiter card.
+/// **Why**: Shows which employees are assigned to a job and their hours.
+///
+/// # Returns
+/// `200 OK` with `{ assignments: [...] }`.
+async fn list_inquiry_employees(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let rows: Vec<EmployeeAssignmentRow> = sqlx::query_as(
+        r#"
+        SELECT ie.employee_id, e.first_name, e.last_name, e.email,
+               ie.planned_hours::float8 AS planned_hours,
+               ie.actual_hours::float8 AS actual_hours,
+               ie.notes
+        FROM inquiry_employees ie
+        JOIN employees e ON ie.employee_id = e.id
+        WHERE ie.inquiry_id = $1
+        ORDER BY e.last_name, e.first_name
+        "#,
+    )
+    .bind(id)
+    .fetch_all(&state.db)
+    .await?;
+
+    Ok(Json(serde_json::json!({ "assignments": rows })))
+}
+
+/// `POST /api/v1/inquiries/{id}/employees` — Assign an employee to this inquiry.
+///
+/// **Caller**: Inquiry detail Mitarbeiter card assign button.
+/// **Why**: Links an employee to a moving job with planned hours.
+///
+/// # Returns
+/// `201 Created` with the assignment.
+async fn assign_employee(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<aust_core::models::AssignEmployee>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    // Verify inquiry exists
+    let exists: Option<(Uuid,)> =
+        sqlx::query_as("SELECT id FROM inquiries WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await?;
+    if exists.is_none() {
+        return Err(ApiError::NotFound("Anfrage nicht gefunden".into()));
+    }
+
+    // Verify employee exists and is active
+    let emp: Option<(bool,)> =
+        sqlx::query_as("SELECT active FROM employees WHERE id = $1")
+            .bind(body.employee_id)
+            .fetch_optional(&state.db)
+            .await?;
+    match emp {
+        None => return Err(ApiError::NotFound("Mitarbeiter nicht gefunden".into())),
+        Some((false,)) => {
+            return Err(ApiError::BadRequest("Mitarbeiter ist inaktiv".into()))
+        }
+        _ => {}
+    }
+
+    sqlx::query(
+        r#"
+        INSERT INTO inquiry_employees (id, inquiry_id, employee_id, planned_hours, notes)
+        VALUES ($1, $2, $3, $4, $5)
+        "#,
+    )
+    .bind(Uuid::now_v7())
+    .bind(id)
+    .bind(body.employee_id)
+    .bind(body.planned_hours)
+    .bind(&body.notes)
+    .execute(&state.db)
+    .await
+    .map_err(|e| {
+        if let sqlx::Error::Database(ref db_err) = e {
+            if db_err.constraint() == Some("inquiry_employees_inquiry_id_employee_id_key") {
+                return ApiError::Conflict(
+                    "Mitarbeiter ist bereits dieser Anfrage zugewiesen".into(),
+                );
+            }
+        }
+        ApiError::from(e)
+    })?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "employee_id": body.employee_id,
+            "inquiry_id": id,
+            "planned_hours": body.planned_hours,
+            "notes": body.notes,
+        })),
+    ))
+}
+
+/// `PATCH /api/v1/inquiries/{id}/employees/{emp_id}` — Update assignment hours/notes.
+///
+/// **Caller**: Inquiry detail Mitarbeiter card inline edit.
+/// **Why**: Allows updating planned/actual hours after initial assignment.
+///
+/// # Returns
+/// `200 OK` with updated assignment.
+async fn update_assignment(
+    State(state): State<Arc<AppState>>,
+    Path((id, emp_id)): Path<(Uuid, Uuid)>,
+    Json(body): Json<aust_core::models::UpdateAssignment>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let result = sqlx::query(
+        r#"
+        UPDATE inquiry_employees SET
+            planned_hours = COALESCE($3, planned_hours),
+            actual_hours = COALESCE($4, actual_hours),
+            notes = COALESCE($5, notes)
+        WHERE inquiry_id = $1 AND employee_id = $2
+        "#,
+    )
+    .bind(id)
+    .bind(emp_id)
+    .bind(body.planned_hours)
+    .bind(body.actual_hours)
+    .bind(&body.notes)
+    .execute(&state.db)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(ApiError::NotFound("Zuweisung nicht gefunden".into()));
+    }
+
+    #[derive(sqlx::FromRow)]
+    struct Updated {
+        planned_hours: f64,
+        actual_hours: Option<f64>,
+        notes: Option<String>,
+    }
+
+    let row: Updated = sqlx::query_as(
+        r#"
+        SELECT planned_hours::float8 AS planned_hours,
+               actual_hours::float8 AS actual_hours,
+               notes
+        FROM inquiry_employees
+        WHERE inquiry_id = $1 AND employee_id = $2
+        "#,
+    )
+    .bind(id)
+    .bind(emp_id)
+    .fetch_one(&state.db)
+    .await?;
+
+    Ok(Json(serde_json::json!({
+        "employee_id": emp_id,
+        "inquiry_id": id,
+        "planned_hours": row.planned_hours,
+        "actual_hours": row.actual_hours,
+        "notes": row.notes,
+    })))
+}
+
+/// `DELETE /api/v1/inquiries/{id}/employees/{emp_id}` — Remove employee from inquiry.
+///
+/// **Caller**: Inquiry detail Mitarbeiter card remove button.
+/// **Why**: Unlinks an employee from a moving job.
+///
+/// # Returns
+/// `204 No Content`.
+async fn remove_assignment(
+    State(state): State<Arc<AppState>>,
+    Path((id, emp_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, ApiError> {
+    let result = sqlx::query(
+        "DELETE FROM inquiry_employees WHERE inquiry_id = $1 AND employee_id = $2",
+    )
+    .bind(id)
+    .bind(emp_id)
+    .execute(&state.db)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(ApiError::NotFound("Zuweisung nicht gefunden".into()));
+    }
+
+    Ok(StatusCode::NO_CONTENT)
 }

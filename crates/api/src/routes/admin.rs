@@ -35,6 +35,10 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/users", get(list_users))
         .route("/users/{id}/delete", post(delete_user))
         .route("/orders", get(list_orders))
+        .route("/employees", get(list_employees).post(create_employee))
+        .route("/employees/{id}", get(get_employee).patch(update_employee))
+        .route("/employees/{id}/delete", post(delete_employee))
+        .route("/employees/{id}/hours", get(employee_hours_summary))
 }
 
 // --- Dashboard ---
@@ -1404,4 +1408,522 @@ async fn send_plain_email(
     )
     .await
     .map_err(|e| e.to_string())
+}
+
+// --- Employees ---
+
+#[derive(Debug, Deserialize)]
+struct ListEmployeesQuery {
+    search: Option<String>,
+    active: Option<bool>,
+    month: Option<String>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+#[derive(Debug, Serialize, FromRow)]
+struct EmployeeDbRow {
+    id: Uuid,
+    salutation: Option<String>,
+    first_name: String,
+    last_name: String,
+    email: String,
+    phone: Option<String>,
+    monthly_hours_target: f64,
+    active: bool,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+struct EmployeeListItem {
+    id: Uuid,
+    salutation: Option<String>,
+    first_name: String,
+    last_name: String,
+    email: String,
+    phone: Option<String>,
+    monthly_hours_target: f64,
+    active: bool,
+    planned_hours_month: Option<f64>,
+    actual_hours_month: Option<f64>,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+struct EmployeeListResponse {
+    employees: Vec<EmployeeListItem>,
+    total: i64,
+}
+
+/// `GET /api/v1/admin/employees` — List employees with optional search and month filter.
+///
+/// **Caller**: Admin employees list page.
+/// **Why**: Paginated employee listing with monthly hours aggregation.
+///
+/// # Parameters
+/// - `search` — ILIKE on first_name, last_name, email
+/// - `active` — filter by active status
+/// - `month` — YYYY-MM format; when present, includes planned/actual hours for that month
+/// - `limit`, `offset` — pagination
+///
+/// # Returns
+/// `200 OK` with `EmployeeListResponse`.
+async fn list_employees(
+    State(state): State<Arc<AppState>>,
+    Extension(_claims): Extension<TokenClaims>,
+    Query(query): Query<ListEmployeesQuery>,
+) -> Result<Json<EmployeeListResponse>, ApiError> {
+    let limit = query.limit.unwrap_or(50).min(100);
+    let offset = query.offset.unwrap_or(0);
+    let search = query.search.map(|s| format!("%{s}%"));
+    let active_filter = query.active;
+
+    let rows: Vec<EmployeeDbRow> = sqlx::query_as(
+        r#"
+        SELECT id, salutation, first_name, last_name, email, phone,
+               monthly_hours_target::float8 AS monthly_hours_target,
+               active, created_at, updated_at
+        FROM employees
+        WHERE ($1::text IS NULL OR first_name ILIKE $1 OR last_name ILIKE $1 OR email ILIKE $1)
+          AND ($2::bool IS NULL OR active = $2)
+        ORDER BY last_name, first_name
+        LIMIT $3 OFFSET $4
+        "#,
+    )
+    .bind(&search)
+    .bind(active_filter)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(&state.db)
+    .await?;
+
+    let (total,): (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*)
+        FROM employees
+        WHERE ($1::text IS NULL OR first_name ILIKE $1 OR last_name ILIKE $1 OR email ILIKE $1)
+          AND ($2::bool IS NULL OR active = $2)
+        "#,
+    )
+    .bind(&search)
+    .bind(active_filter)
+    .fetch_one(&state.db)
+    .await?;
+
+    // Parse month range for hours aggregation
+    let month_range = query.month.as_ref().and_then(|m| parse_month_range(m));
+
+    let mut employees = Vec::with_capacity(rows.len());
+    for row in rows {
+        let (planned, actual) = if let Some((from, to)) = &month_range {
+            fetch_employee_month_hours(&state.db, row.id, *from, *to).await?
+        } else {
+            (None, None)
+        };
+
+        employees.push(EmployeeListItem {
+            id: row.id,
+            salutation: row.salutation,
+            first_name: row.first_name,
+            last_name: row.last_name,
+            email: row.email,
+            phone: row.phone,
+            monthly_hours_target: row.monthly_hours_target,
+            active: row.active,
+            planned_hours_month: planned,
+            actual_hours_month: actual,
+            created_at: row.created_at,
+        });
+    }
+
+    Ok(Json(EmployeeListResponse { employees, total }))
+}
+
+/// `POST /api/v1/admin/employees` — Create a new employee.
+///
+/// **Caller**: Admin employees page create form.
+/// **Why**: Registers a new employee for assignment tracking.
+///
+/// # Returns
+/// `201 Created` with the new `Employee` JSON.
+async fn create_employee(
+    State(state): State<Arc<AppState>>,
+    Extension(_claims): Extension<TokenClaims>,
+    Json(body): Json<aust_core::models::CreateEmployee>,
+) -> Result<(axum::http::StatusCode, Json<serde_json::Value>), ApiError> {
+    let target = body.monthly_hours_target.unwrap_or(160.0);
+    let id = uuid::Uuid::now_v7();
+
+    sqlx::query(
+        r#"
+        INSERT INTO employees (id, salutation, first_name, last_name, email, phone, monthly_hours_target)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        "#,
+    )
+    .bind(id)
+    .bind(&body.salutation)
+    .bind(&body.first_name)
+    .bind(&body.last_name)
+    .bind(&body.email)
+    .bind(&body.phone)
+    .bind(target)
+    .execute(&state.db)
+    .await
+    .map_err(|e| {
+        if let sqlx::Error::Database(ref db_err) = e {
+            if db_err.constraint() == Some("employees_email_key") {
+                return ApiError::Conflict("Ein Mitarbeiter mit dieser E-Mail existiert bereits.".into());
+            }
+        }
+        ApiError::from(e)
+    })?;
+
+    let employee = fetch_employee_json(&state.db, id).await?;
+    Ok((axum::http::StatusCode::CREATED, Json(employee)))
+}
+
+/// `GET /api/v1/admin/employees/{id}` — Get employee detail with recent assignments.
+///
+/// **Caller**: Admin employee detail page.
+/// **Why**: Returns profile + recent inquiry assignments for the employee.
+///
+/// # Returns
+/// `200 OK` with employee profile and assignments array.
+async fn get_employee(
+    State(state): State<Arc<AppState>>,
+    Extension(_claims): Extension<TokenClaims>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let employee = fetch_employee_json(&state.db, id).await?;
+
+    #[derive(Debug, Serialize, FromRow)]
+    struct AssignmentRow {
+        inquiry_id: Uuid,
+        customer_name: Option<String>,
+        origin_city: Option<String>,
+        destination_city: Option<String>,
+        booking_date: Option<NaiveDate>,
+        planned_hours: f64,
+        actual_hours: Option<f64>,
+        notes: Option<String>,
+        inquiry_status: String,
+    }
+
+    let assignments: Vec<AssignmentRow> = sqlx::query_as(
+        r#"
+        SELECT ie.inquiry_id,
+               COALESCE(c.first_name || ' ' || c.last_name, c.name) AS customer_name,
+               oa.city AS origin_city,
+               da.city AS destination_city,
+               COALESCE(cb.booking_date, i.preferred_date::date) AS booking_date,
+               ie.planned_hours::float8 AS planned_hours,
+               ie.actual_hours::float8 AS actual_hours,
+               ie.notes,
+               i.status AS inquiry_status
+        FROM inquiry_employees ie
+        JOIN inquiries i ON ie.inquiry_id = i.id
+        JOIN customers c ON i.customer_id = c.id
+        LEFT JOIN addresses oa ON i.origin_address_id = oa.id
+        LEFT JOIN addresses da ON i.destination_address_id = da.id
+        LEFT JOIN calendar_bookings cb ON cb.inquiry_id = i.id AND cb.status != 'cancelled'
+        WHERE ie.employee_id = $1
+        ORDER BY COALESCE(cb.booking_date, i.preferred_date::date) DESC NULLS LAST
+        LIMIT 50
+        "#,
+    )
+    .bind(id)
+    .fetch_all(&state.db)
+    .await?;
+
+    let assignments_json: Vec<serde_json::Value> = assignments
+        .into_iter()
+        .map(|a| {
+            serde_json::json!({
+                "inquiry_id": a.inquiry_id,
+                "customer_name": a.customer_name,
+                "origin_city": a.origin_city,
+                "destination_city": a.destination_city,
+                "booking_date": a.booking_date,
+                "planned_hours": a.planned_hours,
+                "actual_hours": a.actual_hours,
+                "notes": a.notes,
+                "status": a.inquiry_status,
+            })
+        })
+        .collect();
+
+    let mut result = employee;
+    result["assignments"] = serde_json::Value::Array(assignments_json);
+    Ok(Json(result))
+}
+
+/// `PATCH /api/v1/admin/employees/{id}` — Update employee fields.
+///
+/// **Caller**: Admin employee detail page save button.
+/// **Why**: Partial update of employee profile.
+///
+/// # Returns
+/// `200 OK` with updated employee JSON.
+async fn update_employee(
+    State(state): State<Arc<AppState>>,
+    Extension(_claims): Extension<TokenClaims>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<aust_core::models::UpdateEmployee>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // Verify exists
+    let exists: Option<(Uuid,)> =
+        sqlx::query_as("SELECT id FROM employees WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await?;
+    if exists.is_none() {
+        return Err(ApiError::NotFound("Mitarbeiter nicht gefunden".into()));
+    }
+
+    if let Some(ref sal) = body.salutation {
+        if !["Herr", "Frau", "D"].contains(&sal.as_str()) {
+            return Err(ApiError::BadRequest("Ungueltige Anrede".into()));
+        }
+    }
+
+    sqlx::query(
+        r#"
+        UPDATE employees SET
+            salutation = COALESCE($2, salutation),
+            first_name = COALESCE($3, first_name),
+            last_name = COALESCE($4, last_name),
+            email = COALESCE($5, email),
+            phone = COALESCE($6, phone),
+            monthly_hours_target = COALESCE($7, monthly_hours_target),
+            active = COALESCE($8, active)
+        WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .bind(&body.salutation)
+    .bind(&body.first_name)
+    .bind(&body.last_name)
+    .bind(&body.email)
+    .bind(&body.phone)
+    .bind(body.monthly_hours_target)
+    .bind(body.active)
+    .execute(&state.db)
+    .await?;
+
+    let employee = fetch_employee_json(&state.db, id).await?;
+    Ok(Json(employee))
+}
+
+/// `POST /api/v1/admin/employees/{id}/delete` — Soft-delete employee (set active=false).
+///
+/// **Caller**: Admin employee list/detail delete button.
+/// **Why**: Preserves assignment history while removing from active pool.
+///
+/// # Returns
+/// `204 No Content`.
+async fn delete_employee(
+    State(state): State<Arc<AppState>>,
+    Extension(_claims): Extension<TokenClaims>,
+    Path(id): Path<Uuid>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    let result = sqlx::query("UPDATE employees SET active = false WHERE id = $1")
+        .bind(id)
+        .execute(&state.db)
+        .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(ApiError::NotFound("Mitarbeiter nicht gefunden".into()));
+    }
+
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// `GET /api/v1/admin/employees/{id}/hours?month=YYYY-MM` — Monthly hours summary.
+///
+/// **Caller**: Admin employee detail page hours card.
+/// **Why**: Aggregates planned/actual hours for a given month with per-assignment breakdown.
+///
+/// # Returns
+/// `200 OK` with target, planned, actual totals and assignment breakdown.
+async fn employee_hours_summary(
+    State(state): State<Arc<AppState>>,
+    Extension(_claims): Extension<TokenClaims>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let month_str = query.get("month").cloned().unwrap_or_else(|| {
+        Utc::now().format("%Y-%m").to_string()
+    });
+
+    let (from_date, to_date) = parse_month_range(&month_str)
+        .ok_or_else(|| ApiError::BadRequest("Ungueltiges Monatsformat. Erwartet: YYYY-MM".into()))?;
+
+    // Fetch employee target
+    #[derive(FromRow)]
+    struct TargetRow {
+        monthly_hours_target: f64,
+    }
+    let target_row: TargetRow = sqlx::query_as(
+        "SELECT monthly_hours_target::float8 AS monthly_hours_target FROM employees WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Mitarbeiter nicht gefunden".into()))?;
+
+    #[derive(Debug, Serialize, FromRow)]
+    struct HoursRow {
+        inquiry_id: Uuid,
+        customer_name: Option<String>,
+        origin_city: Option<String>,
+        destination_city: Option<String>,
+        booking_date: Option<NaiveDate>,
+        planned_hours: f64,
+        actual_hours: Option<f64>,
+        inquiry_status: String,
+    }
+
+    let rows: Vec<HoursRow> = sqlx::query_as(
+        r#"
+        SELECT ie.inquiry_id,
+               COALESCE(c.first_name || ' ' || c.last_name, c.name) AS customer_name,
+               oa.city AS origin_city,
+               da.city AS destination_city,
+               COALESCE(cb.booking_date, i.preferred_date::date) AS booking_date,
+               ie.planned_hours::float8 AS planned_hours,
+               ie.actual_hours::float8 AS actual_hours,
+               i.status AS inquiry_status
+        FROM inquiry_employees ie
+        JOIN inquiries i ON ie.inquiry_id = i.id
+        JOIN customers c ON i.customer_id = c.id
+        LEFT JOIN addresses oa ON i.origin_address_id = oa.id
+        LEFT JOIN addresses da ON i.destination_address_id = da.id
+        LEFT JOIN calendar_bookings cb ON cb.inquiry_id = i.id AND cb.status != 'cancelled'
+        WHERE ie.employee_id = $1
+          AND COALESCE(cb.booking_date, i.preferred_date::date) BETWEEN $2 AND $3
+        ORDER BY COALESCE(cb.booking_date, i.preferred_date::date)
+        "#,
+    )
+    .bind(id)
+    .bind(from_date)
+    .bind(to_date)
+    .fetch_all(&state.db)
+    .await?;
+
+    let target = target_row.monthly_hours_target;
+    let mut planned_sum = 0.0_f64;
+    let mut actual_sum = 0.0_f64;
+
+    let assignments: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|r| {
+            planned_sum += r.planned_hours;
+            if let Some(av) = r.actual_hours {
+                actual_sum += av;
+            }
+            serde_json::json!({
+                "inquiry_id": r.inquiry_id,
+                "customer_name": r.customer_name,
+                "origin_city": r.origin_city,
+                "destination_city": r.destination_city,
+                "booking_date": r.booking_date,
+                "planned_hours": r.planned_hours,
+                "actual_hours": r.actual_hours,
+                "status": r.inquiry_status,
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "month": month_str,
+        "target_hours": target,
+        "planned_hours": planned_sum,
+        "actual_hours": actual_sum,
+        "assignment_count": assignments.len(),
+        "assignments": assignments,
+    })))
+}
+
+/// Parse "YYYY-MM" into (first_day, last_day) NaiveDate range.
+fn parse_month_range(month: &str) -> Option<(NaiveDate, NaiveDate)> {
+    let parts: Vec<&str> = month.split('-').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    let year: i32 = parts[0].parse().ok()?;
+    let m: u32 = parts[1].parse().ok()?;
+    let from = NaiveDate::from_ymd_opt(year, m, 1)?;
+    let to = if m == 12 {
+        NaiveDate::from_ymd_opt(year + 1, 1, 1)?
+    } else {
+        NaiveDate::from_ymd_opt(year, m + 1, 1)?
+    }
+    .pred_opt()?;
+    Some((from, to))
+}
+
+/// Fetch planned/actual hours totals for an employee in a date range.
+async fn fetch_employee_month_hours(
+    pool: &sqlx::PgPool,
+    employee_id: Uuid,
+    from: NaiveDate,
+    to: NaiveDate,
+) -> Result<(Option<f64>, Option<f64>), ApiError> {
+    #[derive(FromRow)]
+    struct HoursSums {
+        planned: Option<f64>,
+        actual: Option<f64>,
+    }
+
+    let sums: HoursSums = sqlx::query_as(
+        r#"
+        SELECT SUM(ie.planned_hours)::float8 AS planned,
+               SUM(ie.actual_hours)::float8 AS actual
+        FROM inquiry_employees ie
+        JOIN inquiries i ON ie.inquiry_id = i.id
+        LEFT JOIN calendar_bookings cb ON cb.inquiry_id = i.id AND cb.status != 'cancelled'
+        WHERE ie.employee_id = $1
+          AND COALESCE(cb.booking_date, i.preferred_date::date) BETWEEN $2 AND $3
+        "#,
+    )
+    .bind(employee_id)
+    .bind(from)
+    .bind(to)
+    .fetch_one(pool)
+    .await?;
+
+    Ok((sums.planned, sums.actual))
+}
+
+/// Fetch a single employee as JSON.
+async fn fetch_employee_json(
+    pool: &sqlx::PgPool,
+    id: Uuid,
+) -> Result<serde_json::Value, ApiError> {
+    let row: EmployeeDbRow = sqlx::query_as(
+        r#"
+        SELECT id, salutation, first_name, last_name, email, phone,
+               monthly_hours_target::float8 AS monthly_hours_target,
+               active, created_at, updated_at
+        FROM employees WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Mitarbeiter nicht gefunden".into()))?;
+
+    Ok(serde_json::json!({
+        "id": row.id,
+        "salutation": row.salutation,
+        "first_name": row.first_name,
+        "last_name": row.last_name,
+        "email": row.email,
+        "phone": row.phone,
+        "monthly_hours_target": row.monthly_hours_target,
+        "active": row.active,
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+    }))
 }
