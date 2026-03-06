@@ -67,6 +67,7 @@ impl InquiryStatus {
             // Skip intermediate: Estimated -> OfferSent
             | (Estimated, OfferSent)
             | (OfferReady, OfferSent)
+            | (OfferReady, Accepted)
             | (OfferReady, Cancelled)
             | (OfferSent, Accepted)
             | (OfferSent, Rejected)
