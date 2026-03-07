@@ -553,10 +553,8 @@ Switch providers via `AUST__LLM__DEFAULT_PROVIDER` (claude/openai/ollama)
 - [x] Remove legacy `/quotes`, `/offers`, `/distance` route stubs (superseded by `/inquiries`)
 - [x] Delete old `crates/api/src/routes/quotes.rs` and `distance.rs`
 - [x] Delete orphaned frontend `/admin/offers` pages (offers embedded in inquiry detail)
-- [ ] Fix `run_agent.rs` example (missing 4th arg to `EmailProcessor::new()`)
+- [x] Remove dead `status_sync.rs` (sync_quote_* functions never wired; offer status synced inline in customer.rs)
 - [ ] Migrate `/estimates` protected handlers into inquiry-level endpoints (currently re-mounted for frontend polling + delete)
 - [ ] Add multipart upload support to `trigger_estimate` for vision/depth/video methods (currently only inventory works inline)
 - [ ] Restore `/distance/calculate` endpoint or embed route geometry in inquiry response (route map broken)
-- [ ] Wire `sync_quote_accepted/cancelled/downgraded` into inquiry status transitions in `inquiries.rs`
-- [ ] Rename `sync_quote_*` → `sync_inquiry_*` in `status_sync.rs`
 - [ ] Rename `update_quote_volume` → `update_inquiry_volume` in `services/db.rs`

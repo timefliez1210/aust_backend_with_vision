@@ -22,7 +22,6 @@ struct PendingDraft {
     pub subject: String,
     pub body: String,
     pub in_reply_to: Option<String>,
-    pub inquiry: MovingInquiry,
     pub thread_id: Option<Uuid>,
     /// DB message ID for the stored draft (so we can update status on approve/deny).
     pub db_message_id: Option<Uuid>,
@@ -31,10 +30,6 @@ struct PendingDraft {
 /// Pending capacity override request waiting for Alex's decision.
 #[derive(Debug, Clone)]
 struct PendingCapacityRequest {
-    pub customer_email: String,
-    pub inquiry: MovingInquiry,
-    pub original_body: String,
-    pub in_reply_to: Option<String>,
     pub availability: AvailabilityResult,
 }
 
@@ -414,10 +409,7 @@ impl EmailProcessor {
                     avail.requested_date
                 );
                 self.send_capacity_question_to_admin(
-                    &customer_email,
                     &inquiry_snapshot,
-                    &email.body_text,
-                    email.message_id.clone(),
                     avail.clone(),
                 )
                 .await;
@@ -449,7 +441,6 @@ impl EmailProcessor {
                         &customer_email,
                         response,
                         email.message_id.clone(),
-                        inquiry_snapshot,
                         thread_id,
                     )
                     .await;
@@ -479,7 +470,6 @@ impl EmailProcessor {
         customer_email: &str,
         response: EmailResponse,
         in_reply_to: String,
-        inquiry: MovingInquiry,
         thread_id: Option<Uuid>,
     ) {
         let draft_id = Uuid::now_v7().to_string();
@@ -522,7 +512,6 @@ impl EmailProcessor {
             } else {
                 Some(in_reply_to)
             },
-            inquiry,
             thread_id,
             db_message_id,
         };
@@ -785,10 +774,7 @@ impl EmailProcessor {
     /// Send a capacity question to Alex when a date is overbooked.
     async fn send_capacity_question_to_admin(
         &mut self,
-        customer_email: &str,
         inquiry: &MovingInquiry,
-        original_body: &str,
-        in_reply_to: String,
         availability: AvailabilityResult,
     ) {
         let request_id = Uuid::now_v7().to_string();
@@ -869,17 +855,7 @@ impl EmailProcessor {
                 drop(tg);
                 self.pending_capacity.insert(
                     request_id,
-                    PendingCapacityRequest {
-                        customer_email: customer_email.to_string(),
-                        inquiry: inquiry.clone(),
-                        original_body: original_body.to_string(),
-                        in_reply_to: if in_reply_to.is_empty() {
-                            None
-                        } else {
-                            Some(in_reply_to)
-                        },
-                        availability,
-                    },
+                    PendingCapacityRequest { availability },
                 );
             }
             Err(e) => {
