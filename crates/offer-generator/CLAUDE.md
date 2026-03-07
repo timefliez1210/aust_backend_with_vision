@@ -1,5 +1,8 @@
 # crates/offer-generator — Pricing & XLSX/PDF Offer Generation
 
+> XLSX template layout + two separate hours systems: [../../docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md#offer-xlsx-template-layout)
+> Recurring bugs (XLSX preset values, LibreOffice missing, brutto/netto): [../../docs/DEBUGGING.md](../../docs/DEBUGGING.md)
+
 Generates moving offers from an XLSX template, converts to PDF via LibreOffice, and calculates pricing.
 
 ## Key Files

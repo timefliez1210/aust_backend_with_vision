@@ -1,5 +1,8 @@
 # crates/email-agent — Email Processing & Telegram Approval
 
+> Pipeline map: [../../docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md)
+> Recurring bugs (customer stub, Telegram conflict, IMAP sender): [../../docs/DEBUGGING.md](../../docs/DEBUGGING.md)
+
 IMAP polling, email parsing (JSON attachments + text fallback), and human-in-the-loop approval via Telegram.
 
 ## Key Files

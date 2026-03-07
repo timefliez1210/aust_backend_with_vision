@@ -1,5 +1,8 @@
 # crates/api — REST API, Routing & Offer Orchestration
 
+> Pipeline map: [../../docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md)
+> Recurring bugs (employee hours NULL, brutto/netto price): [../../docs/DEBUGGING.md](../../docs/DEBUGGING.md)
+
 HTTP server built on Axum 0.8. Defines all REST endpoints, request/response types, application state, and the offer orchestration pipeline.
 
 ## Key Files

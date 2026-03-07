@@ -1,6 +1,6 @@
+use crate::calendar::{AvailabilityResult, ScheduleEntry};
 use crate::telegram::{ApprovalDecision, CalendarCommand, TelegramBot};
 use crate::{EmailParser, EmailResponder, EmailResponse, ImapClient, SmtpClient};
-use aust_calendar::{AvailabilityResult, CalendarService};
 use aust_core::config::{EmailConfig, TelegramConfig};
 use chrono::Datelike;
 use aust_core::models::{MovingInquiry, ParsedEmail};
@@ -47,7 +47,9 @@ pub struct EmailProcessor {
     telegram: Arc<Mutex<TelegramBot>>,
     parser: EmailParser,
     responder: EmailResponder,
-    calendar: Arc<CalendarService>,
+    default_capacity: i32,
+    alternatives_count: usize,
+    search_window_days: i64,
     /// Active inquiries keyed by customer email.
     inquiries: HashMap<String, MovingInquiry>,
     /// Drafts awaiting approval, keyed by draft_id.
@@ -68,8 +70,10 @@ impl EmailProcessor {
         email_config: EmailConfig,
         telegram_config: TelegramConfig,
         llm: Arc<dyn LlmProvider>,
-        calendar: Arc<CalendarService>,
         db: PgPool,
+        default_capacity: i32,
+        alternatives_count: usize,
+        search_window_days: i64,
     ) -> Self {
         let from_address = email_config.from_address.clone();
         let imap = ImapClient::new(email_config.clone());
@@ -86,7 +90,9 @@ impl EmailProcessor {
             telegram: Arc::new(Mutex::new(telegram)),
             parser: EmailParser::new(),
             responder: EmailResponder::new(llm),
-            calendar,
+            default_capacity,
+            alternatives_count,
+            search_window_days,
             inquiries: HashMap::new(),
             pending_drafts: HashMap::new(),
             editing_draft: None,
@@ -362,7 +368,15 @@ impl EmailProcessor {
 
         // Check calendar availability if a preferred date is set
         let availability = if let Some(date) = inquiry.preferred_date {
-            match self.calendar.check_availability(date).await {
+            match crate::calendar::check_availability(
+                &self.db,
+                date,
+                self.default_capacity,
+                self.alternatives_count,
+                self.search_window_days,
+            )
+            .await
+            {
                 Ok(avail) => Some(avail),
                 Err(e) => {
                     warn!("Calendar availability check failed: {e}");
@@ -622,23 +636,10 @@ impl EmailProcessor {
             match &response.decision {
                 ApprovalDecision::CapacityApprove(request_id) => {
                     if let Some(req) = self.pending_capacity.remove(request_id) {
-                        info!("Capacity approved for {}", req.availability.requested_date);
-                        // Force-create a booking for the approved date
-                        let booking = aust_calendar::NewBooking {
-                            booking_date: req.availability.requested_date,
-                            inquiry_id: req.inquiry.inquiry_id,
-                            customer_name: req.inquiry.name.clone(),
-                            customer_email: Some(req.customer_email.clone()),
-                            departure_address: req.inquiry.departure_address.clone(),
-                            arrival_address: req.inquiry.arrival_address.clone(),
-                            volume_m3: req.inquiry.volume_m3,
-                            distance_km: None,
-                            description: None,
-                            status: "confirmed".to_string(),
-                        };
-                        if let Err(e) = self.calendar.force_create_booking(booking).await {
-                            error!("Failed to create forced booking: {e}");
-                        }
+                        info!(
+                            "Capacity approved for {} — inquiry will proceed through normal pipeline",
+                            req.availability.requested_date
+                        );
                     }
                     continue;
                 }
@@ -796,32 +797,54 @@ impl EmailProcessor {
             .format("%d.%m.%Y")
             .to_string();
 
-        // Build summaries of existing bookings
-        let existing_summaries: Vec<String> = match self
-            .calendar
-            .get_bookings_for_date(availability.requested_date)
+        // Build summaries of existing inquiries on this date
+        let existing_summaries: Vec<String> = {
+            #[derive(sqlx::FromRow)]
+            struct InqRow {
+                customer_name: Option<String>,
+                departure_address: Option<String>,
+                arrival_address: Option<String>,
+                volume_m3: Option<f64>,
+            }
+            match sqlx::query_as::<_, InqRow>(
+                r#"
+                SELECT
+                    COALESCE(
+                        NULLIF(TRIM(COALESCE(c.first_name,'') || ' ' || COALESCE(c.last_name,'')), ''),
+                        c.name, c.email
+                    ) AS customer_name,
+                    CASE WHEN ao.id IS NOT NULL THEN ao.street || ', ' || ao.city END AS departure_address,
+                    CASE WHEN ad.id IS NOT NULL THEN ad.street || ', ' || ad.city END AS arrival_address,
+                    i.estimated_volume_m3 AS volume_m3
+                FROM inquiries i
+                JOIN customers c ON i.customer_id = c.id
+                LEFT JOIN addresses ao ON i.origin_address_id = ao.id
+                LEFT JOIN addresses ad ON i.destination_address_id = ad.id
+                WHERE COALESCE(i.scheduled_date, i.preferred_date::date) = $1
+                  AND i.status NOT IN ('cancelled', 'rejected', 'expired')
+                "#,
+            )
+            .bind(availability.requested_date)
+            .fetch_all(&self.db)
             .await
-        {
-            Ok(bookings) => bookings
-                .iter()
-                .map(|b| {
-                    let name = b.customer_name.as_deref().unwrap_or("Unbekannt");
-                    let from = b.departure_address.as_deref().unwrap_or("?");
-                    let to = b.arrival_address.as_deref().unwrap_or("?");
-                    let vol = b
-                        .volume_m3
-                        .map(|v| format!("{v:.1} m³"))
-                        .unwrap_or_else(|| "? m³".to_string());
-                    let dist = b
-                        .distance_km
-                        .map(|d| format!("{d:.0} km"))
-                        .unwrap_or_else(|| "? km".to_string());
-                    format!("{name} — {from} → {to} ({vol}, {dist})")
-                })
-                .collect(),
-            Err(e) => {
-                warn!("Failed to get existing bookings: {e}");
-                vec!["(Fehler beim Laden der bestehenden Buchungen)".to_string()]
+            {
+                Ok(rows) => rows
+                    .iter()
+                    .map(|b| {
+                        let name = b.customer_name.as_deref().unwrap_or("Unbekannt");
+                        let from = b.departure_address.as_deref().unwrap_or("?");
+                        let to = b.arrival_address.as_deref().unwrap_or("?");
+                        let vol = b
+                            .volume_m3
+                            .map(|v| format!("{v:.1} m³"))
+                            .unwrap_or_else(|| "? m³".to_string());
+                        format!("{name} — {from} → {to} ({vol})")
+                    })
+                    .collect(),
+                Err(e) => {
+                    warn!("Failed to get existing inquiries for date: {e}");
+                    vec!["(Fehler beim Laden der bestehenden Buchungen)".to_string()]
+                }
             }
         };
 
@@ -904,7 +927,7 @@ impl EmailProcessor {
                     (start, end)
                 };
 
-                match self.calendar.get_schedule(from, to).await {
+                match crate::calendar::get_schedule(&self.db, from, to, self.default_capacity).await {
                     Ok(schedule) => {
                         let text = format_schedule_message(&schedule, from);
                         let tg = self.telegram.lock().await;
@@ -922,7 +945,7 @@ impl EmailProcessor {
                 let today = chrono::Utc::now().date_naive();
                 let end = today + chrono::Days::new(7);
 
-                match self.calendar.get_schedule(today, end).await {
+                match crate::calendar::get_schedule(&self.db, today, end, self.default_capacity).await {
                     Ok(schedule) => {
                         let text = format_upcoming_message(&schedule);
                         let tg = self.telegram.lock().await;
@@ -938,7 +961,7 @@ impl EmailProcessor {
             }
             CalendarCommand::SetCapacity(date_str, capacity) => {
                 match NaiveDate::parse_from_str(&date_str, "%Y-%m-%d") {
-                    Ok(date) => match self.calendar.set_capacity(date, capacity).await {
+                    Ok(date) => match crate::calendar::set_capacity(&self.db, date, capacity).await {
                         Ok(_) => {
                             let tg = self.telegram.lock().await;
                             tg.send_status_message(&format!(
@@ -1056,10 +1079,7 @@ impl EmailProcessor {
 }
 
 /// Format a month schedule for Telegram.
-fn format_schedule_message(
-    schedule: &[aust_calendar::ScheduleEntry],
-    month_start: NaiveDate,
-) -> String {
+fn format_schedule_message(schedule: &[ScheduleEntry], month_start: NaiveDate) -> String {
     use chrono::Datelike;
     let month_name = match month_start.month() {
         1 => "Januar",
@@ -1090,13 +1110,7 @@ fn format_schedule_message(
             chrono::Weekday::Sun => "So",
         };
 
-        let active_bookings: Vec<_> = entry
-            .bookings
-            .iter()
-            .filter(|b| b.status != "cancelled")
-            .collect();
-
-        let status_icon = if active_bookings.is_empty() {
+        let status_icon = if entry.inquiries.is_empty() {
             "⬜"
         } else if entry.availability.available {
             "🟡"
@@ -1107,11 +1121,9 @@ fn format_schedule_message(
         let date_str = entry.date.format("%d.%m").to_string();
         text.push_str(&format!("{status_icon} {day_name} {date_str}"));
 
-        if !active_bookings.is_empty() {
-            for b in &active_bookings {
-                let name = b.customer_name.as_deref().unwrap_or("?");
-                text.push_str(&format!(" — {name}"));
-            }
+        for inq in &entry.inquiries {
+            let name = inq.customer_name.as_deref().unwrap_or("?");
+            text.push_str(&format!(" — {name}"));
         }
 
         text.push('\n');
@@ -1121,7 +1133,7 @@ fn format_schedule_message(
 }
 
 /// Format the next 7 days for Telegram.
-fn format_upcoming_message(schedule: &[aust_calendar::ScheduleEntry]) -> String {
+fn format_upcoming_message(schedule: &[ScheduleEntry]) -> String {
     let mut text = "📋 *Nächste 7 Tage*\n\n".to_string();
 
     for entry in schedule {
@@ -1138,20 +1150,14 @@ fn format_upcoming_message(schedule: &[aust_calendar::ScheduleEntry]) -> String 
         let date_str = entry.date.format("%d.%m.%Y").to_string();
         text.push_str(&format!("*{day_name}, {date_str}*\n"));
 
-        let active_bookings: Vec<_> = entry
-            .bookings
-            .iter()
-            .filter(|b| b.status != "cancelled")
-            .collect();
-
-        if active_bookings.is_empty() {
+        if entry.inquiries.is_empty() {
             text.push_str("  Frei\n");
         } else {
-            for b in &active_bookings {
-                let name = b.customer_name.as_deref().unwrap_or("Unbekannt");
-                let from = b.departure_address.as_deref().unwrap_or("?");
-                let to = b.arrival_address.as_deref().unwrap_or("?");
-                let vol = b
+            for inq in &entry.inquiries {
+                let name = inq.customer_name.as_deref().unwrap_or("Unbekannt");
+                let from = inq.departure_address.as_deref().unwrap_or("?");
+                let to = inq.arrival_address.as_deref().unwrap_or("?");
+                let vol = inq
                     .volume_m3
                     .map(|v| format!("{v:.1} m³"))
                     .unwrap_or_else(|| "? m³".to_string());
@@ -1161,9 +1167,7 @@ fn format_upcoming_message(schedule: &[aust_calendar::ScheduleEntry]) -> String 
 
         let remaining = entry.availability.remaining;
         if remaining > 0 {
-            text.push_str(&format!(
-                "  ({remaining} Platz/Plätze frei)\n"
-            ));
+            text.push_str(&format!("  ({remaining} Platz/Plätze frei)\n"));
         }
         text.push('\n');
     }

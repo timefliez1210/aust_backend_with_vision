@@ -1,5 +1,7 @@
 # crates/core — Domain Models & Configuration
 
+> Key types and how they flow through the system: [../../docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md#key-data-types-flowing-through-the-pipeline)
+
 Shared foundation crate used by all other crates. Contains domain models, application configuration, and common error types.
 
 ## Key Files

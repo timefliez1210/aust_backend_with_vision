@@ -1,3 +1,4 @@
+pub mod calendar;
 pub mod error;
 
 mod imap_client;

@@ -16,8 +16,14 @@ Full user-facing docs live in the repository root:
 
 - **[README.md](README.md)** — Quick-start, architecture overview, prerequisites, environment variables, deployment
 - **[docs/API.md](docs/API.md)** — Complete HTTP endpoint reference (request/response shapes, curl examples, business rules, status codes)
+- **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — Crate dependency graph, full pipeline mermaid diagrams, key data types, XLSX template layout, external service map
+- **[docs/DEBUGGING.md](docs/DEBUGGING.md)** — Recurring failure patterns with root causes and fixes (read before investigating unexpected behavior)
 
-**Keep these files current.** When you add, remove, or change an endpoint: update `docs/API.md`. When deployment steps, prerequisites, or config keys change: update `README.md`.
+**Keep these files current.**
+- Endpoint added/removed/changed → update `docs/API.md`
+- Deployment steps, prerequisites, or config keys changed → update `README.md`
+- New recurring bug found and fixed → add an entry to `docs/DEBUGGING.md`
+- Crate added, removed, or pipeline flow changed → update `docs/ARCHITECTURE.md`
 
 ## Tech Stack
 

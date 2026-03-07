@@ -1,6 +1,5 @@
 #![cfg(test)]
 
-use aust_calendar::CalendarService;
 use aust_core::config::*;
 use aust_core::Config;
 use aust_llm_providers::MockLlmProvider;
@@ -90,14 +89,8 @@ pub async fn test_app_state_with_pool(pool: PgPool) -> AppState {
         Arc::new(MockLlmProvider::new("{}"));
     let storage: Arc<dyn aust_storage::StorageProvider> =
         Arc::new(LocalStorage::new("/tmp/aust-test-uploads").expect("create test storage"));
-    let calendar = Arc::new(CalendarService::new(
-        pool.clone(),
-        config.calendar.default_capacity,
-        config.calendar.alternatives_count,
-        config.calendar.search_window_days,
-    ));
 
-    AppState::new(config, pool, llm, storage, calendar, None)
+    AppState::new(config, pool, llm, storage, None)
 }
 
 /// Creates a test AppState with a mock vision service at the given URL.
@@ -107,16 +100,10 @@ pub async fn test_app_state_with_vision(pool: PgPool, vision_url: &str) -> AppSt
         Arc::new(MockLlmProvider::new("{}"));
     let storage: Arc<dyn aust_storage::StorageProvider> =
         Arc::new(LocalStorage::new("/tmp/aust-test-uploads").expect("create test storage"));
-    let calendar = Arc::new(CalendarService::new(
-        pool.clone(),
-        config.calendar.default_capacity,
-        config.calendar.alternatives_count,
-        config.calendar.search_window_days,
-    ));
     let vision = VisionServiceClient::new(vision_url, Some(vision_url), 30, 0)
         .expect("create test vision client");
 
-    AppState::new(config, pool, llm, storage, calendar, Some(vision))
+    AppState::new(config, pool, llm, storage, Some(vision))
 }
 
 /// Generate a valid JWT token for testing using the test config's secret.
@@ -294,29 +281,6 @@ pub async fn insert_test_quote_no_distance(pool: &PgPool, volume_m3: f64) -> uui
     id
 }
 
-/// Insert a test booking and return its ID.
-/// Note: calendar_bookings has a unique partial index on (inquiry_id) WHERE status != 'cancelled',
-/// so only ONE active booking per inquiry is allowed.
-pub async fn insert_test_booking(
-    pool: &PgPool,
-    inquiry_id: uuid::Uuid,
-    status: &str,
-) -> uuid::Uuid {
-    let id = uuid::Uuid::now_v7();
-    sqlx::query(
-        "INSERT INTO calendar_bookings (id, booking_date, inquiry_id, customer_name,
-         customer_email, status, created_at, updated_at)
-         VALUES ($1, '2026-04-01', $2, 'Test Kunde', 'test@example.com', $3, NOW(), NOW())",
-    )
-    .bind(id)
-    .bind(inquiry_id)
-    .bind(status)
-    .execute(pool)
-    .await
-    .expect("insert test booking");
-    id
-}
-
 /// Insert a test volume estimation and return its ID.
 pub async fn insert_test_estimation(
     pool: &PgPool,
@@ -360,21 +324,10 @@ pub async fn get_offer_status(pool: &PgPool, offer_id: uuid::Uuid) -> String {
     row.0
 }
 
-/// Helper to get a booking's status from DB.
-pub async fn get_booking_status(pool: &PgPool, booking_id: uuid::Uuid) -> String {
-    let row: (String,) = sqlx::query_as("SELECT status FROM calendar_bookings WHERE id = $1")
-        .bind(booking_id)
-        .fetch_one(pool)
-        .await
-        .expect("get booking status");
-    row.0
-}
-
 /// Clean up all test data. Call at the start of tests for isolation.
 pub async fn clean_test_data(pool: &PgPool) {
     // Delete in order respecting foreign keys
     for table in &[
-        "calendar_bookings",
         "volume_estimations",
         "offers",
         "inquiries",

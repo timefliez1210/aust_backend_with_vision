@@ -98,7 +98,7 @@ async fn dashboard(
 
     let today = Utc::now().date_naive();
     let (todays_bookings,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM calendar_bookings WHERE booking_date = $1 AND status != 'cancelled'",
+        "SELECT COUNT(*) FROM inquiries WHERE COALESCE(scheduled_date, preferred_date::date) = $1 AND status NOT IN ('cancelled', 'rejected', 'expired')",
     )
     .bind(today)
     .fetch_optional(&state.db)
@@ -141,13 +141,13 @@ async fn dashboard(
 
     let conflict_rows: Vec<ConflictRow> = sqlx::query_as(
         r#"
-        SELECT booking_date, COUNT(*) AS booking_count
-        FROM calendar_bookings
-        WHERE booking_date BETWEEN $1 AND $2
-          AND status != 'cancelled'
-        GROUP BY booking_date
+        SELECT COALESCE(scheduled_date, preferred_date::date) AS booking_date, COUNT(*) AS booking_count
+        FROM inquiries
+        WHERE COALESCE(scheduled_date, preferred_date::date) BETWEEN $1 AND $2
+          AND status NOT IN ('cancelled', 'rejected', 'expired')
+        GROUP BY COALESCE(scheduled_date, preferred_date::date)
         HAVING COUNT(*) > COALESCE(
-            (SELECT capacity FROM calendar_capacity_overrides WHERE override_date = booking_date),
+            (SELECT capacity FROM calendar_capacity_overrides WHERE override_date = COALESCE(scheduled_date, preferred_date::date)),
             $3
         )
         ORDER BY booking_date
@@ -566,7 +566,7 @@ async fn list_orders(
                    q.status,
                    q.preferred_date,
                    (SELECT ROUND(o.price_cents * 1.19)::bigint FROM offers o WHERE o.inquiry_id = q.id ORDER BY o.created_at DESC LIMIT 1) AS offer_price_brutto,
-                   (SELECT cb.booking_date FROM calendar_bookings cb WHERE cb.inquiry_id = q.id AND cb.status <> 'cancelled' LIMIT 1) AS booking_date,
+                   q.scheduled_date AS booking_date,
                    q.created_at
             FROM inquiries q
             JOIN customers c ON q.customer_id = c.id
@@ -597,7 +597,7 @@ async fn list_orders(
                    q.status,
                    q.preferred_date,
                    (SELECT ROUND(o.price_cents * 1.19)::bigint FROM offers o WHERE o.inquiry_id = q.id ORDER BY o.created_at DESC LIMIT 1) AS offer_price_brutto,
-                   (SELECT cb.booking_date FROM calendar_bookings cb WHERE cb.inquiry_id = q.id AND cb.status <> 'cancelled' LIMIT 1) AS booking_date,
+                   q.scheduled_date AS booking_date,
                    q.created_at
             FROM inquiries q
             JOIN customers c ON q.customer_id = c.id
@@ -1616,7 +1616,7 @@ async fn get_employee(
                COALESCE(c.first_name || ' ' || c.last_name, c.name) AS customer_name,
                oa.city AS origin_city,
                da.city AS destination_city,
-               COALESCE(cb.booking_date, i.preferred_date::date) AS booking_date,
+               COALESCE(i.scheduled_date, i.preferred_date::date) AS booking_date,
                ie.planned_hours::float8 AS planned_hours,
                ie.actual_hours::float8 AS actual_hours,
                ie.notes,
@@ -1626,9 +1626,8 @@ async fn get_employee(
         JOIN customers c ON i.customer_id = c.id
         LEFT JOIN addresses oa ON i.origin_address_id = oa.id
         LEFT JOIN addresses da ON i.destination_address_id = da.id
-        LEFT JOIN calendar_bookings cb ON cb.inquiry_id = i.id AND cb.status != 'cancelled'
         WHERE ie.employee_id = $1
-        ORDER BY COALESCE(cb.booking_date, i.preferred_date::date) DESC NULLS LAST
+        ORDER BY COALESCE(i.scheduled_date, i.preferred_date::date) DESC NULLS LAST
         LIMIT 50
         "#,
     )
@@ -1790,7 +1789,7 @@ async fn employee_hours_summary(
                COALESCE(c.first_name || ' ' || c.last_name, c.name) AS customer_name,
                oa.city AS origin_city,
                da.city AS destination_city,
-               COALESCE(cb.booking_date, i.preferred_date::date) AS booking_date,
+               COALESCE(i.scheduled_date, i.preferred_date::date) AS booking_date,
                ie.planned_hours::float8 AS planned_hours,
                ie.actual_hours::float8 AS actual_hours,
                i.status AS inquiry_status
@@ -1799,10 +1798,9 @@ async fn employee_hours_summary(
         JOIN customers c ON i.customer_id = c.id
         LEFT JOIN addresses oa ON i.origin_address_id = oa.id
         LEFT JOIN addresses da ON i.destination_address_id = da.id
-        LEFT JOIN calendar_bookings cb ON cb.inquiry_id = i.id AND cb.status != 'cancelled'
         WHERE ie.employee_id = $1
-          AND COALESCE(cb.booking_date, i.preferred_date::date, ie.created_at::date) BETWEEN $2 AND $3
-        ORDER BY COALESCE(cb.booking_date, i.preferred_date::date, ie.created_at::date)
+          AND COALESCE(i.scheduled_date, i.preferred_date::date, ie.created_at::date) BETWEEN $2 AND $3
+        ORDER BY COALESCE(i.scheduled_date, i.preferred_date::date, ie.created_at::date)
         "#,
     )
     .bind(id)
@@ -1882,9 +1880,8 @@ async fn fetch_employee_month_hours(
                SUM(ie.actual_hours)::float8 AS actual
         FROM inquiry_employees ie
         JOIN inquiries i ON ie.inquiry_id = i.id
-        LEFT JOIN calendar_bookings cb ON cb.inquiry_id = i.id AND cb.status != 'cancelled'
         WHERE ie.employee_id = $1
-          AND COALESCE(cb.booking_date, i.preferred_date::date, ie.created_at::date) BETWEEN $2 AND $3
+          AND COALESCE(i.scheduled_date, i.preferred_date::date, ie.created_at::date) BETWEEN $2 AND $3
         "#,
     )
     .bind(employee_id)

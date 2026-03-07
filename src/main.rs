@@ -1,6 +1,5 @@
 use anyhow::Result;
 use aust_api::{create_pool, create_router, run_offer_event_handler, AppState};
-use aust_calendar::CalendarService;
 use aust_core::Config;
 use aust_email_agent::EmailProcessor;
 use config::{ConfigBuilder, Environment, File};
@@ -42,15 +41,6 @@ async fn main() -> Result<()> {
     let storage = aust_storage::create_provider(&config.storage).await?;
     tracing::info!("Storage provider initialized");
 
-    // Create calendar service
-    let calendar = Arc::new(CalendarService::new(
-        db.clone(),
-        config.calendar.default_capacity,
-        config.calendar.alternatives_count,
-        config.calendar.search_window_days,
-    ));
-    tracing::info!("Calendar service initialized (default capacity: {})", config.calendar.default_capacity);
-
     // Create vision service client (if enabled)
     let vision_service = if config.vision_service.enabled {
         match aust_volume_estimator::VisionServiceClient::new(
@@ -79,15 +69,17 @@ async fn main() -> Result<()> {
     // Create offer event channel (email agent → orchestrator)
     let (offer_tx, offer_rx) = tokio::sync::mpsc::unbounded_channel();
 
-    // Create email processor (needs LLM + calendar clones before they move into AppState)
+    // Create email processor
     let llm_for_email = llm.clone();
-    let calendar_for_email = calendar.clone();
     let email_config = config.email.clone();
     let telegram_config = config.telegram.clone();
     let db_for_email = db.clone();
+    let cal_default_capacity = config.calendar.default_capacity;
+    let cal_alternatives_count = config.calendar.alternatives_count;
+    let cal_search_window_days = config.calendar.search_window_days;
 
     // Create app state
-    let state = AppState::new(config.clone(), db, llm, storage, calendar, vision_service);
+    let state = AppState::new(config.clone(), db, llm, storage, vision_service);
 
     // Start email processor as background task
     let poll_interval = config.email.poll_interval_secs;
@@ -96,8 +88,10 @@ async fn main() -> Result<()> {
             email_config,
             telegram_config,
             llm_for_email,
-            calendar_for_email,
             db_for_email,
+            cal_default_capacity,
+            cal_alternatives_count,
+            cal_search_window_days,
         );
         processor.set_offer_channel(offer_tx);
         processor.run(poll_interval).await;

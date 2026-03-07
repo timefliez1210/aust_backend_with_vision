@@ -1,4 +1,3 @@
-use aust_calendar::CalendarService;
 use aust_core::Config;
 use aust_llm_providers::LlmProvider;
 use aust_storage::StorageProvider;
@@ -13,7 +12,6 @@ pub struct AppState {
     pub db: PgPool,
     pub llm: Arc<dyn LlmProvider>,
     pub storage: Arc<dyn StorageProvider>,
-    pub calendar: Arc<CalendarService>,
     pub vision_service: Option<VisionServiceClient>,
     /// Semaphore that limits concurrent Modal vision calls to 1.
     /// All background workers acquire this before calling the GPU service,
@@ -27,7 +25,6 @@ impl AppState {
         db: PgPool,
         llm: Arc<dyn LlmProvider>,
         storage: Arc<dyn StorageProvider>,
-        calendar: Arc<CalendarService>,
         vision_service: Option<VisionServiceClient>,
     ) -> Self {
         Self {
@@ -35,7 +32,6 @@ impl AppState {
             db,
             llm,
             storage,
-            calendar,
             vision_service,
             vision_semaphore: Arc::new(Semaphore::new(1)),
         }

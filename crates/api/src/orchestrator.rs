@@ -13,7 +13,6 @@ use reqwest::{
     multipart::{Form, Part},
     Client,
 };
-use aust_calendar::NewBooking;
 use sqlx::PgPool;
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -166,9 +165,6 @@ pub async fn try_auto_generate_offer(state: Arc<AppState>, inquiry_id: Uuid) {
             );
 
             send_offer_to_telegram(&state.config.telegram, &generated).await;
-
-            // Auto-create tentative booking if quote has a preferred_date
-            auto_create_booking(&state, inquiry_id).await;
         }
         Err(e) => {
             error!("Auto-offer generation failed for quote {inquiry_id}: {e}");
@@ -177,110 +173,6 @@ pub async fn try_auto_generate_offer(state: Arc<AppState>, inquiry_id: Uuid) {
                 &format!("Angebotserstellung fehlgeschlagen für Quote {inquiry_id}: {e}"),
             )
             .await;
-        }
-    }
-}
-
-/// Auto-create a tentative calendar booking when an offer is generated for a quote that has a
-/// preferred moving date.
-///
-/// **Caller**: `try_auto_generate_offer`, called immediately after a successful offer build.
-/// **Why**: Reserving the date tentatively prevents the admin from accidentally double-booking
-/// while still reviewing the offer. The booking is visible in the dashboard even if over-capacity.
-///
-/// Uses `force_create_booking`, which intentionally bypasses capacity limits — resulting
-/// conflicts appear in the calendar dashboard as a warning rather than blocking the flow.
-/// All errors are logged but never propagated, so booking failures cannot break offer generation.
-///
-/// # Parameters
-/// - `state` — shared application state (DB, calendar service, config)
-/// - `inquiry_id` — the quote whose `preferred_date` is used as the booking date
-async fn auto_create_booking(state: &AppState, inquiry_id: Uuid) {
-    // Fetch preferred_date from quote
-    let row: Option<(Option<chrono::DateTime<chrono::Utc>>,)> =
-        sqlx::query_as("SELECT preferred_date FROM inquiries WHERE id = $1")
-            .bind(inquiry_id)
-            .fetch_optional(&state.db)
-            .await
-            .unwrap_or(None);
-
-    let booking_date = match row {
-        Some((Some(dt),)) => dt.date_naive(),
-        _ => {
-            info!("Quote {inquiry_id} has no preferred_date, skipping auto-booking");
-            return;
-        }
-    };
-
-    // Check if an active booking already exists for this quote (the unique index would catch this too)
-    let existing: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT id FROM calendar_bookings WHERE inquiry_id = $1 AND status != 'cancelled' LIMIT 1",
-    )
-    .bind(inquiry_id)
-    .fetch_optional(&state.db)
-    .await
-    .unwrap_or(None);
-
-    if existing.is_some() {
-        info!("Active booking already exists for quote {inquiry_id}, skipping");
-        return;
-    }
-
-    // Fetch customer and address info for the booking
-    let info_row: Option<(Option<String>, Option<String>, Option<f64>, Option<f64>)> = sqlx::query_as(
-        r#"
-        SELECT c.name, c.email, q.estimated_volume_m3, q.distance_km
-        FROM inquiries q
-        JOIN customers c ON q.customer_id = c.id
-        WHERE q.id = $1
-        "#,
-    )
-    .bind(inquiry_id)
-    .fetch_optional(&state.db)
-    .await
-    .unwrap_or(None);
-
-    let (customer_name, customer_email, volume_m3, distance_km) =
-        info_row.unwrap_or((None, None, None, None));
-
-    // Fetch addresses
-    let addr_row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
-        r#"
-        SELECT
-            (SELECT street || ', ' || city FROM addresses WHERE id = q.origin_address_id),
-            (SELECT street || ', ' || city FROM addresses WHERE id = q.destination_address_id)
-        FROM inquiries q WHERE q.id = $1
-        "#,
-    )
-    .bind(inquiry_id)
-    .fetch_optional(&state.db)
-    .await
-    .unwrap_or(None);
-
-    let (departure, arrival) = addr_row.unwrap_or((None, None));
-
-    let new_booking = NewBooking {
-        booking_date,
-        inquiry_id: Some(inquiry_id),
-        customer_name,
-        customer_email,
-        departure_address: departure,
-        arrival_address: arrival,
-        volume_m3,
-        distance_km,
-        description: None,
-        status: "tentative".to_string(),
-    };
-
-    match state.calendar.force_create_booking(new_booking).await {
-        Ok(booking) => {
-            info!(
-                "Auto-created tentative booking {} for quote {inquiry_id} on {}",
-                booking.id, booking_date
-            );
-        }
-        Err(e) => {
-            warn!("Failed to auto-create booking for quote {inquiry_id}: {e}");
         }
     }
 }

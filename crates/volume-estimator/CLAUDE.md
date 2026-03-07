@@ -1,5 +1,8 @@
 # crates/volume-estimator — Volume Calculation
 
+> Pipeline context (how volume feeds into pricing): [../../docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md)
+> Two separate hours systems (offer hours vs payroll hours): [../../docs/ARCHITECTURE.md#two-separate-hours-systems](../../docs/ARCHITECTURE.md)
+
 Calculates moving volume from images (LLM vision or 3D ML pipeline), manual inventory lists, or depth sensor data.
 
 ## Key Files

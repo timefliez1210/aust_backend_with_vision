@@ -1,5 +1,8 @@
 # Distance Calculator Crate
 
+> External service map: [../../docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md#external-service-dependencies)
+> ORS 406 error fix: [../../docs/DEBUGGING.md#5-ors-directions-api-returns-406](../../docs/DEBUGGING.md)
+
 Multi-stop driving distance and travel time calculator using OpenRouteService (free, OpenStreetMap-based).
 
 ## Architecture

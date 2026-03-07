@@ -1,5 +1,7 @@
 # crates/llm-providers — Multi-Provider LLM Abstraction
 
+> External service map (provider selection, primary = Claude for German): [../../docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md#external-service-dependencies)
+
 Pluggable LLM backend with a unified trait interface. Supports Claude, OpenAI, and Ollama.
 
 ## Key Files

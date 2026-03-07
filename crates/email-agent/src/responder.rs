@@ -1,4 +1,4 @@
-use aust_calendar::AvailabilityResult;
+use crate::calendar::AvailabilityResult;
 use crate::EmailError;
 use aust_core::models::{InquirySource, MissingField, MovingInquiry};
 use aust_llm_providers::{LlmMessage, LlmProvider, LlmRole};

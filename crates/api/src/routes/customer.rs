@@ -10,7 +10,6 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::middleware::customer_auth::CustomerClaims;
-use crate::services::db::find_active_booking_id;
 use crate::{ApiError, AppState};
 
 /// Protected customer routes (require customer session token).
@@ -613,11 +612,6 @@ async fn accept_inquiry(
         .execute(&state.db)
         .await?;
 
-    // Confirm booking if exists
-    if let Some(booking_id) = find_active_booking_id(&state.db, inquiry_id).await? {
-        let _ = state.calendar.confirm_booking(booking_id).await;
-    }
-
     // Notify admin via Telegram
     notify_admin_telegram(
         &state.config.telegram,
@@ -704,11 +698,6 @@ async fn reject_inquiry(
         .bind(inquiry_id)
         .execute(&state.db)
         .await?;
-
-    // Cancel booking if exists
-    if let Some(booking_id) = find_active_booking_id(&state.db, inquiry_id).await? {
-        let _ = state.calendar.cancel_booking(booking_id).await;
-    }
 
     // Notify admin via Telegram
     notify_admin_telegram(

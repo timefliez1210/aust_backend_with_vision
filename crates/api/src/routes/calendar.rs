@@ -1,64 +1,191 @@
 use axum::{
     extract::{Path, Query, State},
-    routing::{get, post, put},
+    routing::{get, put},
     Json, Router,
 };
-use chrono::NaiveDate;
+use chrono::{Datelike, NaiveDate};
 use serde::{Deserialize, Serialize};
+use sqlx::FromRow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use aust_calendar::{
-    AvailabilityResult, Booking, CapacityOverride, NewBooking,
-};
 use crate::{ApiError, AppState};
 
-/// Register the calendar and booking routes.
+/// Register the calendar routes.
 ///
 /// **Caller**: `crates/api/src/routes/mod.rs` route tree assembly.
-/// **Why**: Exposes availability checking, schedule overview, booking CRUD, and daily
-/// capacity overrides for the moving company calendar.
+/// **Why**: Exposes availability checking, schedule overview, and daily capacity
+/// overrides. Data comes directly from `inquiries` — no separate bookings table.
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/availability", get(check_availability))
         .route("/schedule", get(get_schedule))
-        .route("/bookings", post(create_booking))
-        .route("/bookings/{id}", get(get_booking).patch(update_booking).delete(delete_booking_handler))
         .route("/capacity/{date}", put(set_capacity))
 }
+
+// ── Response types ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+struct DateAvailability {
+    date: NaiveDate,
+    available: bool,
+    capacity: i32,
+    booked: i32,
+    remaining: i32,
+}
+
+#[derive(Debug, Serialize)]
+struct AvailabilityResult {
+    requested_date: NaiveDate,
+    requested_date_available: bool,
+    requested_date_info: DateAvailability,
+    alternatives: Vec<DateAvailability>,
+}
+
+#[derive(Debug, Serialize)]
+struct ScheduleInquiry {
+    inquiry_id: Uuid,
+    customer_name: Option<String>,
+    departure_address: Option<String>,
+    arrival_address: Option<String>,
+    volume_m3: Option<f64>,
+    status: String,
+    offer_price_cents: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct ScheduleEntry {
+    date: NaiveDate,
+    available: bool,
+    capacity: i32,
+    booked: i32,
+    remaining: i32,
+    inquiries: Vec<ScheduleInquiry>,
+}
+
+#[derive(Debug, Serialize, Deserialize, FromRow)]
+pub struct CapacityOverride {
+    pub override_date: NaiveDate,
+    pub capacity: i32,
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+async fn count_active_on_date(pool: &sqlx::PgPool, date: NaiveDate) -> Result<i32, sqlx::Error> {
+    let (count,): (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*) FROM inquiries
+        WHERE COALESCE(scheduled_date, preferred_date::date) = $1
+          AND status NOT IN ('cancelled', 'rejected', 'expired')
+        "#,
+    )
+    .bind(date)
+    .fetch_one(pool)
+    .await?;
+    Ok(count as i32)
+}
+
+async fn effective_capacity(
+    pool: &sqlx::PgPool,
+    date: NaiveDate,
+    default: i32,
+) -> Result<i32, sqlx::Error> {
+    let row: Option<(i32,)> = sqlx::query_as(
+        "SELECT capacity FROM calendar_capacity_overrides WHERE override_date = $1",
+    )
+    .bind(date)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(c,)| c).unwrap_or(default))
+}
+
+async fn build_date_availability(
+    pool: &sqlx::PgPool,
+    date: NaiveDate,
+    default_capacity: i32,
+) -> Result<DateAvailability, sqlx::Error> {
+    let capacity = effective_capacity(pool, date, default_capacity).await?;
+    let booked = count_active_on_date(pool, date).await?;
+    let remaining = (capacity - booked).max(0);
+    Ok(DateAvailability { date, available: remaining > 0, capacity, booked, remaining })
+}
+
+async fn find_nearest_available(
+    pool: &sqlx::PgPool,
+    around: NaiveDate,
+    default_capacity: i32,
+    count: usize,
+    search_window_days: i64,
+) -> Result<Vec<DateAvailability>, sqlx::Error> {
+    let today = chrono::Utc::now().date_naive();
+    let mut results = Vec::new();
+    let mut offset = 1i64;
+
+    while results.len() < count && offset <= search_window_days {
+        let future = around + chrono::Days::new(offset as u64);
+        if future.weekday() != chrono::Weekday::Sun {
+            let avail = build_date_availability(pool, future, default_capacity).await?;
+            if avail.available {
+                results.push(avail);
+                if results.len() >= count {
+                    break;
+                }
+            }
+        }
+        let past = around - chrono::Days::new(offset as u64);
+        if past >= today && past.weekday() != chrono::Weekday::Sun {
+            let avail = build_date_availability(pool, past, default_capacity).await?;
+            if avail.available {
+                results.push(avail);
+            }
+        }
+        offset += 1;
+    }
+
+    results.sort_by_key(|a| (a.date - around).num_days().unsigned_abs());
+    results.truncate(count);
+    Ok(results)
+}
+
+// ── Handlers ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 struct AvailabilityQuery {
     date: NaiveDate,
 }
 
-/// `GET /api/v1/calendar/availability?date=YYYY-MM-DD` — Check availability for a specific date.
+/// `GET /api/v1/calendar/availability?date=YYYY-MM-DD` — Check availability for a date.
 ///
-/// **Caller**: Axum router / customer-facing booking calendar and admin scheduling view.
-/// **Why**: Returns whether the requested date is available and, if not, suggests nearby
-/// alternative dates (count configured in `Config.calendar.alternatives_count`).
-///
-/// # Parameters
-/// - `state` — shared AppState (calendar service)
-/// - `query` — `date` query parameter (NaiveDate, format YYYY-MM-DD)
-///
-/// # Returns
-/// `200 OK` with `AvailabilityResult` (available flag + alternative dates).
-///
-/// # Errors
-/// - `500` on calendar service failures
+/// Counts active inquiries on that date and compares against effective capacity
+/// (override or default). Returns alternatives when the date is full.
 async fn check_availability(
     State(state): State<Arc<AppState>>,
     Query(query): Query<AvailabilityQuery>,
 ) -> Result<Json<AvailabilityResult>, ApiError> {
-    let result = state
-        .calendar
-        .check_availability(query.date)
+    let default_capacity = state.config.calendar.default_capacity;
+    let alternatives_count = state.config.calendar.alternatives_count;
+    let search_window = state.config.calendar.search_window_days;
+
+    let info = build_date_availability(&state.db, query.date, default_capacity)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    Ok(Json(result))
+    let available = info.available;
+    let alternatives = if !available {
+        find_nearest_available(&state.db, query.date, default_capacity, alternatives_count, search_window)
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?
+    } else {
+        Vec::new()
+    };
+
+    Ok(Json(AvailabilityResult {
+        requested_date: query.date,
+        requested_date_available: available,
+        requested_date_info: info,
+        alternatives,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,297 +194,157 @@ struct ScheduleQuery {
     to: NaiveDate,
 }
 
-/// Enriched booking with offer price for frontend display.
-#[derive(Debug, Serialize)]
-struct EnrichedBooking {
-    #[serde(flatten)]
-    booking: Booking,
-    offer_price_cents: Option<i64>,
-}
-
-#[derive(Debug, Serialize)]
-struct EnrichedScheduleEntry {
-    date: NaiveDate,
-    availability: aust_calendar::DateAvailability,
-    bookings: Vec<EnrichedBooking>,
-}
-
-/// `GET /api/v1/calendar/schedule?from=YYYY-MM-DD&to=YYYY-MM-DD` — Fetch the schedule for a date range.
+/// `GET /api/v1/calendar/schedule?from=YYYY-MM-DD&to=YYYY-MM-DD` — Fetch schedule for a date range.
 ///
-/// **Caller**: Axum router / admin dashboard calendar view.
-/// **Why**: Returns each date in the range with its availability status and all bookings
-/// for that day. Also enriches bookings with the latest non-rejected offer's netto price
-/// so the calendar view can display the job value without extra requests. Maximum range is
-/// 90 days.
-///
-/// # Parameters
-/// - `state` — shared AppState (DB pool, calendar service)
-/// - `query` — `from` and `to` NaiveDate query parameters
-///
-/// # Returns
-/// `200 OK` with `Vec<EnrichedScheduleEntry>` (date, availability, enriched bookings).
-///
-/// # Errors
-/// - `400` if `from > to` or the range exceeds 90 days
-/// - `500` on calendar service failures
+/// Returns one entry per day with active inquiries and availability info.
+/// Inquiries are joined with customers and addresses for display. Max 90-day range.
 async fn get_schedule(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ScheduleQuery>,
-) -> Result<Json<Vec<EnrichedScheduleEntry>>, ApiError> {
+) -> Result<Json<Vec<ScheduleEntry>>, ApiError> {
     if query.from > query.to {
-        return Err(ApiError::BadRequest(
-            "'from' must be before or equal to 'to'".to_string(),
-        ));
+        return Err(ApiError::BadRequest("'from' must be before or equal to 'to'".into()));
+    }
+    if (query.to - query.from).num_days() > 90 {
+        return Err(ApiError::BadRequest("Date range must not exceed 90 days".into()));
     }
 
-    let max_days = 90;
-    if (query.to - query.from).num_days() > max_days {
-        return Err(ApiError::BadRequest(format!(
-            "Date range must not exceed {max_days} days"
-        )));
+    let default_capacity = state.config.calendar.default_capacity;
+
+    // Fetch all active inquiries in range
+    #[derive(FromRow)]
+    struct InquiryRow {
+        effective_date: NaiveDate,
+        inquiry_id: Uuid,
+        customer_name: Option<String>,
+        departure_address: Option<String>,
+        arrival_address: Option<String>,
+        volume_m3: Option<f64>,
+        status: String,
     }
 
-    let schedule = state
-        .calendar
-        .get_schedule(query.from, query.to)
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let inquiry_rows: Vec<InquiryRow> = sqlx::query_as(
+        r#"
+        SELECT
+            COALESCE(i.scheduled_date, i.preferred_date::date) AS effective_date,
+            i.id AS inquiry_id,
+            COALESCE(
+                NULLIF(TRIM(COALESCE(c.first_name,'') || ' ' || COALESCE(c.last_name,'')), ''),
+                c.name, c.email
+            ) AS customer_name,
+            CASE WHEN ao.id IS NOT NULL THEN ao.street || ', ' || ao.city END AS departure_address,
+            CASE WHEN ad.id IS NOT NULL THEN ad.street || ', ' || ad.city END AS arrival_address,
+            i.estimated_volume_m3 AS volume_m3,
+            i.status
+        FROM inquiries i
+        JOIN customers c ON i.customer_id = c.id
+        LEFT JOIN addresses ao ON i.origin_address_id = ao.id
+        LEFT JOIN addresses ad ON i.destination_address_id = ad.id
+        WHERE COALESCE(i.scheduled_date, i.preferred_date::date) BETWEEN $1 AND $2
+          AND i.status NOT IN ('cancelled', 'rejected', 'expired')
+        ORDER BY effective_date
+        "#,
+    )
+    .bind(query.from)
+    .bind(query.to)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    // Collect all inquiry_ids from bookings to fetch offer prices in one query
-    let inquiry_ids: Vec<Uuid> = schedule
-        .iter()
-        .flat_map(|entry| &entry.bookings)
-        .filter_map(|b| b.inquiry_id)
-        .collect();
-
+    // Fetch offer prices for all inquiry_ids in one query
+    let inquiry_ids: Vec<Uuid> = inquiry_rows.iter().map(|r| r.inquiry_id).collect();
     let mut price_map: HashMap<Uuid, i64> = HashMap::new();
     if !inquiry_ids.is_empty() {
-        let rows: Vec<(Uuid, i64)> = sqlx::query_as(
+        let price_rows: Vec<(Uuid, i64)> = sqlx::query_as(
             "SELECT inquiry_id, price_cents FROM offers WHERE inquiry_id = ANY($1) AND status != 'rejected' ORDER BY created_at DESC",
         )
         .bind(&inquiry_ids)
         .fetch_all(&state.db)
         .await
         .unwrap_or_default();
-
-        for (qid, price) in rows {
-            price_map.entry(qid).or_insert(price);
+        for (id, price) in price_rows {
+            price_map.entry(id).or_insert(price);
         }
     }
 
-    let enriched: Vec<EnrichedScheduleEntry> = schedule
-        .into_iter()
-        .map(|entry| EnrichedScheduleEntry {
-            date: entry.date,
-            availability: entry.availability,
-            bookings: entry
-                .bookings
-                .into_iter()
-                .map(|b| {
-                    let price = b.inquiry_id.and_then(|qid| price_map.get(&qid).copied());
-                    EnrichedBooking {
-                        booking: b,
-                        offer_price_cents: price,
-                    }
-                })
-                .collect(),
-        })
-        .collect();
+    // Fetch capacity overrides for range
+    let override_rows: Vec<(NaiveDate, i32)> = sqlx::query_as(
+        "SELECT override_date, capacity FROM calendar_capacity_overrides WHERE override_date BETWEEN $1 AND $2",
+    )
+    .bind(query.from)
+    .bind(query.to)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+    let override_map: HashMap<NaiveDate, i32> = override_rows.into_iter().collect();
 
-    Ok(Json(enriched))
-}
+    // Group inquiries by date
+    let mut inquiry_map: HashMap<NaiveDate, Vec<ScheduleInquiry>> = HashMap::new();
+    for row in inquiry_rows {
+        let price = price_map.get(&row.inquiry_id).copied();
+        inquiry_map.entry(row.effective_date).or_default().push(ScheduleInquiry {
+            inquiry_id: row.inquiry_id,
+            customer_name: row.customer_name,
+            departure_address: row.departure_address,
+            arrival_address: row.arrival_address,
+            volume_m3: row.volume_m3,
+            status: row.status,
+            offer_price_cents: price,
+        });
+    }
 
-/// `POST /api/v1/calendar/bookings` — Create a new moving booking.
-///
-/// **Caller**: Axum router / admin dashboard booking creation.
-/// **Why**: Delegates to `CalendarService.create_booking`, which checks capacity before
-/// inserting. Returns a `FullyBooked` error (mapped to 400) if the date is at capacity.
-///
-/// # Parameters
-/// - `state` — shared AppState (calendar service)
-/// - `request` — `NewBooking` JSON body (date, optional inquiry_id, notes)
-///
-/// # Returns
-/// `200 OK` with the created `Booking` JSON.
-///
-/// # Errors
-/// - `400` if the selected date is fully booked
-/// - `500` on DB failures
-async fn create_booking(
-    State(state): State<Arc<AppState>>,
-    Json(request): Json<NewBooking>,
-) -> Result<Json<Booking>, ApiError> {
-    let booking = state
-        .calendar
-        .create_booking(request)
-        .await
-        .map_err(|e| match &e {
-            aust_calendar::CalendarError::FullyBooked(_) => {
-                ApiError::BadRequest(e.to_string())
-            }
-            _ => ApiError::Internal(e.to_string()),
-        })?;
+    // Build one entry per day in the range
+    let mut entries = Vec::new();
+    let mut current = query.from;
+    while current <= query.to {
+        let capacity = override_map.get(&current).copied().unwrap_or(default_capacity);
+        let day_inquiries = inquiry_map.remove(&current).unwrap_or_default();
+        let booked = day_inquiries.len() as i32;
+        let remaining = (capacity - booked).max(0);
 
-    Ok(Json(booking))
-}
+        entries.push(ScheduleEntry {
+            date: current,
+            available: remaining > 0,
+            capacity,
+            booked,
+            remaining,
+            inquiries: day_inquiries,
+        });
+        current = current.succ_opt().unwrap();
+    }
 
-/// `GET /api/v1/calendar/bookings/{id}` — Retrieve a single booking by ID.
-///
-/// **Caller**: Axum router / admin dashboard booking detail.
-///
-/// # Parameters
-/// - `state` — shared AppState (calendar service)
-/// - `id` — booking UUID path parameter
-///
-/// # Returns
-/// `200 OK` with `Booking` JSON.
-///
-/// # Errors
-/// - `404` if booking not found
-async fn get_booking(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<Uuid>,
-) -> Result<Json<Booking>, ApiError> {
-    let booking = state
-        .calendar
-        .get_booking(id)
-        .await
-        .map_err(|e| match &e {
-            aust_calendar::CalendarError::NotFound(_) => ApiError::NotFound(e.to_string()),
-            _ => ApiError::Internal(e.to_string()),
-        })?;
-
-    Ok(Json(booking))
+    Ok(Json(entries))
 }
 
 #[derive(Debug, Deserialize)]
-struct UpdateBookingRequest {
-    status: String,
+struct SetCapacityRequest {
+    capacity: i32,
 }
 
-/// `PATCH /api/v1/calendar/bookings/{id}` — Update booking status (confirm or cancel).
+/// `PUT /api/v1/calendar/capacity/{date}` — Override daily capacity for a specific date.
 ///
-/// **Caller**: Axum router / admin dashboard booking management.
-/// **Why**: Only "confirmed" and "cancelled" status transitions are accepted. When a
-/// booking with a linked `inquiry_id` is confirmed or cancelled, `status_sync` cascades the
-/// change to the quote status so the pipeline state stays consistent.
-///
-/// # Parameters
-/// - `state` — shared AppState (DB pool, calendar service)
-/// - `id` — booking UUID path parameter
-/// - `request` — JSON body with `status` field ("confirmed" or "cancelled")
-///
-/// # Returns
-/// `200 OK` with updated `Booking` JSON.
-///
-/// # Errors
-/// - `400` if status is not "confirmed" or "cancelled"
-/// - `404` if booking not found
-async fn update_booking(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<Uuid>,
-    Json(request): Json<UpdateBookingRequest>,
-) -> Result<Json<Booking>, ApiError> {
-    let booking = match request.status.as_str() {
-        "cancelled" => state.calendar.cancel_booking(id).await,
-        "confirmed" => state.calendar.confirm_booking(id).await,
-        other => {
-            return Err(ApiError::BadRequest(format!(
-                "Invalid status transition: '{other}'. Use 'confirmed' or 'cancelled'."
-            )));
-        }
-    }
-    .map_err(|e| match &e {
-        aust_calendar::CalendarError::NotFound(_) => ApiError::NotFound(e.to_string()),
-        _ => ApiError::Internal(e.to_string()),
-    })?;
-
-    // Sync linked quote status when booking has a inquiry_id
-    if let Some(inquiry_id) = booking.inquiry_id {
-        match booking.status.as_str() {
-            "confirmed" => {
-                crate::services::status_sync::sync_booking_confirmed(&state.db, inquiry_id).await.ok();
-            }
-            "cancelled" => {
-                crate::services::status_sync::sync_booking_cancelled(&state.db, inquiry_id).await.ok();
-            }
-            _ => {}
-        }
-    }
-
-    Ok(Json(booking))
-}
-
-/// `DELETE /api/v1/calendar/bookings/{id}` — Hard-delete a booking record.
-///
-/// **Caller**: Axum router / admin dashboard "Buchung löschen" action.
-/// **Why**: Permanently removes the booking. Does not update the linked quote status —
-/// use `update_booking` with "cancelled" first if status sync is needed.
-///
-/// # Parameters
-/// - `state` — shared AppState (calendar service)
-/// - `id` — booking UUID path parameter
-///
-/// # Returns
-/// `200 OK` with `{"ok": true}`.
-///
-/// # Errors
-/// - `404` if booking not found
-async fn delete_booking_handler(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<Uuid>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    state
-        .calendar
-        .delete_booking(id)
-        .await
-        .map_err(|e| match &e {
-            aust_calendar::CalendarError::NotFound(_) => ApiError::NotFound(e.to_string()),
-            _ => ApiError::Internal(e.to_string()),
-        })?;
-
-    Ok(Json(serde_json::json!({ "ok": true })))
-}
-
-/// `PUT /api/v1/calendar/capacity/{date}` — Override the daily booking capacity for a specific date.
-///
-/// **Caller**: Axum router / admin dashboard capacity management.
-/// **Why**: The default daily capacity is set in `Config.calendar.default_capacity`. This
-/// endpoint upserts a `calendar_capacity_overrides` row so a particular day can have a
-/// different limit (e.g. set to 0 for holidays or set higher for extra crew days).
-///
-/// # Parameters
-/// - `state` — shared AppState (calendar service)
-/// - `date` — NaiveDate path parameter (YYYY-MM-DD)
-/// - `request` — JSON body with `capacity` (non-negative integer)
-///
-/// # Returns
-/// `200 OK` with `CapacityOverride` JSON.
-///
-/// # Errors
-/// - `400` if `capacity < 0`
-/// - `500` on DB failures
+/// Setting capacity to 0 blocks the date. Higher than default allows extra bookings.
 async fn set_capacity(
     State(state): State<Arc<AppState>>,
     Path(date): Path<NaiveDate>,
     Json(request): Json<SetCapacityRequest>,
 ) -> Result<Json<CapacityOverride>, ApiError> {
     if request.capacity < 0 {
-        return Err(ApiError::BadRequest(
-            "Capacity must be >= 0".to_string(),
-        ));
+        return Err(ApiError::BadRequest("Capacity must be >= 0".into()));
     }
 
-    let result = state
-        .calendar
-        .set_capacity(date, request.capacity)
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    sqlx::query(
+        r#"
+        INSERT INTO calendar_capacity_overrides (id, override_date, capacity, created_at)
+        VALUES (gen_random_uuid(), $1, $2, NOW())
+        ON CONFLICT (override_date) DO UPDATE SET capacity = EXCLUDED.capacity
+        "#,
+    )
+    .bind(date)
+    .bind(request.capacity)
+    .execute(&state.db)
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    Ok(Json(result))
-}
-
-#[derive(Debug, Deserialize)]
-struct SetCapacityRequest {
-    capacity: i32,
+    Ok(Json(CapacityOverride { override_date: date, capacity: request.capacity }))
 }

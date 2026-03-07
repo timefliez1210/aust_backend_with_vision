@@ -24,31 +24,6 @@ pub async fn update_quote_volume(
     Ok(())
 }
 
-/// Check if a quote has any non-cancelled calendar booking.
-pub async fn has_active_booking(pool: &PgPool, inquiry_id: Uuid) -> Result<bool, sqlx::Error> {
-    let row: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT id FROM calendar_bookings WHERE inquiry_id = $1 AND status != 'cancelled' LIMIT 1",
-    )
-    .bind(inquiry_id)
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.is_some())
-}
-
-/// Return the booking ID for the first non-cancelled booking of a quote, if any.
-pub async fn find_active_booking_id(
-    pool: &PgPool,
-    inquiry_id: Uuid,
-) -> Result<Option<Uuid>, sqlx::Error> {
-    let row: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT id FROM calendar_bookings WHERE inquiry_id = $1 AND status != 'cancelled' LIMIT 1",
-    )
-    .bind(inquiry_id)
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.map(|(id,)| id))
-}
-
 /// Row returned by insert_estimation.
 #[derive(Debug, FromRow)]
 pub struct EstimationRow {
@@ -132,65 +107,6 @@ pub async fn insert_estimation_no_return(
 mod tests {
     use super::*;
     use crate::test_helpers::*;
-
-    #[tokio::test]
-    async fn test_has_active_booking_ignores_cancelled() {
-        let pool = test_db_pool().await;
-
-        let inquiry_id = insert_test_quote(&pool).await;
-        insert_test_booking(&pool, inquiry_id, "cancelled").await;
-        let result = has_active_booking(&pool, inquiry_id).await.unwrap();
-        assert!(!result);
-    }
-
-    #[tokio::test]
-    async fn test_has_active_booking_finds_confirmed() {
-        let pool = test_db_pool().await;
-
-        let inquiry_id = insert_test_quote(&pool).await;
-        insert_test_booking(&pool, inquiry_id, "confirmed").await;
-        let result = has_active_booking(&pool, inquiry_id).await.unwrap();
-        assert!(result);
-    }
-
-    #[tokio::test]
-    async fn test_has_active_booking_finds_tentative() {
-        let pool = test_db_pool().await;
-
-        let inquiry_id = insert_test_quote(&pool).await;
-        insert_test_booking(&pool, inquiry_id, "tentative").await;
-        let result = has_active_booking(&pool, inquiry_id).await.unwrap();
-        assert!(result);
-    }
-
-    #[tokio::test]
-    async fn test_has_active_booking_no_booking() {
-        let pool = test_db_pool().await;
-
-        let inquiry_id = insert_test_quote(&pool).await;
-        let result = has_active_booking(&pool, inquiry_id).await.unwrap();
-        assert!(!result);
-    }
-
-    #[tokio::test]
-    async fn test_find_active_booking_id_returns_id() {
-        let pool = test_db_pool().await;
-
-        let inquiry_id = insert_test_quote(&pool).await;
-        let booking_id = insert_test_booking(&pool, inquiry_id, "confirmed").await;
-        let result = find_active_booking_id(&pool, inquiry_id).await.unwrap();
-        assert_eq!(result, Some(booking_id));
-    }
-
-    #[tokio::test]
-    async fn test_find_active_booking_id_returns_none_for_cancelled() {
-        let pool = test_db_pool().await;
-
-        let inquiry_id = insert_test_quote(&pool).await;
-        insert_test_booking(&pool, inquiry_id, "cancelled").await;
-        let result = find_active_booking_id(&pool, inquiry_id).await.unwrap();
-        assert_eq!(result, None);
-    }
 
     #[tokio::test]
     async fn test_update_quote_volume_sets_status() {

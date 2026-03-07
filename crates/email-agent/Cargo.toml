@@ -7,7 +7,6 @@ license.workspace = true
 
 [dependencies]
 aust-core = { workspace = true }
-aust-calendar = { workspace = true }
 aust-llm-providers = { workspace = true }
 
 tokio = { workspace = true }

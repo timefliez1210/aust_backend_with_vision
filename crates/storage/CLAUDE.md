@@ -1,5 +1,7 @@
 # crates/storage — File Storage Abstraction
 
+> External service map (S3/MinIO): [../../docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md#external-service-dependencies)
+
 Abstract file storage with pluggable backends: S3-compatible (MinIO for dev, AWS for prod) or local filesystem.
 
 ## Key Files
