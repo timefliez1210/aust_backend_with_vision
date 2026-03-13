@@ -208,7 +208,7 @@ impl Default for CalendarConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct VisionServiceConfig {
     /// Whether the vision service integration is active. When `false`, the
-    /// API falls back to LLM-only volume estimation.
+    /// API skips the vision service entirely and returns an error.
     pub enabled: bool,
     /// Base URL of the photo vision service (Modal deployment or localhost).
     pub base_url: String,
@@ -216,10 +216,17 @@ pub struct VisionServiceConfig {
     /// Falls back to `base_url` when `None`.
     #[serde(default)]
     pub video_base_url: Option<String>,
-    /// HTTP request timeout in seconds. Video processing can take up to 600 s.
+    /// HTTP request timeout in seconds for individual submit/poll requests.
+    /// Submit should complete in <60s; poll responses are tiny (~1ms).
     pub timeout_secs: u64,
-    /// Number of times to retry a failed vision request before returning an error.
+    /// Number of times to resubmit a job after a `failed` or `not_found` status.
     pub max_retries: u32,
+    /// Seconds to wait between polling attempts for async jobs.
+    /// Default: 60s (Modal containers stay warm for at least 60s of idle).
+    pub poll_interval_secs: u64,
+    /// Maximum number of poll attempts before declaring the job timed out.
+    /// Default: 20 (20 × 60s = 20 min ceiling for photo; video may need more).
+    pub max_polls: u32,
 }
 
 impl Default for VisionServiceConfig {
@@ -230,6 +237,8 @@ impl Default for VisionServiceConfig {
             video_base_url: None,
             timeout_secs: 120,
             max_retries: 1,
+            poll_interval_secs: 60,
+            max_polls: 20,
         }
     }
 }

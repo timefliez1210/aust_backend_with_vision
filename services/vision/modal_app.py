@@ -6,16 +6,25 @@ Deploys the vision pipeline as serverless GPU endpoints on Modal:
 
 GPU: L4 (24GB VRAM) for both — MASt3R needs ~12-15GB during reconstruction.
 
+Architecture: async submit + polling.
+  1. POST /estimate/submit  → accepts images, starts pipeline in background,
+                             returns {"job_id": "...", "status": "accepted"} immediately.
+  2. GET  /estimate/status/{job_id} → returns processing/succeeded/failed.
+  The Rust backend submits, then polls every 60 s until done or timeout.
+
+Deprecated sync endpoints are kept for backward compatibility:
+  - POST /estimate/upload  (photo, blocks until done)
+  - POST /estimate/video   (video, blocks until done)
+
 Usage:
     modal deploy services/vision/modal_app.py      # deploy to Modal
     modal serve services/vision/modal_app.py       # dev mode with hot-reload
 
 Test:
     curl https://<app>.modal.run/health
-    curl -X POST https://<app>.modal.run/estimate/upload \\
+    curl -X POST https://<app>.modal.run/estimate/submit \\
         -F "job_id=test-1" -F "images=@room1.jpg"
-    curl -X POST https://<app>.modal.run/estimate/video \\
-        -F "job_id=test-1" -F "video=@room.mp4"
+    curl https://<app>.modal.run/estimate/status/test-1
 """
 from pathlib import Path
 
@@ -101,19 +110,23 @@ vision_image = (
 app = modal.App("aust-vision", image=vision_image)
 
 
-# -- Photo endpoint: fast, concurrent processing ----------------------------
+# -- Photo endpoint: single-job async processing ----------------------------
 
-@app.function(gpu="L4", scaledown_window=60, max_containers=1)
-@modal.concurrent(max_inputs=4)
+@app.function(gpu="L4", scaledown_window=60, max_containers=1, timeout=900)
+@modal.concurrent(max_inputs=1)
 @modal.asgi_app()
 def serve():
     """Serve photo estimation endpoint on Modal with GPU.
 
-    Handles concurrent photo requests (up to 4). Fast ~5s per job.
+    Exposes two patterns:
+    - Async (preferred): POST /estimate/submit + GET /estimate/status/{job_id}
+    - Sync (deprecated): POST /estimate/upload  (blocks until done)
     """
+    import asyncio
     import io
     import logging
     import sys
+    import time
 
     logging.basicConfig(
         level=logging.INFO,
@@ -140,6 +153,53 @@ def serve():
 
     web_app = FastAPI(title="AUST Vision Service (Modal)")
 
+    # In-memory job store: job_id -> {"status": str, "result": dict|None,
+    #                                  "error": str|None, "started_at": float,
+    #                                  "finished_at": float|None}
+    jobs: dict = {}
+
+    def _cleanup_old_jobs() -> None:
+        """Remove jobs older than 30 minutes to bound memory usage."""
+        cutoff = time.time() - 1800  # 30 minutes
+        expired = [
+            jid for jid, info in jobs.items()
+            if info.get("finished_at", info.get("started_at", 0)) < cutoff
+        ]
+        for jid in expired:
+            del jobs[jid]
+
+    async def _run_photo_job(
+        job_id: str,
+        pil_images: list,
+        threshold: float,
+    ) -> None:
+        """Execute vision pipeline in a thread and record result in jobs dict."""
+        jobs[job_id] = {"status": "processing", "started_at": time.time()}
+        try:
+            pipeline = VisionPipeline(registry)
+            result = await asyncio.to_thread(
+                pipeline.run,
+                job_id=job_id,
+                images=pil_images,
+                detection_threshold=threshold,
+            )
+            jobs[job_id] = {
+                "status": "succeeded",
+                "result": result.model_dump(),
+                "finished_at": time.time(),
+            }
+            logger.info(
+                "Photo job %s succeeded: %d items, %.3f m³",
+                job_id, len(result.detected_items), result.total_volume_m3,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Photo pipeline failed for job %s", job_id)
+            jobs[job_id] = {
+                "status": "failed",
+                "error": str(exc),
+                "finished_at": time.time(),
+            }
+
     @web_app.get("/health")
     def health():
         return {"status": "ok"}
@@ -161,18 +221,70 @@ def serve():
             "gpu_available": registry.gpu_available,
         }
 
+    @web_app.post("/estimate/submit")
+    async def estimate_submit(
+        job_id: str = Form(default="test"),
+        images: List[UploadFile] = File(...),
+        detection_threshold: float = Form(default=0.3),
+    ):
+        """Async photo submit endpoint.
+
+        Starts the vision pipeline in the background and returns immediately.
+        Poll GET /estimate/status/{job_id} for the result.
+
+        curl -X POST <url>/estimate/submit \\
+            -F "job_id=uuid-here" -F "images=@room1.jpg" -F "images=@room2.jpg"
+        """
+        _cleanup_old_jobs()
+
+        if not registry.is_loaded:
+            return JSONResponse(status_code=503, content={"detail": "Models not loaded yet."})
+
+        pil_images = []
+        for upload in images:
+            data = await upload.read()
+            pil_images.append(PILImage.open(io.BytesIO(data)).convert("RGB"))
+
+        # Kick off background task — do not await
+        asyncio.create_task(_run_photo_job(job_id, pil_images, detection_threshold))
+
+        return {"job_id": job_id, "status": "accepted"}
+
+    @web_app.get("/estimate/status/{job_id}")
+    async def estimate_status(job_id: str):
+        """Poll endpoint for async photo jobs.
+
+        Returns:
+        - {"status": "processing"} while running
+        - {"status": "succeeded", "result": {...}} on success
+        - {"status": "failed", "error": "..."} on failure
+        - 404 if job_id is unknown (container restarted, or expired)
+        """
+        _cleanup_old_jobs()
+
+        info = jobs.get(job_id)
+        if info is None:
+            return JSONResponse(status_code=404, content={"detail": f"Job {job_id!r} not found"})
+
+        response: dict = {"status": info["status"]}
+        if info["status"] == "succeeded":
+            response["result"] = info["result"]
+        elif info["status"] == "failed":
+            response["error"] = info.get("error", "Unknown error")
+        return response
+
     @web_app.post("/estimate/upload", response_model=EstimateResponse)
     async def estimate_upload(
         job_id: str = Form(default="test"),
         images: List[UploadFile] = File(...),
     ):
-        """Direct image upload endpoint for photo estimation.
+        """Deprecated sync photo upload endpoint — blocks until pipeline completes.
+
+        Kept for backward compatibility. Prefer /estimate/submit + /estimate/status.
 
         curl -X POST <url>/estimate/upload \\
             -F "job_id=test-1" -F "images=@room1.jpg" -F "images=@room2.jpg"
         """
-        import asyncio
-
         if not registry.is_loaded:
             return JSONResponse(status_code=503, content={"detail": "Models not loaded yet."})
 
@@ -198,10 +310,16 @@ def serve_video():
 
     Handles one video job at a time (max_inputs=1) due to GPU model swapping.
     Processing takes 2-10 minutes per video.
+
+    Exposes two patterns:
+    - Async (preferred): POST /estimate/video/submit + GET /estimate/video/status/{job_id}
+    - Sync (deprecated): POST /estimate/video  (blocks until done)
     """
+    import asyncio
     import io
     import logging
     import sys
+    import time
 
     logging.basicConfig(
         level=logging.INFO,
@@ -211,6 +329,8 @@ def serve_video():
 
     if "/root" not in sys.path:
         sys.path.insert(0, "/root")
+
+    from typing import List
 
     from fastapi import FastAPI, File, Form, UploadFile
     from fastapi.responses import JSONResponse
@@ -225,6 +345,53 @@ def serve_video():
     logger.info("Models loaded, starting FastAPI app (video).")
 
     web_app = FastAPI(title="AUST Vision Service - Video (Modal)")
+
+    # In-memory job store: job_id -> {"status", "result", "error", "started_at", "finished_at"}
+    jobs: dict = {}
+
+    def _cleanup_old_jobs() -> None:
+        """Remove jobs older than 30 minutes to bound memory usage."""
+        cutoff = time.time() - 1800
+        expired = [
+            jid for jid, info in jobs.items()
+            if info.get("finished_at", info.get("started_at", 0)) < cutoff
+        ]
+        for jid in expired:
+            del jobs[jid]
+
+    async def _run_video_job(
+        job_id: str,
+        video_bytes: bytes,
+        detection_threshold: float,
+        max_keyframes: int,
+    ) -> None:
+        """Execute video pipeline in a thread and record result in jobs dict."""
+        jobs[job_id] = {"status": "processing", "started_at": time.time()}
+        try:
+            pipeline = VideoPipeline(registry)
+            result = await asyncio.to_thread(
+                pipeline.run,
+                job_id=job_id,
+                video_bytes=video_bytes,
+                detection_threshold=detection_threshold,
+                max_keyframes=max_keyframes,
+            )
+            jobs[job_id] = {
+                "status": "succeeded",
+                "result": result.model_dump(),
+                "finished_at": time.time(),
+            }
+            logger.info(
+                "Video job %s succeeded: %d items, %.3f m³",
+                job_id, len(result.detected_items), result.total_volume_m3,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Video pipeline failed for job %s", job_id)
+            jobs[job_id] = {
+                "status": "failed",
+                "error": str(exc),
+                "finished_at": time.time(),
+            }
 
     @web_app.get("/health")
     def health():
@@ -247,6 +414,58 @@ def serve_video():
             "gpu_available": registry.gpu_available,
         }
 
+    @web_app.post("/estimate/video/submit")
+    async def estimate_video_submit(
+        job_id: str = Form(default="test"),
+        video: UploadFile = File(...),
+        max_keyframes: int = Form(default=60),
+        detection_threshold: float = Form(default=0.3),
+    ):
+        """Async video submit endpoint.
+
+        Starts the video pipeline in the background and returns immediately.
+        Poll GET /estimate/video/status/{job_id} for the result.
+
+        curl -X POST <url>/estimate/video/submit \\
+            -F "job_id=uuid-here" -F "video=@room_walkthrough.mp4"
+        """
+        _cleanup_old_jobs()
+
+        if not registry.is_loaded:
+            return JSONResponse(status_code=503, content={"detail": "Models not loaded yet."})
+
+        video_bytes = await video.read()
+
+        # Kick off background task — do not await
+        asyncio.create_task(
+            _run_video_job(job_id, video_bytes, detection_threshold, max_keyframes)
+        )
+
+        return {"job_id": job_id, "status": "accepted"}
+
+    @web_app.get("/estimate/video/status/{job_id}")
+    async def estimate_video_status(job_id: str):
+        """Poll endpoint for async video jobs.
+
+        Returns:
+        - {"status": "processing"} while running
+        - {"status": "succeeded", "result": {...}} on success
+        - {"status": "failed", "error": "..."} on failure
+        - 404 if job_id is unknown (container restarted, or expired)
+        """
+        _cleanup_old_jobs()
+
+        info = jobs.get(job_id)
+        if info is None:
+            return JSONResponse(status_code=404, content={"detail": f"Job {job_id!r} not found"})
+
+        response: dict = {"status": info["status"]}
+        if info["status"] == "succeeded":
+            response["result"] = info["result"]
+        elif info["status"] == "failed":
+            response["error"] = info.get("error", "Unknown error")
+        return response
+
     @web_app.post("/estimate/video", response_model=EstimateResponse)
     async def estimate_video(
         job_id: str = Form(default="test"),
@@ -254,13 +473,13 @@ def serve_video():
         max_keyframes: int = Form(default=60),
         detection_threshold: float = Form(default=0.3),
     ):
-        """Video upload endpoint for 3D volume estimation.
+        """Deprecated sync video upload endpoint — blocks until pipeline completes.
+
+        Kept for backward compatibility. Prefer /estimate/video/submit + /estimate/video/status.
 
         curl -X POST <url>/estimate/video \\
             -F "job_id=test-1" -F "video=@room_walkthrough.mp4"
         """
-        import asyncio
-
         if not registry.is_loaded:
             return JSONResponse(status_code=503, content={"detail": "Models not loaded yet."})
 
@@ -268,8 +487,6 @@ def serve_video():
 
         pipeline = VideoPipeline(registry)
         # Run blocking pipeline in thread pool to keep event loop responsive.
-        # Without this, the 2-10 min sync call blocks uvicorn's event loop,
-        # causing Modal's proxy to drop the connection before response is sent.
         result = await asyncio.to_thread(
             pipeline.run,
             job_id=job_id,
@@ -284,16 +501,12 @@ def serve_video():
         return result
 
     # Also expose photo upload on the video endpoint for convenience
-    from typing import List
-
     @web_app.post("/estimate/upload", response_model=EstimateResponse)
     async def estimate_upload(
         job_id: str = Form(default="test"),
         images: List[UploadFile] = File(...),
     ):
         """Photo upload endpoint (also available on video function for testing)."""
-        import asyncio
-
         if not registry.is_loaded:
             return JSONResponse(status_code=503, content={"detail": "Models not loaded yet."})
 

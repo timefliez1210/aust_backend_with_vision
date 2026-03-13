@@ -1005,7 +1005,7 @@ async fn trigger_estimate_upload(
         .execute(&state.db)
         .await?;
 
-    // Pre-create the estimation row so the frontend can poll it immediately
+    // Pre-create the estimation row so the frontend can poll it immediately.
     let estimation_id = Uuid::now_v7();
     sqlx::query(
         "INSERT INTO volume_estimations (id, inquiry_id, method, status, source_data, created_at) \
@@ -1015,6 +1015,23 @@ async fn trigger_estimate_upload(
     .bind(inquiry_id)
     .execute(&state.db)
     .await?;
+
+    // Upload images to S3 synchronously so the frontend can display them while Modal processes.
+    let s3_keys = if !parsed.images.is_empty() {
+        services::vision::upload_images_to_s3(
+            &*state.storage,
+            inquiry_id,
+            estimation_id,
+            &parsed.images,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(inquiry_id = %inquiry_id, "Pre-spawn S3 upload failed: {e}");
+            Vec::new()
+        })
+    } else {
+        Vec::new()
+    };
 
     // Spawn background processing (same pipeline as public submission)
     let state_bg = Arc::clone(&state);
@@ -1028,6 +1045,7 @@ async fn trigger_estimate_upload(
             parsed.ar_metadata,
             String::new(),
             String::new(),
+            s3_keys,
             now,
         )
         .await
@@ -1130,10 +1148,25 @@ async fn trigger_video_upload(
     .execute(&state.db)
     .await?;
 
+    // Upload video to S3 synchronously so the frontend can reference the file
+    // while Modal processes it in the background.
+    let s3_key = format!("estimates/{inquiry_id}/{estimation_id}/video.mp4");
+    state
+        .storage
+        .upload(
+            &s3_key,
+            bytes::Bytes::from(video_bytes.clone()),
+            &mime_type,
+        )
+        .await
+        .map_err(|e| ApiError::Internal(format!("S3 video upload failed: {e}")))?;
+
+    tracing::info!(inquiry_id = %inquiry_id, %s3_key, "Video uploaded to S3 before spawn");
+
     let state_bg = Arc::clone(&state);
     tokio::spawn(async move {
         if let Err(e) =
-            process_video_background(state_bg.clone(), inquiry_id, estimation_id, video_bytes, mime_type).await
+            process_video_background(state_bg.clone(), inquiry_id, estimation_id, video_bytes, mime_type, s3_key).await
         {
             tracing::error!(inquiry_id = %inquiry_id, error = %e, "Background video estimation failed");
             let _ = sqlx::query(
@@ -1151,29 +1184,28 @@ async fn trigger_video_upload(
     ))
 }
 
-/// Background task: S3 upload → semaphore acquire → Modal video endpoint → store results → generate offer.
+/// Background task: semaphore acquire → async Modal video submit → poll → store results → generate offer.
+///
+/// **Caller**: `trigger_video_upload` (admin dashboard) and `video_inquiry` (public endpoint).
+/// **Why**: Video upload to S3 is now done synchronously by the caller before this task
+///          is spawned. This function acquires the vision semaphore, submits the video
+///          to Modal via the async submit/poll pattern, and stores the result.
+///          No LLM fallback — if the vision service fails, the estimation is marked failed.
+///
+/// # Parameters
+/// - `s3_key` — the S3 key where the video was already uploaded by the caller
+///
+/// # Errors
+/// Returns `Err(String)` on any fatal failure; the caller marks the estimation 'failed'.
 async fn process_video_background(
     state: Arc<AppState>,
     inquiry_id: Uuid,
     estimation_id: Uuid,
     video_bytes: Vec<u8>,
     mime_type: String,
+    s3_key: String,
 ) -> Result<(), String> {
-    // 1. Upload video to S3
-    let s3_key = format!("estimates/{inquiry_id}/{estimation_id}/video.mp4");
-    state
-        .storage
-        .upload(
-            &s3_key,
-            bytes::Bytes::from(video_bytes.clone()),
-            &mime_type,
-        )
-        .await
-        .map_err(|e| format!("S3 video upload failed: {e}"))?;
-
-    tracing::info!(inquiry_id = %inquiry_id, s3_key = %s3_key, "Video uploaded to S3");
-
-    // 2. Acquire vision semaphore — waits if a photo or video job is already running on Modal
+    // 1. Acquire vision semaphore — waits if a photo or video job is already running on Modal.
     let _vision_permit = state
         .vision_semaphore
         .acquire()
@@ -1181,16 +1213,37 @@ async fn process_video_background(
         .map_err(|e| format!("Vision semaphore closed: {e}"))?;
     tracing::info!(estimation_id = %estimation_id, "Vision semaphore acquired, submitting video to Modal");
 
-    // 3. Call Modal video endpoint
+    // 2. Submit video job and poll for result via async pattern.
     let client = state
         .vision_service
         .as_ref()
         .ok_or("Vision service not configured")?;
 
+    let poll_interval =
+        std::time::Duration::from_secs(state.config.vision_service.poll_interval_secs);
+    let max_polls = state.config.vision_service.max_polls;
+    let max_retries = state.config.vision_service.max_retries;
+
     let response = client
-        .estimate_video(&estimation_id.to_string(), &video_bytes, &mime_type, None, None)
+        .estimate_video_async(
+            &estimation_id.to_string(),
+            &video_bytes,
+            &mime_type,
+            None,
+            None,
+            poll_interval,
+            max_polls,
+            max_retries,
+        )
         .await
-        .map_err(|e| format!("Video estimation failed: {e}"))?;
+        .map_err(|e| {
+            tracing::error!(
+                inquiry_id = %inquiry_id,
+                estimation_id = %estimation_id,
+                "Video estimation failed after all retries — manual intervention required: {e}"
+            );
+            format!("Video estimation failed: {e}")
+        })?;
 
     tracing::info!(
         estimation_id = %estimation_id,
@@ -1199,7 +1252,7 @@ async fn process_video_background(
         "Video estimation succeeded"
     );
 
-    // 4. Store results
+    // 3. Store results
     let source_data = serde_json::json!({
         "source": "video",
         "s3_key": s3_key,
@@ -1230,7 +1283,7 @@ async fn process_video_background(
     .await
     .map_err(|e| format!("Failed to store video estimation: {e}"))?;
 
-    // 5. Update inquiry status and trigger offer generation
+    // 4. Update inquiry status and trigger offer generation
     sqlx::query(
         "UPDATE inquiries SET status = 'estimated', volume_m3 = $1, updated_at = $2 WHERE id = $3",
     )
@@ -1437,9 +1490,12 @@ async fn video_inquiry(
     .execute(&state.db).await
     .map_err(|e| ApiError::Internal(format!("Anfrage konnte nicht erstellt werden: {e}")))?;
 
-    // Pre-create one estimation row per uploaded video
+    // Pre-create one estimation row per uploaded video and upload each video to S3
+    // synchronously before returning 202, so the frontend can reference the files
+    // while Modal processes them.
     let mut estimation_ids: Vec<Uuid> = Vec::new();
-    for _ in &video_files {
+    let mut s3_keys_per_video: Vec<String> = Vec::new();
+    for (video_bytes, mime_type) in &video_files {
         let eid = Uuid::now_v7();
         sqlx::query(
             "INSERT INTO volume_estimations (id, inquiry_id, method, status, source_data, created_at) \
@@ -1448,6 +1504,15 @@ async fn video_inquiry(
         .bind(eid).bind(inquiry_id).execute(&state.db).await
         .map_err(|e| ApiError::Internal(format!("Schätzung konnte nicht erstellt werden: {e}")))?;
         estimation_ids.push(eid);
+
+        // Upload video to S3
+        let s3_key = format!("estimates/{inquiry_id}/{eid}/video.mp4");
+        if let Err(e) = state.storage.upload(&s3_key, bytes::Bytes::from(video_bytes.clone()), mime_type).await {
+            tracing::warn!(inquiry_id = %inquiry_id, "Pre-spawn video S3 upload failed: {e}");
+            s3_keys_per_video.push(String::new());
+        } else {
+            s3_keys_per_video.push(s3_key);
+        }
     }
 
     tracing::info!(
@@ -1456,7 +1521,7 @@ async fn video_inquiry(
         "Video inquiry created, spawning background processing"
     );
 
-    // Spawn background: distance calc → for each video: S3 → semaphore → Modal → offer
+    // Spawn background: distance calc → for each video: semaphore → async Modal → offer
     let state_bg = Arc::clone(&state);
     let dep_addr = departure_address.clone();
     let arr_addr = arrival_address.clone();
@@ -1475,8 +1540,13 @@ async fn video_inquiry(
                 Err(e) => tracing::warn!(inquiry_id = %inquiry_id, error = %e, "Distance calculation failed"),
             }
         }
-        for ((video_bytes, mime_type), estimation_id) in video_files.into_iter().zip(estimation_ids.into_iter()) {
-            if let Err(e) = process_video_background(state_bg.clone(), inquiry_id, estimation_id, video_bytes, mime_type).await {
+        for (((video_bytes, mime_type), estimation_id), s3_key) in video_files.into_iter()
+            .zip(estimation_ids.into_iter())
+            .zip(s3_keys_per_video.into_iter())
+        {
+            if let Err(e) = process_video_background(
+                state_bg.clone(), inquiry_id, estimation_id, video_bytes, mime_type, s3_key,
+            ).await {
                 tracing::error!(inquiry_id = %inquiry_id, estimation_id = %estimation_id, error = %e, "Background video estimation failed");
                 let _ = sqlx::query(
                     "UPDATE volume_estimations SET status = 'failed' WHERE id = $1 AND status = 'processing'",
@@ -1791,8 +1861,46 @@ async fn handle_submission(
 
     tracing::info!(inquiry_id = %inquiry_id, "Inquiry created for submission");
 
-    // 7. Return 202 immediately -- spawn background processing
+    // 7. Pre-create estimation row and upload images to S3 *before* spawning the
+    //    background task so the frontend sees images immediately after receiving 202.
     let estimation_id = Uuid::now_v7();
+
+    // Pre-create estimation record with status='processing' so polling works immediately.
+    sqlx::query(
+        "INSERT INTO volume_estimations (id, inquiry_id, method, status, source_data, created_at) \
+         VALUES ($1, $2, 'depth_sensor', 'processing', '{}', NOW())",
+    )
+    .bind(estimation_id)
+    .bind(inquiry_id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| ApiError::Internal(format!("Schätzung konnte nicht erstellt werden: {e}")))?;
+
+    // Upload images to S3 synchronously — frontend can display them while Modal processes.
+    let s3_keys = if !form.images.is_empty() {
+        services::vision::upload_images_to_s3(
+            &*state.storage,
+            inquiry_id,
+            estimation_id,
+            &form.images,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(inquiry_id = %inquiry_id, "Pre-spawn S3 upload failed: {e}");
+            Vec::new()
+        })
+    } else {
+        Vec::new()
+    };
+
+    tracing::info!(
+        inquiry_id = %inquiry_id,
+        image_count = form.images.len(),
+        s3_keys_count = s3_keys.len(),
+        "Images uploaded to S3 before spawn"
+    );
+
+    // 8. Spawn background processing: distance calc → semaphore → Modal → offer.
     let state_bg = Arc::clone(&state);
     let dep_addr = departure_address.clone();
     let arr_addr = arrival_address.clone();
@@ -1806,6 +1914,7 @@ async fn handle_submission(
             form.ar_metadata,
             dep_addr,
             arr_addr,
+            s3_keys,
             now,
         )
         .await
@@ -1826,7 +1935,23 @@ async fn handle_submission(
     ))
 }
 
-/// Background processing: distance calc -> S3 upload -> vision estimation -> store results -> generate offer.
+/// Background processing: distance calc → semaphore acquire → async Modal submission
+/// → poll for result → store estimation → generate offer.
+///
+/// **Caller**: `handle_submission` (photo/mobile public endpoints) and
+///             `trigger_estimate_upload` (admin dashboard).
+/// **Why**: S3 upload and estimation row creation now happen synchronously in the
+///          caller before this task is spawned, so the frontend can display images
+///          immediately. This function acquires the vision semaphore, submits the job
+///          to Modal via the async submit/poll pattern, and stores the result.
+///          No LLM fallback — if the vision service fails after all retries, the
+///          estimation is marked failed and manual intervention is required.
+///
+/// # Parameters
+/// - `s3_keys` — already-uploaded image keys (pre-computed by the caller)
+///
+/// # Errors
+/// Returns `Err(String)` on any fatal failure; the caller marks the estimation 'failed'.
 async fn process_submission_background(
     state: Arc<AppState>,
     inquiry_id: Uuid,
@@ -1836,6 +1961,7 @@ async fn process_submission_background(
     ar_metadata: Option<String>,
     departure_address: String,
     arrival_address: String,
+    s3_keys: Vec<String>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), String> {
     // 0. Calculate distance between origin and destination
@@ -1869,19 +1995,7 @@ async fn process_submission_background(
         tracing::warn!("Maps API key not configured, skipping distance calculation");
     }
 
-    // 1. Upload images to S3
-    let s3_keys =
-        services::vision::upload_images_to_s3(&*state.storage, inquiry_id, estimation_id, &images)
-            .await
-            .map_err(|e| format!("S3 upload failed: {e}"))?;
-
-    tracing::info!(
-        inquiry_id = %inquiry_id,
-        image_count = images.len(),
-        "Images uploaded to S3"
-    );
-
-    // Upload depth maps if present
+    // 1. Upload depth maps if present (images are already in S3 from the caller)
     if !depth_maps.is_empty() {
         if let Err(e) =
             upload_depth_maps_to_s3(&*state.storage, inquiry_id, estimation_id, &depth_maps).await
@@ -1890,9 +2004,8 @@ async fn process_submission_background(
         }
     }
 
-    // 2. Run volume estimation (vision service -> LLM fallback)
-    // Acquire the vision semaphore so only one job runs on Modal at a time.
-    // Other workers will wait here until the current GPU job completes.
+    // 2. Acquire the vision semaphore so only one job runs on Modal at a time.
+    //    Other workers will queue here until the current GPU job completes.
     let _vision_permit = state
         .vision_semaphore
         .acquire()
@@ -1900,7 +2013,10 @@ async fn process_submission_background(
         .map_err(|e| format!("Vision semaphore closed: {e}"))?;
     tracing::info!(estimation_id = %estimation_id, "Vision semaphore acquired, submitting to Modal");
 
-    let (total_volume, confidence, result_data, method) = match services::vision::try_vision_service(
+    // 3. Run volume estimation via async submit + poll (no LLM fallback).
+    //    If the vision service fails after all retries, the estimation is marked
+    //    'failed' by the tokio::spawn error handler — manual review required.
+    let (total_volume, confidence, result_data) = services::vision::try_vision_service_async(
         &state,
         &images,
         estimation_id,
@@ -1908,24 +2024,24 @@ async fn process_submission_background(
         estimation_id,
     )
     .await
-    {
-        Ok((vol, conf, data)) => {
-            tracing::info!(
-                estimation_id = %estimation_id,
-                volume = vol,
-                "Vision service estimation succeeded"
-            );
-            (vol, conf, data, EstimationMethod::DepthSensor)
-        }
-        Err(e) => {
-            tracing::warn!("Vision service unavailable, falling back to LLM: {e}");
-            services::vision::fallback_llm_analysis(&state, &images)
-                .await
-                .map_err(|e| format!("LLM fallback failed: {e}"))?
-        }
-    };
+    .map_err(|e| {
+        tracing::error!(
+            inquiry_id = %inquiry_id,
+            estimation_id = %estimation_id,
+            "Vision estimation failed after all retries — manual intervention required: {e}"
+        );
+        format!("Vision estimation failed: {e}")
+    })?;
 
-    // 3. Build source_data JSON
+    let method = EstimationMethod::DepthSensor;
+
+    tracing::info!(
+        estimation_id = %estimation_id,
+        volume = total_volume,
+        "Vision service estimation succeeded"
+    );
+
+    // 4. Build source_data JSON
     let source_data = serde_json::json!({
         "source": if depth_maps.is_empty() { "photo_webapp" } else { "mobile_app" },
         "image_count": images.len(),
@@ -1935,7 +2051,7 @@ async fn process_submission_background(
             .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()),
     });
 
-    // 4. Store volume_estimation record — UPSERT so it works whether the row was
+    // 5. Store volume_estimation record — UPSERT so it works whether the row was
     //    pre-created as 'processing' (admin trigger) or is brand-new (public submission).
     let now_update = chrono::Utc::now();
     sqlx::query(
@@ -1964,7 +2080,7 @@ async fn process_submission_background(
     .await
     .map_err(|e| format!("Failed to store estimation: {e}"))?;
 
-    // 5. Update inquiry with estimated volume
+    // 6. Update inquiry with estimated volume
     update_quote_volume(
         &state.db,
         inquiry_id,
@@ -1982,7 +2098,7 @@ async fn process_submission_background(
         "Volume estimation completed"
     );
 
-    // 6. Auto-generate offer (XLSX -> PDF -> Telegram)
+    // 7. Auto-generate offer (XLSX -> PDF -> Telegram)
     orchestrator::try_auto_generate_offer(Arc::clone(&state), inquiry_id).await;
 
     Ok(())

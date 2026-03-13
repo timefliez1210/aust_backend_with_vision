@@ -288,15 +288,15 @@ async fn depth_sensor_estimate(
     // Upload images to S3
     let s3_keys = services::vision::upload_images_to_s3(&*state.storage, inquiry_id, id, &images).await?;
 
-    // Try the vision service first, fall back to LLM analysis
-    let (total_volume, confidence, result_data, method) =
-        match services::vision::try_vision_service(&state, &images, id, inquiry_id, id).await {
-            Ok((vol, conf, data)) => (vol, conf, data, EstimationMethod::DepthSensor),
-            Err(e) => {
-                tracing::warn!("Vision service failed, falling back to LLM analysis: {e}");
-                services::vision::fallback_llm_analysis(&state, &images).await?
-            }
-        };
+    // Run vision estimation via async submit + poll — no LLM fallback.
+    let (total_volume, confidence, result_data) =
+        services::vision::try_vision_service_async(&state, &images, id, inquiry_id, id)
+            .await
+            .map_err(|e| {
+                tracing::error!(%inquiry_id, estimation_id = %id, "Vision estimation failed: {e}");
+                e
+            })?;
+    let method = EstimationMethod::DepthSensor;
 
     let now = chrono::Utc::now();
     let source_data = serde_json::json!({
@@ -546,19 +546,27 @@ async fn process_video_background(
         "Background: calling vision service video endpoint..."
     );
 
+    let poll_interval =
+        std::time::Duration::from_secs(state.config.vision_service.poll_interval_secs);
+    let max_polls = state.config.vision_service.max_polls;
+    let max_retries_cfg = state.config.vision_service.max_retries;
+
     let response = match client
-        .estimate_video(
+        .estimate_video_async(
             &estimation_id.to_string(),
             &video_bytes,
             &video_mime,
             max_keyframes,
             detection_threshold,
+            poll_interval,
+            max_polls,
+            max_retries_cfg,
         )
         .await
     {
         Ok(r) => r,
         Err(e) => {
-            tracing::error!(%inquiry_id, %estimation_id, error = %e, "Background: vision service video call failed");
+            tracing::error!(%inquiry_id, %estimation_id, error = %e, "Background: video estimation failed after all retries");
             let _ = sqlx::query("UPDATE volume_estimations SET status = 'failed' WHERE id = $1")
                 .bind(estimation_id)
                 .execute(&state.db)
@@ -921,18 +929,37 @@ async fn serve_image(
         .await
         .map_err(|e| ApiError::Internal(format!("Failed to download image: {e}")))?;
 
-    let content_type = if key.ends_with(".png") {
+    let key_lower = key.to_lowercase();
+    let content_type = if key_lower.ends_with(".png") {
         "image/png"
-    } else if key.ends_with(".webp") {
+    } else if key_lower.ends_with(".webp") {
         "image/webp"
-    } else if key.ends_with(".mp4") {
+    } else if key_lower.ends_with(".heic") {
+        "image/heic"
+    } else if key_lower.ends_with(".heif") {
+        "image/heif"
+    } else if key_lower.ends_with(".gif") {
+        "image/gif"
+    } else if key_lower.ends_with(".bmp") {
+        "image/bmp"
+    } else if key_lower.ends_with(".tiff") || key_lower.ends_with(".tif") {
+        "image/tiff"
+    } else if key_lower.ends_with(".avif") {
+        "image/avif"
+    } else if key_lower.ends_with(".mp4") || key_lower.ends_with(".m4v") {
         "video/mp4"
-    } else if key.ends_with(".mov") {
+    } else if key_lower.ends_with(".mov") {
         "video/quicktime"
-    } else if key.ends_with(".webm") {
+    } else if key_lower.ends_with(".webm") {
         "video/webm"
-    } else if key.ends_with(".mkv") {
+    } else if key_lower.ends_with(".mkv") {
         "video/x-matroska"
+    } else if key_lower.ends_with(".mpeg") || key_lower.ends_with(".mpg") {
+        "video/mpeg"
+    } else if key_lower.ends_with(".avi") {
+        "video/x-msvideo"
+    } else if key_lower.ends_with(".3gp") {
+        "video/3gpp"
     } else {
         "image/jpeg"
     };

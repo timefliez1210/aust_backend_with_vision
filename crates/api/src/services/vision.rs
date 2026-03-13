@@ -2,12 +2,11 @@
 
 use base64::Engine;
 use bytes::Bytes;
+use std::time::Duration;
 use uuid::Uuid;
 
 use crate::{ApiError, AppState};
-use aust_core::models::EstimationMethod;
 use aust_storage::StorageProvider;
-use aust_volume_estimator::VisionAnalyzer;
 
 /// Upload decoded images to S3, returning the list of S3 keys.
 pub async fn upload_images_to_s3(
@@ -33,10 +32,29 @@ pub async fn upload_images_to_s3(
     Ok(s3_keys)
 }
 
-/// Try the Python vision service for 3D volume estimation.
-/// Sends raw image bytes directly via multipart upload.
-/// Uploads crop thumbnails to S3 and replaces base64 with S3 keys.
-pub async fn try_vision_service(
+/// Try the Python vision service using async submit + polling.
+///
+/// **Caller**: `process_submission_background` and `process_video_background` in
+///             `crates/api/src/routes/inquiries.rs`.
+/// **Why**: Replaces the old synchronous long-poll approach. The backend submits the job
+///          to Modal, receives an immediate acknowledgement, then polls every
+///          `vision_service.poll_interval_secs` until the job finishes.
+///          This avoids holding an HTTP connection open for the 5-600 s pipeline duration.
+///
+/// # Parameters
+/// - `state` — application state (provides the vision client and config)
+/// - `images` — raw image bytes paired with MIME types
+/// - `job_id` — UUID of the vision job (used as the Modal job identifier)
+/// - `inquiry_id` — parent inquiry (used for S3 crop key paths)
+/// - `estimation_id` — the pre-created estimation row (used for S3 crop key paths)
+///
+/// # Returns
+/// `(total_volume_m3, confidence_score, detected_items_json)` on success.
+///
+/// # Errors
+/// Returns `ApiError::Internal` if the vision service is not configured or if all
+/// retries are exhausted without a successful result.
+pub async fn try_vision_service_async(
     state: &AppState,
     images: &[(Vec<u8>, String)],
     job_id: Uuid,
@@ -48,8 +66,19 @@ pub async fn try_vision_service(
         .as_ref()
         .ok_or_else(|| ApiError::Internal("Vision service not configured".into()))?;
 
+    let poll_interval =
+        Duration::from_secs(state.config.vision_service.poll_interval_secs);
+    let max_polls = state.config.vision_service.max_polls;
+    let max_retries = state.config.vision_service.max_retries;
+
     let response = client
-        .estimate_upload(&job_id.to_string(), images)
+        .estimate_upload_async(
+            &job_id.to_string(),
+            images,
+            poll_interval,
+            max_polls,
+            max_retries,
+        )
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
@@ -61,7 +90,10 @@ pub async fn try_vision_service(
         for (idx, item_val) in items_arr.iter_mut().enumerate() {
             if let Some(crop_b64) = item_val.get("crop_base64").and_then(|v| v.as_str()) {
                 if !crop_b64.is_empty() {
-                    let name = item_val.get("name").and_then(|v| v.as_str()).unwrap_or("item");
+                    let name = item_val
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("item");
                     let safe_name = name.replace(' ', "_").to_lowercase();
                     let key = format!(
                         "estimates/{inquiry_id}/{estimation_id}/crops/{safe_name}_{idx}.jpg"
@@ -89,33 +121,11 @@ pub async fn try_vision_service(
         }
     }
 
-    Ok((response.total_volume_m3, response.confidence_score, Some(items_value)))
-}
-
-/// Fallback: run LLM-based vision analysis on the raw image data.
-/// Returns (total_volume, confidence, result_data, method).
-pub async fn fallback_llm_analysis(
-    state: &AppState,
-    images: &[(Vec<u8>, String)],
-) -> Result<(f64, f64, Option<serde_json::Value>, EstimationMethod), ApiError> {
-    let analyzer = VisionAnalyzer::new(state.llm.clone());
-    let mut total_volume = 0.0;
-    let mut results = Vec::new();
-
-    for (data, mime_type) in images {
-        let result = analyzer
-            .analyze_image(data, mime_type)
-            .await
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
-        total_volume += result.total_volume_m3;
-        results.push(result);
-    }
-
-    let avg_confidence =
-        results.iter().map(|r| r.confidence_score).sum::<f64>() / results.len() as f64;
-    let result_data = serde_json::to_value(&results).ok();
-
-    Ok((total_volume, avg_confidence, result_data, EstimationMethod::Vision))
+    Ok((
+        response.total_volume_m3,
+        response.confidence_score,
+        Some(items_value),
+    ))
 }
 
 /// Parse a free-form address string into (street, city, postal_code).

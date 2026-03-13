@@ -50,8 +50,10 @@ search_window_days = 14
 enabled = true
 base_url = "https://crfabig--aust-vision-serve.modal.run"
 video_base_url = "https://crfabig--aust-vision-serve-video.modal.run"
-timeout_secs = 600
+timeout_secs = 120
 max_retries = 2
+poll_interval_secs = 60
+max_polls = 20
 
 [company]
 depot_address = "Borsigstr 6 31135 Hildesheim"

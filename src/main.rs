@@ -5,6 +5,7 @@ use aust_email_agent::EmailProcessor;
 use config::{ConfigBuilder, Environment, File};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
@@ -104,6 +105,26 @@ async fn main() -> Result<()> {
         run_offer_event_handler(offer_state, offer_rx).await;
     });
     tracing::info!("Offer event handler started");
+
+    // Periodic cleanup: mark estimations stuck in 'processing' for > 30 min as 'failed'.
+    // This handles Modal container restarts or Rust panics that leave orphaned rows.
+    let cleanup_db = state.db.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(300)); // every 5 min
+        loop {
+            interval.tick().await;
+            if let Err(e) = sqlx::query(
+                "UPDATE volume_estimations SET status = 'failed' \
+                 WHERE status = 'processing' AND created_at < NOW() - INTERVAL '30 minutes'"
+            )
+            .execute(&cleanup_db)
+            .await
+            {
+                tracing::warn!("Stuck estimation cleanup failed: {e}");
+            }
+        }
+    });
+    tracing::info!("Stuck estimation cleanup task started");
 
     // Create router and start server
     let app = create_router(state);

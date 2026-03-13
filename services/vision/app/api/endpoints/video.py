@@ -19,6 +19,9 @@ _ALLOWED_TYPES = {
     "video/x-matroska",
     "video/mpeg",
     "video/avi",
+    "video/x-msvideo",
+    "video/3gpp",
+    "video/x-m4v",
 }
 
 # Max upload size: 500 MB
