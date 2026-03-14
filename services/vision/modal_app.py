@@ -57,6 +57,9 @@ vision_image = (
         "httpx>=0.28,<1",
         "python-multipart>=0.0.18,<1",
         "opencv-python-headless>=4.9,<5",
+        "pillow-heif>=0.18,<1",
+        "qwen-vl-utils>=0.0.8,<1",
+        "accelerate>=0.26,<2",
     )
     # SAM 2.1 (replaces SAM ViT-H) — install from GitHub, package name is "SAM-2"
     .run_commands(
@@ -94,6 +97,14 @@ vision_image = (
         "from huggingface_hub import snapshot_download; "
         "snapshot_download('naver/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric', cache_dir='/weights/huggingface'); "
         "print('MASt3R weights downloaded.')\""
+    )
+    .run_commands(
+        # Download Qwen2-VL-7B-Instruct weights (VLM dedup step)
+        "python -c \""
+        "from transformers import Qwen2VLForConditionalGeneration, AutoProcessor; "
+        "AutoProcessor.from_pretrained('Qwen/Qwen2-VL-7B-Instruct', cache_dir='/weights/huggingface'); "
+        "Qwen2VLForConditionalGeneration.from_pretrained('Qwen/Qwen2-VL-7B-Instruct', cache_dir='/weights/huggingface'); "
+        "print('Qwen2-VL-7B weights downloaded.')\""
     )
     .env({
         "VISION_DEVICE": "cuda",
@@ -142,6 +153,8 @@ def serve():
     from fastapi import FastAPI, File, Form, UploadFile
     from fastapi.responses import JSONResponse
     from PIL import Image as PILImage
+    from pillow_heif import register_heif_opener
+    register_heif_opener()  # enables HEIC/HEIF support in Pillow
 
     from app.models.schemas import EstimateResponse
     from app.vision.model_loader import registry
@@ -335,6 +348,8 @@ def serve_video():
     from fastapi import FastAPI, File, Form, UploadFile
     from fastapi.responses import JSONResponse
     from PIL import Image as PILImage
+    from pillow_heif import register_heif_opener
+    register_heif_opener()  # enables HEIC/HEIF support in Pillow
 
     from app.models.schemas import EstimateResponse
     from app.vision.model_loader import registry

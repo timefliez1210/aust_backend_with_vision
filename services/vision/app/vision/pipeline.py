@@ -19,6 +19,7 @@ from app.vision.depth import DepthEstimator
 from app.vision.detector import Detector
 from app.vision.model_loader import ModelRegistry
 from app.vision.segmenter import Segmenter
+from app.vision.vlm_dedup import vlm_dedup
 from app.vision.volume import VolumeCalculator
 
 logger = logging.getLogger(__name__)
@@ -31,6 +32,7 @@ class VisionPipeline:
     """
 
     def __init__(self, registry: ModelRegistry) -> None:
+        self._registry = registry
         self._detector = Detector(registry)
         self._segmenter = Segmenter(registry)
         self._depth_estimator = DepthEstimator(registry)
@@ -80,7 +82,11 @@ class VisionPipeline:
         # Stage 5: Cross-image deduplication
         merged_items = self._deduplicate(volume_estimates)
 
-        # Stage 6: Apply packing multipliers to geometric-sourced items only.
+        # Stage 6: VLM cross-image deduplication (Qwen2-VL-7B)
+        # Identifies items that are the same physical object across multiple photos.
+        merged_items = vlm_dedup(merged_items, self._registry)
+
+        # Stage 7: Apply packing multipliers to geometric-sourced items only.
         # RE-sourced volumes already include handling/packing space.
         for i, item in enumerate(merged_items):
             if item.volume_source == "re":

@@ -22,6 +22,9 @@ SAM2_CHECKPOINT = "sam2.1_hiera_large.pt"
 # MASt3R (loaded on demand for video pipeline)
 MAST3R_MODEL_ID = "naver/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric"
 
+# Qwen2-VL-7B (loaded at startup for VLM cross-image dedup — photo pipeline only)
+QWEN_VL_MODEL_ID = "Qwen/Qwen2-VL-7B-Instruct"
+
 
 def get_device() -> torch.device:
     """Return the configured torch device, falling back to CPU."""
@@ -115,6 +118,7 @@ class ModelRegistry:
     Manages GPU memory by swapping models between detection and reconstruction:
     - Startup: DINO + SAM 2 + Depth Anything (~3GB idle)
     - Photo pipeline: DINO + SAM 2 + DA active (~8GB)
+    - Dedup phase: DINO + SAM 2 + DA + Qwen2-VL-7B all resident (~22GB)
     - Video Phase 1: MASt3R only (~12-15GB)
     - Video Phase 2: DINO + SAM 2 (~5GB)
     - Video Phase 3: CPU only (Open3D)
@@ -129,6 +133,8 @@ class ModelRegistry:
         self.depth_model = None
         self.depth_processor = None
         self.mast3r_model = None
+        self.qwen_vlm_model = None
+        self.qwen_vlm_processor = None
         self._loaded = False
         # Track whether detection models are on GPU or CPU
         self._detection_on_gpu = False
@@ -157,6 +163,7 @@ class ModelRegistry:
         )
         self.sam2_image_predictor, self.sam2_video_predictor = load_sam2(self.device)
         self.depth_model, self.depth_processor = load_depth_anything(self.device)
+        self.load_qwen_vlm()
         self._detection_on_gpu = True
 
         self._warm_up()
@@ -188,6 +195,30 @@ class ModelRegistry:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             logger.info("MASt3R unloaded from GPU")
+
+    def load_qwen_vlm(self) -> None:
+        """Load Qwen2-VL-7B-Instruct for VLM-based cross-image deduplication.
+
+        Caller: load_all() during startup (photo endpoint only).
+        Why: With L4 24GB VRAM and photo pipeline using ~8GB, there is ~16GB
+             free — Qwen2-VL-7B in BF16 (~14GB) fits without any model swapping.
+        """
+        from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
+
+        weights_dir = ensure_weights_dir()
+        cache_dir = str(weights_dir / "huggingface")
+
+        logger.info("Loading Qwen2-VL-7B-Instruct (%s) ...", QWEN_VL_MODEL_ID)
+        self.qwen_vlm_processor = AutoProcessor.from_pretrained(
+            QWEN_VL_MODEL_ID, cache_dir=cache_dir
+        )
+        self.qwen_vlm_model = Qwen2VLForConditionalGeneration.from_pretrained(
+            QWEN_VL_MODEL_ID,
+            torch_dtype=torch.bfloat16,
+            cache_dir=cache_dir,
+        ).to(self.device)
+        self.qwen_vlm_model.eval()
+        logger.info("Qwen2-VL-7B-Instruct loaded on %s", self.device)
 
     def unload_detection_models(self) -> None:
         """Move detection models (DINO, SAM 2, DA) to CPU to free GPU for MASt3R."""
