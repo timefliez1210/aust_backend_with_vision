@@ -1513,7 +1513,8 @@ async fn list_employees(
         r#"
         SELECT id, salutation, first_name, last_name, email, phone,
                monthly_hours_target::float8 AS monthly_hours_target,
-               active, created_at, updated_at
+               active, created_at, updated_at,
+               arbeitsvertrag_key, mitarbeiterfragebogen_key
         FROM employees
         WHERE ($1::text IS NULL OR first_name ILIKE $1 OR last_name ILIKE $1 OR email ILIKE $1)
           AND ($2::bool IS NULL OR active = $2)
