@@ -274,7 +274,13 @@ struct MonthQuery {
 
 #[derive(Debug, Serialize)]
 struct ScheduleJob {
-    inquiry_id: Uuid,
+    /// `"job"` for moving inquiries, `"item"` for internal calendar items.
+    entry_type: String,
+    inquiry_id: Option<Uuid>,
+    calendar_item_id: Option<Uuid>,
+    title: Option<String>,
+    location: Option<String>,
+    category: Option<String>,
     job_date: Option<NaiveDate>,
     status: String,
     origin_street: Option<String>,
@@ -291,11 +297,13 @@ struct ScheduleJob {
     colleague_names: Vec<String>,
 }
 
-/// `GET /employee/schedule?month=YYYY-MM` — list assigned jobs for a given month.
+/// `GET /employee/schedule?month=YYYY-MM` — list assigned jobs and calendar items for a given month.
 ///
 /// **Caller**: Worker portal schedule page.
-/// **Why**: Shows the employee only their own jobs with logistics info — no financial data.
-///          Defaults to the current month when no `month` param is supplied.
+/// **Why**: Shows the employee only their own jobs and internal events with logistics info —
+///          no financial data. Defaults to the current month when no `month` param is supplied.
+///          Returns a combined, date-sorted list of moving jobs (`entry_type="job"`) and
+///          internal calendar items (`entry_type="item"`).
 ///
 /// # Returns
 /// Array of `ScheduleJob` objects ordered by job date ascending.
@@ -310,6 +318,10 @@ async fn get_schedule(
 
     let (from_date, to_date) = parse_month_range(&month_str)
         .ok_or_else(|| ApiError::BadRequest("Ungueltiges Monatsformat (erwartet: YYYY-MM)".into()))?;
+
+    // -----------------------------------------------------------------------
+    // Fetch moving inquiry assignments
+    // -----------------------------------------------------------------------
 
     #[derive(sqlx::FromRow)]
     struct JobRow {
@@ -329,7 +341,7 @@ async fn get_schedule(
         actual_hours: Option<f64>,
     }
 
-    let rows: Vec<JobRow> = sqlx::query_as(
+    let job_rows: Vec<JobRow> = sqlx::query_as(
         r#"
         SELECT
             ie.inquiry_id,
@@ -363,16 +375,21 @@ async fn get_schedule(
     .fetch_all(&state.db)
     .await?;
 
-    // Fetch colleague names for each job in one query
-    let inquiry_ids: Vec<Uuid> = rows.iter().map(|r| r.inquiry_id).collect();
+    // Fetch colleague names for each job in one batch query
+    let inquiry_ids: Vec<Uuid> = job_rows.iter().map(|r| r.inquiry_id).collect();
     let colleague_map = fetch_colleague_names(&state.db, &inquiry_ids, claims.employee_id).await?;
 
-    let jobs = rows
+    let mut entries: Vec<ScheduleJob> = job_rows
         .into_iter()
         .map(|r| {
             let colleagues = colleague_map.get(&r.inquiry_id).cloned().unwrap_or_default();
             ScheduleJob {
-                inquiry_id: r.inquiry_id,
+                entry_type: "job".to_string(),
+                inquiry_id: Some(r.inquiry_id),
+                calendar_item_id: None,
+                title: None,
+                location: None,
+                category: None,
                 job_date: r.job_date,
                 status: r.status,
                 origin_street: r.origin_street,
@@ -391,7 +408,89 @@ async fn get_schedule(
         })
         .collect();
 
-    Ok(Json(jobs))
+    // -----------------------------------------------------------------------
+    // Fetch calendar item assignments
+    // -----------------------------------------------------------------------
+
+    #[derive(sqlx::FromRow)]
+    struct ItemRow {
+        calendar_item_id: Uuid,
+        title: String,
+        location: Option<String>,
+        category: String,
+        scheduled_date: Option<NaiveDate>,
+        status: String,
+        planned_hours: f64,
+        actual_hours: Option<f64>,
+    }
+
+    let item_rows: Vec<ItemRow> = sqlx::query_as(
+        r#"
+        SELECT
+            cie.calendar_item_id,
+            ci.title,
+            ci.location,
+            ci.category,
+            ci.scheduled_date,
+            ci.status,
+            cie.planned_hours::float8 AS planned_hours,
+            cie.actual_hours::float8  AS actual_hours
+        FROM calendar_item_employees cie
+        JOIN calendar_items ci ON ci.id = cie.calendar_item_id
+        WHERE cie.employee_id = $1
+          AND ci.scheduled_date BETWEEN $2 AND $3
+        ORDER BY ci.scheduled_date ASC NULLS LAST
+        "#,
+    )
+    .bind(claims.employee_id)
+    .bind(from_date)
+    .bind(to_date)
+    .fetch_all(&state.db)
+    .await?;
+
+    // Fetch colleague names for each calendar item (same batch pattern)
+    let item_ids: Vec<Uuid> = item_rows.iter().map(|r| r.calendar_item_id).collect();
+    let item_colleague_map =
+        fetch_item_colleague_names(&state.db, &item_ids, claims.employee_id).await?;
+
+    for r in item_rows {
+        let colleagues = item_colleague_map
+            .get(&r.calendar_item_id)
+            .cloned()
+            .unwrap_or_default();
+        entries.push(ScheduleJob {
+            entry_type: "item".to_string(),
+            inquiry_id: None,
+            calendar_item_id: Some(r.calendar_item_id),
+            title: Some(r.title),
+            location: r.location,
+            category: Some(r.category),
+            job_date: r.scheduled_date,
+            status: r.status,
+            origin_street: None,
+            origin_city: None,
+            origin_postal_code: None,
+            destination_street: None,
+            destination_city: None,
+            destination_postal_code: None,
+            estimated_volume_m3: None,
+            customer_name: None,
+            customer_phone: None,
+            planned_hours: r.planned_hours,
+            actual_hours: r.actual_hours,
+            colleague_names: colleagues,
+        });
+    }
+
+    // Sort combined list by date ascending, nulls last
+    entries.sort_by(|a, b| match (a.job_date, b.job_date) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, _) => std::cmp::Ordering::Greater,
+        (_, None) => std::cmp::Ordering::Less,
+        (Some(da), Some(db)) => da.cmp(&db),
+    });
+
+    Ok(Json(entries))
 }
 
 // ---------------------------------------------------------------------------
@@ -571,7 +670,12 @@ struct HoursSummary {
 
 #[derive(Debug, Serialize)]
 struct HoursEntry {
-    inquiry_id: Uuid,
+    /// `"job"` for moving inquiries, `"item"` for internal calendar items.
+    entry_type: String,
+    inquiry_id: Option<Uuid>,
+    calendar_item_id: Option<Uuid>,
+    title: Option<String>,
+    location: Option<String>,
     job_date: Option<NaiveDate>,
     origin_city: Option<String>,
     destination_city: Option<String>,
@@ -583,8 +687,8 @@ struct HoursEntry {
 /// `GET /employee/hours?month=YYYY-MM` — monthly hours overview for the authenticated employee.
 ///
 /// **Caller**: Worker portal hours page.
-/// **Why**: Employees need to see their own planned vs. actual hours per month —
-///          past (completed), present (scheduled), and future (upcoming).
+/// **Why**: Employees need to see their own planned vs. actual hours per month across both
+///          moving jobs and internal calendar items (training, maintenance, etc.).
 ///          No financial data included.
 async fn get_hours(
     State(state): State<Arc<AppState>>,
@@ -610,7 +714,11 @@ async fn get_hours(
 
     #[derive(sqlx::FromRow)]
     struct HoursRow {
-        inquiry_id: Uuid,
+        entry_type: String,
+        inquiry_id: Option<Uuid>,
+        calendar_item_id: Option<Uuid>,
+        title: Option<String>,
+        location: Option<String>,
         job_date: Option<NaiveDate>,
         origin_city: Option<String>,
         destination_city: Option<String>,
@@ -622,13 +730,17 @@ async fn get_hours(
     let rows: Vec<HoursRow> = sqlx::query_as(
         r#"
         SELECT
-            ie.inquiry_id,
+            'job'                                              AS entry_type,
+            ie.inquiry_id                                     AS inquiry_id,
+            NULL::uuid                                        AS calendar_item_id,
+            NULL::text                                        AS title,
+            NULL::text                                        AS location,
             COALESCE(i.scheduled_date, i.preferred_date::date) AS job_date,
-            oa.city AS origin_city,
-            da.city AS destination_city,
-            ie.planned_hours::float8 AS planned_hours,
-            ie.actual_hours::float8  AS actual_hours,
-            i.status
+            oa.city                                           AS origin_city,
+            da.city                                           AS destination_city,
+            ie.planned_hours::float8                          AS planned_hours,
+            ie.actual_hours::float8                           AS actual_hours,
+            i.status                                          AS status
         FROM inquiry_employees ie
         JOIN inquiries i ON ie.inquiry_id = i.id
         LEFT JOIN addresses oa ON i.origin_address_id      = oa.id
@@ -636,7 +748,27 @@ async fn get_hours(
         WHERE ie.employee_id = $1
           AND COALESCE(i.scheduled_date, i.preferred_date::date, ie.created_at::date)
               BETWEEN $2 AND $3
-        ORDER BY COALESCE(i.scheduled_date, i.preferred_date::date) ASC NULLS LAST
+
+        UNION ALL
+
+        SELECT
+            'item'                   AS entry_type,
+            NULL::uuid               AS inquiry_id,
+            cie.calendar_item_id     AS calendar_item_id,
+            ci.title                 AS title,
+            ci.location              AS location,
+            ci.scheduled_date        AS job_date,
+            NULL::text               AS origin_city,
+            NULL::text               AS destination_city,
+            cie.planned_hours::float8 AS planned_hours,
+            cie.actual_hours::float8  AS actual_hours,
+            ci.status                AS status
+        FROM calendar_item_employees cie
+        JOIN calendar_items ci ON ci.id = cie.calendar_item_id
+        WHERE cie.employee_id = $1
+          AND ci.scheduled_date BETWEEN $2 AND $3
+
+        ORDER BY job_date ASC NULLS LAST
         "#,
     )
     .bind(claims.employee_id)
@@ -656,7 +788,11 @@ async fn get_hours(
                 actual_sum += a;
             }
             HoursEntry {
+                entry_type: r.entry_type,
                 inquiry_id: r.inquiry_id,
+                calendar_item_id: r.calendar_item_id,
+                title: r.title,
+                location: r.location,
                 job_date: r.job_date,
                 origin_city: r.origin_city,
                 destination_city: r.destination_city,
@@ -705,6 +841,53 @@ fn parse_month_range(month: &str) -> Option<(NaiveDate, NaiveDate)> {
     }
     .pred_opt()?;
     Some((from, to))
+}
+
+/// Fetch colleague names for calendar items (other employees on the same items, excluding self).
+///
+/// **Caller**: `get_schedule`.
+/// **Why**: Employees need to know who else is attending the same training / maintenance
+/// session. Mirrors `fetch_colleague_names` but queries `calendar_item_employees`.
+///
+/// # Returns
+/// Map of `calendar_item_id` → list of `"FirstName LastName"` strings.
+async fn fetch_item_colleague_names(
+    pool: &sqlx::PgPool,
+    item_ids: &[Uuid],
+    exclude_employee_id: Uuid,
+) -> Result<HashMap<Uuid, Vec<String>>, ApiError> {
+    if item_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    #[derive(sqlx::FromRow)]
+    struct ColleagueRow {
+        calendar_item_id: Uuid,
+        first_name: String,
+        last_name: String,
+    }
+
+    let rows: Vec<ColleagueRow> = sqlx::query_as(
+        r#"
+        SELECT cie.calendar_item_id, e.first_name, e.last_name
+        FROM calendar_item_employees cie
+        JOIN employees e ON cie.employee_id = e.id
+        WHERE cie.calendar_item_id = ANY($1) AND cie.employee_id != $2
+        ORDER BY e.last_name, e.first_name
+        "#,
+    )
+    .bind(item_ids)
+    .bind(exclude_employee_id)
+    .fetch_all(pool)
+    .await?;
+
+    let mut map: HashMap<Uuid, Vec<String>> = HashMap::new();
+    for r in rows {
+        map.entry(r.calendar_item_id)
+            .or_default()
+            .push(format!("{} {}", r.first_name, r.last_name));
+    }
+    Ok(map)
 }
 
 /// Fetch colleague names (other employees assigned to the same inquiries, excluding self).

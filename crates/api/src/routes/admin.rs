@@ -1908,12 +1908,23 @@ async fn fetch_employee_month_hours(
 
     let sums: HoursSums = sqlx::query_as(
         r#"
-        SELECT SUM(ie.planned_hours)::float8 AS planned,
-               SUM(ie.actual_hours)::float8 AS actual
-        FROM inquiry_employees ie
-        JOIN inquiries i ON ie.inquiry_id = i.id
-        WHERE ie.employee_id = $1
-          AND COALESCE(i.scheduled_date, i.preferred_date::date, ie.created_at::date) BETWEEN $2 AND $3
+        SELECT
+            COALESCE(SUM(planned_hours), 0.0)::float8 AS planned,
+            COALESCE(SUM(COALESCE(actual_hours, planned_hours)), 0.0)::float8 AS actual
+        FROM (
+            SELECT ie.planned_hours::float8, ie.actual_hours::float8
+            FROM inquiry_employees ie
+            JOIN inquiries i ON i.id = ie.inquiry_id
+            WHERE ie.employee_id = $1
+              AND COALESCE(i.scheduled_date, i.preferred_date::date, ie.created_at::date)
+                  BETWEEN $2 AND $3
+            UNION ALL
+            SELECT cie.planned_hours::float8, cie.actual_hours::float8
+            FROM calendar_item_employees cie
+            JOIN calendar_items ci ON ci.id = cie.calendar_item_id
+            WHERE cie.employee_id = $1
+              AND ci.scheduled_date BETWEEN $2 AND $3
+        ) combined
         "#,
     )
     .bind(employee_id)
