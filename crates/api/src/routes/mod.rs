@@ -3,6 +3,7 @@ pub mod auth;
 pub mod calendar;
 pub mod customer;
 pub mod distance;
+pub mod employee;
 pub mod estimates;
 pub mod health;
 pub mod inquiries;
@@ -19,6 +20,7 @@ pub fn public_api_router() -> Router<Arc<AppState>> {
         .nest("/auth", auth::router())
         .nest("/submit", inquiries::submit_router())
         .nest("/customer", customer::auth_router())
+        .nest("/employee", employee::auth_router())
         .nest("/estimates", estimates::public_router())
         .nest("/media", estimates::public_router())
         .route("/distance/calculate", post(distance::calculate))

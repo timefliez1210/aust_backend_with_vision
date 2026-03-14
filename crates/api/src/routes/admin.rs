@@ -1,8 +1,11 @@
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Multipart, Path, Query, State},
+    http::header,
+    response::Response,
     routing::{get, patch, post},
     Extension, Json, Router,
 };
+use bytes::Bytes;
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
@@ -39,6 +42,12 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/employees/{id}", get(get_employee).patch(update_employee))
         .route("/employees/{id}/delete", post(delete_employee))
         .route("/employees/{id}/hours", get(employee_hours_summary))
+        .route(
+            "/employees/{id}/documents/{doc_type}",
+            post(upload_employee_document)
+                .get(download_employee_document)
+                .delete(delete_employee_document),
+        )
 }
 
 // --- Dashboard ---
@@ -748,8 +757,9 @@ struct UserListResponse {
 /// `200 OK` with `UserListResponse` containing all users (id, email, name, role, created_at).
 async fn list_users(
     State(state): State<Arc<AppState>>,
-    Extension(_claims): Extension<TokenClaims>,
+    Extension(claims): Extension<TokenClaims>,
 ) -> Result<Json<UserListResponse>, ApiError> {
+    require_admin(&claims)?;
     let users: Vec<UserListItem> = sqlx::query_as(
         "SELECT id, email, name, role, created_at FROM users ORDER BY created_at ASC",
     )
@@ -781,6 +791,7 @@ async fn delete_user(
     Extension(claims): Extension<TokenClaims>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&claims)?;
     if claims.sub == id {
         return Err(ApiError::Validation(
             "Sie koennen sich nicht selbst loeschen".into(),
@@ -819,9 +830,10 @@ async fn delete_user(
 /// - `404` if customer not found
 async fn delete_customer(
     State(state): State<Arc<AppState>>,
-    Extension(_claims): Extension<TokenClaims>,
+    Extension(claims): Extension<TokenClaims>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&claims)?;
     // Cascades: inquiries, offers, volume_estimations, email_threads, email_messages
     let result = sqlx::query("DELETE FROM customers WHERE id = $1")
         .bind(id)
@@ -1410,6 +1422,22 @@ async fn send_plain_email(
     .map_err(|e| e.to_string())
 }
 
+// --- Permission helpers ---
+
+/// Guard that allows only Admin-role users to proceed.
+///
+/// **Caller**: Sensitive admin handlers (deletes, user management).
+/// **Why**: Buerokraft users share the admin JWT middleware but should not be able to
+///          delete records or access user management.
+fn require_admin(claims: &TokenClaims) -> Result<(), ApiError> {
+    if !claims.role.is_admin() {
+        return Err(ApiError::Forbidden(
+            "Diese Aktion erfordert Administrator-Berechtigungen".into(),
+        ));
+    }
+    Ok(())
+}
+
 // --- Employees ---
 
 #[derive(Debug, Deserialize)]
@@ -1431,6 +1459,8 @@ struct EmployeeDbRow {
     phone: Option<String>,
     monthly_hours_target: f64,
     active: bool,
+    arbeitsvertrag_key: Option<String>,
+    mitarbeiterfragebogen_key: Option<String>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -1723,9 +1753,10 @@ async fn update_employee(
 /// `204 No Content`.
 async fn delete_employee(
     State(state): State<Arc<AppState>>,
-    Extension(_claims): Extension<TokenClaims>,
+    Extension(claims): Extension<TokenClaims>,
     Path(id): Path<Uuid>,
 ) -> Result<axum::http::StatusCode, ApiError> {
+    require_admin(&claims)?;
     let result = sqlx::query("UPDATE employees SET active = false WHERE id = $1")
         .bind(id)
         .execute(&state.db)
@@ -1902,7 +1933,8 @@ async fn fetch_employee_json(
         r#"
         SELECT id, salutation, first_name, last_name, email, phone,
                monthly_hours_target::float8 AS monthly_hours_target,
-               active, created_at, updated_at
+               active, arbeitsvertrag_key, mitarbeiterfragebogen_key,
+               created_at, updated_at
         FROM employees WHERE id = $1
         "#,
     )
@@ -1920,7 +1952,206 @@ async fn fetch_employee_json(
         "phone": row.phone,
         "monthly_hours_target": row.monthly_hours_target,
         "active": row.active,
+        "arbeitsvertrag_key": row.arbeitsvertrag_key,
+        "mitarbeiterfragebogen_key": row.mitarbeiterfragebogen_key,
         "created_at": row.created_at,
         "updated_at": row.updated_at,
     }))
+}
+
+// --- Employee Documents ---
+
+/// Validate and return the DB column name for a document type path segment.
+///
+/// **Caller**: upload/download/delete employee document handlers
+/// **Why**: Centralises the allow-list so that only valid document types reach the DB.
+fn resolve_doc_column(doc_type: &str) -> Option<&'static str> {
+    match doc_type {
+        "arbeitsvertrag" => Some("arbeitsvertrag_key"),
+        "mitarbeiterfragebogen" => Some("mitarbeiterfragebogen_key"),
+        _ => None,
+    }
+}
+
+/// Derive a best-effort MIME type from an S3 key's file extension.
+fn doc_content_type(key: &str) -> &'static str {
+    match key.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str() {
+        "pdf"  => "application/pdf",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "doc"  => "application/msword",
+        "png"  => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        _      => "application/octet-stream",
+    }
+}
+
+/// `POST /api/v1/admin/employees/{id}/documents/{doc_type}` — Upload an employee document.
+///
+/// **Caller**: Admin employee detail page document card.
+/// **Why**: Stores Arbeitsvertrag or Mitarbeiterfragebogen in S3 and saves the key in the DB.
+///
+/// # Parameters
+/// - `id`       — Employee UUID
+/// - `doc_type` — `"arbeitsvertrag"` or `"mitarbeiterfragebogen"`
+///
+/// Expects a `multipart/form-data` body with a single `"file"` part.
+///
+/// # Returns
+/// `200 OK` with updated employee JSON on success.
+async fn upload_employee_document(
+    State(state): State<Arc<AppState>>,
+    Extension(_claims): Extension<TokenClaims>,
+    Path((id, doc_type)): Path<(Uuid, String)>,
+    mut multipart: Multipart,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let col = resolve_doc_column(&doc_type)
+        .ok_or_else(|| ApiError::BadRequest("Unbekannter Dokumenttyp".into()))?;
+
+    // Verify employee exists
+    let exists: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM employees WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await?;
+    if exists.is_none() {
+        return Err(ApiError::NotFound("Mitarbeiter nicht gefunden".into()));
+    }
+
+    // Extract the "file" part from the multipart body
+    let mut file_bytes: Option<Bytes> = None;
+    let mut file_ext = String::from("pdf");
+    let mut content_type_str = String::from("application/pdf");
+
+    while let Some(field) = multipart.next_field().await.map_err(|e| {
+        ApiError::BadRequest(format!("Fehler beim Lesen der Datei: {e}"))
+    })? {
+        if field.name() == Some("file") {
+            // Derive extension from original filename
+            if let Some(fname) = field.file_name() {
+                if let Some(ext) = fname.rsplit('.').next().filter(|e| !e.is_empty()) {
+                    file_ext = ext.to_lowercase();
+                }
+            }
+            if let Some(ct) = field.content_type() {
+                content_type_str = ct.to_string();
+            }
+            file_bytes = Some(
+                field.bytes().await.map_err(|e| {
+                    ApiError::BadRequest(format!("Fehler beim Lesen der Dateidaten: {e}"))
+                })?
+            );
+            break;
+        }
+    }
+
+    let data = file_bytes.ok_or_else(|| ApiError::BadRequest("Kein Dateifeld gefunden".into()))?;
+
+    // Upload to S3
+    let key = format!("employees/{}/{}.{}", id, doc_type, file_ext);
+    state.storage.upload(&key, data, &content_type_str).await.map_err(|e| {
+        tracing::error!("S3 upload error for employee document: {e}");
+        ApiError::Internal("Datei-Upload fehlgeschlagen".into())
+    })?;
+
+    // Persist key in DB (safe: col is from the allow-list above, not user input)
+    sqlx::query(&format!("UPDATE employees SET {col} = $2 WHERE id = $1"))
+        .bind(id)
+        .bind(&key)
+        .execute(&state.db)
+        .await?;
+
+    tracing::info!("Employee {id}: uploaded {doc_type} → {key}");
+    let employee = fetch_employee_json(&state.db, id).await?;
+    Ok(Json(employee))
+}
+
+/// `GET /api/v1/admin/employees/{id}/documents/{doc_type}` — Download an employee document.
+///
+/// **Caller**: Admin employee detail page document card download button.
+/// **Why**: Proxies the S3 object through the API so the JWT-protected endpoint can gate access.
+///
+/// # Parameters
+/// - `id`       — Employee UUID
+/// - `doc_type` — `"arbeitsvertrag"` or `"mitarbeiterfragebogen"`
+///
+/// # Returns
+/// Raw file bytes with appropriate `Content-Type` and `Content-Disposition: attachment` header.
+async fn download_employee_document(
+    State(state): State<Arc<AppState>>,
+    Extension(_claims): Extension<TokenClaims>,
+    Path((id, doc_type)): Path<(Uuid, String)>,
+) -> Result<Response, ApiError> {
+    resolve_doc_column(&doc_type)
+        .ok_or_else(|| ApiError::BadRequest("Unbekannter Dokumenttyp".into()))?;
+
+    // Fetch the stored S3 key
+    let key: Option<String> = sqlx::query_scalar(&format!(
+        "SELECT {}_key FROM employees WHERE id = $1",
+        doc_type.replace('-', "_")
+    ))
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await?;
+
+    let key = key.ok_or_else(|| ApiError::NotFound("Dokument nicht vorhanden".into()))?;
+
+    let data = state.storage.download(&key).await.map_err(|e| {
+        tracing::error!("S3 download error for employee document: {e}");
+        ApiError::NotFound("Dokument nicht abrufbar".into())
+    })?;
+
+    let ct = doc_content_type(&key);
+    let filename = key.rsplit('/').next().unwrap_or("document");
+
+    Ok(Response::builder()
+        .header(header::CONTENT_TYPE, ct)
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{}\"", filename),
+        )
+        .body(axum::body::Body::from(data))
+        .unwrap())
+}
+
+/// `DELETE /api/v1/admin/employees/{id}/documents/{doc_type}` — Remove an employee document.
+///
+/// **Caller**: Admin employee detail page document card delete button.
+/// **Why**: Deletes the file from S3 and clears the DB key so the slot appears empty again.
+///
+/// # Parameters
+/// - `id`       — Employee UUID
+/// - `doc_type` — `"arbeitsvertrag"` or `"mitarbeiterfragebogen"`
+///
+/// # Returns
+/// `200 OK` with updated employee JSON.
+async fn delete_employee_document(
+    State(state): State<Arc<AppState>>,
+    Extension(_claims): Extension<TokenClaims>,
+    Path((id, doc_type)): Path<(Uuid, String)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let col = resolve_doc_column(&doc_type)
+        .ok_or_else(|| ApiError::BadRequest("Unbekannter Dokumenttyp".into()))?;
+
+    // Fetch stored key
+    let key: Option<String> = sqlx::query_scalar(&format!(
+        "SELECT {col} FROM employees WHERE id = $1"
+    ))
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await?;
+
+    if let Some(ref k) = key {
+        // Best-effort S3 delete — log but don't fail if the object is already gone
+        if let Err(e) = state.storage.delete(k).await {
+            tracing::warn!("S3 delete for employee document {k} failed (ignoring): {e}");
+        }
+    }
+
+    sqlx::query(&format!("UPDATE employees SET {col} = NULL WHERE id = $1"))
+        .bind(id)
+        .execute(&state.db)
+        .await?;
+
+    tracing::info!("Employee {id}: deleted {doc_type}");
+    let employee = fetch_employee_json(&state.db, id).await?;
+    Ok(Json(employee))
 }

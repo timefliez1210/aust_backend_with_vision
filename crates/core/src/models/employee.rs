@@ -16,6 +16,10 @@ pub struct Employee {
     pub phone: Option<String>,
     pub monthly_hours_target: f64,
     pub active: bool,
+    /// S3 key for the uploaded Arbeitsvertrag PDF. Null if not yet uploaded.
+    pub arbeitsvertrag_key: Option<String>,
+    /// S3 key for the uploaded Mitarbeiterfragebogen. Null if not yet uploaded.
+    pub mitarbeiterfragebogen_key: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

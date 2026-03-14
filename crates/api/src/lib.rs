@@ -64,6 +64,13 @@ pub fn create_router(state: AppState) -> Router {
             middleware::require_customer_auth,
         ));
 
+    let employee_routes = Router::new()
+        .nest("/employee", routes::employee::protected_router())
+        .route_layer(axum::middleware::from_fn_with_state(
+            shared_state.clone(),
+            middleware::require_employee_auth,
+        ));
+
     let protected_api = routes::protected_api_router()
         .route_layer(axum::middleware::from_fn_with_state(
             shared_state.clone(),
@@ -78,6 +85,7 @@ pub fn create_router(state: AppState) -> Router {
                 .merge(protected_api)
                 .merge(admin_routes)
                 .merge(customer_routes)
+                .merge(employee_routes)
                 .layer(axum::extract::DefaultBodyLimit::max(250 * 1024 * 1024)),
         )
         .layer(TraceLayer::new_for_http())

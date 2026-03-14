@@ -11,15 +11,18 @@ use validator::Validate;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UserRole {
-    /// Full access to all admin operations including user management.
+    /// Full access to all admin operations including user management and destructive actions.
     Admin,
-    /// Read/write access to quotes and offers; no user management.
+    /// Office manager: can create/edit offers, assign employees, manage calendar.
+    /// Cannot delete customers, employees, or perform other destructive operations.
+    Buerokraft,
+    /// Legacy alias for Buerokraft — kept for backwards compatibility with existing tokens.
     Operator,
 }
 
 impl Default for UserRole {
     fn default() -> Self {
-        Self::Operator
+        Self::Buerokraft
     }
 }
 
@@ -28,17 +31,24 @@ impl UserRole {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Admin => "admin",
+            Self::Buerokraft => "buerokraft",
             Self::Operator => "operator",
         }
     }
 
     /// Parses a role from its database string representation.
-    /// Unknown strings default to `Operator` rather than failing.
+    /// Unknown strings default to `Buerokraft`.
     pub fn from_str(s: &str) -> Self {
         match s {
             "admin" => Self::Admin,
-            _ => Self::Operator,
+            "buerokraft" => Self::Buerokraft,
+            _ => Self::Buerokraft,
         }
+    }
+
+    /// Returns true for Admin only — used to gate destructive operations.
+    pub fn is_admin(self) -> bool {
+        self == Self::Admin
     }
 }
 

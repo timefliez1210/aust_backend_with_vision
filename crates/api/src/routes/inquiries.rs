@@ -7,7 +7,7 @@ use axum::{
     http::{header, StatusCode},
     response::IntoResponse,
     routing::{get, post, put},
-    Json, Router,
+    Extension, Json, Router,
 };
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -22,7 +22,7 @@ use crate::services::inquiry_builder;
 use crate::{orchestrator, services, ApiError, AppState};
 use aust_core::models::{
     EstimationMethod, InquiryListItem, InquiryResponse as InquiryResponseModel,
-    InquiryStatus, Offer, Services,
+    InquiryStatus, Offer, Services, TokenClaims,
 };
 use aust_llm_providers::LlmMessage;
 use aust_offer_generator::OfferLineItem;
@@ -483,8 +483,14 @@ async fn update_inquiry(
 /// handle offers, estimations, items, email threads, and bookings automatically.
 async fn delete_inquiry(
     State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<TokenClaims>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
+    if !claims.role.is_admin() {
+        return Err(ApiError::Forbidden(
+            "Diese Aktion erfordert Administrator-Berechtigungen".into(),
+        ));
+    }
     let rows_affected = sqlx::query("DELETE FROM inquiries WHERE id = $1")
         .bind(id)
         .execute(&state.db)
@@ -1033,6 +1039,19 @@ async fn trigger_estimate_upload(
         Vec::new()
     };
 
+    // Update source_data with s3_keys immediately so images are visible in the admin UI
+    // while Modal is still processing.
+    if !s3_keys.is_empty() {
+        let source_data = serde_json::json!({ "s3_keys": &s3_keys, "image_count": s3_keys.len() });
+        let _ = sqlx::query(
+            "UPDATE volume_estimations SET source_data = $1 WHERE id = $2",
+        )
+        .bind(&source_data)
+        .bind(estimation_id)
+        .execute(&state.db)
+        .await;
+    }
+
     // Spawn background processing (same pipeline as public submission)
     let state_bg = Arc::clone(&state);
     tokio::spawn(async move {
@@ -1511,6 +1530,10 @@ async fn video_inquiry(
             tracing::warn!(inquiry_id = %inquiry_id, "Pre-spawn video S3 upload failed: {e}");
             s3_keys_per_video.push(String::new());
         } else {
+            // Update source_data immediately so the admin UI can show the video
+            let source_data = serde_json::json!({ "video_s3_key": &s3_key });
+            let _ = sqlx::query("UPDATE volume_estimations SET source_data = $1 WHERE id = $2")
+                .bind(&source_data).bind(eid).execute(&state.db).await;
             s3_keys_per_video.push(s3_key);
         }
     }
@@ -1899,6 +1922,19 @@ async fn handle_submission(
         s3_keys_count = s3_keys.len(),
         "Images uploaded to S3 before spawn"
     );
+
+    // Update source_data with s3_keys immediately so images are visible in the admin UI
+    // while Modal is still processing.
+    if !s3_keys.is_empty() {
+        let source_data = serde_json::json!({ "s3_keys": &s3_keys, "image_count": s3_keys.len() });
+        let _ = sqlx::query(
+            "UPDATE volume_estimations SET source_data = $1 WHERE id = $2",
+        )
+        .bind(&source_data)
+        .bind(estimation_id)
+        .execute(&state.db)
+        .await;
+    }
 
     // 8. Spawn background processing: distance calc → semaphore → Modal → offer.
     let state_bg = Arc::clone(&state);
