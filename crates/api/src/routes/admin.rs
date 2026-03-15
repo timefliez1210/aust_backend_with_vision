@@ -75,6 +75,9 @@ struct ActivityItem {
     activity_type: String,
     description: String,
     created_at: DateTime<Utc>,
+    /// UUID of the target resource (inquiry id, email thread id, or calendar item id).
+    id: Option<Uuid>,
+    status: Option<String>,
 }
 
 /// `GET /api/v1/admin/dashboard` — Return headline KPIs and recent activity for the dashboard.
@@ -120,17 +123,67 @@ async fn dashboard(
             .fetch_one(&state.db)
             .await?;
 
+    // Unified recent activity: recent inquiry updates, unanswered emails, upcoming Termine.
     let recent_offers: Vec<ActivityItem> = sqlx::query_as(
         r#"
-        SELECT
-            'offer_' || o.status AS activity_type,
-            COALESCE(c.name, c.email) || ' — ' || (o.price_cents::float / 100)::text || ' €' AS description,
-            o.created_at
-        FROM offers o
-        JOIN inquiries q ON o.inquiry_id = q.id
-        JOIN customers c ON q.customer_id = c.id
-        ORDER BY o.created_at DESC
-        LIMIT 10
+        SELECT activity_type, description, created_at, id, status
+        FROM (
+            -- Recently updated inquiries (not terminal)
+            SELECT
+                'inquiry' AS activity_type,
+                COALESCE(c.name, c.email) || ' — ' || i.status AS description,
+                i.updated_at AS created_at,
+                i.id AS id,
+                i.status AS status
+            FROM inquiries i
+            JOIN customers c ON i.customer_id = c.id
+            WHERE i.status NOT IN ('cancelled', 'rejected', 'expired', 'paid')
+
+            UNION ALL
+
+            -- Recent offers (link goes to inquiry)
+            SELECT
+                'offer_' || o.status AS activity_type,
+                COALESCE(c.name, c.email) || ' — ' || round((o.price_cents::numeric / 100 * 1.19), 2)::text || ' € brutto' AS description,
+                o.created_at AS created_at,
+                q.id AS id,
+                o.status AS status
+            FROM offers o
+            JOIN inquiries q ON o.inquiry_id = q.id
+            JOIN customers c ON q.customer_id = c.id
+
+            UNION ALL
+
+            -- Email threads awaiting reply (last message is inbound)
+            SELECT
+                'email' AS activity_type,
+                COALESCE(c.name, c.email) || ': ' || COALESCE(et.subject, '(kein Betreff)') AS description,
+                et.updated_at AS created_at,
+                et.id AS id,
+                'unanswered' AS status
+            FROM email_threads et
+            JOIN customers c ON et.customer_id = c.id
+            WHERE (
+                SELECT direction FROM email_messages
+                WHERE thread_id = et.id
+                ORDER BY created_at DESC LIMIT 1
+            ) = 'inbound'
+
+            UNION ALL
+
+            -- Upcoming / recently created calendar items
+            SELECT
+                'calendar_item' AS activity_type,
+                ci.title || COALESCE(' @ ' || ci.location, '') AS description,
+                ci.created_at AS created_at,
+                ci.id AS id,
+                ci.status AS status
+            FROM calendar_items ci
+            WHERE ci.status = 'scheduled'
+              AND (ci.scheduled_date IS NULL OR ci.scheduled_date >= CURRENT_DATE)
+        ) combined
+        ORDER BY created_at DESC
+        LIMIT 15
         "#,
     )
     .fetch_all(&state.db)
