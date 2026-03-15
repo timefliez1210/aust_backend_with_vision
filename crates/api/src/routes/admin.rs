@@ -1841,6 +1841,42 @@ async fn employee_hours_summary(
     .fetch_all(&state.db)
     .await?;
 
+    // Also fetch calendar item assignments for this employee in the same month.
+    #[derive(Debug, Serialize, FromRow)]
+    struct CalendarItemHoursRow {
+        calendar_item_id: Uuid,
+        title: String,
+        category: String,
+        location: Option<String>,
+        scheduled_date: Option<NaiveDate>,
+        planned_hours: f64,
+        actual_hours: Option<f64>,
+        status: String,
+    }
+
+    let item_rows: Vec<CalendarItemHoursRow> = sqlx::query_as(
+        r#"
+        SELECT cie.calendar_item_id,
+               ci.title,
+               ci.category,
+               ci.location,
+               ci.scheduled_date,
+               cie.planned_hours::float8 AS planned_hours,
+               cie.actual_hours::float8 AS actual_hours,
+               ci.status
+        FROM calendar_item_employees cie
+        JOIN calendar_items ci ON ci.id = cie.calendar_item_id
+        WHERE cie.employee_id = $1
+          AND ci.scheduled_date BETWEEN $2 AND $3
+        ORDER BY ci.scheduled_date
+        "#,
+    )
+    .bind(id)
+    .bind(from_date)
+    .bind(to_date)
+    .fetch_all(&state.db)
+    .await?;
+
     let target = target_row.monthly_hours_target;
     let mut planned_sum = 0.0_f64;
     let mut actual_sum = 0.0_f64;
@@ -1865,13 +1901,34 @@ async fn employee_hours_summary(
         })
         .collect();
 
+    let calendar_items: Vec<serde_json::Value> = item_rows
+        .into_iter()
+        .map(|r| {
+            planned_sum += r.planned_hours;
+            if let Some(av) = r.actual_hours {
+                actual_sum += av;
+            }
+            serde_json::json!({
+                "calendar_item_id": r.calendar_item_id,
+                "title": r.title,
+                "category": r.category,
+                "location": r.location,
+                "scheduled_date": r.scheduled_date,
+                "planned_hours": r.planned_hours,
+                "actual_hours": r.actual_hours,
+                "status": r.status,
+            })
+        })
+        .collect();
+
     Ok(Json(serde_json::json!({
         "month": month_str,
         "target_hours": target,
         "planned_hours": planned_sum,
         "actual_hours": actual_sum,
-        "assignment_count": assignments.len(),
+        "assignment_count": assignments.len() + calendar_items.len(),
         "assignments": assignments,
+        "calendar_items": calendar_items,
     })))
 }
 
