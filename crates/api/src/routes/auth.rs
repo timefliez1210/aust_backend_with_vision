@@ -1,6 +1,7 @@
 use axum::{extract::State, routing::post, Extension, Json, Router};
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use rand::Rng;
 use serde::Deserialize;
 use sqlx::FromRow;
 use std::sync::Arc;
@@ -25,6 +26,8 @@ pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/login", post(login))
         .route("/refresh", post(refresh_token))
+        .route("/reset-password/request", post(reset_password_request))
+        .route("/reset-password/verify", post(reset_password_verify))
 }
 
 /// Register the protected authentication routes (require an existing valid JWT).
@@ -393,6 +396,192 @@ async fn change_password(
         .bind(claims.sub)
         .execute(&state.db)
         .await?;
+
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+// --- Password Reset (OTP) ---
+
+#[derive(Debug, Deserialize)]
+struct ResetRequestBody {
+    email: String,
+}
+
+/// `POST /api/v1/auth/reset-password/request` — Send a 6-digit OTP to the user's email.
+///
+/// **Caller**: Axum public router / admin login page "Passwort vergessen" flow.
+/// **Why**: Initiates password recovery by generating a short-lived OTP, storing its
+/// Argon2 hash in `admin_password_resets`, and emailing the plaintext code to the user.
+/// Always returns 200 regardless of whether the email exists to prevent user enumeration.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool, email config)
+/// - `body` — JSON with `email`
+///
+/// # Returns
+/// `200 OK` with `{"ok": true}` in all cases.
+async fn reset_password_request(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ResetRequestBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let email = body.email.trim().to_lowercase();
+
+    // Look up user — if not found, return 200 silently (no enumeration)
+    let user: Option<UserRow> = sqlx::query_as(
+        "SELECT id, email, password_hash, role FROM users WHERE LOWER(email) = $1",
+    )
+    .bind(&email)
+    .fetch_optional(&state.db)
+    .await?;
+
+    if let Some(user) = user {
+        // Generate 6-digit OTP
+        let otp: u32 = rand::thread_rng().gen_range(100_000..=999_999);
+        let otp_str = format!("{otp:06}");
+
+        // Hash it for storage
+        let otp_hash = hash_password(&otp_str)?;
+        let expires_at = Utc::now() + Duration::minutes(15);
+
+        // Invalidate any existing unused tokens for this user
+        sqlx::query(
+            "UPDATE admin_password_resets SET used_at = now() WHERE user_id = $1 AND used_at IS NULL",
+        )
+        .bind(user.id)
+        .execute(&state.db)
+        .await?;
+
+        // Store new token
+        sqlx::query(
+            "INSERT INTO admin_password_resets (user_id, otp_hash, expires_at) VALUES ($1, $2, $3)",
+        )
+        .bind(user.id)
+        .bind(&otp_hash)
+        .bind(expires_at)
+        .execute(&state.db)
+        .await?;
+
+        // Send email (best-effort — don't fail the request if SMTP is down)
+        let body_text = format!(
+            "Ihr Passwort-Reset-Code lautet:\n\n  {otp_str}\n\nDer Code ist 15 Minuten gültig.\n\nFalls Sie kein Passwort-Reset angefordert haben, können Sie diese E-Mail ignorieren."
+        );
+        let _ = crate::services::email::send_email(
+            &state.config.email.smtp_host,
+            state.config.email.smtp_port,
+            &state.config.email.username,
+            &state.config.email.password,
+            crate::services::email::build_plain_email(
+                &state.config.email.from_address,
+                &state.config.email.from_name,
+                &user.email,
+                "Passwort-Reset Code – AUST Admin",
+                &body_text,
+            )
+            .map_err(|e| ApiError::Internal(e.to_string()))?,
+        )
+        .await;
+    }
+
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+#[derive(Debug, Deserialize)]
+struct ResetVerifyBody {
+    email: String,
+    otp: String,
+    new_password: String,
+}
+
+#[derive(Debug, FromRow)]
+struct ResetRow {
+    id: Uuid,
+    user_id: Uuid,
+    otp_hash: String,
+    expires_at: chrono::DateTime<Utc>,
+}
+
+/// `POST /api/v1/auth/reset-password/verify` — Validate OTP and set a new password.
+///
+/// **Caller**: Axum public router / admin login page OTP entry step.
+/// **Why**: Verifies the 6-digit OTP against the stored Argon2 hash, checks expiry and
+/// single-use, then updates the user's password hash and marks the token used.
+///
+/// # Parameters
+/// - `state` — shared AppState (DB pool)
+/// - `body` — JSON with `email`, `otp` (6 digits), `new_password`
+///
+/// # Returns
+/// `200 OK` with `{"ok": true}` on success.
+///
+/// # Errors
+/// - `400` if new password is shorter than 8 characters
+/// - `400` if OTP is invalid or expired (generic message, no enumeration)
+async fn reset_password_verify(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ResetVerifyBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if body.new_password.len() < 8 {
+        return Err(ApiError::Validation(
+            "Neues Passwort muss mindestens 8 Zeichen haben".into(),
+        ));
+    }
+
+    let email = body.email.trim().to_lowercase();
+
+    let user: Option<UserRow> = sqlx::query_as(
+        "SELECT id, email, password_hash, role FROM users WHERE LOWER(email) = $1",
+    )
+    .bind(&email)
+    .fetch_optional(&state.db)
+    .await?;
+
+    let user = user.ok_or_else(|| ApiError::Validation("Ungültiger oder abgelaufener Code".into()))?;
+
+    // Fetch the latest unused, unexpired token for this user
+    let reset: Option<ResetRow> = sqlx::query_as(
+        r#"
+        SELECT id, user_id, otp_hash, expires_at
+        FROM admin_password_resets
+        WHERE user_id = $1 AND used_at IS NULL AND expires_at > now()
+        ORDER BY created_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(user.id)
+    .fetch_optional(&state.db)
+    .await?;
+
+    let reset =
+        reset.ok_or_else(|| ApiError::Validation("Ungültiger oder abgelaufener Code".into()))?;
+
+    // Verify OTP
+    let parsed_hash = PasswordHash::new(&reset.otp_hash)
+        .map_err(|_| ApiError::Internal("OTP-Hash ungültig".into()))?;
+
+    Argon2::default()
+        .verify_password(body.otp.trim().as_bytes(), &parsed_hash)
+        .map_err(|_| ApiError::Validation("Ungültiger oder abgelaufener Code".into()))?;
+
+    // Mark token used and update password in a transaction
+    let new_hash = hash_password(&body.new_password)?;
+    let now = Utc::now();
+
+    let mut tx = state.db.begin().await?;
+
+    sqlx::query("UPDATE admin_password_resets SET used_at = $1 WHERE id = $2")
+        .bind(now)
+        .bind(reset.id)
+        .execute(&mut *tx)
+        .await?;
+
+    sqlx::query("UPDATE users SET password_hash = $1, updated_at = $2 WHERE id = $3")
+        .bind(&new_hash)
+        .bind(now)
+        .bind(user.id)
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
 
     Ok(Json(serde_json::json!({ "ok": true })))
 }
