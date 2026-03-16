@@ -74,6 +74,8 @@ pub struct InquiryListItem {
     pub id: Uuid,
     pub customer_name: Option<String>,
     pub customer_email: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub salutation: Option<String>,
     pub origin_city: Option<String>,
     pub destination_city: Option<String>,
     pub volume_m3: Option<f64>,
