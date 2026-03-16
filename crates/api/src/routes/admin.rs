@@ -337,6 +337,7 @@ struct CustomerDetailResponse {
     created_at: DateTime<Utc>,
     quotes: Vec<CustomerQuote>,
     offers: Vec<CustomerOffer>,
+    termine: Vec<CustomerTermin>,
 }
 
 #[derive(Debug, Serialize, FromRow)]
@@ -356,6 +357,15 @@ struct CustomerOffer {
     status: String,
     created_at: DateTime<Utc>,
     sent_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Serialize, FromRow)]
+struct CustomerTermin {
+    id: Uuid,
+    title: String,
+    category: String,
+    scheduled_date: Option<chrono::NaiveDate>,
+    status: String,
 }
 
 /// `GET /api/v1/admin/customers/{id}` — Retrieve a customer with their quotes and offers.
@@ -412,6 +422,17 @@ async fn get_customer(
     .fetch_all(&state.db)
     .await?;
 
+    let termine: Vec<CustomerTermin> = sqlx::query_as(
+        r#"
+        SELECT id, title, category, scheduled_date, status
+        FROM calendar_items WHERE customer_id = $1
+        ORDER BY scheduled_date DESC NULLS LAST
+        "#,
+    )
+    .bind(id)
+    .fetch_all(&state.db)
+    .await?;
+
     Ok(Json(CustomerDetailResponse {
         id: customer.id,
         email: customer.email,
@@ -423,6 +444,7 @@ async fn get_customer(
         created_at: customer.created_at,
         quotes,
         offers,
+        termine,
     }))
 }
 

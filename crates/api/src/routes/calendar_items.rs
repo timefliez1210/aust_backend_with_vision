@@ -54,6 +54,10 @@ struct CalendarItemRow {
     status: String,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
+    #[sqlx(default)]
+    customer_id: Option<Uuid>,
+    #[sqlx(default)]
+    customer_name: Option<String>,
 }
 
 /// Employee assignment record for a calendar item.
@@ -80,6 +84,8 @@ struct CalendarItemDetail {
     status: String,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
+    customer_id: Option<Uuid>,
+    customer_name: Option<String>,
     employees: Vec<CalendarItemEmployee>,
 }
 
@@ -93,6 +99,7 @@ struct CreateItemBody {
     location: Option<String>,
     scheduled_date: Option<NaiveDate>,
     duration_hours: Option<f64>,
+    customer_id: Option<Uuid>,
 }
 
 /// Body for partially updating an existing calendar item.
@@ -105,6 +112,10 @@ struct UpdateItemBody {
     scheduled_date: Option<NaiveDate>,
     duration_hours: Option<f64>,
     status: Option<String>,
+    customer_id: Option<Uuid>,
+    /// Set to true to explicitly remove the customer assignment.
+    #[serde(default)]
+    remove_customer: bool,
 }
 
 /// Body for assigning an employee to a calendar item.
@@ -153,6 +164,36 @@ fn parse_month_bounds(month: &str) -> Option<(NaiveDate, NaiveDate)> {
 }
 
 // ---------------------------------------------------------------------------
+// Helper: fetch single item row with customer join
+// ---------------------------------------------------------------------------
+
+/// Fetch a single `CalendarItemRow` by id, LEFT JOINing the customer name.
+///
+/// **Caller**: `create_item`, `get_item`, `update_item`
+/// **Why**: RETURNING clauses cannot do JOINs in PostgreSQL; this centralises
+/// the post-write SELECT with customer data.
+///
+/// # Errors
+/// `404 Not Found` when no item with the given UUID exists.
+async fn fetch_item_row(pool: &sqlx::PgPool, id: Uuid) -> Result<CalendarItemRow, ApiError> {
+    sqlx::query_as(
+        r#"
+        SELECT ci.id, ci.title, ci.description, ci.category, ci.location,
+               ci.scheduled_date, ci.duration_hours::float8 AS duration_hours,
+               ci.status, ci.created_at, ci.updated_at,
+               ci.customer_id, c.name AS customer_name
+        FROM calendar_items ci
+        LEFT JOIN customers c ON c.id = ci.customer_id
+        WHERE ci.id = $1
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Kalendereintrag nicht gefunden".into()))
+}
+
+// ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
 
@@ -178,19 +219,14 @@ async fn list_items(
 
         sqlx::query_as(
             r#"
-            SELECT id,
-                   title,
-                   description,
-                   category,
-                   location,
-                   scheduled_date,
-                   duration_hours::float8 AS duration_hours,
-                   status,
-                   created_at,
-                   updated_at
-            FROM calendar_items
-            WHERE scheduled_date >= $1 AND scheduled_date < $2
-            ORDER BY scheduled_date ASC NULLS LAST
+            SELECT ci.id, ci.title, ci.description, ci.category, ci.location,
+                   ci.scheduled_date, ci.duration_hours::float8 AS duration_hours,
+                   ci.status, ci.created_at, ci.updated_at,
+                   ci.customer_id, c.name AS customer_name
+            FROM calendar_items ci
+            LEFT JOIN customers c ON c.id = ci.customer_id
+            WHERE ci.scheduled_date >= $1 AND ci.scheduled_date < $2
+            ORDER BY ci.scheduled_date ASC NULLS LAST
             "#,
         )
         .bind(start)
@@ -200,18 +236,13 @@ async fn list_items(
     } else {
         sqlx::query_as(
             r#"
-            SELECT id,
-                   title,
-                   description,
-                   category,
-                   location,
-                   scheduled_date,
-                   duration_hours::float8 AS duration_hours,
-                   status,
-                   created_at,
-                   updated_at
-            FROM calendar_items
-            ORDER BY scheduled_date ASC NULLS LAST
+            SELECT ci.id, ci.title, ci.description, ci.category, ci.location,
+                   ci.scheduled_date, ci.duration_hours::float8 AS duration_hours,
+                   ci.status, ci.created_at, ci.updated_at,
+                   ci.customer_id, c.name AS customer_name
+            FROM calendar_items ci
+            LEFT JOIN customers c ON c.id = ci.customer_id
+            ORDER BY ci.scheduled_date ASC NULLS LAST
             "#,
         )
         .fetch_all(&state.db)
@@ -241,20 +272,11 @@ async fn create_item(
     let category = body.category.unwrap_or_else(|| "internal".to_string());
     let duration_hours = body.duration_hours.unwrap_or(0.0);
 
-    let row: CalendarItemRow = sqlx::query_as(
+    let (new_id,): (Uuid,) = sqlx::query_as(
         r#"
-        INSERT INTO calendar_items (title, description, category, location, scheduled_date, duration_hours)
-        VALUES ($1, $2, $3, $4, $5, $6)
-        RETURNING id,
-                  title,
-                  description,
-                  category,
-                  location,
-                  scheduled_date,
-                  duration_hours::float8 AS duration_hours,
-                  status,
-                  created_at,
-                  updated_at
+        INSERT INTO calendar_items (title, description, category, location, scheduled_date, duration_hours, customer_id)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        RETURNING id
         "#,
     )
     .bind(body.title.trim())
@@ -263,9 +285,11 @@ async fn create_item(
     .bind(body.location)
     .bind(body.scheduled_date)
     .bind(duration_hours)
+    .bind(body.customer_id)
     .fetch_one(&state.db)
     .await?;
 
+    let row = fetch_item_row(&state.db, new_id).await?;
     Ok((StatusCode::CREATED, Json(row)))
 }
 
@@ -285,28 +309,7 @@ async fn get_item(
     Extension(_claims): Extension<TokenClaims>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<CalendarItemDetail>, ApiError> {
-    let row: Option<CalendarItemRow> = sqlx::query_as(
-        r#"
-        SELECT id,
-               title,
-               description,
-               category,
-               location,
-               scheduled_date,
-               duration_hours::float8 AS duration_hours,
-               status,
-               created_at,
-               updated_at
-        FROM calendar_items
-        WHERE id = $1
-        "#,
-    )
-    .bind(id)
-    .fetch_optional(&state.db)
-    .await?;
-
-    let item = row.ok_or_else(|| ApiError::NotFound("Kalendereintrag nicht gefunden".into()))?;
-
+    let item = fetch_item_row(&state.db, id).await?;
     let employees = fetch_item_employees(&state.db, id).await?;
 
     Ok(Json(CalendarItemDetail {
@@ -320,6 +323,8 @@ async fn get_item(
         status: item.status,
         created_at: item.created_at,
         updated_at: item.updated_at,
+        customer_id: item.customer_id,
+        customer_name: item.customer_name,
         employees,
     }))
 }
@@ -379,39 +384,29 @@ async fn update_item(
         sets.push(format!("status = ${idx}"));
         idx += 1;
     }
+    if body.remove_customer {
+        sets.push(format!("customer_id = NULL"));
+    } else if body.customer_id.is_some() {
+        sets.push(format!("customer_id = ${idx}"));
+        idx += 1;
+    }
 
     // Always update updated_at
     sets.push(format!("updated_at = ${idx}"));
 
     if sets.len() == 1 {
         // Only updated_at would be set — nothing actually changed
-        let row: CalendarItemRow = sqlx::query_as(
-            r#"
-            SELECT id, title, description, category, location, scheduled_date,
-                   duration_hours::float8 AS duration_hours, status, created_at, updated_at
-            FROM calendar_items WHERE id = $1
-            "#,
-        )
-        .bind(id)
-        .fetch_one(&state.db)
-        .await?;
-        return Ok(Json(row));
+        return Ok(Json(fetch_item_row(&state.db, id).await?));
     }
 
     let sql = format!(
-        r#"
-        UPDATE calendar_items
-        SET {}
-        WHERE id = ${}
-        RETURNING id, title, description, category, location, scheduled_date,
-                  duration_hours::float8 AS duration_hours, status, created_at, updated_at
-        "#,
+        "UPDATE calendar_items SET {} WHERE id = ${}",
         sets.join(", "),
         idx + 1,
     );
 
     // Bind values in the same order as the SET clause was built
-    let mut q = sqlx::query_as::<_, CalendarItemRow>(&sql);
+    let mut q = sqlx::query(&sql);
     if let Some(v) = body.title {
         q = q.bind(v);
     }
@@ -430,11 +425,16 @@ async fn update_item(
     if let Some(v) = body.status {
         q = q.bind(v);
     }
+    if !body.remove_customer {
+        if let Some(v) = body.customer_id {
+            q = q.bind(v);
+        }
+    }
     q = q.bind(Utc::now()); // updated_at
     q = q.bind(id);         // WHERE id
 
-    let row = q.fetch_one(&state.db).await?;
-    Ok(Json(row))
+    q.execute(&state.db).await?;
+    Ok(Json(fetch_item_row(&state.db, id).await?))
 }
 
 /// `DELETE /api/v1/admin/calendar-items/{id}` — Delete a calendar item and all its assignments.

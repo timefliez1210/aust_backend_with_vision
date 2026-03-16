@@ -453,6 +453,7 @@ async fn update_inquiry(
             estimated_volume_m3 = COALESCE($5, estimated_volume_m3),
             distance_km = COALESCE($6, distance_km),
             preferred_date = COALESCE($7, preferred_date),
+            scheduled_date = CASE WHEN $7 IS NOT NULL THEN NULL ELSE scheduled_date END,
             origin_address_id = COALESCE($8, origin_address_id),
             destination_address_id = COALESCE($9, destination_address_id),
             updated_at = $10
