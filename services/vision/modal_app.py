@@ -1,24 +1,26 @@
 """Modal deployment for the AUST Vision Service.
 
-Deploys the vision pipeline as serverless GPU endpoints on Modal:
-- Photo endpoint: Grounding DINO + SAM 2 + Depth Anything V2 (max_inputs=1)
-- Video endpoint: + MASt3R 3D reconstruction (max_inputs=1, long-running)
+Architecture:
+  PhotoPipeline (@app.cls, GPU L4)
+    - @modal.enter() loads all models once when the container starts
+    - run_job()  receives image bytes, runs pipeline, writes result to job_store
+    - Container shuts down naturally when idle (scaledown_window=120)
 
-GPU: L4 (24GB VRAM) for both — MASt3R needs ~12-15GB during reconstruction.
+  serve (@app.function, no GPU)
+    - Thin FastAPI layer: /estimate/submit spawns PhotoPipeline().run_job
+    - /estimate/status reads from job_store
+    - No background asyncio tasks, no scaledown_window tricks
 
-Architecture: async submit + polling.
-  1. POST /estimate/submit  → accepts images, starts pipeline in background,
-                             returns {"job_id": "...", "status": "accepted"} immediately.
-  2. GET  /estimate/status/{job_id} → returns processing/succeeded/failed.
-  The Rust backend submits, then polls every 60 s until done or timeout.
+  VideoPipeline (@app.cls, GPU L4) + serve_video — same pattern for video jobs
 
-Deprecated sync endpoints are kept for backward compatibility:
-  - POST /estimate/upload  (photo, blocks until done)
-  - POST /estimate/video   (video, blocks until done)
+  job_store (modal.Dict)
+    - Persistent key-value store, visible to all containers
+    - Survives container restarts between submit and the first status poll
+    - Replaces both the in-memory dict and the S3 job-result fallback
 
 Usage:
-    modal deploy services/vision/modal_app.py      # deploy to Modal
-    modal serve services/vision/modal_app.py       # dev mode with hot-reload
+    modal deploy services/vision/modal_app.py
+    modal serve  services/vision/modal_app.py   # dev hot-reload
 
 Test:
     curl https://<app>.modal.run/health
@@ -32,7 +34,9 @@ import modal
 
 LOCAL_APP_DIR = Path(__file__).parent / "app"
 
-# -- Modal image: install deps + bake model weights -------------------------
+# ---------------------------------------------------------------------------
+# Container image — install deps + bake model weights
+# ---------------------------------------------------------------------------
 
 vision_image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -61,11 +65,11 @@ vision_image = (
         "qwen-vl-utils>=0.0.8,<1",
         "accelerate>=0.26,<2",
     )
-    # SAM 2.1 (replaces SAM ViT-H) — install from GitHub, package name is "SAM-2"
+    # SAM 2.1
     .run_commands(
         "pip install git+https://github.com/facebookresearch/sam2.git",
     )
-    # MASt3R + DUSt3R (not pip-installable — clone repo, install deps, add to PYTHONPATH)
+    # MASt3R + DUSt3R
     .run_commands(
         "git clone --recursive https://github.com/naver/mast3r.git /opt/mast3r && "
         "pip install -r /opt/mast3r/requirements.txt && "
@@ -74,7 +78,6 @@ vision_image = (
     )
     .env({"PYTHONPATH": "/opt/mast3r:/opt/mast3r/dust3r"})
     .run_commands(
-        # Download and cache model weights into the image
         "python -c \""
         "from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor; "
         "AutoProcessor.from_pretrained('openmmlab-community/mm_grounding_dino_large_all', cache_dir='/weights/huggingface'); "
@@ -85,21 +88,18 @@ vision_image = (
         "print('HuggingFace weights downloaded.')\""
     )
     .run_commands(
-        # Download SAM 2.1 checkpoint (download only, don't load to GPU)
         "python -c \""
         "from huggingface_hub import snapshot_download; "
         "snapshot_download('facebook/sam2.1-hiera-large', cache_dir='/weights/huggingface'); "
         "print('SAM 2.1 weights downloaded.')\""
     )
     .run_commands(
-        # Download MASt3R checkpoint (download only, don't load to GPU)
         "python -c \""
         "from huggingface_hub import snapshot_download; "
         "snapshot_download('naver/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric', cache_dir='/weights/huggingface'); "
         "print('MASt3R weights downloaded.')\""
     )
     .run_commands(
-        # Download Qwen2-VL-7B-Instruct weights (VLM dedup step)
         "python -c \""
         "from transformers import Qwen2VLForConditionalGeneration, AutoProcessor; "
         "AutoProcessor.from_pretrained('Qwen/Qwen2-VL-7B-Instruct', cache_dir='/weights/huggingface'); "
@@ -120,20 +120,105 @@ vision_image = (
 
 app = modal.App("aust-vision", image=vision_image)
 
+# Persistent job store — visible to all containers, survives restarts.
+job_store = modal.Dict.from_name("aust-vision-jobs", create_if_missing=True)
 
-# -- Photo endpoint: single-job async processing ----------------------------
 
-@app.function(gpu="L4", scaledown_window=60, max_containers=1, timeout=900)
-@modal.concurrent(max_inputs=1)
+# ---------------------------------------------------------------------------
+# Photo pipeline — GPU worker class
+# ---------------------------------------------------------------------------
+
+@app.cls(gpu="L4", scaledown_window=120, max_containers=1, timeout=900)
+class PhotoPipeline:
+    """GPU worker for photo volume estimation.
+
+    Models are loaded once when the container starts (@modal.enter) and reused
+    for every job. The container shuts down 120 s after the last job completes —
+    no wasted GPU time, no scaledown_window hacks.
+    """
+
+    @modal.enter()
+    def setup(self) -> None:
+        import logging
+        import sys
+
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        )
+        self._logger = logging.getLogger("photo_pipeline")
+
+        if "/root" not in sys.path:
+            sys.path.insert(0, "/root")
+
+        from pillow_heif import register_heif_opener
+        register_heif_opener()
+
+        from app.vision.model_loader import registry
+        registry.load_all()
+        self._registry = registry
+        self._logger.info("PhotoPipeline ready")
+
+    @modal.method()
+    def run_job(self, job_id: str, image_bytes_list: list, threshold: float = 0.3) -> None:
+        """Run the full photo vision pipeline for one job.
+
+        Called by: serve() ASGI app via .spawn() — runs in this GPU container.
+        Why: Decoupled from the HTTP layer so Modal tracks this as an active
+             invocation and keeps the container alive until the method returns.
+             Result is written to job_store (modal.Dict) so the HTTP container
+             can read it on the next status poll.
+        """
+        import io
+        import time
+
+        from PIL import Image as PILImage
+        from app.vision.pipeline import VisionPipeline
+
+        job_store[job_id] = {"status": "processing", "started_at": time.time()}
+        try:
+            pil_images = [
+                PILImage.open(io.BytesIO(b)).convert("RGB")
+                for b in image_bytes_list
+            ]
+            pipeline = VisionPipeline(self._registry)
+            result = pipeline.run(
+                job_id=job_id,
+                images=pil_images,
+                detection_threshold=threshold,
+            )
+            payload = {
+                "status": "succeeded",
+                "result": result.model_dump(),
+                "finished_at": time.time(),
+            }
+            self._logger.info(
+                "Job %s succeeded: %d items, %.3f m³",
+                job_id, len(result.detected_items), result.total_volume_m3,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._logger.exception("Job %s failed", job_id)
+            payload = {
+                "status": "failed",
+                "error": str(exc),
+                "finished_at": time.time(),
+            }
+        job_store[job_id] = payload
+
+
+# ---------------------------------------------------------------------------
+# Photo HTTP layer — no GPU, just submit + status
+# ---------------------------------------------------------------------------
+
+@app.function(scaledown_window=60, max_containers=2, timeout=60)
 @modal.asgi_app()
 def serve():
-    """Serve photo estimation endpoint on Modal with GPU.
+    """Thin HTTP layer for photo estimation — no GPU.
 
-    Exposes two patterns:
-    - Async (preferred): POST /estimate/submit + GET /estimate/status/{job_id}
-    - Sync (deprecated): POST /estimate/upload  (blocks until done)
+    POST /estimate/submit  — reads images, spawns PhotoPipeline.run_job, returns 202
+    GET  /estimate/status  — reads job_store, returns current status/result
+    POST /estimate/upload  — deprecated sync endpoint (kept for compatibility)
     """
-    import asyncio
     import io
     import logging
     import sys
@@ -143,7 +228,7 @@ def serve():
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
-    logger = logging.getLogger("modal_app")
+    logger = logging.getLogger("serve")
 
     if "/root" not in sys.path:
         sys.path.insert(0, "/root")
@@ -152,66 +237,10 @@ def serve():
 
     from fastapi import FastAPI, File, Form, UploadFile
     from fastapi.responses import JSONResponse
-    from PIL import Image as PILImage
     from pillow_heif import register_heif_opener
-    register_heif_opener()  # enables HEIC/HEIF support in Pillow
-
-    from app.models.schemas import EstimateResponse
-    from app.vision.model_loader import registry
-    from app.vision.pipeline import VisionPipeline
-
-    logger.info("Loading detection models on GPU ...")
-    registry.load_all()
-    logger.info("Models loaded, starting FastAPI app (photo).")
+    register_heif_opener()
 
     web_app = FastAPI(title="AUST Vision Service (Modal)")
-
-    # In-memory job store: job_id -> {"status": str, "result": dict|None,
-    #                                  "error": str|None, "started_at": float,
-    #                                  "finished_at": float|None}
-    jobs: dict = {}
-
-    def _cleanup_old_jobs() -> None:
-        """Remove jobs older than 30 minutes to bound memory usage."""
-        cutoff = time.time() - 1800  # 30 minutes
-        expired = [
-            jid for jid, info in jobs.items()
-            if info.get("finished_at", info.get("started_at", 0)) < cutoff
-        ]
-        for jid in expired:
-            del jobs[jid]
-
-    async def _run_photo_job(
-        job_id: str,
-        pil_images: list,
-        threshold: float,
-    ) -> None:
-        """Execute vision pipeline in a thread and record result in jobs dict."""
-        jobs[job_id] = {"status": "processing", "started_at": time.time()}
-        try:
-            pipeline = VisionPipeline(registry)
-            result = await asyncio.to_thread(
-                pipeline.run,
-                job_id=job_id,
-                images=pil_images,
-                detection_threshold=threshold,
-            )
-            jobs[job_id] = {
-                "status": "succeeded",
-                "result": result.model_dump(),
-                "finished_at": time.time(),
-            }
-            logger.info(
-                "Photo job %s succeeded: %d items, %.3f m³",
-                job_id, len(result.detected_items), result.total_volume_m3,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Photo pipeline failed for job %s", job_id)
-            jobs[job_id] = {
-                "status": "failed",
-                "error": str(exc),
-                "finished_at": time.time(),
-            }
 
     @web_app.get("/health")
     def health():
@@ -219,20 +248,8 @@ def serve():
 
     @web_app.get("/ready")
     def ready():
-        if not registry.is_loaded:
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "status": "not_ready",
-                    "models_loaded": False,
-                    "gpu_available": registry.gpu_available,
-                },
-            )
-        return {
-            "status": "ready",
-            "models_loaded": True,
-            "gpu_available": registry.gpu_available,
-        }
+        # HTTP layer is always ready; pipeline readiness is implicit via job_store
+        return {"status": "ready"}
 
     @web_app.post("/estimate/submit")
     async def estimate_submit(
@@ -240,44 +257,64 @@ def serve():
         images: List[UploadFile] = File(...),
         detection_threshold: float = Form(default=0.3),
     ):
-        """Async photo submit endpoint.
+        """Async submit: spawn GPU job, return immediately.
 
-        Starts the vision pipeline in the background and returns immediately.
         Poll GET /estimate/status/{job_id} for the result.
-
-        curl -X POST <url>/estimate/submit \\
-            -F "job_id=uuid-here" -F "images=@room1.jpg" -F "images=@room2.jpg"
         """
-        _cleanup_old_jobs()
+        image_bytes_list = [await img.read() for img in images]
+        logger.info("Spawning photo job %s (%d images)", job_id, len(image_bytes_list))
 
-        if not registry.is_loaded:
-            return JSONResponse(status_code=503, content={"detail": "Models not loaded yet."})
-
-        pil_images = []
-        for upload in images:
-            data = await upload.read()
-            pil_images.append(PILImage.open(io.BytesIO(data)).convert("RGB"))
-
-        # Kick off background task — do not await
-        asyncio.create_task(_run_photo_job(job_id, pil_images, detection_threshold))
+        call = PhotoPipeline().run_job.spawn(job_id, image_bytes_list, detection_threshold)
+        job_store[job_id] = {
+            "status": "accepted",
+            "call_id": call.object_id,
+            "started_at": time.time(),
+        }
 
         return {"job_id": job_id, "status": "accepted"}
 
     @web_app.get("/estimate/status/{job_id}")
     async def estimate_status(job_id: str):
-        """Poll endpoint for async photo jobs.
+        """Poll endpoint — reads from modal.Dict, works across container restarts.
 
-        Returns:
-        - {"status": "processing"} while running
-        - {"status": "succeeded", "result": {...}} on success
-        - {"status": "failed", "error": "..."} on failure
-        - 404 if job_id is unknown (container restarted, or expired)
+        If the job is stuck in processing/accepted, verifies the Modal invocation
+        is still alive via FunctionCall.from_id(). If it died without writing a
+        result (OOM, timeout, hardware failure), marks the job as failed immediately
+        instead of leaving it stuck at 'processing' until max_polls is exhausted.
         """
-        _cleanup_old_jobs()
-
-        info = jobs.get(job_id)
+        info = job_store.get(job_id)
         if info is None:
-            return JSONResponse(status_code=404, content={"detail": f"Job {job_id!r} not found"})
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"Job {job_id!r} not found"},
+            )
+
+        if info["status"] in ("accepted", "processing"):
+            call_id = info.get("call_id")
+            if call_id:
+                try:
+                    fc = modal.FunctionCall.from_id(call_id)
+                    fc.get(timeout=0)
+                    # If we reach here the call finished but didn't write to job_store
+                    # (shouldn't happen, but treat as failed to be safe)
+                    error = "Invocation completed without writing result"
+                    job_store[job_id] = {"status": "failed", "error": error}
+                    return JSONResponse(
+                        status_code=500,
+                        content={"status": "failed", "error": error},
+                    )
+                except TimeoutError:
+                    pass  # still running — normal case
+                except modal.exception.InputCancellation as exc:
+                    error = f"Job cancelled: {exc}"
+                    job_store[job_id] = {"status": "failed", "error": error}
+                    return {"status": "failed", "error": error}
+                except Exception as exc:
+                    # Invocation failed/killed without writing to job_store
+                    error = f"Invocation died: {exc}"
+                    logger.error("Photo job %s invocation failed: %s", job_id, exc)
+                    job_store[job_id] = {"status": "failed", "error": error}
+                    return {"status": "failed", "error": error}
 
         response: dict = {"status": info["status"]}
         if info["status"] == "succeeded":
@@ -286,50 +323,114 @@ def serve():
             response["error"] = info.get("error", "Unknown error")
         return response
 
-    @web_app.post("/estimate/upload", response_model=EstimateResponse)
-    async def estimate_upload(
+    @web_app.post("/estimate/upload")
+    async def estimate_upload_deprecated(
         job_id: str = Form(default="test"),
         images: List[UploadFile] = File(...),
+        detection_threshold: float = Form(default=0.3),
     ):
-        """Deprecated sync photo upload endpoint — blocks until pipeline completes.
-
-        Kept for backward compatibility. Prefer /estimate/submit + /estimate/status.
-
-        curl -X POST <url>/estimate/upload \\
-            -F "job_id=test-1" -F "images=@room1.jpg" -F "images=@room2.jpg"
-        """
-        if not registry.is_loaded:
-            return JSONResponse(status_code=503, content={"detail": "Models not loaded yet."})
-
-        pil_images = []
-        for upload in images:
-            data = await upload.read()
-            pil_images.append(PILImage.open(io.BytesIO(data)).convert("RGB"))
-
-        pipeline = VisionPipeline(registry)
-        result = await asyncio.to_thread(pipeline.run, job_id=job_id, images=pil_images)
-        return result
+        """Deprecated — alias for /estimate/submit. Poll /estimate/status/{job_id} for result."""
+        image_bytes_list = [await img.read() for img in images]
+        call = PhotoPipeline().run_job.spawn(job_id, image_bytes_list, detection_threshold)
+        job_store[job_id] = {"status": "accepted", "call_id": call.object_id, "started_at": time.time()}
+        return {"job_id": job_id, "status": "accepted"}
 
     return web_app
 
 
-# -- Video endpoint: single-job processing with model swapping --------------
+# ---------------------------------------------------------------------------
+# Video pipeline — GPU worker class
+# ---------------------------------------------------------------------------
 
-@app.function(gpu="L4", scaledown_window=120, max_containers=1, timeout=900)
-@modal.concurrent(max_inputs=1)
+@app.cls(gpu="L4", scaledown_window=120, max_containers=1, timeout=900)
+class VideoPipeline:
+    """GPU worker for video volume estimation.
+
+    Same lifecycle pattern as PhotoPipeline: models loaded once at container
+    start, container shuts down 120 s after the last job.
+    """
+
+    @modal.enter()
+    def setup(self) -> None:
+        import logging
+        import sys
+
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        )
+        self._logger = logging.getLogger("video_pipeline")
+
+        if "/root" not in sys.path:
+            sys.path.insert(0, "/root")
+
+        from pillow_heif import register_heif_opener
+        register_heif_opener()
+
+        from app.vision.model_loader import registry
+        registry.load_all()
+        self._registry = registry
+        self._logger.info("VideoPipeline ready")
+
+    @modal.method()
+    def run_job(
+        self,
+        job_id: str,
+        video_bytes: bytes,
+        detection_threshold: float = 0.3,
+        max_keyframes: int = 60,
+    ) -> None:
+        """Run the full video vision pipeline for one job.
+
+        Called by: serve_video() ASGI app via .spawn().
+        Why: Same reasoning as PhotoPipeline.run_job — Modal tracks the method
+             invocation and keeps the container alive until it returns.
+        """
+        import time
+
+        from app.vision.video_pipeline import VideoPipeline as _VP
+
+        job_store[job_id] = {"status": "processing", "started_at": time.time()}
+        try:
+            pipeline = _VP(self._registry)
+            result = pipeline.run(
+                job_id=job_id,
+                video_bytes=video_bytes,
+                detection_threshold=detection_threshold,
+                max_keyframes=max_keyframes,
+            )
+            payload = {
+                "status": "succeeded",
+                "result": result.model_dump(),
+                "finished_at": time.time(),
+            }
+            self._logger.info(
+                "Video job %s succeeded: %d items, %.3f m³",
+                job_id, len(result.detected_items), result.total_volume_m3,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._logger.exception("Video job %s failed", job_id)
+            payload = {
+                "status": "failed",
+                "error": str(exc),
+                "finished_at": time.time(),
+            }
+        job_store[job_id] = payload
+
+
+# ---------------------------------------------------------------------------
+# Video HTTP layer — no GPU, just submit + status
+# ---------------------------------------------------------------------------
+
+@app.function(scaledown_window=60, max_containers=2, timeout=60)
 @modal.asgi_app()
 def serve_video():
-    """Serve video estimation endpoint on Modal with GPU.
+    """Thin HTTP layer for video estimation — no GPU.
 
-    Handles one video job at a time (max_inputs=1) due to GPU model swapping.
-    Processing takes 2-10 minutes per video.
-
-    Exposes two patterns:
-    - Async (preferred): POST /estimate/video/submit + GET /estimate/video/status/{job_id}
-    - Sync (deprecated): POST /estimate/video  (blocks until done)
+    POST /estimate/video/submit  — reads video, spawns VideoPipeline.run_job
+    GET  /estimate/video/status  — reads job_store
+    POST /estimate/video         — deprecated sync endpoint
     """
-    import asyncio
-    import io
     import logging
     import sys
     import time
@@ -338,7 +439,7 @@ def serve_video():
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
-    logger = logging.getLogger("modal_app_video")
+    logger = logging.getLogger("serve_video")
 
     if "/root" not in sys.path:
         sys.path.insert(0, "/root")
@@ -347,66 +448,10 @@ def serve_video():
 
     from fastapi import FastAPI, File, Form, UploadFile
     from fastapi.responses import JSONResponse
-    from PIL import Image as PILImage
     from pillow_heif import register_heif_opener
-    register_heif_opener()  # enables HEIC/HEIF support in Pillow
-
-    from app.models.schemas import EstimateResponse
-    from app.vision.model_loader import registry
-    from app.vision.video_pipeline import VideoPipeline
-
-    logger.info("Loading detection models on GPU (video endpoint) ...")
-    registry.load_all()
-    logger.info("Models loaded, starting FastAPI app (video).")
+    register_heif_opener()
 
     web_app = FastAPI(title="AUST Vision Service - Video (Modal)")
-
-    # In-memory job store: job_id -> {"status", "result", "error", "started_at", "finished_at"}
-    jobs: dict = {}
-
-    def _cleanup_old_jobs() -> None:
-        """Remove jobs older than 30 minutes to bound memory usage."""
-        cutoff = time.time() - 1800
-        expired = [
-            jid for jid, info in jobs.items()
-            if info.get("finished_at", info.get("started_at", 0)) < cutoff
-        ]
-        for jid in expired:
-            del jobs[jid]
-
-    async def _run_video_job(
-        job_id: str,
-        video_bytes: bytes,
-        detection_threshold: float,
-        max_keyframes: int,
-    ) -> None:
-        """Execute video pipeline in a thread and record result in jobs dict."""
-        jobs[job_id] = {"status": "processing", "started_at": time.time()}
-        try:
-            pipeline = VideoPipeline(registry)
-            result = await asyncio.to_thread(
-                pipeline.run,
-                job_id=job_id,
-                video_bytes=video_bytes,
-                detection_threshold=detection_threshold,
-                max_keyframes=max_keyframes,
-            )
-            jobs[job_id] = {
-                "status": "succeeded",
-                "result": result.model_dump(),
-                "finished_at": time.time(),
-            }
-            logger.info(
-                "Video job %s succeeded: %d items, %.3f m³",
-                job_id, len(result.detected_items), result.total_volume_m3,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Video pipeline failed for job %s", job_id)
-            jobs[job_id] = {
-                "status": "failed",
-                "error": str(exc),
-                "finished_at": time.time(),
-            }
 
     @web_app.get("/health")
     def health():
@@ -414,20 +459,7 @@ def serve_video():
 
     @web_app.get("/ready")
     def ready():
-        if not registry.is_loaded:
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "status": "not_ready",
-                    "models_loaded": False,
-                    "gpu_available": registry.gpu_available,
-                },
-            )
-        return {
-            "status": "ready",
-            "models_loaded": True,
-            "gpu_available": registry.gpu_available,
-        }
+        return {"status": "ready"}
 
     @web_app.post("/estimate/video/submit")
     async def estimate_video_submit(
@@ -436,43 +468,55 @@ def serve_video():
         max_keyframes: int = Form(default=60),
         detection_threshold: float = Form(default=0.3),
     ):
-        """Async video submit endpoint.
-
-        Starts the video pipeline in the background and returns immediately.
-        Poll GET /estimate/video/status/{job_id} for the result.
-
-        curl -X POST <url>/estimate/video/submit \\
-            -F "job_id=uuid-here" -F "video=@room_walkthrough.mp4"
-        """
-        _cleanup_old_jobs()
-
-        if not registry.is_loaded:
-            return JSONResponse(status_code=503, content={"detail": "Models not loaded yet."})
-
+        """Async submit: spawn GPU job, return immediately."""
         video_bytes = await video.read()
+        logger.info("Spawning video job %s (%d bytes)", job_id, len(video_bytes))
 
-        # Kick off background task — do not await
-        asyncio.create_task(
-            _run_video_job(job_id, video_bytes, detection_threshold, max_keyframes)
-        )
+        call = VideoPipeline().run_job.spawn(job_id, video_bytes, detection_threshold, max_keyframes)
+        job_store[job_id] = {
+            "status": "accepted",
+            "call_id": call.object_id,
+            "started_at": time.time(),
+        }
 
         return {"job_id": job_id, "status": "accepted"}
 
     @web_app.get("/estimate/video/status/{job_id}")
     async def estimate_video_status(job_id: str):
-        """Poll endpoint for async video jobs.
+        """Poll endpoint — reads from modal.Dict.
 
-        Returns:
-        - {"status": "processing"} while running
-        - {"status": "succeeded", "result": {...}} on success
-        - {"status": "failed", "error": "..."} on failure
-        - 404 if job_id is unknown (container restarted, or expired)
+        Same dead-invocation detection as the photo status endpoint.
         """
-        _cleanup_old_jobs()
-
-        info = jobs.get(job_id)
+        info = job_store.get(job_id)
         if info is None:
-            return JSONResponse(status_code=404, content={"detail": f"Job {job_id!r} not found"})
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"Job {job_id!r} not found"},
+            )
+
+        if info["status"] in ("accepted", "processing"):
+            call_id = info.get("call_id")
+            if call_id:
+                try:
+                    fc = modal.FunctionCall.from_id(call_id)
+                    fc.get(timeout=0)
+                    error = "Invocation completed without writing result"
+                    job_store[job_id] = {"status": "failed", "error": error}
+                    return JSONResponse(
+                        status_code=500,
+                        content={"status": "failed", "error": error},
+                    )
+                except TimeoutError:
+                    pass  # still running
+                except modal.exception.InputCancellation as exc:
+                    error = f"Job cancelled: {exc}"
+                    job_store[job_id] = {"status": "failed", "error": error}
+                    return {"status": "failed", "error": error}
+                except Exception as exc:
+                    error = f"Invocation died: {exc}"
+                    logger.error("Video job %s invocation failed: %s", job_id, exc)
+                    job_store[job_id] = {"status": "failed", "error": error}
+                    return {"status": "failed", "error": error}
 
         response: dict = {"status": info["status"]}
         if info["status"] == "succeeded":
@@ -481,57 +525,17 @@ def serve_video():
             response["error"] = info.get("error", "Unknown error")
         return response
 
-    @web_app.post("/estimate/video", response_model=EstimateResponse)
-    async def estimate_video(
+    @web_app.post("/estimate/video")
+    async def estimate_video_deprecated(
         job_id: str = Form(default="test"),
         video: UploadFile = File(...),
         max_keyframes: int = Form(default=60),
         detection_threshold: float = Form(default=0.3),
     ):
-        """Deprecated sync video upload endpoint — blocks until pipeline completes.
-
-        Kept for backward compatibility. Prefer /estimate/video/submit + /estimate/video/status.
-
-        curl -X POST <url>/estimate/video \\
-            -F "job_id=test-1" -F "video=@room_walkthrough.mp4"
-        """
-        if not registry.is_loaded:
-            return JSONResponse(status_code=503, content={"detail": "Models not loaded yet."})
-
+        """Deprecated — alias for /estimate/video/submit. Poll /estimate/video/status/{job_id} for result."""
         video_bytes = await video.read()
-
-        pipeline = VideoPipeline(registry)
-        # Run blocking pipeline in thread pool to keep event loop responsive.
-        result = await asyncio.to_thread(
-            pipeline.run,
-            job_id=job_id,
-            video_bytes=video_bytes,
-            detection_threshold=detection_threshold,
-            max_keyframes=max_keyframes,
-        )
-        logger.info(
-            "Returning response: job_id=%s, items=%d, volume=%.3f m3",
-            result.job_id, len(result.detected_items), result.total_volume_m3,
-        )
-        return result
-
-    # Also expose photo upload on the video endpoint for convenience
-    @web_app.post("/estimate/upload", response_model=EstimateResponse)
-    async def estimate_upload(
-        job_id: str = Form(default="test"),
-        images: List[UploadFile] = File(...),
-    ):
-        """Photo upload endpoint (also available on video function for testing)."""
-        if not registry.is_loaded:
-            return JSONResponse(status_code=503, content={"detail": "Models not loaded yet."})
-
-        from app.vision.pipeline import VisionPipeline
-        pil_images = []
-        for upload in images:
-            data = await upload.read()
-            pil_images.append(PILImage.open(io.BytesIO(data)).convert("RGB"))
-
-        pipeline = VisionPipeline(registry)
-        return await asyncio.to_thread(pipeline.run, job_id=job_id, images=pil_images)
+        call = VideoPipeline().run_job.spawn(job_id, video_bytes, detection_threshold, max_keyframes)
+        job_store[job_id] = {"status": "accepted", "call_id": call.object_id, "started_at": time.time()}
+        return {"job_id": job_id, "status": "accepted"}
 
     return web_app

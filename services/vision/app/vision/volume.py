@@ -14,6 +14,7 @@ from app.models.schemas import (
     ItemDimensions,
     VolumeEstimate,
     classify_item,
+    get_item_flags,
     get_max_volume,
     get_reference_dims,
     lookup_re_volume,
@@ -282,6 +283,8 @@ class VolumeCalculator:
             units=est.units,
             bbox=est.bbox,
             crop_base64=est.crop_base64,
+            is_moveable=est.is_moveable,
+            packs_into_boxes=est.packs_into_boxes,
         )
 
     def _estimate_single(
@@ -380,14 +383,19 @@ class VolumeCalculator:
             height_m=apparent_height_m,
         )
 
+        is_moveable, packs_into_boxes = get_item_flags(detection.label)
+
         if re_result is not None:
             volume_m3, re_total, units, german_name = re_result
             logger.info(
                 "RE lookup: '%s' → %s (%.1f RE, %d unit(s), %.2f m³) "
-                "[apparent: %.2fm × %.2fm, OBB: %.2fm × %.2fm × %.2fm = %.3f m³]",
+                "[apparent: %.2fm × %.2fm, OBB: %.2fm × %.2fm × %.2fm = %.3f m³]"
+                "%s%s",
                 detection.label, german_name, re_total, units, volume_m3,
                 apparent_dims[0], apparent_dims[1],
                 dims[0], dims[1], dims[2], obb_volume,
+                " [NOT MOVED]" if not is_moveable else "",
+                " [PACKS INTO BOX]" if packs_into_boxes else "",
             )
 
             return VolumeEstimate(
@@ -408,12 +416,15 @@ class VolumeCalculator:
                 units=units,
                 bbox=list(bbox),
                 crop_base64=crop_b64,
+                is_moveable=is_moveable,
+                packs_into_boxes=packs_into_boxes,
             )
 
         # Fallback: geometric OBB volume (item not in RE catalog)
         logger.info(
-            "Geometric fallback: '%s' OBB volume=%.4f m³, dims=%.2f×%.2f×%.2f",
+            "Geometric fallback: '%s' OBB volume=%.4f m³, dims=%.2f×%.2f×%.2f%s",
             detection.label, obb_volume, dims[0], dims[1], dims[2],
+            " [NOT MOVED]" if not is_moveable else "",
         )
 
         return VolumeEstimate(
@@ -431,6 +442,8 @@ class VolumeCalculator:
             volume_source="geometric",
             bbox=list(bbox),
             crop_base64=crop_b64,
+            is_moveable=is_moveable,
+            packs_into_boxes=packs_into_boxes,
         )
 
     @staticmethod

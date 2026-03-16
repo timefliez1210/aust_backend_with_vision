@@ -235,6 +235,12 @@ pub async fn build_inquiry_response(
                 });
                 let category = raw.and_then(|r| r.get("category")?.as_str().map(String::from));
                 let dimensions = raw.and_then(|r| r.get("dimensions").cloned());
+                let is_moveable = raw
+                    .and_then(|r| r.get("is_moveable")?.as_bool())
+                    .unwrap_or(true);
+                let packs_into_boxes = raw
+                    .and_then(|r| r.get("packs_into_boxes")?.as_bool())
+                    .unwrap_or(false);
 
                 ItemSnapshot {
                     name: d.german_name.clone().unwrap_or_else(|| d.name.clone()),
@@ -248,6 +254,8 @@ pub async fn build_inquiry_response(
                     bbox: d.bbox.clone(),
                     bbox_image_index: d.bbox_image_index.map(|i| i as i32),
                     seen_in_images,
+                    is_moveable,
+                    packs_into_boxes,
                 }
             })
             .collect();

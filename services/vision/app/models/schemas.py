@@ -35,6 +35,9 @@ class DetectedItem(BaseModel):
     bbox: list[float] | None = None
     bbox_image_index: int | None = None
     crop_base64: str | None = None
+    # Transport flags (defaults keep existing behaviour for callers that don't set them)
+    is_moveable: bool = True       # False → item stays in apartment (wall-mounted heater etc.)
+    packs_into_boxes: bool = False  # True → volume folded into Karton count, not counted individually
 
 
 class EstimateResponse(BaseModel):
@@ -100,6 +103,8 @@ class VolumeEstimate(BaseModel):
     units: int | None = None
     bbox: list[float] | None = None          # [x1, y1, x2, y2] pixels
     crop_base64: str | None = None           # JPEG thumbnail, max 300px wide
+    is_moveable: bool = True
+    packs_into_boxes: bool = False
 
 
 # Category mapping for common household / moving items
@@ -460,9 +465,9 @@ RE_CATALOG: dict[str, dict] = {
     "printer": {"re": 5, "german": "Tischkopierer"},
     "speaker": {"re": 4, "german": "Stereoanlage"},
     "stereo": {"re": 4, "german": "Stereoanlage"},
-    "lamp": {"re": 2, "german": "Deckenlampe"},
+    "lamp": {"re": 2, "german": "Deckenlampe", "packs_into_boxes": True},
     "floor lamp": {"re": 2, "german": "Stehlampe"},
-    "chandelier": {"re": 5, "german": "Lüster"},
+    "chandelier": {"re": 5, "german": "Lüster", "moveable": False},  # ceiling-fixed
 
     # ── APPLIANCES ──
     "refrigerator": {
@@ -485,7 +490,7 @@ RE_CATALOG: dict[str, dict] = {
     "stove": {"re": 5, "german": "Herd"},
     "vacuum cleaner": {"re": 1, "german": "Staubsauger"},
     "fan": {"re": 2, "german": "Ventilator"},
-    "heater": {"re": 2, "german": "Heizgerät"},
+    "heater": {"re": 2, "german": "Heizgerät", "moveable": False},  # wall-mounted Heizkörper
 
     # ── BOXES / CONTAINERS ──
     "box": {"re": 1, "german": "Umzugskarton bis 80 l"},
@@ -522,9 +527,20 @@ RE_CATALOG: dict[str, dict] = {
     "mirror": {"re": 1, "german": "Spiegel"},
     "rug": {"re": 3, "german": "Teppich"},
     "carpet": {"re": 3, "german": "Teppich"},
-    "curtain": {"re": 1, "german": "Vorhang"},
+    "curtain": {"re": 1, "german": "Vorhang", "packs_into_boxes": True},
     "ironing board": {"re": 1, "german": "Bügelbrett"},
 }
+
+
+# Labels detected by DINO that are never moved, regardless of RE catalog presence.
+# These are items that are physically fixed or belong to the occupant's daily life
+# rather than the moving inventory.
+NON_MOVEABLE_LABELS: frozenset[str] = frozenset({
+    "radiator",
+    "house shoe", "house shoes", "slipper", "slippers",
+    "wall unit", "built-in", "built-in shelf",
+    "smoke detector", "thermostat", "outlet", "socket",
+})
 
 
 def _find_re_entry(label: str) -> dict | None:
@@ -613,3 +629,29 @@ def lookup_re_volume(
         return (total_re * RE_M3, total_re, units, german)
 
     return None
+
+
+def get_item_flags(label: str) -> tuple[bool, bool]:
+    """Return (is_moveable, packs_into_boxes) for a detected item label.
+
+    Does NOT change the lookup_re_volume() signature — call this separately.
+
+    Returns:
+        (is_moveable, packs_into_boxes) — both True/False by default.
+        is_moveable=False means the item stays in the apartment.
+        packs_into_boxes=True means volume is folded into Karton count.
+    """
+    normalized = label.lower().strip()
+
+    # Check NON_MOVEABLE_LABELS first (items not necessarily in RE catalog)
+    for nm in NON_MOVEABLE_LABELS:
+        if nm in normalized:
+            return (False, False)
+
+    entry = _find_re_entry(label)
+    if entry is None:
+        return (True, False)
+
+    is_moveable = bool(entry.get("moveable", True))
+    packs_into_boxes = bool(entry.get("packs_into_boxes", False))
+    return (is_moveable, packs_into_boxes)

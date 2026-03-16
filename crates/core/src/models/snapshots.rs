@@ -151,6 +151,18 @@ pub struct ItemSnapshot {
     pub bbox_image_index: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seen_in_images: Option<Vec<i32>>,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub is_moveable: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub packs_into_boxes: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(v: &bool) -> bool {
+    *v
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

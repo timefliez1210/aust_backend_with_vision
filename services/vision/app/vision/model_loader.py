@@ -118,7 +118,7 @@ class ModelRegistry:
     Manages GPU memory by swapping models between detection and reconstruction:
     - Startup: DINO + SAM 2 + Depth Anything (~3GB idle)
     - Photo pipeline: DINO + SAM 2 + DA active (~8GB)
-    - Dedup phase: DINO + SAM 2 + DA + Qwen2-VL-7B all resident (~22GB)
+    - Dedup phase: detection models on CPU + Qwen2-VL-7B on GPU (~14GB)
     - Video Phase 1: MASt3R only (~12-15GB)
     - Video Phase 2: DINO + SAM 2 (~5GB)
     - Video Phase 3: CPU only (Open3D)
@@ -154,7 +154,13 @@ class ModelRegistry:
         return self.sam2_image_predictor
 
     def load_all(self) -> None:
-        """Load all detection models. Called once during application startup."""
+        """Load detection models at startup. Qwen2-VL is NOT loaded here.
+
+        Qwen2-VL-7B BF16 (~14GB) + DINO + SAM(×2) + DA leaves no headroom for
+        forward-pass activations on the 22GB L4. Qwen is instead loaded on-demand
+        in the pipeline before the VLM dedup step and unloaded immediately after,
+        following the same swap pattern as MASt3R in the video pipeline.
+        """
         self.device = get_device()
         logger.info("Loading all models on device=%s ...", self.device)
 
@@ -163,7 +169,6 @@ class ModelRegistry:
         )
         self.sam2_image_predictor, self.sam2_video_predictor = load_sam2(self.device)
         self.depth_model, self.depth_processor = load_depth_anything(self.device)
-        self.load_qwen_vlm()
         self._detection_on_gpu = True
 
         self._warm_up()
@@ -197,11 +202,13 @@ class ModelRegistry:
             logger.info("MASt3R unloaded from GPU")
 
     def load_qwen_vlm(self) -> None:
-        """Load Qwen2-VL-7B-Instruct for VLM-based cross-image deduplication.
+        """Load Qwen2-VL-7B-Instruct on-demand for VLM cross-image deduplication.
 
-        Caller: load_all() during startup (photo endpoint only).
-        Why: With L4 24GB VRAM and photo pipeline using ~8GB, there is ~16GB
-             free — Qwen2-VL-7B in BF16 (~14GB) fits without any model swapping.
+        Caller: VisionPipeline.run() — called just before Stage 6 (vlm_dedup).
+        Why: At ~14GB BF16, loading Qwen alongside DINO + SAM(×2) + DA exceeds the
+             L4's 22GB budget. The pipeline must call unload_detection_models() first,
+             then load_qwen_vlm(), then unload_qwen_vlm() + ensure_detection_models()
+             when done — same swap pattern used for MASt3R in the video pipeline.
         """
         from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
 
@@ -219,6 +226,23 @@ class ModelRegistry:
         ).to(self.device)
         self.qwen_vlm_model.eval()
         logger.info("Qwen2-VL-7B-Instruct loaded on %s", self.device)
+
+    def unload_qwen_vlm(self) -> None:
+        """Free GPU memory used by Qwen2-VL-7B after the dedup step.
+
+        Caller: VisionPipeline.run() — called after Stage 6 (vlm_dedup) completes.
+        Why: Frees ~14GB so detection models can be restored to GPU for any
+             subsequent pipeline run in the same container lifetime.
+        """
+        if self.qwen_vlm_model is not None:
+            del self.qwen_vlm_model
+            self.qwen_vlm_model = None
+        if self.qwen_vlm_processor is not None:
+            del self.qwen_vlm_processor
+            self.qwen_vlm_processor = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        logger.info("Qwen2-VL-7B unloaded from GPU")
 
     def unload_detection_models(self) -> None:
         """Move detection models (DINO, SAM 2, DA) to CPU to free GPU for MASt3R."""

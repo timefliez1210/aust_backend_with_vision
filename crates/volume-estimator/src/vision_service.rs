@@ -73,6 +73,10 @@ pub struct VisionDetectedItem {
     pub units: Option<u32>,
     #[serde(default)]
     pub volume_source: Option<String>,
+    #[serde(default)]
+    pub is_moveable: Option<bool>,
+    #[serde(default)]
+    pub packs_into_boxes: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

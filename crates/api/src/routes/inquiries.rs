@@ -176,6 +176,14 @@ struct UpdateEstimationItem {
     category: Option<String>,
     #[serde(default)]
     dimensions: Option<serde_json::Value>,
+    #[serde(default = "default_true")]
+    is_moveable: bool,
+    #[serde(default)]
+    packs_into_boxes: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Serialize)]
@@ -207,6 +215,8 @@ struct EstimationItemResponse {
     category: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     dimensions: Option<serde_json::Value>,
+    is_moveable: bool,
+    packs_into_boxes: bool,
 }
 
 #[derive(Debug, sqlx::FromRow, Serialize)]
@@ -633,6 +643,8 @@ async fn update_inquiry_items(
                 seen_in_images: item.seen_in_images.clone(),
                 category: item.category.clone(),
                 dimensions: item.dimensions.clone(),
+                is_moveable: item.is_moveable,
+                packs_into_boxes: item.packs_into_boxes,
             }
         })
         .collect();
