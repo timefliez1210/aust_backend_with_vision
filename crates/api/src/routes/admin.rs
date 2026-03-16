@@ -597,6 +597,8 @@ struct OrderListItem {
     offer_price_brutto: Option<i64>,
     booking_date: Option<NaiveDate>,
     created_at: DateTime<Utc>,
+    employees_assigned: i64,
+    employees_quoted: Option<i32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -651,7 +653,9 @@ async fn list_orders(
                    q.preferred_date,
                    (SELECT ROUND(o.price_cents * 1.19)::bigint FROM offers o WHERE o.inquiry_id = q.id ORDER BY o.created_at DESC LIMIT 1) AS offer_price_brutto,
                    q.scheduled_date AS booking_date,
-                   q.created_at
+                   q.created_at,
+                   (SELECT COUNT(*)::bigint FROM inquiry_employees WHERE inquiry_id = q.id) AS employees_assigned,
+                   (SELECT o.persons FROM offers o WHERE o.inquiry_id = q.id ORDER BY o.created_at DESC LIMIT 1) AS employees_quoted
             FROM inquiries q
             JOIN customers c ON q.customer_id = c.id
             LEFT JOIN addresses oa ON q.origin_address_id = oa.id
@@ -682,7 +686,9 @@ async fn list_orders(
                    q.preferred_date,
                    (SELECT ROUND(o.price_cents * 1.19)::bigint FROM offers o WHERE o.inquiry_id = q.id ORDER BY o.created_at DESC LIMIT 1) AS offer_price_brutto,
                    q.scheduled_date AS booking_date,
-                   q.created_at
+                   q.created_at,
+                   (SELECT COUNT(*)::bigint FROM inquiry_employees WHERE inquiry_id = q.id) AS employees_assigned,
+                   (SELECT o.persons FROM offers o WHERE o.inquiry_id = q.id ORDER BY o.created_at DESC LIMIT 1) AS employees_quoted
             FROM inquiries q
             JOIN customers c ON q.customer_id = c.id
             LEFT JOIN addresses oa ON q.origin_address_id = oa.id
