@@ -21,6 +21,7 @@ from app.models.schemas import (
 # 1 standard Umzugskarton = 1 RE = 0.1 m³
 _KARTON_RE = 1
 _KARTON_M3 = _KARTON_RE * RE_M3
+from app.vision.clip_dedup import clip_dedup
 from app.vision.depth import DepthEstimator
 from app.vision.detector import Detector
 from app.vision.model_loader import ModelRegistry
@@ -85,8 +86,19 @@ class VisionPipeline:
             images, detections, masks_by_image, depth_maps
         )
 
-        # Stage 5: Cross-image deduplication
+        # Stage 5: Within-image deduplication (label + feature vector)
         merged_items = self._deduplicate(volume_estimates)
+
+        # Stage 5.5: CLIP cross-image deduplication.
+        # Encodes crop thumbnails, clusters visually similar items from different
+        # images, keeps best-confidence detection per cluster.
+        # Drops from ~250 → ~30-60 items before the expensive Qwen VLM step.
+        before_clip = len(merged_items)
+        merged_items = clip_dedup(merged_items, self._registry)
+        logger.info(
+            "CLIP dedup: %d → %d items (%d removed)",
+            before_clip, len(merged_items), before_clip - len(merged_items),
+        )
 
         # Stage 6: VLM cross-image deduplication (Qwen2-VL-7B).
         # Swap: move detection models to CPU, load Qwen (~14GB), run dedup,

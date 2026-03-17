@@ -32,8 +32,9 @@ from app.models.schemas import DetectedItem, classify_item, lookup_re_volume
 logger = logging.getLogger(__name__)
 
 # Cap items per VLM call to control latency and context window size.
-# At 24 items × ~256px crops, the token budget is comfortably within 7B limits.
-_MAX_ITEMS_PER_CALL = 24
+# CLIP dedup runs first and reduces item count to ~30-60, so this cap is
+# rarely hit. Set to 60 to handle the post-CLIP list in a single pass.
+_MAX_ITEMS_PER_CALL = 60
 
 
 def vlm_dedup(
