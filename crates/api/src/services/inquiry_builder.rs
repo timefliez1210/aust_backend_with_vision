@@ -250,6 +250,7 @@ pub async fn build_inquiry_response(
                     category,
                     dimensions,
                     crop_url,
+                    crop_s3_key: d.crop_s3_key.clone(),
                     source_image_url,
                     bbox: d.bbox.clone(),
                     bbox_image_index: d.bbox_image_index.map(|i| i as i32),

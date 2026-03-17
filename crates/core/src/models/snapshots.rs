@@ -144,6 +144,8 @@ pub struct ItemSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub crop_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub crop_s3_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub source_image_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bbox: Option<Vec<f64>>,
