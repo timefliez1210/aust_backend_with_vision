@@ -442,7 +442,11 @@ fn force_recalc_on_load(workbook_xml: &str) -> String {
     if let Some(pos) = workbook_xml.find("<calcPr") {
         let after = &workbook_xml[pos..];
         if let Some(gt) = after.find('>') {
-            let insert_at = pos + gt;
+            // Insert before `/>` (self-closing) or just before `>` (open tag).
+            // Without this check we'd produce `<calcPr .../ fullCalcOnLoad="1">`
+            // which is invalid XML.
+            let slash_offset = if gt > 0 && after.as_bytes()[gt - 1] == b'/' { 1 } else { 0 };
+            let insert_at = pos + gt - slash_offset;
             let mut result = workbook_xml.to_string();
             result.insert_str(insert_at, r#" fullCalcOnLoad="1""#);
             return result;
