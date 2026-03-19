@@ -802,39 +802,17 @@ async fn generate_inquiry_offer(
     });
 
     // Reuse any existing active offer so we UPDATE in-place
-    let existing_offer: Option<(Uuid, Option<i32>)> = sqlx::query_as(
-        "SELECT id, fahrt_override_cents FROM offers WHERE inquiry_id = $1 AND status NOT IN ('rejected', 'cancelled') LIMIT 1",
+    let existing_offer_id: Option<Uuid> = sqlx::query_as(
+        "SELECT id FROM offers WHERE inquiry_id = $1 AND status NOT IN ('rejected', 'cancelled') LIMIT 1",
     )
     .bind(inquiry_id)
     .fetch_optional(&state.db)
-    .await?;
+    .await?
+    .map(|(id,): (Uuid,)| id);
 
-    let (existing_offer_id, stored_fahrt_override) = match existing_offer {
-        Some((id, cents)) => (Some(id), cents),
-        None => (None, None),
-    };
-
-    // Determine final fahrt_flat_total:
-    // 1. fahrt_reset=true           → None (force ORS, clear stored override)
-    // 2. explicit fahrt_flat_total  → use it directly
-    // 3. line_items contains Fahrt  → let build_offer_with_overrides extract it from line_items
-    //                                 (do NOT also inject stored override — line_items takes precedence)
-    // 4. no explicit override       → carry forward stored override so "Neu Berechnen" preserves it
-    let line_items_has_fahrt = request.line_items.as_deref().map_or(false, |items| {
-        items.iter().any(|li| li.description == "Fahrkostenpauschale")
-    });
-    let fahrt_flat_total = if request.fahrt_reset {
-        None
-    } else if let Some(v) = request.fahrt_flat_total {
-        Some(v)
-    } else if line_items_has_fahrt {
-        // line_items carries the Fahrkostenpauschale — don't inject stored override on top of it
-        None
-    } else {
-        // No explicit override in request → preserve stored admin override (if any)
-        stored_fahrt_override.map(|cents| cents as f64 / 100.0)
-    };
-
+    // fahrt_flat_total and fahrt_reset are passed straight through to build_offer_with_overrides,
+    // which is now the single place responsible for the full resolution order:
+    // new admin value → line_items value → stored DB override → ORS calculation.
     let overrides = OfferOverrides {
         price_cents: request.price_cents_netto,
         persons: request.persons,
@@ -853,7 +831,8 @@ async fn generate_inquiry_offer(
                 .collect()
         }),
         existing_offer_id,
-        fahrt_flat_total,
+        fahrt_flat_total: request.fahrt_flat_total,
+        fahrt_reset: request.fahrt_reset,
     };
 
     let result = build_offer_with_overrides(

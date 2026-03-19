@@ -1034,7 +1034,8 @@ async fn handle_offer_edit(
         rate: overrides.rate,
         line_items: None,
         existing_offer_id: Some(old_offer_id),
-        fahrt_flat_total: None,  // Telegram edits don't touch Fahrkostenpauschale; stored override is preserved via COALESCE
+        fahrt_flat_total: None, // loaded from DB inside build_offer_with_overrides
+        fahrt_reset: false,
     };
 
     match build_offer_with_overrides(&state.db, &*state.storage, &state.config, inquiry_id, Some(30), &offer_overrides).await {
