@@ -2,7 +2,7 @@
 //! from the database, replacing duplicate implementations in quotes.rs, admin.rs,
 //! and customer.rs.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
@@ -31,6 +31,9 @@ struct InquiryDbRow {
     estimated_volume_m3: Option<f64>,
     distance_km: Option<f64>,
     preferred_date: Option<DateTime<Utc>>,
+    scheduled_date: Option<NaiveDate>,
+    start_time: NaiveTime,
+    end_time: NaiveTime,
     notes: Option<String>,
     #[sqlx(default)]
     services: serde_json::Value,
@@ -147,7 +150,8 @@ pub async fn build_inquiry_response(
     let row: InquiryDbRow = sqlx::query_as(
         r#"
         SELECT id, customer_id, origin_address_id, destination_address_id, stop_address_id,
-               status, estimated_volume_m3, distance_km, preferred_date, notes,
+               status, estimated_volume_m3, distance_km, preferred_date, scheduled_date,
+               start_time, end_time, notes,
                services, source, offer_sent_at, accepted_at, created_at, updated_at
         FROM inquiries WHERE id = $1
         "#,
@@ -295,7 +299,7 @@ pub async fn build_inquiry_response(
     .fetch_optional(pool)
     .await?;
 
-    let offer = offer_row.map(|r| build_offer_snapshot(&r));
+    let offer = offer_row.map(|r| build_offer_snapshot(&r, inquiry_id));
 
     // 6. Fetch employee assignments
     let employees = fetch_employee_assignments(pool, inquiry_id).await?;
@@ -316,6 +320,9 @@ pub async fn build_inquiry_response(
         volume_m3: row.estimated_volume_m3,
         distance_km: row.distance_km,
         preferred_date: row.preferred_date.map(|d| d.format("%Y-%m-%d").to_string()),
+        scheduled_date: row.scheduled_date,
+        start_time: row.start_time,
+        end_time: row.end_time,
         notes: row.notes,
         customer_message,
         created_at: row.created_at,
@@ -486,7 +493,7 @@ async fn fetch_address(
         city: a.city,
         postal_code: a.postal_code.unwrap_or_default(),
         country: if a.country.is_empty() {
-            "Österreich".to_string()
+            "Deutschland".to_string()
         } else {
             a.country
         },
@@ -499,7 +506,7 @@ async fn fetch_address(
 }
 
 /// Build an OfferSnapshot from a DB row, parsing line items.
-fn build_offer_snapshot(r: &OfferDbRow) -> OfferSnapshot {
+fn build_offer_snapshot(r: &OfferDbRow, inquiry_id: Uuid) -> OfferSnapshot {
     let persons = r.persons.unwrap_or(2);
     let netto = r.price_cents;
     let brutto = (netto as f64 * 1.19).round() as i64;
@@ -511,9 +518,10 @@ fn build_offer_snapshot(r: &OfferDbRow) -> OfferSnapshot {
         .map(|items| items.iter().map(|item| map_line_item(item, persons)).collect())
         .unwrap_or_default();
 
-    let pdf_url = r.pdf_storage_key.as_ref().map(|_| {
-        format!("/api/v1/inquiries/{}/pdf", "placeholder") // caller can override
-    });
+    let pdf_url = r
+        .pdf_storage_key
+        .as_ref()
+        .map(|_| format!("/api/v1/inquiries/{inquiry_id}/pdf"));
 
     OfferSnapshot {
         id: r.id,

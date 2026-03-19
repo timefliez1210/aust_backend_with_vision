@@ -10,6 +10,7 @@ use axum::{
     Extension, Json, Router,
 };
 use bytes::Bytes;
+use chrono::NaiveTime;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -60,6 +61,7 @@ pub fn router() -> Router<Arc<AppState>> {
             axum::routing::patch(update_assignment)
                 .delete(remove_assignment),
         )
+        .merge(super::invoices::router())
 }
 
 /// Public submission routes (no auth required).
@@ -125,6 +127,9 @@ struct UpdateInquiryRequest {
     estimated_volume_m3: Option<f64>,
     distance_km: Option<f64>,
     preferred_date: Option<String>,
+    scheduled_date: Option<String>,
+    start_time: Option<NaiveTime>,
+    end_time: Option<NaiveTime>,
     origin_address_id: Option<Uuid>,
     destination_address_id: Option<Uuid>,
 }
@@ -142,6 +147,13 @@ struct GenerateOfferRequest {
     rate: Option<f64>,
     #[serde(default)]
     line_items: Option<Vec<GenerateLineItem>>,
+    /// Explicit Fahrkostenpauschale flat total in €. When set, overrides ORS calculation and
+    /// is persisted so future regenerations also use it. Send `null` to clear a stored override.
+    #[serde(default)]
+    fahrt_flat_total: Option<f64>,
+    /// When true, clears any stored Fahrkostenpauschale override so ORS recalculates it.
+    #[serde(default)]
+    fahrt_reset: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -454,6 +466,10 @@ async fn update_inquiry(
         .as_ref()
         .and_then(|s| serde_json::to_value(s).ok());
 
+    let scheduled_date = request.scheduled_date.as_deref().and_then(|s| {
+        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
+    });
+
     sqlx::query(
         r#"
         UPDATE inquiries SET
@@ -463,10 +479,12 @@ async fn update_inquiry(
             estimated_volume_m3 = COALESCE($5, estimated_volume_m3),
             distance_km = COALESCE($6, distance_km),
             preferred_date = COALESCE($7, preferred_date),
-            scheduled_date = CASE WHEN $7 IS NOT NULL THEN NULL ELSE scheduled_date END,
-            origin_address_id = COALESCE($8, origin_address_id),
-            destination_address_id = COALESCE($9, destination_address_id),
-            updated_at = $10
+            scheduled_date = CASE WHEN $7 IS NOT NULL THEN NULL WHEN $11 IS NOT NULL THEN $11 ELSE scheduled_date END,
+            start_time = COALESCE($8, start_time),
+            end_time = COALESCE($9, end_time),
+            origin_address_id = COALESCE($10, origin_address_id),
+            destination_address_id = COALESCE($12, destination_address_id),
+            updated_at = $13
         WHERE id = $1
         "#,
     )
@@ -477,7 +495,10 @@ async fn update_inquiry(
     .bind(request.estimated_volume_m3)
     .bind(request.distance_km)
     .bind(preferred_date)
+    .bind(request.start_time)
+    .bind(request.end_time)
     .bind(request.origin_address_id)
+    .bind(scheduled_date)
     .bind(request.destination_address_id)
     .bind(now)
     .execute(&state.db)
@@ -776,16 +797,43 @@ async fn generate_inquiry_offer(
         hours: None,
         rate: None,
         line_items: None,
+        fahrt_flat_total: None,
+        fahrt_reset: false,
     });
 
     // Reuse any existing active offer so we UPDATE in-place
-    let existing_offer_id: Option<Uuid> = sqlx::query_as::<_, (Uuid,)>(
-        "SELECT id FROM offers WHERE inquiry_id = $1 AND status NOT IN ('rejected', 'cancelled') LIMIT 1",
+    let existing_offer: Option<(Uuid, Option<i32>)> = sqlx::query_as(
+        "SELECT id, fahrt_override_cents FROM offers WHERE inquiry_id = $1 AND status NOT IN ('rejected', 'cancelled') LIMIT 1",
     )
     .bind(inquiry_id)
     .fetch_optional(&state.db)
-    .await?
-    .map(|(id,)| id);
+    .await?;
+
+    let (existing_offer_id, stored_fahrt_override) = match existing_offer {
+        Some((id, cents)) => (Some(id), cents),
+        None => (None, None),
+    };
+
+    // Determine final fahrt_flat_total:
+    // 1. fahrt_reset=true           → None (force ORS, clear stored override)
+    // 2. explicit fahrt_flat_total  → use it directly
+    // 3. line_items contains Fahrt  → let build_offer_with_overrides extract it from line_items
+    //                                 (do NOT also inject stored override — line_items takes precedence)
+    // 4. no explicit override       → carry forward stored override so "Neu Berechnen" preserves it
+    let line_items_has_fahrt = request.line_items.as_deref().map_or(false, |items| {
+        items.iter().any(|li| li.description == "Fahrkostenpauschale")
+    });
+    let fahrt_flat_total = if request.fahrt_reset {
+        None
+    } else if let Some(v) = request.fahrt_flat_total {
+        Some(v)
+    } else if line_items_has_fahrt {
+        // line_items carries the Fahrkostenpauschale — don't inject stored override on top of it
+        None
+    } else {
+        // No explicit override in request → preserve stored admin override (if any)
+        stored_fahrt_override.map(|cents| cents as f64 / 100.0)
+    };
 
     let overrides = OfferOverrides {
         price_cents: request.price_cents_netto,
@@ -805,6 +853,7 @@ async fn generate_inquiry_offer(
                 .collect()
         }),
         existing_offer_id,
+        fahrt_flat_total,
     };
 
     let result = build_offer_with_overrides(

@@ -3,7 +3,7 @@ use axum::{
     routing::{get, put},
     Json, Router,
 };
-use chrono::{Datelike, NaiveDate};
+use chrono::{Datelike, NaiveDate, NaiveTime};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use std::collections::HashMap;
@@ -52,6 +52,8 @@ struct ScheduleInquiry {
     volume_m3: Option<f64>,
     status: String,
     offer_price_cents: Option<i64>,
+    start_time: NaiveTime,
+    end_time: NaiveTime,
 }
 
 #[derive(Debug, Serialize)]
@@ -221,6 +223,8 @@ async fn get_schedule(
         arrival_address: Option<String>,
         volume_m3: Option<f64>,
         status: String,
+        start_time: NaiveTime,
+        end_time: NaiveTime,
     }
 
     let inquiry_rows: Vec<InquiryRow> = sqlx::query_as(
@@ -235,7 +239,9 @@ async fn get_schedule(
             CASE WHEN ao.id IS NOT NULL THEN ao.street || ', ' || ao.city END AS departure_address,
             CASE WHEN ad.id IS NOT NULL THEN ad.street || ', ' || ad.city END AS arrival_address,
             i.estimated_volume_m3 AS volume_m3,
-            i.status
+            i.status,
+            i.start_time,
+            i.end_time
         FROM inquiries i
         JOIN customers c ON i.customer_id = c.id
         LEFT JOIN addresses ao ON i.origin_address_id = ao.id
@@ -290,6 +296,8 @@ async fn get_schedule(
             volume_m3: row.volume_m3,
             status: row.status,
             offer_price_cents: price,
+            start_time: row.start_time,
+            end_time: row.end_time,
         });
     }
 

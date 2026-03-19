@@ -32,6 +32,7 @@ struct OfferRow {
     hours_estimated: Option<f64>,
     rate_per_hour_cents: Option<i64>,
     line_items_json: Option<serde_json::Value>,
+    fahrt_override_cents: Option<i32>,
 }
 
 impl From<OfferRow> for Offer {
@@ -188,7 +189,7 @@ pub struct GeneratedOffer {
 ///
 /// Also used by the admin dashboard's regenerate endpoint for manual price/person/hour
 /// adjustments submitted as JSON.
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct OfferOverrides {
     pub price_cents: Option<i64>,
     pub persons: Option<u32>,
@@ -199,6 +200,9 @@ pub struct OfferOverrides {
     /// When set, UPDATE this offer in-place instead of INSERTing a new one.
     /// The offer_number and created_at are preserved; pricing/PDF/line_items are refreshed.
     pub existing_offer_id: Option<Uuid>,
+    /// When set, use this flat amount (in €) for Fahrkostenpauschale instead of recalculating
+    /// via ORS. Persisted in `offers.fahrt_override_cents` so subsequent regenerations keep it.
+    pub fahrt_flat_total: Option<f64>,
 }
 
 /// Generate an offer with no manual overrides — delegates to `build_offer_with_overrides`.
@@ -387,27 +391,44 @@ pub async fn build_offer_with_overrides(
     }
 
     // 7. Build line items.
-    //    Fahrkostenpauschale: if the admin explicitly provided one in the override, use that value
-    //    (converting qty×price → flat_total for correct XLSX rendering). Otherwise re-compute via ORS.
+    //    Fahrkostenpauschale resolution order (first match wins):
+    //    a) overrides.fahrt_flat_total is Some  → admin explicitly set it (persisted to DB)
+    //    b) overrides.line_items contains entry → admin set it via line_items (also persisted)
+    //    c) neither                             → re-compute from ORS (NOT persisted as override)
     let quote_services = quote.services.clone().unwrap_or_default();
 
-    let line_items = if let Some(ref items) = overrides.line_items {
-        // Check whether the admin sent a Fahrkostenpauschale override
-        let fahrt_item = if let Some(admin_fahrt) = items.iter().find(|li| li.description == "Fahrkostenpauschale") {
-            // Admin overrode the value — normalise to flat_total for XLSX
-            let total = admin_fahrt.flat_total.unwrap_or(admin_fahrt.quantity * admin_fahrt.unit_price);
+    // Resolved fahrt value: Some(euros) if admin-set, None if ORS should calculate
+    let admin_fahrt_euros: Option<f64> = if let Some(v) = overrides.fahrt_flat_total {
+        Some(v)
+    } else if let Some(ref items) = overrides.line_items {
+        items
+            .iter()
+            .find(|li| li.description == "Fahrkostenpauschale")
+            .map(|li| li.flat_total.unwrap_or(li.quantity * li.unit_price))
+    } else {
+        None
+    };
+
+    let (fahrt_item, fahrt_was_manually_set) = if let Some(total) = admin_fahrt_euros {
+        (
             OfferLineItem {
                 description: "Fahrkostenpauschale".to_string(),
                 quantity: 0.0,
                 unit_price: 0.0,
                 is_labor: false,
                 flat_total: Some(total),
-                remark: admin_fahrt.remark.clone(),
-            }
-        } else {
-            // No override — re-compute from ORS
-            build_fahrt_item(config, origin.as_ref(), destination.as_ref(), stop_address.as_ref(), distance).await
-        };
+                remark: None,
+            },
+            true,
+        )
+    } else {
+        (
+            build_fahrt_item(config, origin.as_ref(), destination.as_ref(), stop_address.as_ref(), distance).await,
+            false,
+        )
+    };
+
+    let line_items = if let Some(ref items) = overrides.line_items {
         let mut result = vec![fahrt_item];
         result.extend(
             items
@@ -426,7 +447,6 @@ pub async fn build_offer_with_overrides(
         });
         result
     } else {
-        let fahrt_item = build_fahrt_item(config, origin.as_ref(), destination.as_ref(), stop_address.as_ref(), distance).await;
         let mut items = vec![fahrt_item];
         items.extend(build_line_items(&quote_services));
         items
@@ -571,6 +591,14 @@ pub async fn build_offer_with_overrides(
     // 10. Insert or update offer record
     let line_items_json = serde_json::to_value(&offer_data.line_items).ok();
     let rate_cents = (rate_override * 100.0).round() as i64;
+    // Persist the fahrt override: Some(cents) when admin explicitly set it, None when ORS-calculated.
+    // When Some, the COALESCE in the UPDATE query ensures it is never reset to NULL by a later
+    // regeneration that doesn't include an explicit override.
+    let fahrt_override_cents: Option<i32> = if fahrt_was_manually_set {
+        admin_fahrt_euros.map(|euros| (euros * 100.0).round() as i32)
+    } else {
+        None
+    };
 
     // Compute actual netto from line items (must match XLSX SUM(G31:G42))
     let actual_netto: f64 = offer_data.line_items.iter().map(|item| {
@@ -590,11 +618,12 @@ pub async fn build_offer_with_overrides(
             UPDATE offers
             SET price_cents = $1, pdf_storage_key = $2, status = $3,
                 persons = $4, hours_estimated = $5, rate_per_hour_cents = $6,
-                line_items_json = $7
-            WHERE id = $8
+                line_items_json = $7,
+                fahrt_override_cents = COALESCE($8, fahrt_override_cents)
+            WHERE id = $9
             RETURNING id, inquiry_id, price_cents, currency, valid_until, pdf_storage_key, status,
                       created_at, sent_at, offer_number, persons, hours_estimated,
-                      rate_per_hour_cents, line_items_json
+                      rate_per_hour_cents, line_items_json, fahrt_override_cents
             "#,
         )
         .bind(actual_netto_cents)
@@ -604,6 +633,7 @@ pub async fn build_offer_with_overrides(
         .bind(pricing_result.estimated_hours)
         .bind(rate_cents)
         .bind(&line_items_json)
+        .bind(fahrt_override_cents)
         .bind(offer_id)
         .fetch_one(db)
         .await?
@@ -611,10 +641,11 @@ pub async fn build_offer_with_overrides(
         sqlx::query_as(
             r#"
             INSERT INTO offers (id, inquiry_id, price_cents, currency, valid_until, pdf_storage_key, status, created_at,
-                                offer_number, persons, hours_estimated, rate_per_hour_cents, line_items_json)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                                offer_number, persons, hours_estimated, rate_per_hour_cents, line_items_json,
+                                fahrt_override_cents)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             RETURNING id, inquiry_id, price_cents, currency, valid_until, pdf_storage_key, status, created_at, sent_at,
-                      offer_number, persons, hours_estimated, rate_per_hour_cents, line_items_json
+                      offer_number, persons, hours_estimated, rate_per_hour_cents, line_items_json, fahrt_override_cents
             "#,
         )
         .bind(offer_id)
@@ -630,6 +661,7 @@ pub async fn build_offer_with_overrides(
         .bind(pricing_result.estimated_hours)
         .bind(rate_cents)
         .bind(&line_items_json)
+        .bind(fahrt_override_cents)
         .fetch_one(db)
         .await?
     };

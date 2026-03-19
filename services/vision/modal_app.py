@@ -128,7 +128,7 @@ job_store = modal.Dict.from_name("aust-vision-jobs", create_if_missing=True)
 # Photo pipeline — GPU worker class
 # ---------------------------------------------------------------------------
 
-@app.cls(gpu="L4", scaledown_window=120, max_containers=1, timeout=900)
+@app.cls(gpu="L4", scaledown_window=120, max_containers=1, timeout=1800)
 class PhotoPipeline:
     """GPU worker for photo volume estimation.
 

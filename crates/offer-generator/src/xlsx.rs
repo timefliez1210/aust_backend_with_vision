@@ -331,11 +331,12 @@ fn build_cell_modifications(
     mods.push(("A11".into(), CellValue::Text(data.customer_city.clone())));
     mods.push(("A12".into(), CellValue::StyledText(data.customer_email.clone(), "0")));
 
-    // Clear the old TODAY() formula in G14-G15 (overlaps with company info text box).
-    mods.push(("G14".into(), CellValue::Text(String::new())));
+    // Replace the TODAY() formula in G14 with the actual formatted date string.
+    // Writing as plain text avoids any dependency on the template's date-format styles
+    // (none of which are a proper dd.mm.yyyy style in this template).
+    mods.push(("G14".into(), CellValue::Text(data.date.format("%d.%m.%Y").to_string())));
     mods.push(("G15".into(), CellValue::Text(String::new())));
-    // Date in G16 — same row as title. Style 10 = dd.mm.yyyy date format.
-    mods.push(("G16".into(), CellValue::StyledNumber(date_to_excel_serial(data.date), "10")));
+    // G16 is the title row — do not write the date there.
 
     // Title
     mods.push((
@@ -1459,28 +1460,6 @@ fn extract_row_number(cell_ref: &str) -> u32 {
     cell_ref[num_start..].parse().unwrap_or(1)
 }
 
-/// Convert a `chrono::NaiveDate` to an Excel serial date number.
-///
-/// **Why**: Excel stores dates as floating-point day counts since a fixed epoch.
-/// Writing the date as a plain serial number to a cell with a date-format style
-/// (`s="10"`) causes both Excel and LibreOffice to render it as `dd.mm.yyyy`.
-///
-/// The epoch is 1899-12-30 (not 1900-01-01) because Excel historically included
-/// a phantom leap day for 1900-02-29 to maintain Lotus 1-2-3 compatibility.
-/// Subtracting from 1899-12-30 implicitly accounts for this off-by-one.
-///
-/// # Parameters
-/// - `date` — the calendar date to convert
-///
-/// # Returns
-/// `f64` Excel serial number, e.g. `46107.0` for 2026-04-01.
-///
-/// # Math
-/// `serial = (date - 1899-12-30).num_days()`
-fn date_to_excel_serial(date: chrono::NaiveDate) -> f64 {
-    let base = chrono::NaiveDate::from_ymd_opt(1899, 12, 30).unwrap();
-    (date - base).num_days() as f64
-}
 
 /// Format an `f64` as a decimal string suitable for embedding in XLSX XML.
 ///

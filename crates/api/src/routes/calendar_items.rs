@@ -4,7 +4,7 @@ use axum::{
     routing::{get, patch},
     Extension, Json, Router,
 };
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use std::sync::Arc;
@@ -50,6 +50,8 @@ struct CalendarItemRow {
     category: String,
     location: Option<String>,
     scheduled_date: Option<NaiveDate>,
+    start_time: NaiveTime,
+    end_time: Option<NaiveTime>,
     duration_hours: f64,
     status: String,
     created_at: DateTime<Utc>,
@@ -80,6 +82,8 @@ struct CalendarItemDetail {
     category: String,
     location: Option<String>,
     scheduled_date: Option<NaiveDate>,
+    start_time: NaiveTime,
+    end_time: Option<NaiveTime>,
     duration_hours: f64,
     status: String,
     created_at: DateTime<Utc>,
@@ -98,6 +102,10 @@ struct CreateItemBody {
     category: Option<String>,
     location: Option<String>,
     scheduled_date: Option<NaiveDate>,
+    /// Required. Start time in HH:MM:SS format (e.g. "09:00:00").
+    start_time: NaiveTime,
+    /// Optional end time in HH:MM:SS format.
+    end_time: Option<NaiveTime>,
     duration_hours: Option<f64>,
     customer_id: Option<Uuid>,
 }
@@ -110,6 +118,8 @@ struct UpdateItemBody {
     category: Option<String>,
     location: Option<String>,
     scheduled_date: Option<NaiveDate>,
+    start_time: Option<NaiveTime>,
+    end_time: Option<NaiveTime>,
     duration_hours: Option<f64>,
     status: Option<String>,
     customer_id: Option<Uuid>,
@@ -179,7 +189,8 @@ async fn fetch_item_row(pool: &sqlx::PgPool, id: Uuid) -> Result<CalendarItemRow
     sqlx::query_as(
         r#"
         SELECT ci.id, ci.title, ci.description, ci.category, ci.location,
-               ci.scheduled_date, ci.duration_hours::float8 AS duration_hours,
+               ci.scheduled_date, ci.start_time, ci.end_time,
+               ci.duration_hours::float8 AS duration_hours,
                ci.status, ci.created_at, ci.updated_at,
                ci.customer_id, c.name AS customer_name
         FROM calendar_items ci
@@ -220,7 +231,8 @@ async fn list_items(
         sqlx::query_as(
             r#"
             SELECT ci.id, ci.title, ci.description, ci.category, ci.location,
-                   ci.scheduled_date, ci.duration_hours::float8 AS duration_hours,
+                   ci.scheduled_date, ci.start_time, ci.end_time,
+                   ci.duration_hours::float8 AS duration_hours,
                    ci.status, ci.created_at, ci.updated_at,
                    ci.customer_id, c.name AS customer_name
             FROM calendar_items ci
@@ -237,7 +249,8 @@ async fn list_items(
         sqlx::query_as(
             r#"
             SELECT ci.id, ci.title, ci.description, ci.category, ci.location,
-                   ci.scheduled_date, ci.duration_hours::float8 AS duration_hours,
+                   ci.scheduled_date, ci.start_time, ci.end_time,
+                   ci.duration_hours::float8 AS duration_hours,
                    ci.status, ci.created_at, ci.updated_at,
                    ci.customer_id, c.name AS customer_name
             FROM calendar_items ci
@@ -274,8 +287,8 @@ async fn create_item(
 
     let (new_id,): (Uuid,) = sqlx::query_as(
         r#"
-        INSERT INTO calendar_items (title, description, category, location, scheduled_date, duration_hours, customer_id)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        INSERT INTO calendar_items (title, description, category, location, scheduled_date, start_time, end_time, duration_hours, customer_id)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         RETURNING id
         "#,
     )
@@ -284,6 +297,8 @@ async fn create_item(
     .bind(category)
     .bind(body.location)
     .bind(body.scheduled_date)
+    .bind(body.start_time)
+    .bind(body.end_time)
     .bind(duration_hours)
     .bind(body.customer_id)
     .fetch_one(&state.db)
@@ -319,6 +334,8 @@ async fn get_item(
         category: item.category,
         location: item.location,
         scheduled_date: item.scheduled_date,
+        start_time: item.start_time,
+        end_time: item.end_time,
         duration_hours: item.duration_hours,
         status: item.status,
         created_at: item.created_at,
@@ -361,8 +378,9 @@ async fn update_item(
         sets.push(format!("title = ${idx}"));
         idx += 1;
     }
-    if body.description.is_some() || body.description.as_ref().map(|_| true).is_none() {
-        // description can be explicitly null — always allow it when key present
+    if body.description.is_some() {
+        sets.push(format!("description = ${idx}"));
+        idx += 1;
     }
     if body.category.is_some() {
         sets.push(format!("category = ${idx}"));
@@ -374,6 +392,14 @@ async fn update_item(
     }
     if body.scheduled_date.is_some() {
         sets.push(format!("scheduled_date = ${idx}"));
+        idx += 1;
+    }
+    if body.start_time.is_some() {
+        sets.push(format!("start_time = ${idx}"));
+        idx += 1;
+    }
+    if body.end_time.is_some() {
+        sets.push(format!("end_time = ${idx}"));
         idx += 1;
     }
     if body.duration_hours.is_some() {
@@ -410,6 +436,9 @@ async fn update_item(
     if let Some(v) = body.title {
         q = q.bind(v);
     }
+    if let Some(v) = body.description {
+        q = q.bind(v);
+    }
     if let Some(v) = body.category {
         q = q.bind(v);
     }
@@ -417,6 +446,12 @@ async fn update_item(
         q = q.bind(v);
     }
     if let Some(v) = body.scheduled_date {
+        q = q.bind(v);
+    }
+    if let Some(v) = body.start_time {
+        q = q.bind(v);
+    }
+    if let Some(v) = body.end_time {
         q = q.bind(v);
     }
     if let Some(v) = body.duration_hours {

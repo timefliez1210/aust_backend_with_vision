@@ -1,0 +1,1047 @@
+//! Invoice (Rechnung) routes — creation, PDF download, status updates, and email dispatch.
+//!
+//! All routes are nested under `/api/v1/inquiries/{id}/invoices`.
+//!
+//! Two invoice modes:
+//! - **Full**: single invoice for the complete job amount + any on-site extras.
+//! - **Partial**: two linked invoices — `partial_first` (Anzahlung, sendable immediately)
+//!   and `partial_final` (Restbetrag + extras, sendable after inquiry = `completed`).
+
+use axum::{
+    extract::{Path, State},
+    http::{header, StatusCode},
+    response::Response,
+    routing::{get, post},
+    Json, Router,
+};
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use sqlx::FromRow;
+use std::sync::Arc;
+use uuid::Uuid;
+
+use crate::routes::offers::CustomerRow;
+use crate::ApiError;
+use crate::AppState;
+use aust_offer_generator::{
+    convert_xlsx_to_pdf, generate_invoice_xlsx, ExtraService, InvoiceData, InvoiceType,
+};
+
+// ---------------------------------------------------------------------------
+// Router
+// ---------------------------------------------------------------------------
+
+/// Sub-router for all invoice routes nested under `/inquiries`.
+///
+/// **Caller**: `routes/inquiries.rs::router()` via `.merge()`
+/// **Why**: Keeps invoice logic separate from inquiry CRUD while sharing the
+/// `/{id}` path segment.
+pub(crate) fn router() -> Router<Arc<AppState>> {
+    Router::new()
+        .route(
+            "/{id}/invoices",
+            get(list_invoices).post(create_invoice),
+        )
+        .route(
+            "/{id}/invoices/{inv_id}",
+            get(get_invoice).patch(update_invoice),
+        )
+        .route("/{id}/invoices/{inv_id}/pdf", get(get_invoice_pdf))
+        .route("/{id}/invoices/{inv_id}/send", post(send_invoice))
+}
+
+// ---------------------------------------------------------------------------
+// DB projection rows
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, FromRow)]
+struct InvoiceRow {
+    id: Uuid,
+    inquiry_id: Uuid,
+    invoice_number: String,
+    invoice_type: String,
+    partial_group_id: Option<Uuid>,
+    partial_percent: Option<i32>,
+    status: String,
+    extra_services: serde_json::Value,
+    pdf_s3_key: Option<String>,
+    sent_at: Option<chrono::DateTime<Utc>>,
+    paid_at: Option<chrono::DateTime<Utc>>,
+    created_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, FromRow)]
+struct AddressRow {
+    street: Option<String>,
+    city: Option<String>,
+    postal_code: Option<String>,
+}
+
+#[derive(Debug, FromRow)]
+struct ActiveOfferRow {
+    price_cents: i64,
+    offer_number: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Request / Response types
+// ---------------------------------------------------------------------------
+
+/// Request body for `POST /inquiries/{id}/invoices`.
+#[derive(Debug, Deserialize)]
+pub struct CreateInvoiceRequest {
+    /// `"full"` or `"partial"`.
+    pub invoice_type: String,
+    /// Required when `invoice_type = "partial"`. Range: 1–99.
+    pub partial_percent: Option<u8>,
+}
+
+/// Request body for `PATCH /inquiries/{id}/invoices/{inv_id}`.
+#[derive(Debug, Deserialize)]
+pub struct UpdateInvoiceRequest {
+    /// Set to `"paid"` to mark the invoice as paid (sets `paid_at`).
+    pub status: Option<String>,
+    /// Replace the extra services list (only allowed on `full` and `partial_final`).
+    pub extra_services: Option<Vec<ExtraServiceRequest>>,
+}
+
+/// A single extra service as provided by the API caller.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ExtraServiceRequest {
+    pub description: String,
+    /// Netto price in cents.
+    pub price_cents: i64,
+}
+
+/// Full invoice representation returned by all read endpoints.
+#[derive(Debug, Serialize)]
+pub struct InvoiceResponse {
+    pub id: Uuid,
+    pub inquiry_id: Uuid,
+    pub invoice_number: String,
+    pub invoice_type: String,
+    pub partial_group_id: Option<Uuid>,
+    pub partial_percent: Option<i32>,
+    pub status: String,
+    pub extra_services: Vec<ExtraServiceRequest>,
+    /// Netto total (base + extras) in cents, for display.
+    pub total_netto_cents: i64,
+    /// Brutto total (netto × 1.19) in cents, for display.
+    pub total_brutto_cents: i64,
+    pub pdf_s3_key: Option<String>,
+    pub sent_at: Option<chrono::DateTime<Utc>>,
+    pub paid_at: Option<chrono::DateTime<Utc>>,
+    pub created_at: chrono::DateTime<Utc>,
+}
+
+// ---------------------------------------------------------------------------
+// Handlers
+// ---------------------------------------------------------------------------
+
+/// `GET /api/v1/inquiries/{id}/invoices` — List all invoices for an inquiry.
+///
+/// **Caller**: Admin dashboard Rechnungen card
+/// **Why**: Shows all invoices (full or partial pair) for the given inquiry.
+///
+/// # Returns
+/// Array of `InvoiceResponse` ordered by creation date.
+async fn list_invoices(
+    State(state): State<Arc<AppState>>,
+    Path(inquiry_id): Path<Uuid>,
+) -> Result<Json<Vec<InvoiceResponse>>, ApiError> {
+    let rows: Vec<InvoiceRow> = sqlx::query_as(
+        "SELECT id, inquiry_id, invoice_number, invoice_type, partial_group_id,
+                partial_percent, status, extra_services, pdf_s3_key, sent_at, paid_at, created_at
+         FROM invoices WHERE inquiry_id = $1 ORDER BY created_at",
+    )
+    .bind(inquiry_id)
+    .fetch_all(&state.db)
+    .await?;
+
+    // Need the active offer to compute display amounts
+    let offer: Option<ActiveOfferRow> = sqlx::query_as(
+        "SELECT price_cents, offer_number FROM offers WHERE inquiry_id = $1
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(inquiry_id)
+    .fetch_optional(&state.db)
+    .await?;
+
+    let offer_netto = offer.map(|o| o.price_cents).unwrap_or(0);
+
+    let responses: Vec<InvoiceResponse> = rows
+        .into_iter()
+        .map(|row| build_invoice_response(row, offer_netto))
+        .collect();
+
+    Ok(Json(responses))
+}
+
+/// `POST /api/v1/inquiries/{id}/invoices` — Create a new invoice or partial pair.
+///
+/// **Caller**: Admin dashboard "Rechnung Erstellen" / "Partielle Rechnung Erstellen"
+/// **Why**: Triggers XLSX + PDF generation and S3 upload for one or two invoices.
+///
+/// For `partial`, two invoices are created atomically sharing a `partial_group_id`:
+/// - `partial_first` → status `ready` (sendable immediately)
+/// - `partial_final` → status `draft` (sendable after inquiry = `completed`)
+///
+/// # Errors
+/// - 400 if inquiry status is not ≥ `accepted`
+/// - 400 if `invoice_type = "partial"` and `partial_percent` is missing or out of range
+/// - 404 if inquiry or active offer not found
+async fn create_invoice(
+    State(state): State<Arc<AppState>>,
+    Path(inquiry_id): Path<Uuid>,
+    Json(req): Json<CreateInvoiceRequest>,
+) -> Result<Json<Vec<InvoiceResponse>>, ApiError> {
+    // Validate invoice type
+    let is_partial = match req.invoice_type.as_str() {
+        "full" => false,
+        "partial" => true,
+        other => {
+            return Err(ApiError::BadRequest(format!(
+                "invoice_type must be 'full' or 'partial', got '{other}'"
+            )));
+        }
+    };
+
+    let percent = if is_partial {
+        let p = req.partial_percent.ok_or_else(|| {
+            ApiError::BadRequest("partial_percent is required for partial invoices".into())
+        })?;
+        if p == 0 || p >= 100 {
+            return Err(ApiError::BadRequest(
+                "partial_percent must be between 1 and 99".into(),
+            ));
+        }
+        p
+    } else {
+        0
+    };
+
+    // Load inquiry and validate status
+    let inquiry_status: (String,) = sqlx::query_as("SELECT status FROM inquiries WHERE id = $1")
+        .bind(inquiry_id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Inquiry {inquiry_id} not found")))?;
+
+    let status = inquiry_status.0.as_str();
+    let allowed = matches!(
+        status,
+        "accepted" | "scheduled" | "completed" | "invoiced" | "paid"
+    );
+    if !allowed {
+        return Err(ApiError::BadRequest(format!(
+            "Invoices can only be created for accepted or later inquiries (current status: {status})"
+        )));
+    }
+
+    // Guard: only one invoice (or pair) per inquiry
+    let (existing_count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM invoices WHERE inquiry_id = $1")
+            .bind(inquiry_id)
+            .fetch_one(&state.db)
+            .await?;
+    if existing_count > 0 {
+        return Err(ApiError::BadRequest(
+            "Invoices already exist for this inquiry".into(),
+        ));
+    }
+
+    // Load data needed for PDF generation
+    let invoice_context = load_invoice_context(&state.db, inquiry_id).await?;
+    let offer_netto = invoice_context.offer.price_cents;
+
+    // Guard: offer must have a positive amount
+    if offer_netto <= 0 {
+        return Err(ApiError::BadRequest(
+            "Offer price must be greater than 0 to create invoices".into(),
+        ));
+    }
+
+    let offer_brutto = (offer_netto as f64 * 1.19).round() as i64;
+
+    let now = Utc::now();
+    let today = now.date_naive();
+
+    if is_partial {
+        // Create both partial invoices atomically
+        let group_id = Uuid::now_v7();
+
+        // Compute amounts — derive final_netto from offer_netto to ensure totals sum exactly
+        let first_brutto = (offer_brutto as f64 * percent as f64 / 100.0).round() as i64;
+        let first_netto = (first_brutto as f64 / 1.19).round() as i64;
+        let final_netto = offer_netto - first_netto; // exact: first + final == offer
+
+        // Generate invoice numbers — single round-trip to avoid sequence gaps on failure
+        let (first_num, final_num) = {
+            let (seq1, seq2): (i64, i64) = sqlx::query_as(
+                "SELECT nextval('invoice_number_seq'), nextval('invoice_number_seq')",
+            )
+            .fetch_one(&state.db)
+            .await?;
+            (
+                format!("{}-{:04}", today.format("%Y"), seq1),
+                format!("{}-{:04}", today.format("%Y"), seq2),
+            )
+        };
+
+        // Generate PDFs
+        let first_data = build_invoice_data(
+            &invoice_context,
+            InvoiceType::PartialFirst { percent },
+            &first_num,
+            today,
+            first_netto,
+            vec![],
+        );
+        let first_xlsx = generate_invoice_xlsx(&first_data)
+            .map_err(|e| ApiError::Internal(format!("Invoice XLSX error: {e}")))?;
+        let first_pdf = generate_pdf_bytes(&first_xlsx).await;
+
+        let final_data = build_invoice_data(
+            &invoice_context,
+            InvoiceType::PartialFinal,
+            &final_num,
+            today,
+            final_netto,
+            vec![],
+        );
+        let final_xlsx = generate_invoice_xlsx(&final_data)
+            .map_err(|e| ApiError::Internal(format!("Invoice XLSX error: {e}")))?;
+        let final_pdf = generate_pdf_bytes(&final_xlsx).await;
+
+        let first_id = Uuid::now_v7();
+        let final_id = Uuid::now_v7();
+
+        // Upload PDFs to S3
+        let first_key = upload_invoice_pdf(
+            &*state.storage,
+            first_id,
+            &first_pdf,
+        )
+        .await?;
+        let final_key = upload_invoice_pdf(
+            &*state.storage,
+            final_id,
+            &final_pdf,
+        )
+        .await?;
+
+        // Insert both rows atomically so a partial failure can't leave an orphaned first row
+        let mut tx = state.db.begin().await?;
+        sqlx::query(
+            "INSERT INTO invoices (id, inquiry_id, invoice_number, invoice_type,
+                partial_group_id, partial_percent, status, extra_services, pdf_s3_key, created_at)
+             VALUES ($1,$2,$3,'partial_first',$4,$5,'ready','[]',$6,$7)",
+        )
+        .bind(first_id)
+        .bind(inquiry_id)
+        .bind(&first_num)
+        .bind(group_id)
+        .bind(percent as i32)
+        .bind(&first_key)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO invoices (id, inquiry_id, invoice_number, invoice_type,
+                partial_group_id, partial_percent, status, extra_services, pdf_s3_key, created_at)
+             VALUES ($1,$2,$3,'partial_final',$4,$5,'draft','[]',$6,$7)",
+        )
+        .bind(final_id)
+        .bind(inquiry_id)
+        .bind(&final_num)
+        .bind(group_id)
+        .bind(percent as i32) // stored on both rows so build_invoice_response needs no sibling lookup
+        .bind(&final_key)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        let first_row = fetch_invoice_row(&state.db, first_id).await?;
+        let final_row = fetch_invoice_row(&state.db, final_id).await?;
+
+        Ok(Json(vec![
+            build_invoice_response(first_row, offer_netto),
+            build_invoice_response(final_row, offer_netto),
+        ]))
+    } else {
+        // Single full invoice
+        let (seq_val,): (i64,) = sqlx::query_as("SELECT nextval('invoice_number_seq')")
+            .fetch_one(&state.db)
+            .await?;
+        let invoice_num = format!("{}-{:04}", today.format("%Y"), seq_val);
+        let inv_id = Uuid::now_v7();
+
+        let data = build_invoice_data(
+            &invoice_context,
+            InvoiceType::Full,
+            &invoice_num,
+            today,
+            offer_netto,
+            vec![],
+        );
+        let xlsx = generate_invoice_xlsx(&data)
+            .map_err(|e| ApiError::Internal(format!("Invoice XLSX error: {e}")))?;
+        let pdf = generate_pdf_bytes(&xlsx).await;
+        let s3_key = upload_invoice_pdf(&*state.storage, inv_id, &pdf).await?;
+
+        sqlx::query(
+            "INSERT INTO invoices (id, inquiry_id, invoice_number, invoice_type,
+                status, extra_services, pdf_s3_key, created_at)
+             VALUES ($1,$2,$3,'full','ready','[]',$4,$5)",
+        )
+        .bind(inv_id)
+        .bind(inquiry_id)
+        .bind(&invoice_num)
+        .bind(&s3_key)
+        .bind(now)
+        .execute(&state.db)
+        .await?;
+
+        let row = fetch_invoice_row(&state.db, inv_id).await?;
+        Ok(Json(vec![build_invoice_response(row, offer_netto)]))
+    }
+}
+
+/// `GET /api/v1/inquiries/{id}/invoices/{inv_id}` — Get a single invoice.
+async fn get_invoice(
+    State(state): State<Arc<AppState>>,
+    Path((inquiry_id, inv_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<InvoiceResponse>, ApiError> {
+    let row: InvoiceRow = sqlx::query_as(
+        "SELECT id, inquiry_id, invoice_number, invoice_type, partial_group_id,
+                partial_percent, status, extra_services, pdf_s3_key, sent_at, paid_at, created_at
+         FROM invoices WHERE id = $1 AND inquiry_id = $2",
+    )
+    .bind(inv_id)
+    .bind(inquiry_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| ApiError::NotFound(format!("Invoice {inv_id} not found")))?;
+
+    let offer_netto = get_offer_netto(&state.db, inquiry_id).await?;
+    Ok(Json(build_invoice_response(row, offer_netto)))
+}
+
+/// `GET /api/v1/inquiries/{id}/invoices/{inv_id}/pdf` — Download invoice PDF.
+///
+/// **Caller**: Admin dashboard PDF download button
+/// **Why**: Streams the stored PDF (or XLSX fallback) from S3.
+async fn get_invoice_pdf(
+    State(state): State<Arc<AppState>>,
+    Path((inquiry_id, inv_id)): Path<(Uuid, Uuid)>,
+) -> Result<Response, ApiError> {
+    let row: (Option<String>, String) = sqlx::query_as(
+        "SELECT pdf_s3_key, invoice_number FROM invoices WHERE id = $1 AND inquiry_id = $2",
+    )
+    .bind(inv_id)
+    .bind(inquiry_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| ApiError::NotFound(format!("Invoice {inv_id} not found")))?;
+
+    let (key_opt, invoice_number) = row;
+    let key = key_opt
+        .ok_or_else(|| ApiError::NotFound("Invoice PDF not yet generated".into()))?;
+
+    let bytes = state
+        .storage
+        .download(&key)
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to download invoice PDF: {e}")))?;
+
+    let (content_type, filename) = if key.ends_with(".pdf") {
+        (
+            "application/pdf",
+            format!("Rechnung_{invoice_number}.pdf"),
+        )
+    } else {
+        (
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            format!("Rechnung_{invoice_number}.xlsx"),
+        )
+    };
+
+    let response = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{filename}\""),
+        )
+        .body(axum::body::Body::from(bytes::Bytes::from(bytes)))
+        .map_err(|e| ApiError::Internal(format!("Response build error: {e}")))?;
+
+    Ok(response)
+}
+
+/// `PATCH /api/v1/inquiries/{id}/invoices/{inv_id}` — Update invoice status or extra services.
+///
+/// **Caller**: Admin dashboard — "Als bezahlt markieren" button, or extra services editor
+/// **Why**: Two update paths:
+/// 1. `{ status: "paid" }` → sets `paid_at`, updates status.
+///    When all invoices for an inquiry are paid, auto-transitions inquiry to `paid`.
+/// 2. `{ extra_services: [...] }` → replaces the extra services list and regenerates the PDF.
+///    Only allowed on `full` and `partial_final` invoice types.
+///
+/// # Errors
+/// - 400 if trying to set `extra_services` on a `partial_first` invoice
+/// - 404 if invoice not found
+async fn update_invoice(
+    State(state): State<Arc<AppState>>,
+    Path((inquiry_id, inv_id)): Path<(Uuid, Uuid)>,
+    Json(req): Json<UpdateInvoiceRequest>,
+) -> Result<Json<InvoiceResponse>, ApiError> {
+    // Load existing invoice
+    let row = fetch_invoice_by_inquiry(&state.db, inv_id, inquiry_id).await?;
+
+    let now = Utc::now();
+
+    // Handle status update
+    if let Some(ref new_status) = req.status {
+        if new_status == "paid" {
+            sqlx::query(
+                "UPDATE invoices SET status = 'paid', paid_at = $1 WHERE id = $2",
+            )
+            .bind(now)
+            .bind(inv_id)
+            .execute(&state.db)
+            .await?;
+
+            // Auto-transition inquiry to 'paid' when all invoices are paid
+            let unpaid: (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM invoices WHERE inquiry_id = $1 AND status != 'paid'",
+            )
+            .bind(inquiry_id)
+            .fetch_one(&state.db)
+            .await?;
+            if unpaid.0 == 0 {
+                sqlx::query(
+                    "UPDATE inquiries SET status = 'paid', updated_at = $1 WHERE id = $2
+                     AND status != 'paid'",
+                )
+                .bind(now)
+                .bind(inquiry_id)
+                .execute(&state.db)
+                .await?;
+            }
+        }
+    }
+
+    // Handle extra services update + PDF regeneration
+    if let Some(ref extras) = req.extra_services {
+        if row.invoice_type == "partial_first" {
+            return Err(ApiError::BadRequest(
+                "Extra services can only be added to full or partial_final invoices".into(),
+            ));
+        }
+
+        // Validate each extra service
+        for (i, extra) in extras.iter().enumerate() {
+            if extra.price_cents < 0 {
+                return Err(ApiError::BadRequest(format!(
+                    "extra_services[{i}].price_cents must be >= 0"
+                )));
+            }
+            if extra.description.trim().is_empty() {
+                return Err(ApiError::BadRequest(format!(
+                    "extra_services[{i}].description must not be empty"
+                )));
+            }
+        }
+
+        let extra_services_json = serde_json::to_value(extras)
+            .map_err(|e| ApiError::Internal(format!("JSON error: {e}")))?;
+
+        // Persist extra services
+        sqlx::query("UPDATE invoices SET extra_services = $1 WHERE id = $2")
+            .bind(&extra_services_json)
+            .bind(inv_id)
+            .execute(&state.db)
+            .await?;
+
+        // Regenerate PDF with updated extras
+        let invoice_context = load_invoice_context(&state.db, inquiry_id).await?;
+        let today = now.date_naive();
+
+        let inv_type = match row.invoice_type.as_str() {
+            "partial_final" => InvoiceType::PartialFinal,
+            _ => InvoiceType::Full,
+        };
+
+        let (base_netto, extra_service_vec) = compute_invoice_amounts(
+            invoice_context.offer.price_cents,
+            &inv_type,
+            row.partial_percent,
+            &state.db,
+            row.partial_group_id,
+            extras,
+        )
+        .await?;
+
+        let data = build_invoice_data(
+            &invoice_context,
+            inv_type,
+            &row.invoice_number,
+            today,
+            base_netto,
+            extra_service_vec,
+        );
+
+        let xlsx = generate_invoice_xlsx(&data)
+            .map_err(|e| ApiError::Internal(format!("Invoice XLSX error: {e}")))?;
+        let pdf = generate_pdf_bytes(&xlsx).await;
+        let new_key = upload_invoice_pdf(&*state.storage, inv_id, &pdf).await?;
+
+        sqlx::query("UPDATE invoices SET pdf_s3_key = $1 WHERE id = $2")
+            .bind(&new_key)
+            .bind(inv_id)
+            .execute(&state.db)
+            .await?;
+    }
+
+    let updated_row = fetch_invoice_row(&state.db, inv_id).await?;
+    let offer_netto = get_offer_netto(&state.db, inquiry_id).await?;
+    Ok(Json(build_invoice_response(updated_row, offer_netto)))
+}
+
+/// `POST /api/v1/inquiries/{id}/invoices/{inv_id}/send` — Send invoice by email.
+///
+/// **Caller**: Admin dashboard "Senden" button
+/// **Why**: Attaches the invoice PDF and sends it to the customer via SMTP.
+///
+/// Sendability rules:
+/// - `partial_first`: always sendable if status = `ready` or `draft`
+/// - `full` / `partial_final`: require inquiry status = `completed`
+///
+/// On success: sets `status = 'sent'`, `sent_at = now()`.
+/// Auto-transitions inquiry to `invoiced` if not already past that stage.
+///
+/// # Errors
+/// - 400 if the sendability gate is not met
+/// - 404 if invoice PDF is not yet generated
+async fn send_invoice(
+    State(state): State<Arc<AppState>>,
+    Path((inquiry_id, inv_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<InvoiceResponse>, ApiError> {
+    let row = fetch_invoice_by_inquiry(&state.db, inv_id, inquiry_id).await?;
+
+    // Sendability gate
+    if row.invoice_type == "partial_first" {
+        if row.status == "draft" {
+            return Err(ApiError::BadRequest(
+                "Diese Anzahlungsrechnung ist noch im Entwurfsstatus und kann nicht gesendet werden".into(),
+            ));
+        }
+    } else {
+        let (inq_status,): (String,) =
+            sqlx::query_as("SELECT status FROM inquiries WHERE id = $1")
+                .bind(inquiry_id)
+                .fetch_one(&state.db)
+                .await?;
+        if inq_status != "completed" {
+            return Err(ApiError::BadRequest(
+                "Diese Rechnung kann erst nach Auftragsabschluss (Status: abgeschlossen) gesendet werden".into(),
+            ));
+        }
+    }
+
+    let pdf_key = row
+        .pdf_s3_key
+        .clone()
+        .ok_or_else(|| ApiError::NotFound("Invoice PDF not yet generated".into()))?;
+
+    // Load PDF bytes from S3
+    let pdf_bytes = state
+        .storage
+        .download(&pdf_key)
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to load invoice PDF: {e}")))?;
+
+    // Load customer email
+    let (customer_email, customer_name): (String, Option<String>) = sqlx::query_as(
+        "SELECT c.email, c.name FROM customers c
+         JOIN inquiries i ON i.customer_id = c.id
+         WHERE i.id = $1",
+    )
+    .bind(inquiry_id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|_| ApiError::NotFound("Customer not found for inquiry".into()))?;
+
+    let display_name = customer_name.as_deref().unwrap_or("Kunde");
+    let invoice_num = &row.invoice_number;
+    let subject = format!("Ihre Rechnung Nr. {invoice_num} — Aust Umzüge & Haushaltsauflösungen");
+    let body = format!(
+        "Sehr geehrte/r {display_name},\n\n\
+         im Anhang finden Sie Ihre Rechnung Nr. {invoice_num}.\n\n\
+         Bitte überweisen Sie den Rechnungsbetrag innerhalb von 7 Tagen \
+         unter Angabe der Rechnungsnummer auf unser Konto.\n\n\
+         Mit freundlichen Grüßen\n\
+         Aust Umzüge & Haushaltsauflösungen"
+    );
+
+    let filename = format!("Rechnung_{invoice_num}.pdf");
+    let email = crate::services::email::build_email_with_attachment(
+        &state.config.email.username,
+        "Aust Umzüge & Haushaltsauflösungen",
+        &customer_email,
+        &subject,
+        &body,
+        &pdf_bytes,
+        &filename,
+        "application/pdf",
+    )
+    .map_err(|e| ApiError::Internal(format!("Failed to build invoice email: {e}")))?;
+
+    crate::services::email::send_email(
+        &state.config.email.smtp_host,
+        state.config.email.smtp_port,
+        &state.config.email.username,
+        &state.config.email.password,
+        email,
+    )
+    .await
+    .map_err(|e| ApiError::Internal(format!("Failed to send invoice email: {e}")))?;
+
+    // Update invoice status
+    let now = Utc::now();
+    sqlx::query("UPDATE invoices SET status = 'sent', sent_at = $1 WHERE id = $2")
+        .bind(now)
+        .bind(inv_id)
+        .execute(&state.db)
+        .await?;
+
+    // Auto-transition inquiry to 'invoiced' if still in an earlier stage
+    sqlx::query(
+        "UPDATE inquiries SET status = 'invoiced', updated_at = $1 WHERE id = $2
+         AND status IN ('accepted','scheduled','completed')",
+    )
+    .bind(now)
+    .bind(inquiry_id)
+    .execute(&state.db)
+    .await?;
+
+    let updated_row = fetch_invoice_row(&state.db, inv_id).await?;
+    let offer_netto = get_offer_netto(&state.db, inquiry_id).await?;
+    Ok(Json(build_invoice_response(updated_row, offer_netto)))
+}
+
+// ---------------------------------------------------------------------------
+// Invoice data loading helpers
+// ---------------------------------------------------------------------------
+
+/// All DB data needed to generate an invoice PDF.
+struct InvoiceContext {
+    offer: ActiveOfferRow,
+    customer: CustomerRow,
+    origin_street: String,
+    origin_city: String,
+    moving_date: Option<chrono::NaiveDate>,
+}
+
+/// Load all data needed for invoice generation from the database.
+///
+/// **Why**: Centralised data loading used by both create and update (PDF regeneration) paths.
+///
+/// # Errors
+/// Returns `NotFound` if there is no active offer for the inquiry.
+async fn load_invoice_context(
+    db: &sqlx::PgPool,
+    inquiry_id: Uuid,
+) -> Result<InvoiceContext, ApiError> {
+    // Active offer (most recent)
+    let offer: ActiveOfferRow = sqlx::query_as(
+        "SELECT price_cents, offer_number FROM offers WHERE inquiry_id = $1
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(inquiry_id)
+    .fetch_optional(db)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("No offer found for inquiry — generate an offer first".into()))?;
+
+    // Customer + moving date
+    let customer: CustomerRow = sqlx::query_as(
+        "SELECT c.id, c.email, c.name, c.salutation, c.first_name, c.last_name, c.phone
+         FROM customers c
+         JOIN inquiries i ON i.customer_id = c.id
+         WHERE i.id = $1",
+    )
+    .bind(inquiry_id)
+    .fetch_one(db)
+    .await
+    .map_err(|_| ApiError::NotFound("Customer not found for inquiry".into()))?;
+
+    let moving_date: Option<chrono::NaiveDate> = sqlx::query_as::<_, (Option<chrono::DateTime<Utc>>,)>(
+        "SELECT preferred_date FROM inquiries WHERE id = $1",
+    )
+    .bind(inquiry_id)
+    .fetch_one(db)
+    .await
+    .ok()
+    .and_then(|(dt,)| dt)
+    .map(|dt| dt.date_naive());
+
+    // Origin address
+    let origin: Option<AddressRow> = sqlx::query_as(
+        "SELECT a.street, a.city, a.postal_code
+         FROM addresses a
+         JOIN inquiries i ON i.origin_address_id = a.id
+         WHERE i.id = $1",
+    )
+    .bind(inquiry_id)
+    .fetch_optional(db)
+    .await?;
+
+    let origin_street = origin
+        .as_ref()
+        .and_then(|a| a.street.clone())
+        .unwrap_or_default();
+    let origin_city = origin
+        .as_ref()
+        .map(|a| {
+            let postal = a.postal_code.as_deref().unwrap_or("");
+            let city = a.city.as_deref().unwrap_or("");
+            format!("{postal} {city}").trim().to_string()
+        })
+        .unwrap_or_default();
+
+    Ok(InvoiceContext {
+        offer,
+        customer,
+        origin_street,
+        origin_city,
+        moving_date,
+    })
+}
+
+/// Build an `InvoiceData` struct from a loaded `InvoiceContext`.
+fn build_invoice_data(
+    ctx: &InvoiceContext,
+    invoice_type: InvoiceType,
+    invoice_number: &str,
+    invoice_date: chrono::NaiveDate,
+    base_netto_cents: i64,
+    extra_services: Vec<ExtraService>,
+) -> InvoiceData {
+    let customer_name = match (ctx.customer.first_name.as_deref(), ctx.customer.last_name.as_deref()) {
+        (Some(f), Some(l)) => format!("{f} {l}"),
+        _ => ctx.customer.name.clone().unwrap_or_else(|| ctx.customer.email.clone()),
+    };
+
+    InvoiceData {
+        invoice_number: invoice_number.to_string(),
+        invoice_type,
+        invoice_date,
+        service_date: ctx.moving_date,
+        customer_name,
+        customer_email: ctx.customer.email.clone(),
+        origin_street: ctx.origin_street.clone(),
+        origin_city: ctx.origin_city.clone(),
+        offer_number: ctx.offer.offer_number.clone().unwrap_or_default(),
+        base_netto_cents,
+        extra_services,
+        salutation: ctx.customer.formal_greeting(),
+    }
+}
+
+/// Compute the base netto and extra service vec for a regeneration (PATCH extra_services).
+///
+/// For `partial_final`, the base netto is derived from the sibling `partial_first` percent.
+/// `extra_percent` comes from the `partial_first` row looked up via `partial_group_id`.
+async fn compute_invoice_amounts(
+    offer_netto: i64,
+    inv_type: &InvoiceType,
+    partial_percent: Option<i32>,
+    db: &sqlx::PgPool,
+    partial_group_id: Option<Uuid>,
+    extras: &[ExtraServiceRequest],
+) -> Result<(i64, Vec<ExtraService>), ApiError> {
+    let offer_brutto = (offer_netto as f64 * 1.19).round() as i64;
+
+    let base_netto = match inv_type {
+        InvoiceType::Full => offer_netto,
+        InvoiceType::PartialFirst { percent } => {
+            let brutto = (offer_brutto as f64 * *percent as f64 / 100.0).round() as i64;
+            (brutto as f64 / 1.19).round() as i64
+        }
+        InvoiceType::PartialFinal => {
+            // partial_percent is stored on both rows since creation, but fall back to sibling lookup
+            let pct = if let Some(p) = partial_percent {
+                p as u8
+            } else if let Some(gid) = partial_group_id {
+                let row: Option<(Option<i32>,)> = sqlx::query_as(
+                    "SELECT partial_percent FROM invoices
+                     WHERE partial_group_id = $1 AND invoice_type = 'partial_first'",
+                )
+                .bind(gid)
+                .fetch_optional(db)
+                .await?;
+                row.and_then(|(p,)| p).unwrap_or(0) as u8
+            } else {
+                0
+            };
+            // Mirror creation math so first + final == offer netto exactly
+            let first_brutto = (offer_brutto as f64 * pct as f64 / 100.0).round() as i64;
+            let first_netto = (first_brutto as f64 / 1.19).round() as i64;
+            offer_netto - first_netto
+        }
+    };
+
+    let extra_services = extras
+        .iter()
+        .map(|e| ExtraService {
+            description: e.description.clone(),
+            price_cents: e.price_cents,
+        })
+        .collect();
+
+    Ok((base_netto, extra_services))
+}
+
+// ---------------------------------------------------------------------------
+// DB helper functions
+// ---------------------------------------------------------------------------
+
+async fn fetch_invoice_row(db: &sqlx::PgPool, inv_id: Uuid) -> Result<InvoiceRow, ApiError> {
+    sqlx::query_as(
+        "SELECT id, inquiry_id, invoice_number, invoice_type, partial_group_id,
+                partial_percent, status, extra_services, pdf_s3_key, sent_at, paid_at, created_at
+         FROM invoices WHERE id = $1",
+    )
+    .bind(inv_id)
+    .fetch_one(db)
+    .await
+    .map_err(|_| ApiError::NotFound(format!("Invoice {inv_id} not found")))
+}
+
+async fn fetch_invoice_by_inquiry(
+    db: &sqlx::PgPool,
+    inv_id: Uuid,
+    inquiry_id: Uuid,
+) -> Result<InvoiceRow, ApiError> {
+    sqlx::query_as(
+        "SELECT id, inquiry_id, invoice_number, invoice_type, partial_group_id,
+                partial_percent, status, extra_services, pdf_s3_key, sent_at, paid_at, created_at
+         FROM invoices WHERE id = $1 AND inquiry_id = $2",
+    )
+    .bind(inv_id)
+    .bind(inquiry_id)
+    .fetch_optional(db)
+    .await?
+    .ok_or_else(|| ApiError::NotFound(format!("Invoice {inv_id} not found")))
+}
+
+async fn get_offer_netto(db: &sqlx::PgPool, inquiry_id: Uuid) -> Result<i64, ApiError> {
+    let row: Option<(i64,)> =
+        sqlx::query_as("SELECT price_cents FROM offers WHERE inquiry_id = $1 ORDER BY created_at DESC LIMIT 1")
+            .bind(inquiry_id)
+            .fetch_optional(db)
+            .await?;
+    Ok(row.map(|(c,)| c).unwrap_or(0))
+}
+
+// ---------------------------------------------------------------------------
+// PDF / S3 helpers
+// ---------------------------------------------------------------------------
+
+/// Convert XLSX bytes to PDF via LibreOffice, falling back to XLSX on failure.
+async fn generate_pdf_bytes(xlsx: &[u8]) -> Vec<u8> {
+    match convert_xlsx_to_pdf(xlsx).await {
+        Ok(pdf) => pdf,
+        Err(e) => {
+            tracing::warn!("Invoice PDF conversion unavailable ({e}), using XLSX");
+            xlsx.to_vec()
+        }
+    }
+}
+
+/// Upload invoice PDF (or XLSX fallback) to S3 and return the storage key.
+async fn upload_invoice_pdf(
+    storage: &dyn aust_storage::StorageProvider,
+    inv_id: Uuid,
+    bytes: &[u8],
+) -> Result<String, ApiError> {
+    let is_pdf = bytes.starts_with(b"%PDF");
+    let (ext, mime) = if is_pdf {
+        ("pdf", "application/pdf")
+    } else {
+        (
+            "xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    };
+    let key = format!("invoices/{inv_id}/rechnung.{ext}");
+    storage
+        .upload(&key, bytes::Bytes::from(bytes.to_vec()), mime)
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to upload invoice PDF: {e}")))?;
+    Ok(key)
+}
+
+// ---------------------------------------------------------------------------
+// Response builder
+// ---------------------------------------------------------------------------
+
+/// Build an `InvoiceResponse` from a DB row plus the offer netto for amount calculation.
+fn build_invoice_response(row: InvoiceRow, offer_netto_cents: i64) -> InvoiceResponse {
+    let extra_services: Vec<ExtraServiceRequest> = row
+        .extra_services
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let extra_netto: i64 = extra_services.iter().map(|e| e.price_cents).sum();
+    let offer_brutto = (offer_netto_cents as f64 * 1.19).round() as i64;
+
+    let (base_netto, total_netto) = match row.invoice_type.as_str() {
+        "partial_first" => {
+            let pct = row.partial_percent.unwrap_or(0) as f64;
+            let first_brutto = (offer_brutto as f64 * pct / 100.0).round() as i64;
+            let n = (first_brutto as f64 / 1.19).round() as i64;
+            (n, n) // no extras on partial_first
+        }
+        "partial_final" => {
+            // Mirror creation math: first_netto derived from first_brutto, final = offer - first
+            let pct = row.partial_percent.unwrap_or(0) as f64;
+            let first_brutto = (offer_brutto as f64 * pct / 100.0).round() as i64;
+            let first_netto = (first_brutto as f64 / 1.19).round() as i64;
+            let n = offer_netto_cents - first_netto;
+            (n, n + extra_netto)
+        }
+        _ => {
+            // full
+            (offer_netto_cents, offer_netto_cents + extra_netto)
+        }
+    };
+
+    let _ = base_netto; // used indirectly via total_netto
+    let total_brutto = (total_netto as f64 * 1.19).round() as i64;
+
+    InvoiceResponse {
+        id: row.id,
+        inquiry_id: row.inquiry_id,
+        invoice_number: row.invoice_number,
+        invoice_type: row.invoice_type,
+        partial_group_id: row.partial_group_id,
+        partial_percent: row.partial_percent,
+        status: row.status,
+        extra_services,
+        total_netto_cents: total_netto,
+        total_brutto_cents: total_brutto,
+        pdf_s3_key: row.pdf_s3_key,
+        sent_at: row.sent_at,
+        paid_at: row.paid_at,
+        created_at: row.created_at,
+    }
+}

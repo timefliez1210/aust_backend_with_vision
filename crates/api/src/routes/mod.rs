@@ -8,6 +8,7 @@ pub mod employee;
 pub mod estimates;
 pub mod health;
 pub mod inquiries;
+pub mod invoices;
 pub mod offers;
 pub(crate) mod shared;
 
