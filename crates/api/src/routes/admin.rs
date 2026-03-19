@@ -635,8 +635,8 @@ async fn list_orders(
     // Filter by specific sub-status within orders, or show all order statuses
     let status_filter = query.status.as_deref();
     let statuses: &[&str] = match status_filter {
-        Some(s) if s == "accepted" || s == "done" || s == "paid" => &[],
-        _ => &["accepted", "done", "paid"],
+        Some(s) if matches!(s, "accepted" | "scheduled" | "completed" | "invoiced" | "paid") => &[],
+        _ => &["accepted", "scheduled", "completed", "invoiced", "paid"],
     };
 
     let orders: Vec<OrderListItem> = if statuses.is_empty() {
@@ -693,7 +693,7 @@ async fn list_orders(
             JOIN customers c ON q.customer_id = c.id
             LEFT JOIN addresses oa ON q.origin_address_id = oa.id
             LEFT JOIN addresses da ON q.destination_address_id = da.id
-            WHERE q.status IN ('accepted', 'done', 'paid')
+            WHERE q.status IN ('accepted', 'scheduled', 'completed', 'invoiced', 'paid')
               AND (c.name ILIKE $1 OR c.email ILIKE $1)
             ORDER BY COALESCE(q.preferred_date, q.created_at) ASC
             LIMIT $2 OFFSET $3
@@ -726,7 +726,7 @@ async fn list_orders(
             SELECT COUNT(*)
             FROM inquiries q
             JOIN customers c ON q.customer_id = c.id
-            WHERE q.status IN ('accepted', 'done', 'paid')
+            WHERE q.status IN ('accepted', 'scheduled', 'completed', 'invoiced', 'paid')
               AND (c.name ILIKE $1 OR c.email ILIKE $1)
             "#,
         )
