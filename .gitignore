@@ -7,9 +7,10 @@ Cargo.lock
 .env.local
 .env.*.local
 
-# IDE
+# IDE / AI tools
 .idea/
 .vscode/
+.claude/
 *.swp
 *.swo
 *~
