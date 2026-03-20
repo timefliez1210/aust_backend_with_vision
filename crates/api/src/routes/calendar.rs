@@ -51,9 +51,12 @@ struct ScheduleInquiry {
     arrival_address: Option<String>,
     volume_m3: Option<f64>,
     status: String,
+    notes: Option<String>,
     offer_price_cents: Option<i64>,
     start_time: NaiveTime,
     end_time: NaiveTime,
+    employees_assigned: i64,
+    employee_names: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -223,8 +226,11 @@ async fn get_schedule(
         arrival_address: Option<String>,
         volume_m3: Option<f64>,
         status: String,
+        notes: Option<String>,
         start_time: NaiveTime,
         end_time: NaiveTime,
+        employees_assigned: i64,
+        employee_names: Option<String>,
     }
 
     let inquiry_rows: Vec<InquiryRow> = sqlx::query_as(
@@ -240,14 +246,23 @@ async fn get_schedule(
             CASE WHEN ad.id IS NOT NULL THEN ad.street || ', ' || ad.city END AS arrival_address,
             i.estimated_volume_m3 AS volume_m3,
             i.status,
+            i.notes,
             i.start_time,
-            i.end_time
+            i.end_time,
+            COUNT(ie.id) AS employees_assigned,
+            NULLIF(STRING_AGG(
+                e.first_name || ' ' || LEFT(e.last_name, 1) || '.',
+                ', ' ORDER BY e.last_name, e.first_name
+            ), '') AS employee_names
         FROM inquiries i
         JOIN customers c ON i.customer_id = c.id
         LEFT JOIN addresses ao ON i.origin_address_id = ao.id
         LEFT JOIN addresses ad ON i.destination_address_id = ad.id
+        LEFT JOIN inquiry_employees ie ON ie.inquiry_id = i.id
+        LEFT JOIN employees e ON ie.employee_id = e.id
         WHERE COALESCE(i.scheduled_date, i.preferred_date::date) BETWEEN $1 AND $2
           AND i.status NOT IN ('cancelled', 'rejected', 'expired')
+        GROUP BY i.id, c.id, ao.id, ad.id
         ORDER BY effective_date
         "#,
     )
@@ -295,9 +310,12 @@ async fn get_schedule(
             arrival_address: row.arrival_address,
             volume_m3: row.volume_m3,
             status: row.status,
+            notes: row.notes,
             offer_price_cents: price,
             start_time: row.start_time,
             end_time: row.end_time,
+            employees_assigned: row.employees_assigned,
+            employee_names: row.employee_names,
         });
     }
 

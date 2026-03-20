@@ -429,28 +429,6 @@ async fn update_inquiry(
 ) -> Result<Json<InquiryResponseModel>, ApiError> {
     let now = chrono::Utc::now();
 
-    // If status transition requested, validate it
-    if let Some(ref new_status_str) = request.status {
-        let new_status: InquiryStatus = new_status_str
-            .parse()
-            .map_err(|e: String| ApiError::BadRequest(e))?;
-
-        let (current_status_str,): (String,) =
-            sqlx::query_as("SELECT status FROM inquiries WHERE id = $1")
-                .bind(id)
-                .fetch_optional(&state.db)
-                .await?
-                .ok_or_else(|| ApiError::NotFound(format!("Inquiry {id} not found")))?;
-
-        let current_status: InquiryStatus = current_status_str.parse().unwrap_or_default();
-
-        if !current_status.can_transition_to(&new_status) {
-            return Err(ApiError::BadRequest(format!(
-                "Ungültiger Statusübergang: {} -> {}",
-                current_status, new_status
-            )));
-        }
-    }
 
     // Parse preferred date if provided
     let preferred_date = request.preferred_date.as_deref().and_then(|s| {
