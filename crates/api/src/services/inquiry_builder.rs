@@ -8,8 +8,8 @@ use uuid::Uuid;
 
 use aust_core::models::{
     AddressSnapshot, CustomerSnapshot, EmployeeAssignmentSnapshot, EstimationSnapshot,
-    InquiryListItem, InquiryResponse, InquiryStatus, ItemSnapshot, LineItemSnapshot,
-    OfferSnapshot, Services,
+    InquiryDaySnapshot, InquiryListItem, InquiryResponse, InquiryStatus, ItemSnapshot,
+    LineItemSnapshot, OfferSnapshot, Services,
 };
 
 use crate::routes::offers::{parse_detected_items, VolumeEstimationRow};
@@ -304,6 +304,10 @@ pub async fn build_inquiry_response(
     // 6. Fetch employee assignments
     let employees = fetch_employee_assignments(pool, inquiry_id).await?;
 
+    // 6b. Fetch scheduled days (empty for single-day inquiries)
+    let scheduled_days = fetch_scheduled_days(pool, inquiry_id).await?;
+    let is_multi_day = scheduled_days.len() > 1;
+
     // 7. Extract customer message from notes
     let customer_message = extract_customer_message(row.notes.as_deref());
 
@@ -345,6 +349,8 @@ pub async fn build_inquiry_response(
         items,
         offer,
         employees,
+        scheduled_days,
+        is_multi_day,
     })
 }
 
@@ -602,6 +608,8 @@ async fn fetch_employee_assignments(
         first_name: String,
         last_name: String,
         planned_hours: f64,
+        clock_in: Option<DateTime<Utc>>,
+        clock_out: Option<DateTime<Utc>>,
         actual_hours: Option<f64>,
         notes: Option<String>,
     }
@@ -610,7 +618,11 @@ async fn fetch_employee_assignments(
         r#"
         SELECT ie.employee_id, e.first_name, e.last_name,
                ie.planned_hours::float8 AS planned_hours,
-               ie.actual_hours::float8 AS actual_hours,
+               ie.clock_in,
+               ie.clock_out,
+               CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
+                    THEN EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0
+                    ELSE NULL END AS actual_hours,
                ie.notes
         FROM inquiry_employees ie
         JOIN employees e ON ie.employee_id = e.id
@@ -629,7 +641,51 @@ async fn fetch_employee_assignments(
             first_name: r.first_name,
             last_name: r.last_name,
             planned_hours: r.planned_hours,
+            clock_in: r.clock_in,
+            clock_out: r.clock_out,
             actual_hours: r.actual_hours,
+            notes: r.notes,
+        })
+        .collect())
+}
+
+/// Fetch all scheduled day records for an inquiry, ordered by day_number.
+///
+/// **Caller**: `build_inquiry_response`
+/// **Why**: Multi-day inquiries need all their dates embedded in the canonical
+/// detail response so the frontend calendar can display them on every day.
+///
+/// # Returns
+/// Empty vec for single-day inquiries (no rows in `inquiry_days`).
+/// Ordered list of `InquiryDaySnapshot` for multi-day inquiries.
+async fn fetch_scheduled_days(
+    pool: &PgPool,
+    inquiry_id: Uuid,
+) -> Result<Vec<InquiryDaySnapshot>, crate::ApiError> {
+    #[derive(FromRow)]
+    struct Row {
+        day_date: NaiveDate,
+        day_number: i16,
+        notes: Option<String>,
+    }
+
+    let rows: Vec<Row> = sqlx::query_as(
+        r#"
+        SELECT day_date, day_number, notes
+        FROM inquiry_days
+        WHERE inquiry_id = $1
+        ORDER BY day_number ASC
+        "#,
+    )
+    .bind(inquiry_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| InquiryDaySnapshot {
+            day_date: r.day_date,
+            day_number: r.day_number,
             notes: r.notes,
         })
         .collect())

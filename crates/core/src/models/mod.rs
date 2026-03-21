@@ -18,7 +18,8 @@ pub use offer::*;
 pub use quote::*;
 pub use snapshots::{
     AddressSnapshot, CustomerSnapshot, EmployeeAssignmentSnapshot, EstimationSnapshot,
-    InquiryListItem, InquiryResponse, ItemSnapshot, LineItemSnapshot, OfferSnapshot, Services,
+    InquiryDaySnapshot, InquiryListItem, InquiryResponse, ItemSnapshot, LineItemSnapshot,
+    OfferSnapshot, Services,
 };
 pub use user::*;
 pub use volume::*;

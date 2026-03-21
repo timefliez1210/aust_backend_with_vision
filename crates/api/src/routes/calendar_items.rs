@@ -28,6 +28,7 @@ pub fn router() -> Router<Arc<AppState>> {
             "/{id}/employees/{emp_id}",
             patch(update_item_employee).delete(remove_item_employee),
         )
+        .merge(super::calendar::calendar_item_days_router())
 }
 
 // ---------------------------------------------------------------------------
@@ -69,6 +70,8 @@ struct CalendarItemEmployee {
     first_name: String,
     last_name: String,
     planned_hours: f64,
+    clock_in: Option<DateTime<Utc>>,
+    clock_out: Option<DateTime<Utc>>,
     actual_hours: Option<f64>,
     notes: Option<String>,
 }
@@ -141,7 +144,8 @@ struct AssignEmployeeBody {
 #[derive(Debug, Deserialize)]
 struct UpdateEmployeeBody {
     planned_hours: Option<f64>,
-    actual_hours: Option<f64>,
+    clock_in: Option<DateTime<Utc>>,
+    clock_out: Option<DateTime<Utc>>,
     notes: Option<String>,
 }
 
@@ -598,105 +602,53 @@ async fn update_item_employee(
     Path((id, emp_id)): Path<(Uuid, Uuid)>,
     Json(body): Json<UpdateEmployeeBody>,
 ) -> Result<Json<CalendarItemEmployee>, ApiError> {
-    // Build dynamic SET clause
-    let mut sets: Vec<String> = Vec::new();
-    let mut idx = 1usize;
-
-    if body.planned_hours.is_some() {
-        sets.push(format!("planned_hours = ${idx}"));
-        idx += 1;
-    }
-    if body.actual_hours.is_some() {
-        sets.push(format!("actual_hours = ${idx}"));
-        idx += 1;
-    }
-    if body.notes.is_some() {
-        sets.push(format!("notes = ${idx}"));
-        idx += 1;
-    }
-
-    if sets.is_empty() {
-        // Nothing to update — fetch and return current row
-        let row: Option<CalendarItemEmployee> = sqlx::query_as(
-            r#"
-            SELECT cie.employee_id,
-                   e.first_name,
-                   e.last_name,
-                   cie.planned_hours::float8 AS planned_hours,
-                   cie.actual_hours::float8 AS actual_hours,
-                   cie.notes
-            FROM calendar_item_employees cie
-            JOIN employees e ON e.id = cie.employee_id
-            WHERE cie.calendar_item_id = $1 AND cie.employee_id = $2
-            "#,
-        )
-        .bind(id)
-        .bind(emp_id)
-        .fetch_optional(&state.db)
-        .await?;
-        return row
-            .map(Json)
-            .ok_or_else(|| ApiError::NotFound("Zuweisung nicht gefunden".into()));
-    }
-
-    let sql = format!(
+    let result = sqlx::query(
         r#"
-        UPDATE calendar_item_employees
-        SET {}
-        WHERE calendar_item_id = ${} AND employee_id = ${}
-        RETURNING employee_id,
-                  planned_hours::float8 AS planned_hours,
-                  actual_hours::float8 AS actual_hours,
-                  notes
+        UPDATE calendar_item_employees SET
+            planned_hours = COALESCE($3, planned_hours),
+            clock_in      = COALESCE($4, clock_in),
+            clock_out     = COALESCE($5, clock_out),
+            notes         = COALESCE($6, notes)
+        WHERE calendar_item_id = $1 AND employee_id = $2
         "#,
-        sets.join(", "),
-        idx,
-        idx + 1,
-    );
+    )
+    .bind(id)
+    .bind(emp_id)
+    .bind(body.planned_hours)
+    .bind(body.clock_in)
+    .bind(body.clock_out)
+    .bind(&body.notes)
+    .execute(&state.db)
+    .await?;
 
-    #[derive(sqlx::FromRow)]
-    struct UpdatedRow {
-        employee_id: Uuid,
-        planned_hours: f64,
-        actual_hours: Option<f64>,
-        notes: Option<String>,
+    if result.rows_affected() == 0 {
+        return Err(ApiError::NotFound("Zuweisung nicht gefunden".into()));
     }
 
-    let mut q = sqlx::query_as::<_, UpdatedRow>(&sql);
-    if let Some(v) = body.planned_hours {
-        q = q.bind(v);
-    }
-    if let Some(v) = body.actual_hours {
-        q = q.bind(v);
-    }
-    if let Some(v) = body.notes {
-        q = q.bind(v);
-    }
-    q = q.bind(id);
-    q = q.bind(emp_id);
+    let row: Option<CalendarItemEmployee> = sqlx::query_as(
+        r#"
+        SELECT cie.employee_id,
+               e.first_name,
+               e.last_name,
+               cie.planned_hours::float8 AS planned_hours,
+               cie.clock_in,
+               cie.clock_out,
+               CASE WHEN cie.clock_out IS NOT NULL AND cie.clock_in IS NOT NULL
+                    THEN EXTRACT(EPOCH FROM (cie.clock_out - cie.clock_in)) / 3600.0
+                    ELSE NULL END AS actual_hours,
+               cie.notes
+        FROM calendar_item_employees cie
+        JOIN employees e ON e.id = cie.employee_id
+        WHERE cie.calendar_item_id = $1 AND cie.employee_id = $2
+        "#,
+    )
+    .bind(id)
+    .bind(emp_id)
+    .fetch_optional(&state.db)
+    .await?;
 
-    let updated = q
-        .fetch_optional(&state.db)
-        .await?
-        .ok_or_else(|| ApiError::NotFound("Zuweisung nicht gefunden".into()))?;
-
-    // Fetch employee name fields separately
-    let name: Option<(String, String)> =
-        sqlx::query_as("SELECT first_name, last_name FROM employees WHERE id = $1")
-            .bind(updated.employee_id)
-            .fetch_optional(&state.db)
-            .await?;
-
-    let (first_name, last_name) = name.unwrap_or_default();
-
-    Ok(Json(CalendarItemEmployee {
-        employee_id: updated.employee_id,
-        first_name,
-        last_name,
-        planned_hours: updated.planned_hours,
-        actual_hours: updated.actual_hours,
-        notes: updated.notes,
-    }))
+    row.map(Json)
+        .ok_or_else(|| ApiError::NotFound("Zuweisung nicht gefunden".into()))
 }
 
 /// `DELETE /api/v1/admin/calendar-items/{id}/employees/{emp_id}` — Remove an employee assignment.
@@ -755,7 +707,11 @@ async fn fetch_item_employees(
                e.first_name,
                e.last_name,
                cie.planned_hours::float8 AS planned_hours,
-               cie.actual_hours::float8  AS actual_hours,
+               cie.clock_in,
+               cie.clock_out,
+               CASE WHEN cie.clock_out IS NOT NULL AND cie.clock_in IS NOT NULL
+                    THEN EXTRACT(EPOCH FROM (cie.clock_out - cie.clock_in)) / 3600.0
+                    ELSE NULL END AS actual_hours,
                cie.notes
         FROM calendar_item_employees cie
         JOIN employees e ON e.id = cie.employee_id

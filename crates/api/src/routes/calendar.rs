@@ -1,7 +1,7 @@
 use axum::{
     extract::{Path, Query, State},
     routing::{get, put},
-    Json, Router,
+    Extension, Json, Router,
 };
 use chrono::{Datelike, NaiveDate, NaiveTime};
 use serde::{Deserialize, Serialize};
@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
+use aust_core::models::TokenClaims;
 use crate::{ApiError, AppState};
 
 /// Register the calendar routes.
@@ -22,6 +23,25 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/availability", get(check_availability))
         .route("/schedule", get(get_schedule))
         .route("/capacity/{date}", put(set_capacity))
+}
+
+/// Sub-router for `/{id}/days` merged into the protected inquiries router.
+///
+/// **Caller**: `inquiries::router()`
+/// **Why**: Day management lives logically next to its parent resource but
+/// the handlers share calendar module types and DB helpers.
+pub fn inquiry_days_router() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/{id}/days", get(get_inquiry_days).put(put_inquiry_days))
+}
+
+/// Sub-router for `/{id}/days` merged into the calendar_items router.
+///
+/// **Caller**: `calendar_items::router()`
+/// **Why**: Mirrors the inquiry days sub-router for calendar items.
+pub fn calendar_item_days_router() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/{id}/days", get(get_calendar_item_days).put(put_calendar_item_days))
 }
 
 // ── Response types ──────────────────────────────────────────────────────────
@@ -57,6 +77,15 @@ struct ScheduleInquiry {
     end_time: NaiveTime,
     employees_assigned: i64,
     employee_names: Option<String>,
+    /// Which day number this entry represents (None for single-day inquiries).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    day_number: Option<i16>,
+    /// Total number of days for this inquiry (None for single-day).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_days: Option<i16>,
+    /// Per-day notes from `inquiry_days` (None for single-day).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    day_notes: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -216,7 +245,9 @@ async fn get_schedule(
 
     let default_capacity = state.config.calendar.default_capacity;
 
-    // Fetch all active inquiries in range
+    // Fetch all active inquiries in range — single-day and multi-day via UNION ALL.
+    // Single-day: no rows in inquiry_days, use scheduled_date / preferred_date.
+    // Multi-day: one row per day from inquiry_days.
     #[derive(FromRow)]
     struct InquiryRow {
         effective_date: NaiveDate,
@@ -231,10 +262,14 @@ async fn get_schedule(
         end_time: NaiveTime,
         employees_assigned: i64,
         employee_names: Option<String>,
+        day_number: Option<i16>,
+        total_days: Option<i16>,
+        day_notes: Option<String>,
     }
 
     let inquiry_rows: Vec<InquiryRow> = sqlx::query_as(
         r#"
+        -- Single-day branch: inquiry has no rows in inquiry_days
         SELECT
             COALESCE(i.scheduled_date, i.preferred_date::date) AS effective_date,
             i.id AS inquiry_id,
@@ -253,16 +288,62 @@ async fn get_schedule(
             NULLIF(STRING_AGG(
                 e.first_name || ' ' || LEFT(e.last_name, 1) || '.',
                 ', ' ORDER BY e.last_name, e.first_name
-            ), '') AS employee_names
+            ), '') AS employee_names,
+            NULL::smallint AS day_number,
+            NULL::smallint AS total_days,
+            NULL::text AS day_notes
         FROM inquiries i
         JOIN customers c ON i.customer_id = c.id
         LEFT JOIN addresses ao ON i.origin_address_id = ao.id
         LEFT JOIN addresses ad ON i.destination_address_id = ad.id
         LEFT JOIN inquiry_employees ie ON ie.inquiry_id = i.id
         LEFT JOIN employees e ON ie.employee_id = e.id
-        WHERE COALESCE(i.scheduled_date, i.preferred_date::date) BETWEEN $1 AND $2
+        WHERE NOT EXISTS (SELECT 1 FROM inquiry_days WHERE inquiry_id = i.id)
+          AND COALESCE(i.scheduled_date, i.preferred_date::date) BETWEEN $1 AND $2
           AND i.status NOT IN ('cancelled', 'rejected', 'expired')
         GROUP BY i.id, c.id, ao.id, ad.id
+
+        UNION ALL
+
+        -- Multi-day branch: one row per day from inquiry_days
+        SELECT
+            id2.day_date AS effective_date,
+            i.id AS inquiry_id,
+            COALESCE(
+                NULLIF(TRIM(COALESCE(c.first_name,'') || ' ' || COALESCE(c.last_name,'')), ''),
+                c.name, c.email
+            ) AS customer_name,
+            CASE WHEN ao.id IS NOT NULL THEN ao.street || ', ' || ao.city END AS departure_address,
+            CASE WHEN ad.id IS NOT NULL THEN ad.street || ', ' || ad.city END AS arrival_address,
+            i.estimated_volume_m3 AS volume_m3,
+            i.status,
+            i.notes,
+            i.start_time,
+            i.end_time,
+            COUNT(ie.id) AS employees_assigned,
+            NULLIF(STRING_AGG(
+                e.first_name || ' ' || LEFT(e.last_name, 1) || '.',
+                ', ' ORDER BY e.last_name, e.first_name
+            ), '') AS employee_names,
+            id2.day_number,
+            total.total_days,
+            id2.notes AS day_notes
+        FROM inquiries i
+        JOIN customers c ON i.customer_id = c.id
+        LEFT JOIN addresses ao ON i.origin_address_id = ao.id
+        LEFT JOIN addresses ad ON i.destination_address_id = ad.id
+        JOIN inquiry_days id2 ON id2.inquiry_id = i.id
+        JOIN (
+            SELECT inquiry_id, COUNT(*)::smallint AS total_days
+            FROM inquiry_days
+            GROUP BY inquiry_id
+        ) total ON total.inquiry_id = i.id
+        LEFT JOIN inquiry_employees ie ON ie.inquiry_id = i.id
+        LEFT JOIN employees e ON ie.employee_id = e.id
+        WHERE id2.day_date BETWEEN $1 AND $2
+          AND i.status NOT IN ('cancelled', 'rejected', 'expired')
+        GROUP BY i.id, c.id, ao.id, ad.id, id2.day_date, id2.day_number, id2.notes, total.total_days
+
         ORDER BY effective_date
         "#,
     )
@@ -316,6 +397,9 @@ async fn get_schedule(
             end_time: row.end_time,
             employees_assigned: row.employees_assigned,
             employee_names: row.employee_names,
+            day_number: row.day_number,
+            total_days: row.total_days,
+            day_notes: row.day_notes,
         });
     }
 
@@ -373,4 +457,168 @@ async fn set_capacity(
     .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     Ok(Json(CapacityOverride { override_date: date, capacity: request.capacity }))
+}
+
+// ── Day management ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct DayInput {
+    day_date: NaiveDate,
+    day_number: i16,
+    #[serde(default)]
+    notes: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PutDaysRequest {
+    days: Vec<DayInput>,
+}
+
+#[derive(Debug, Serialize)]
+struct DayResponse {
+    day_date: NaiveDate,
+    day_number: i16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notes: Option<String>,
+}
+
+/// `GET /api/v1/inquiries/{id}/days` — List all scheduled days for a multi-day inquiry.
+///
+/// **Caller**: Calendar frontend, inquiry detail page.
+/// **Why**: Returns the explicit day list so the UI can render multi-day inquiries
+/// and the admin can inspect or edit the schedule.
+async fn get_inquiry_days(
+    State(state): State<Arc<AppState>>,
+    Extension(_claims): Extension<TokenClaims>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Vec<DayResponse>>, ApiError> {
+    let rows: Vec<(NaiveDate, i16, Option<String>)> = sqlx::query_as(
+        "SELECT day_date, day_number, notes FROM inquiry_days WHERE inquiry_id = $1 ORDER BY day_number",
+    )
+    .bind(id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    Ok(Json(rows.into_iter().map(|(day_date, day_number, notes)| DayResponse { day_date, day_number, notes }).collect()))
+}
+
+/// `PUT /api/v1/inquiries/{id}/days` — Replace the full day list for an inquiry.
+///
+/// **Caller**: Calendar frontend when admin sets or edits multi-day schedule.
+/// **Why**: Full-replace semantics keep the client in control — no partial-update
+/// edge cases. Empty `days` array converts the inquiry back to single-day.
+///
+/// # Errors
+/// Returns 400 if any `day_number` values are duplicated or < 1.
+async fn put_inquiry_days(
+    State(state): State<Arc<AppState>>,
+    Extension(_claims): Extension<TokenClaims>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<PutDaysRequest>,
+) -> Result<Json<Vec<DayResponse>>, ApiError> {
+    // Validate day_numbers
+    let mut seen = std::collections::HashSet::new();
+    for d in &body.days {
+        if d.day_number < 1 {
+            return Err(ApiError::BadRequest("day_number must be >= 1".into()));
+        }
+        if !seen.insert(d.day_number) {
+            return Err(ApiError::BadRequest(format!("duplicate day_number: {}", d.day_number)));
+        }
+    }
+
+    let mut tx = state.db.begin().await.map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    sqlx::query("DELETE FROM inquiry_days WHERE inquiry_id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    for d in &body.days {
+        sqlx::query(
+            "INSERT INTO inquiry_days (inquiry_id, day_date, day_number, notes) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(id)
+        .bind(d.day_date)
+        .bind(d.day_number)
+        .bind(&d.notes)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    }
+
+    tx.commit().await.map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    Ok(Json(body.days.into_iter().map(|d| DayResponse { day_date: d.day_date, day_number: d.day_number, notes: d.notes }).collect()))
+}
+
+/// `GET /api/v1/calendar-items/{id}/days` — List all scheduled days for a multi-day calendar item.
+///
+/// **Caller**: Calendar frontend, Termine detail view.
+/// **Why**: Mirrors the inquiry days endpoint for calendar items (Termine).
+async fn get_calendar_item_days(
+    State(state): State<Arc<AppState>>,
+    Extension(_claims): Extension<TokenClaims>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Vec<DayResponse>>, ApiError> {
+    let rows: Vec<(NaiveDate, i16, Option<String>)> = sqlx::query_as(
+        "SELECT day_date, day_number, notes FROM calendar_item_days WHERE calendar_item_id = $1 ORDER BY day_number",
+    )
+    .bind(id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    Ok(Json(rows.into_iter().map(|(day_date, day_number, notes)| DayResponse { day_date, day_number, notes }).collect()))
+}
+
+/// `PUT /api/v1/calendar-items/{id}/days` — Replace the full day list for a calendar item.
+///
+/// **Caller**: Calendar frontend when admin edits multi-day Termin.
+/// **Why**: Full-replace semantics — empty `days` converts back to single-day.
+///
+/// # Errors
+/// Returns 400 if any `day_number` values are duplicated or < 1.
+async fn put_calendar_item_days(
+    State(state): State<Arc<AppState>>,
+    Extension(_claims): Extension<TokenClaims>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<PutDaysRequest>,
+) -> Result<Json<Vec<DayResponse>>, ApiError> {
+    let mut seen = std::collections::HashSet::new();
+    for d in &body.days {
+        if d.day_number < 1 {
+            return Err(ApiError::BadRequest("day_number must be >= 1".into()));
+        }
+        if !seen.insert(d.day_number) {
+            return Err(ApiError::BadRequest(format!("duplicate day_number: {}", d.day_number)));
+        }
+    }
+
+    let mut tx = state.db.begin().await.map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    sqlx::query("DELETE FROM calendar_item_days WHERE calendar_item_id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    for d in &body.days {
+        sqlx::query(
+            "INSERT INTO calendar_item_days (calendar_item_id, day_date, day_number, notes) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(id)
+        .bind(d.day_date)
+        .bind(d.day_number)
+        .bind(&d.notes)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    }
+
+    tx.commit().await.map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    Ok(Json(body.days.into_iter().map(|d| DayResponse { day_date: d.day_date, day_number: d.day_number, notes: d.notes }).collect()))
 }

@@ -1730,7 +1730,9 @@ async fn get_employee(
                da.city AS destination_city,
                COALESCE(i.scheduled_date, i.preferred_date::date) AS booking_date,
                ie.planned_hours::float8 AS planned_hours,
-               ie.actual_hours::float8 AS actual_hours,
+               CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
+                    THEN EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0
+                    ELSE NULL END AS actual_hours,
                ie.notes,
                i.status AS inquiry_status
         FROM inquiry_employees ie
@@ -1892,6 +1894,8 @@ async fn employee_hours_summary(
         destination_city: Option<String>,
         booking_date: Option<NaiveDate>,
         planned_hours: f64,
+        clock_in: Option<chrono::DateTime<chrono::Utc>>,
+        clock_out: Option<chrono::DateTime<chrono::Utc>>,
         actual_hours: Option<f64>,
         inquiry_status: String,
     }
@@ -1904,7 +1908,11 @@ async fn employee_hours_summary(
                da.city AS destination_city,
                COALESCE(i.scheduled_date, i.preferred_date::date) AS booking_date,
                ie.planned_hours::float8 AS planned_hours,
-               ie.actual_hours::float8 AS actual_hours,
+               ie.clock_in,
+               ie.clock_out,
+               CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
+                    THEN EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0
+                    ELSE NULL END AS actual_hours,
                i.status AS inquiry_status
         FROM inquiry_employees ie
         JOIN inquiries i ON ie.inquiry_id = i.id
@@ -1931,6 +1939,8 @@ async fn employee_hours_summary(
         location: Option<String>,
         scheduled_date: Option<NaiveDate>,
         planned_hours: f64,
+        clock_in: Option<chrono::DateTime<chrono::Utc>>,
+        clock_out: Option<chrono::DateTime<chrono::Utc>>,
         actual_hours: Option<f64>,
         status: String,
     }
@@ -1943,7 +1953,11 @@ async fn employee_hours_summary(
                ci.location,
                ci.scheduled_date,
                cie.planned_hours::float8 AS planned_hours,
-               cie.actual_hours::float8 AS actual_hours,
+               cie.clock_in,
+               cie.clock_out,
+               CASE WHEN cie.clock_out IS NOT NULL AND cie.clock_in IS NOT NULL
+                    THEN EXTRACT(EPOCH FROM (cie.clock_out - cie.clock_in)) / 3600.0
+                    ELSE NULL END AS actual_hours,
                ci.status
         FROM calendar_item_employees cie
         JOIN calendar_items ci ON ci.id = cie.calendar_item_id
@@ -1976,6 +1990,8 @@ async fn employee_hours_summary(
                 "destination_city": r.destination_city,
                 "booking_date": r.booking_date,
                 "planned_hours": r.planned_hours,
+                "clock_in": r.clock_in,
+                "clock_out": r.clock_out,
                 "actual_hours": r.actual_hours,
                 "status": r.inquiry_status,
             })
@@ -1996,6 +2012,8 @@ async fn employee_hours_summary(
                 "location": r.location,
                 "scheduled_date": r.scheduled_date,
                 "planned_hours": r.planned_hours,
+                "clock_in": r.clock_in,
+                "clock_out": r.clock_out,
                 "actual_hours": r.actual_hours,
                 "status": r.status,
             })
@@ -2050,14 +2068,20 @@ async fn fetch_employee_month_hours(
             COALESCE(SUM(planned_hours), 0.0)::float8 AS planned,
             COALESCE(SUM(COALESCE(actual_hours, planned_hours)), 0.0)::float8 AS actual
         FROM (
-            SELECT ie.planned_hours::float8, ie.actual_hours::float8
+            SELECT ie.planned_hours::float8,
+                   CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
+                        THEN EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0
+                        ELSE NULL END AS actual_hours
             FROM inquiry_employees ie
             JOIN inquiries i ON i.id = ie.inquiry_id
             WHERE ie.employee_id = $1
               AND COALESCE(i.scheduled_date, i.preferred_date::date, ie.created_at::date)
                   BETWEEN $2 AND $3
             UNION ALL
-            SELECT cie.planned_hours::float8, cie.actual_hours::float8
+            SELECT cie.planned_hours::float8,
+                   CASE WHEN cie.clock_out IS NOT NULL AND cie.clock_in IS NOT NULL
+                        THEN EXTRACT(EPOCH FROM (cie.clock_out - cie.clock_in)) / 3600.0
+                        ELSE NULL END AS actual_hours
             FROM calendar_item_employees cie
             JOIN calendar_items ci ON ci.id = cie.calendar_item_id
             WHERE cie.employee_id = $1

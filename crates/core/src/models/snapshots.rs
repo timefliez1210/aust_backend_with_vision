@@ -70,6 +70,23 @@ pub struct InquiryResponse {
     pub offer: Option<OfferSnapshot>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub employees: Vec<EmployeeAssignmentSnapshot>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scheduled_days: Vec<InquiryDaySnapshot>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_multi_day: bool,
+}
+
+/// One scheduled day within a multi-day inquiry.
+///
+/// **Caller**: `build_inquiry_response()`, `GET /api/v1/inquiries/{id}/days`
+/// **Why**: Multi-day moves need per-day records so the calendar can display
+/// the inquiry on every day it spans.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InquiryDaySnapshot {
+    pub day_date: NaiveDate,
+    pub day_number: i16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
 }
 
 /// Summary item for list endpoints.
@@ -206,13 +223,16 @@ pub struct LineItemSnapshot {
 /// Snapshot of an employee assignment on an inquiry.
 ///
 /// **Caller**: `build_inquiry_response()` in `inquiry_builder.rs`
-/// **Why**: Embeds assigned employee info in the canonical inquiry detail response
+/// **Why**: Embeds assigned employee info in the canonical inquiry detail response.
+/// `actual_hours` is derived from `clock_in`/`clock_out` — never stored in DB.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmployeeAssignmentSnapshot {
     pub employee_id: Uuid,
     pub first_name: String,
     pub last_name: String,
     pub planned_hours: f64,
+    pub clock_in: Option<DateTime<Utc>>,
+    pub clock_out: Option<DateTime<Utc>>,
     pub actual_hours: Option<f64>,
     pub notes: Option<String>,
 }

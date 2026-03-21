@@ -62,6 +62,7 @@ pub fn router() -> Router<Arc<AppState>> {
                 .delete(remove_assignment),
         )
         .merge(super::invoices::router())
+        .merge(super::calendar::inquiry_days_router())
 }
 
 /// Public submission routes (no auth required).
@@ -2263,6 +2264,8 @@ struct EmployeeAssignmentRow {
     last_name: String,
     email: String,
     planned_hours: f64,
+    clock_in: Option<chrono::DateTime<chrono::Utc>>,
+    clock_out: Option<chrono::DateTime<chrono::Utc>>,
     actual_hours: Option<f64>,
     notes: Option<String>,
 }
@@ -2282,7 +2285,11 @@ async fn list_inquiry_employees(
         r#"
         SELECT ie.employee_id, e.first_name, e.last_name, e.email,
                ie.planned_hours::float8 AS planned_hours,
-               ie.actual_hours::float8 AS actual_hours,
+               ie.clock_in,
+               ie.clock_out,
+               CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
+                    THEN EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0
+                    ELSE NULL END AS actual_hours,
                ie.notes
         FROM inquiry_employees ie
         JOIN employees e ON ie.employee_id = e.id
@@ -2384,15 +2391,17 @@ async fn update_assignment(
         r#"
         UPDATE inquiry_employees SET
             planned_hours = COALESCE($3, planned_hours),
-            actual_hours = COALESCE($4, actual_hours),
-            notes = COALESCE($5, notes)
+            clock_in      = COALESCE($4, clock_in),
+            clock_out     = COALESCE($5, clock_out),
+            notes         = COALESCE($6, notes)
         WHERE inquiry_id = $1 AND employee_id = $2
         "#,
     )
     .bind(id)
     .bind(emp_id)
     .bind(body.planned_hours)
-    .bind(body.actual_hours)
+    .bind(body.clock_in)
+    .bind(body.clock_out)
     .bind(&body.notes)
     .execute(&state.db)
     .await?;
@@ -2404,6 +2413,8 @@ async fn update_assignment(
     #[derive(sqlx::FromRow)]
     struct Updated {
         planned_hours: f64,
+        clock_in: Option<chrono::DateTime<chrono::Utc>>,
+        clock_out: Option<chrono::DateTime<chrono::Utc>>,
         actual_hours: Option<f64>,
         notes: Option<String>,
     }
@@ -2411,7 +2422,11 @@ async fn update_assignment(
     let row: Updated = sqlx::query_as(
         r#"
         SELECT planned_hours::float8 AS planned_hours,
-               actual_hours::float8 AS actual_hours,
+               clock_in,
+               clock_out,
+               CASE WHEN clock_out IS NOT NULL AND clock_in IS NOT NULL
+                    THEN EXTRACT(EPOCH FROM (clock_out - clock_in)) / 3600.0
+                    ELSE NULL END AS actual_hours,
                notes
         FROM inquiry_employees
         WHERE inquiry_id = $1 AND employee_id = $2
@@ -2426,6 +2441,8 @@ async fn update_assignment(
         "employee_id": emp_id,
         "inquiry_id": id,
         "planned_hours": row.planned_hours,
+        "clock_in": row.clock_in,
+        "clock_out": row.clock_out,
         "actual_hours": row.actual_hours,
         "notes": row.notes,
     })))
