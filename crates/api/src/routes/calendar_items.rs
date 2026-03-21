@@ -634,7 +634,7 @@ async fn update_item_employee(
                cie.clock_in,
                cie.clock_out,
                CASE WHEN cie.clock_out IS NOT NULL AND cie.clock_in IS NOT NULL
-                    THEN EXTRACT(EPOCH FROM (cie.clock_out - cie.clock_in)) / 3600.0
+                    THEN (EXTRACT(EPOCH FROM (cie.clock_out - cie.clock_in)) / 3600.0)::float8
                     ELSE NULL END AS actual_hours,
                cie.notes
         FROM calendar_item_employees cie
@@ -710,7 +710,7 @@ async fn fetch_item_employees(
                cie.clock_in,
                cie.clock_out,
                CASE WHEN cie.clock_out IS NOT NULL AND cie.clock_in IS NOT NULL
-                    THEN EXTRACT(EPOCH FROM (cie.clock_out - cie.clock_in)) / 3600.0
+                    THEN (EXTRACT(EPOCH FROM (cie.clock_out - cie.clock_in)) / 3600.0)::float8
                     ELSE NULL END AS actual_hours,
                cie.notes
         FROM calendar_item_employees cie

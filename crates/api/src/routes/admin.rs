@@ -1731,7 +1731,7 @@ async fn get_employee(
                COALESCE(i.scheduled_date, i.preferred_date::date) AS booking_date,
                ie.planned_hours::float8 AS planned_hours,
                CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
-                    THEN EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0
+                    THEN (EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0)::float8
                     ELSE NULL END AS actual_hours,
                ie.notes,
                i.status AS inquiry_status
@@ -1911,7 +1911,7 @@ async fn employee_hours_summary(
                ie.clock_in,
                ie.clock_out,
                CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
-                    THEN EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0
+                    THEN (EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0)::float8
                     ELSE NULL END AS actual_hours,
                i.status AS inquiry_status
         FROM inquiry_employees ie
@@ -1956,7 +1956,7 @@ async fn employee_hours_summary(
                cie.clock_in,
                cie.clock_out,
                CASE WHEN cie.clock_out IS NOT NULL AND cie.clock_in IS NOT NULL
-                    THEN EXTRACT(EPOCH FROM (cie.clock_out - cie.clock_in)) / 3600.0
+                    THEN (EXTRACT(EPOCH FROM (cie.clock_out - cie.clock_in)) / 3600.0)::float8
                     ELSE NULL END AS actual_hours,
                ci.status
         FROM calendar_item_employees cie
@@ -2070,7 +2070,7 @@ async fn fetch_employee_month_hours(
         FROM (
             SELECT ie.planned_hours::float8,
                    CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
-                        THEN EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0
+                        THEN (EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0)::float8
                         ELSE NULL END AS actual_hours
             FROM inquiry_employees ie
             JOIN inquiries i ON i.id = ie.inquiry_id
@@ -2080,7 +2080,7 @@ async fn fetch_employee_month_hours(
             UNION ALL
             SELECT cie.planned_hours::float8,
                    CASE WHEN cie.clock_out IS NOT NULL AND cie.clock_in IS NOT NULL
-                        THEN EXTRACT(EPOCH FROM (cie.clock_out - cie.clock_in)) / 3600.0
+                        THEN (EXTRACT(EPOCH FROM (cie.clock_out - cie.clock_in)) / 3600.0)::float8
                         ELSE NULL END AS actual_hours
             FROM calendar_item_employees cie
             JOIN calendar_items ci ON ci.id = cie.calendar_item_id

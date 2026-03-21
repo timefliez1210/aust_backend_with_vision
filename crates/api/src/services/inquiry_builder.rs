@@ -621,7 +621,7 @@ async fn fetch_employee_assignments(
                ie.clock_in,
                ie.clock_out,
                CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
-                    THEN EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0
+                    THEN (EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0)::float8
                     ELSE NULL END AS actual_hours,
                ie.notes
         FROM inquiry_employees ie

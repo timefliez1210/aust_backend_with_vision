@@ -358,7 +358,7 @@ async fn get_schedule(
             c.phone AS customer_phone,
             ie.planned_hours::float8 AS planned_hours,
             CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
-                 THEN EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0
+                 THEN (EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0)::float8
                  ELSE NULL END AS actual_hours
         FROM inquiry_employees ie
         JOIN inquiries  i  ON ie.inquiry_id = i.id
@@ -437,7 +437,7 @@ async fn get_schedule(
             ci.status,
             cie.planned_hours::float8 AS planned_hours,
             CASE WHEN cie.clock_out IS NOT NULL AND cie.clock_in IS NOT NULL
-                 THEN EXTRACT(EPOCH FROM (cie.clock_out - cie.clock_in)) / 3600.0
+                 THEN (EXTRACT(EPOCH FROM (cie.clock_out - cie.clock_in)) / 3600.0)::float8
                  ELSE NULL END AS actual_hours
         FROM calendar_item_employees cie
         JOIN calendar_items ci ON ci.id = cie.calendar_item_id
@@ -560,7 +560,7 @@ async fn get_job_detail(
     }
 
     let assign: Option<AssignRow> = sqlx::query_as(
-        "SELECT planned_hours::float8, CASE WHEN clock_out IS NOT NULL AND clock_in IS NOT NULL THEN EXTRACT(EPOCH FROM (clock_out - clock_in)) / 3600.0 ELSE NULL END AS actual_hours, notes FROM inquiry_employees WHERE inquiry_id = $1 AND employee_id = $2",
+        "SELECT planned_hours::float8, CASE WHEN clock_out IS NOT NULL AND clock_in IS NOT NULL THEN (EXTRACT(EPOCH FROM (clock_out - clock_in)) / 3600.0)::float8 ELSE NULL END AS actual_hours, notes FROM inquiry_employees WHERE inquiry_id = $1 AND employee_id = $2",
     )
     .bind(inquiry_id)
     .bind(claims.employee_id)
@@ -744,7 +744,7 @@ async fn get_hours(
             da.city                                           AS destination_city,
             ie.planned_hours::float8                          AS planned_hours,
             CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
-                 THEN EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0
+                 THEN (EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0)::float8
                  ELSE NULL END                                AS actual_hours,
             i.status                                          AS status
         FROM inquiry_employees ie
@@ -768,7 +768,7 @@ async fn get_hours(
             NULL::text               AS destination_city,
             cie.planned_hours::float8 AS planned_hours,
             CASE WHEN cie.clock_out IS NOT NULL AND cie.clock_in IS NOT NULL
-                 THEN EXTRACT(EPOCH FROM (cie.clock_out - cie.clock_in)) / 3600.0
+                 THEN (EXTRACT(EPOCH FROM (cie.clock_out - cie.clock_in)) / 3600.0)::float8
                  ELSE NULL END        AS actual_hours,
             ci.status                AS status
         FROM calendar_item_employees cie

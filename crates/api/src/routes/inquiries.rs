@@ -2288,7 +2288,7 @@ async fn list_inquiry_employees(
                ie.clock_in,
                ie.clock_out,
                CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
-                    THEN EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0
+                    THEN (EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0)::float8
                     ELSE NULL END AS actual_hours,
                ie.notes
         FROM inquiry_employees ie
@@ -2425,7 +2425,7 @@ async fn update_assignment(
                clock_in,
                clock_out,
                CASE WHEN clock_out IS NOT NULL AND clock_in IS NOT NULL
-                    THEN EXTRACT(EPOCH FROM (clock_out - clock_in)) / 3600.0
+                    THEN (EXTRACT(EPOCH FROM (clock_out - clock_in)) / 3600.0)::float8
                     ELSE NULL END AS actual_hours,
                notes
         FROM inquiry_employees
