@@ -1,9 +1,10 @@
 use axum::{
     extract::{Path, Query, State},
+    http::StatusCode,
     routing::{get, post},
     Extension, Json, Router,
 };
-use chrono::{NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -34,6 +35,7 @@ pub fn protected_router() -> Router<Arc<AppState>> {
         .route("/me", get(get_profile))
         .route("/schedule", get(get_schedule))
         .route("/jobs/{id}", get(get_job_detail))
+        .route("/jobs/{id}/clock", axum::routing::patch(patch_employee_clock))
         .route("/hours", get(get_hours))
 }
 
@@ -510,25 +512,27 @@ struct JobDetail {
     origin_street: Option<String>,
     origin_city: Option<String>,
     origin_postal_code: Option<String>,
-    origin_floor: Option<i32>,
+    origin_floor: Option<String>,
     origin_elevator: Option<bool>,
     // Destination
     destination_street: Option<String>,
     destination_city: Option<String>,
     destination_postal_code: Option<String>,
-    destination_floor: Option<i32>,
+    destination_floor: Option<String>,
     destination_elevator: Option<bool>,
     // Volume
     estimated_volume_m3: Option<f64>,
     items: Vec<ItemInfo>,
-    // Customer contact (logistics only)
+    // Customer contact — phone only, no financial data
     customer_name: Option<String>,
     customer_phone: Option<String>,
-    customer_email: Option<String>,
     // Assignment
     planned_hours: f64,
-    actual_hours: Option<f64>,
     notes: Option<String>,
+    // Employee self-reported times (editable via PATCH /jobs/{id}/clock)
+    employee_clock_in: Option<DateTime<Utc>>,
+    employee_clock_out: Option<DateTime<Utc>>,
+    employee_actual_hours: Option<f64>,
     // Team
     colleague_names: Vec<String>,
 }
@@ -551,16 +555,24 @@ async fn get_job_detail(
     Extension(claims): Extension<EmployeeClaims>,
     Path(inquiry_id): Path<Uuid>,
 ) -> Result<Json<JobDetail>, ApiError> {
-    // Verify assignment + fetch assignment fields
+    // Verify assignment + fetch assignment fields (including employee self-reported times)
     #[derive(sqlx::FromRow)]
     struct AssignRow {
         planned_hours: f64,
-        actual_hours: Option<f64>,
         notes: Option<String>,
+        employee_clock_in: Option<DateTime<Utc>>,
+        employee_clock_out: Option<DateTime<Utc>>,
     }
 
     let assign: Option<AssignRow> = sqlx::query_as(
-        "SELECT planned_hours::float8, CASE WHEN clock_out IS NOT NULL AND clock_in IS NOT NULL THEN (EXTRACT(EPOCH FROM (clock_out - clock_in)) / 3600.0)::float8 ELSE NULL END AS actual_hours, notes FROM inquiry_employees WHERE inquiry_id = $1 AND employee_id = $2",
+        r#"
+        SELECT planned_hours::float8,
+               notes,
+               employee_clock_in,
+               employee_clock_out
+        FROM inquiry_employees
+        WHERE inquiry_id = $1 AND employee_id = $2
+        "#,
     )
     .bind(inquiry_id)
     .bind(claims.employee_id)
@@ -571,7 +583,7 @@ async fn get_job_detail(
         ApiError::NotFound("Einsatz nicht gefunden oder keine Berechtigung".into())
     })?;
 
-    // Fetch inquiry + addresses + customer
+    // Fetch inquiry + addresses + customer (floor stored as VARCHAR in DB)
     #[derive(sqlx::FromRow)]
     struct InquiryRow {
         job_date: Option<NaiveDate>,
@@ -580,16 +592,15 @@ async fn get_job_detail(
         origin_street: Option<String>,
         origin_city: Option<String>,
         origin_postal_code: Option<String>,
-        origin_floor: Option<i32>,
+        origin_floor: Option<String>,
         origin_elevator: Option<bool>,
         destination_street: Option<String>,
         destination_city: Option<String>,
         destination_postal_code: Option<String>,
-        destination_floor: Option<i32>,
+        destination_floor: Option<String>,
         destination_elevator: Option<bool>,
         customer_name: Option<String>,
         customer_phone: Option<String>,
-        customer_email: Option<String>,
     }
 
     let row: Option<InquiryRow> = sqlx::query_as(
@@ -609,8 +620,7 @@ async fn get_job_detail(
             da.floor       AS destination_floor,
             da.elevator    AS destination_elevator,
             COALESCE(c.first_name || ' ' || c.last_name, c.name) AS customer_name,
-            c.phone  AS customer_phone,
-            c.email  AS customer_email
+            c.phone  AS customer_phone
         FROM inquiries i
         JOIN customers c ON i.customer_id = c.id
         LEFT JOIN addresses oa ON i.origin_address_id      = oa.id
@@ -623,6 +633,19 @@ async fn get_job_detail(
     .await?;
 
     let row = row.ok_or_else(|| ApiError::NotFound("Anfrage nicht gefunden".into()))?;
+
+    // Compute employee actual hours from their self-reported times
+    let employee_actual_hours = match (assign.employee_clock_in, assign.employee_clock_out) {
+        (Some(ci), Some(co)) => {
+            let secs = (co - ci).num_seconds();
+            if secs > 0 {
+                Some(secs as f64 / 3600.0)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
 
     // Fetch items from latest volume estimation
     let items = fetch_estimation_items(&state.db, inquiry_id).await?;
@@ -650,12 +673,79 @@ async fn get_job_detail(
         items,
         customer_name: row.customer_name,
         customer_phone: row.customer_phone,
-        customer_email: row.customer_email,
         planned_hours: assign.planned_hours,
-        actual_hours: assign.actual_hours,
         notes: assign.notes,
+        employee_clock_in: assign.employee_clock_in,
+        employee_clock_out: assign.employee_clock_out,
+        employee_actual_hours,
         colleague_names,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Protected: Employee self-reported clock times
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct ClockBody {
+    employee_clock_in: Option<String>,
+    employee_clock_out: Option<String>,
+}
+
+/// `PATCH /employee/jobs/{id}/clock` — employee submits their own clock-in/out.
+///
+/// **Caller**: Worker portal job detail page (post-job time logging).
+/// **Why**: Employees report their actual start/end times independently of what the admin sets.
+///          Both sets are stored and shown side-by-side in the admin interface for
+///          discrepancy checking. Only the authenticated employee can write their own times.
+///
+/// # Parameters
+/// - `id` — Inquiry UUID
+/// - `employee_clock_in`  — ISO 8601 datetime string or null to clear
+/// - `employee_clock_out` — ISO 8601 datetime string or null to clear
+async fn patch_employee_clock(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<EmployeeClaims>,
+    Path(inquiry_id): Path<Uuid>,
+    Json(body): Json<ClockBody>,
+) -> Result<StatusCode, ApiError> {
+    let parse_dt = |s: Option<String>| -> Result<Option<DateTime<Utc>>, ApiError> {
+        match s {
+            None => Ok(None),
+            Some(ref v) if v.is_empty() => Ok(None),
+            Some(v) => v
+                .parse::<DateTime<Utc>>()
+                .map(Some)
+                .map_err(|_| ApiError::Validation(format!("Ungültiges Datumsformat: {v}"))),
+        }
+    };
+
+    let clock_in = parse_dt(body.employee_clock_in)?;
+    let clock_out = parse_dt(body.employee_clock_out)?;
+
+    let rows = sqlx::query(
+        r#"
+        UPDATE inquiry_employees
+        SET employee_clock_in  = $1,
+            employee_clock_out = $2,
+            updated_at         = NOW()
+        WHERE inquiry_id = $3 AND employee_id = $4
+        "#,
+    )
+    .bind(clock_in)
+    .bind(clock_out)
+    .bind(inquiry_id)
+    .bind(claims.employee_id)
+    .execute(&state.db)
+    .await?;
+
+    if rows.rows_affected() == 0 {
+        return Err(ApiError::NotFound(
+            "Einsatz nicht gefunden oder keine Berechtigung".into(),
+        ));
+    }
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ---------------------------------------------------------------------------

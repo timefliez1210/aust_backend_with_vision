@@ -611,6 +611,9 @@ async fn fetch_employee_assignments(
         clock_in: Option<DateTime<Utc>>,
         clock_out: Option<DateTime<Utc>>,
         actual_hours: Option<f64>,
+        employee_clock_in: Option<DateTime<Utc>>,
+        employee_clock_out: Option<DateTime<Utc>>,
+        employee_actual_hours: Option<f64>,
         notes: Option<String>,
     }
 
@@ -623,6 +626,11 @@ async fn fetch_employee_assignments(
                CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
                     THEN (EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0)::float8
                     ELSE NULL END AS actual_hours,
+               ie.employee_clock_in,
+               ie.employee_clock_out,
+               CASE WHEN ie.employee_clock_out IS NOT NULL AND ie.employee_clock_in IS NOT NULL
+                    THEN (EXTRACT(EPOCH FROM (ie.employee_clock_out - ie.employee_clock_in)) / 3600.0)::float8
+                    ELSE NULL END AS employee_actual_hours,
                ie.notes
         FROM inquiry_employees ie
         JOIN employees e ON ie.employee_id = e.id
@@ -644,6 +652,9 @@ async fn fetch_employee_assignments(
             clock_in: r.clock_in,
             clock_out: r.clock_out,
             actual_hours: r.actual_hours,
+            employee_clock_in: r.employee_clock_in,
+            employee_clock_out: r.employee_clock_out,
+            employee_actual_hours: r.employee_actual_hours,
             notes: r.notes,
         })
         .collect())

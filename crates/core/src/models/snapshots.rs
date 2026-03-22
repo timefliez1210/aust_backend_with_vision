@@ -224,16 +224,23 @@ pub struct LineItemSnapshot {
 ///
 /// **Caller**: `build_inquiry_response()` in `inquiry_builder.rs`
 /// **Why**: Embeds assigned employee info in the canonical inquiry detail response.
-/// `actual_hours` is derived from `clock_in`/`clock_out` — never stored in DB.
+/// `actual_hours` is derived from admin `clock_in`/`clock_out`.
+/// `employee_actual_hours` is derived from `employee_clock_in`/`employee_clock_out`.
+/// Both sets are stored separately so the admin can spot discrepancies.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmployeeAssignmentSnapshot {
     pub employee_id: Uuid,
     pub first_name: String,
     pub last_name: String,
     pub planned_hours: f64,
+    /// Admin-set clock times
     pub clock_in: Option<DateTime<Utc>>,
     pub clock_out: Option<DateTime<Utc>>,
     pub actual_hours: Option<f64>,
+    /// Employee self-reported clock times (from worker portal)
+    pub employee_clock_in: Option<DateTime<Utc>>,
+    pub employee_clock_out: Option<DateTime<Utc>>,
+    pub employee_actual_hours: Option<f64>,
     pub notes: Option<String>,
 }
 
