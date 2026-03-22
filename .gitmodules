@@ -1,3 +1,6 @@
 [submodule "frontend"]
 	path = frontend
 	url = git@github.com:timefliez1210/aust-umzuege.git
+[submodule "app"]
+	path = app
+	url = git@github.com:timefliez1210/aust_app.git
