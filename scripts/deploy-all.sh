@@ -94,7 +94,7 @@ fi
 ok "frontend/.env present with FTP_PASS"
 
 # Uncommitted changes on backend (submodule pointer changes are OK — we update it here)
-if [ -n "$(git -C "${PROJECT_DIR}" status --porcelain -- ':!frontend')" ]; then
+if [ -n "$(git -C "${PROJECT_DIR}" status --porcelain -- ':!frontend' ':!app')" ]; then
     fail "Uncommitted changes in backend. Commit or stash first."
 fi
 ok "Working tree clean"
