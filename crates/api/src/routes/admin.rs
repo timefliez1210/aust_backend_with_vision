@@ -2,7 +2,7 @@ use axum::{
     extract::{Multipart, Path, Query, State},
     http::header,
     response::Response,
-    routing::{get, patch, post},
+    routing::{delete, get, patch, post},
     Extension, Json, Router,
 };
 use bytes::Bytes;
@@ -48,6 +48,8 @@ pub fn router() -> Router<Arc<AppState>> {
                 .get(download_employee_document)
                 .delete(delete_employee_document),
         )
+        .route("/notes", get(list_notes).post(create_note))
+        .route("/notes/{id}", patch(update_note).delete(delete_note))
 }
 
 // --- Dashboard ---
@@ -2328,4 +2330,130 @@ async fn delete_employee_document(
     tracing::info!("Employee {id}: deleted {doc_type}");
     let employee = fetch_employee_json(&state.db, id).await?;
     Ok(Json(employee))
+}
+
+// --- Notes (Notepad) ---
+
+#[derive(Debug, Serialize, FromRow)]
+struct NoteRow {
+    id: Uuid,
+    title: String,
+    content: String,
+    color: String,
+    pinned: bool,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+/// `GET /api/v1/admin/notes` — List all notes, pinned first, then by most recent.
+///
+/// **Caller**: Admin notepad panel.
+/// **Why**: Returns all notes for the floating notepad widget.
+///
+/// # Returns
+/// `200 OK` with `{ notes: [...] }`.
+async fn list_notes(
+    State(state): State<Arc<AppState>>,
+    Extension(_claims): Extension<TokenClaims>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let notes: Vec<NoteRow> = sqlx::query_as(
+        "SELECT id, title, content, color, pinned, created_at, updated_at
+         FROM notes ORDER BY pinned DESC, created_at DESC",
+    )
+    .fetch_all(&state.db)
+    .await?;
+
+    Ok(Json(serde_json::json!({ "notes": notes })))
+}
+
+/// `POST /api/v1/admin/notes` — Create a new note.
+///
+/// **Caller**: Admin notepad panel "new note" action.
+/// **Why**: Persists a freeform note created by an admin user.
+///
+/// # Returns
+/// `201 Created` with the new `NoteRow` JSON.
+async fn create_note(
+    State(state): State<Arc<AppState>>,
+    Extension(_claims): Extension<TokenClaims>,
+    Json(body): Json<aust_core::models::CreateNote>,
+) -> Result<(axum::http::StatusCode, Json<NoteRow>), ApiError> {
+    let id = uuid::Uuid::now_v7();
+    let title = body.title.unwrap_or_default();
+    let content = body.content.unwrap_or_default();
+    let color = body.color.unwrap_or_else(|| "default".into());
+    let pinned = body.pinned.unwrap_or(false);
+
+    let note: NoteRow = sqlx::query_as(
+        "INSERT INTO notes (id, title, content, color, pinned)
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING id, title, content, color, pinned, created_at, updated_at",
+    )
+    .bind(id)
+    .bind(&title)
+    .bind(&content)
+    .bind(&color)
+    .bind(pinned)
+    .fetch_one(&state.db)
+    .await?;
+
+    Ok((axum::http::StatusCode::CREATED, Json(note)))
+}
+
+/// `PATCH /api/v1/admin/notes/{id}` — Update an existing note.
+///
+/// **Caller**: Admin notepad panel inline editing.
+/// **Why**: Saves changes to note title, content, color, or pin state.
+///
+/// # Returns
+/// `200 OK` with the updated `NoteRow` JSON.
+async fn update_note(
+    State(state): State<Arc<AppState>>,
+    Extension(_claims): Extension<TokenClaims>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<aust_core::models::UpdateNote>,
+) -> Result<Json<NoteRow>, ApiError> {
+    let note: NoteRow = sqlx::query_as(
+        "UPDATE notes
+         SET title   = COALESCE($2, title),
+             content = COALESCE($3, content),
+             color   = COALESCE($4, color),
+             pinned  = COALESCE($5, pinned)
+         WHERE id = $1
+         RETURNING id, title, content, color, pinned, created_at, updated_at",
+    )
+    .bind(id)
+    .bind(&body.title)
+    .bind(&body.content)
+    .bind(&body.color)
+    .bind(body.pinned)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Notiz nicht gefunden.".into()))?;
+
+    Ok(Json(note))
+}
+
+/// `DELETE /api/v1/admin/notes/{id}` — Delete a note.
+///
+/// **Caller**: Admin notepad panel delete action.
+/// **Why**: Permanently removes a note.
+///
+/// # Returns
+/// `204 No Content` on success.
+async fn delete_note(
+    State(state): State<Arc<AppState>>,
+    Extension(_claims): Extension<TokenClaims>,
+    Path(id): Path<Uuid>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    let result = sqlx::query("DELETE FROM notes WHERE id = $1")
+        .bind(id)
+        .execute(&state.db)
+        .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(ApiError::NotFound("Notiz nicht gefunden.".into()));
+    }
+
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }

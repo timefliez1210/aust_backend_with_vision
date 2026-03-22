@@ -3,6 +3,7 @@ mod customer;
 mod email;
 mod employee;
 mod inquiry;
+mod note;
 mod offer;
 mod quote;
 pub mod snapshots;
@@ -14,6 +15,7 @@ pub use customer::*;
 pub use email::*;
 pub use employee::*;
 pub use inquiry::*;
+pub use note::*;
 pub use offer::*;
 pub use quote::*;
 pub use snapshots::{
