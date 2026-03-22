@@ -605,10 +605,14 @@ async fn update_item_employee(
     let result = sqlx::query(
         r#"
         UPDATE calendar_item_employees SET
-            planned_hours = COALESCE($3, planned_hours),
-            clock_in      = COALESCE($4, clock_in),
-            clock_out     = COALESCE($5, clock_out),
-            notes         = COALESCE($6, notes)
+            clock_in  = COALESCE($4, clock_in),
+            clock_out = COALESCE($5, clock_out),
+            planned_hours = CASE
+                WHEN COALESCE($4, clock_in) IS NOT NULL AND COALESCE($5, clock_out) IS NOT NULL
+                THEN (EXTRACT(EPOCH FROM (COALESCE($5, clock_out) - COALESCE($4, clock_in))) / 3600.0)::float8
+                ELSE COALESCE($3, planned_hours)
+            END,
+            notes = COALESCE($6, notes)
         WHERE calendar_item_id = $1 AND employee_id = $2
         "#,
     )
