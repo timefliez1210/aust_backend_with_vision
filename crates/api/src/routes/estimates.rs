@@ -11,8 +11,7 @@ use sqlx::FromRow;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::repositories::estimation_repo;
-use crate::services::db::{insert_estimation, update_quote_volume};
+use crate::repositories::{estimation_repo, inquiry_repo};
 use crate::services::offer_pipeline::try_auto_generate_offer;
 use crate::{services, ApiError, AppState};
 use aust_core::models::{EstimationMethod, InventoryForm, VolumeEstimation};
@@ -58,23 +57,6 @@ struct VolumeEstimationRow {
 
 impl From<VolumeEstimationRow> for VolumeEstimation {
     fn from(row: VolumeEstimationRow) -> Self {
-        let method: EstimationMethod = row.method.parse().unwrap_or(EstimationMethod::Manual);
-        VolumeEstimation {
-            id: row.id,
-            inquiry_id: row.inquiry_id,
-            method,
-            status: row.status,
-            source_data: row.source_data,
-            result_data: row.result_data,
-            total_volume_m3: row.total_volume_m3,
-            confidence_score: row.confidence_score,
-            created_at: row.created_at,
-        }
-    }
-}
-
-impl From<crate::services::db::EstimationRow> for VolumeEstimation {
-    fn from(row: crate::services::db::EstimationRow) -> Self {
         let method: EstimationMethod = row.method.parse().unwrap_or(EstimationMethod::Manual);
         VolumeEstimation {
             id: row.id,
@@ -193,7 +175,7 @@ async fn vision_estimate(
     });
     let result_data = serde_json::to_value(&results).ok();
 
-    let est = insert_estimation(
+    let est = estimation_repo::insert_returning(
         &state.db,
         id,
         request.inquiry_id,
@@ -206,7 +188,7 @@ async fn vision_estimate(
     )
     .await?;
 
-    update_quote_volume(&state.db, request.inquiry_id, total_volume, "volume_estimated", now).await?;
+    inquiry_repo::update_volume_and_status(&state.db, request.inquiry_id, total_volume, "volume_estimated", now).await?;
 
     // Auto-generate offer in background
     let state_clone = state.clone();
@@ -307,7 +289,7 @@ async fn depth_sensor_estimate(
         "s3_keys": s3_keys,
     });
 
-    let est = insert_estimation(
+    let est = estimation_repo::insert_returning(
         &state.db,
         id,
         inquiry_id,
@@ -320,7 +302,7 @@ async fn depth_sensor_estimate(
     )
     .await?;
 
-    update_quote_volume(&state.db, inquiry_id, total_volume, "volume_estimated", now).await?;
+    inquiry_repo::update_volume_and_status(&state.db, inquiry_id, total_volume, "volume_estimated", now).await?;
 
     // Auto-generate offer in background
     let state_clone = state.clone();
@@ -637,7 +619,7 @@ async fn process_video_background(
         .unwrap_or(0.0);
 
     // Update quote with combined estimated volume
-    let _ = update_quote_volume(&state.db, inquiry_id, combined_volume, "volume_estimated", now).await;
+    let _ = inquiry_repo::update_volume_and_status(&state.db, inquiry_id, combined_volume, "volume_estimated", now).await;
 
     tracing::info!(%inquiry_id, %estimation_id, combined_volume, "Background: all video estimations completed, triggering offer generation");
 
@@ -682,7 +664,7 @@ async fn inventory_estimate(
     let now = chrono::Utc::now();
 
     let source_data = serde_json::to_value(&request.inventory).unwrap_or_default();
-    let est = insert_estimation(
+    let est = estimation_repo::insert_returning(
         &state.db,
         id,
         request.inquiry_id,
@@ -695,7 +677,7 @@ async fn inventory_estimate(
     )
     .await?;
 
-    update_quote_volume(&state.db, request.inquiry_id, total_volume, "volume_estimated", now).await?;
+    inquiry_repo::update_volume_and_status(&state.db, request.inquiry_id, total_volume, "volume_estimated", now).await?;
 
     // Auto-generate offer in background
     let state_clone = state.clone();

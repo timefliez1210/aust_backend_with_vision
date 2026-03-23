@@ -1,4 +1,3 @@
-pub(crate) mod db;
 pub(crate) mod email;
 pub(crate) mod email_dispatch;
 pub(crate) mod inquiry_builder;

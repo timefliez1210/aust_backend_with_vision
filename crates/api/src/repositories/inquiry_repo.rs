@@ -133,7 +133,7 @@ pub(crate) async fn update_distance(
 
 /// Update inquiry volume and status after estimation completes.
 ///
-/// **Caller**: `services::db::update_quote_volume` (moved here)
+/// **Caller**: `estimates::vision_estimate`, `estimates::depth_sensor_estimate`, `estimates::inventory_estimate`, `estimates::process_video_background`
 /// **Why**: Volume estimation completion triggers a status change and volume write.
 pub(crate) async fn update_volume_and_status(
     pool: &PgPool,

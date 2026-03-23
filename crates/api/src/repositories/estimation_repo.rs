@@ -191,6 +191,60 @@ pub(crate) async fn update_results(
     Ok(())
 }
 
+/// Insert a completed estimation record and return the full row.
+///
+/// **Caller**: `estimates::vision_estimate`, `estimates::depth_sensor_estimate`, `estimates::inventory_estimate`
+/// **Why**: These synchronous estimation paths need the returned row to build the
+///          VolumeEstimation response immediately after insert.
+///
+/// # Parameters
+/// - `pool` — DB connection pool
+/// - `id` — pre-generated estimation UUID (v7)
+/// - `inquiry_id` — parent inquiry UUID
+/// - `method` — estimation method string ("vision", "depth_sensor", "inventory")
+/// - `source_data` — JSONB with S3 keys or inventory form data
+/// - `result_data` — optional JSONB with detected items / results
+/// - `total_volume_m3` — computed total volume
+/// - `confidence_score` — model confidence in [0, 1]
+/// - `now` — timestamp for `created_at`
+///
+/// # Returns
+/// The inserted `EstimationRow` with all fields populated.
+///
+/// # Errors
+/// Returns `sqlx::Error` on DB failure.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn insert_returning(
+    pool: &PgPool,
+    id: Uuid,
+    inquiry_id: Uuid,
+    method: &str,
+    source_data: &serde_json::Value,
+    result_data: Option<&serde_json::Value>,
+    total_volume_m3: f64,
+    confidence_score: f64,
+    now: DateTime<Utc>,
+) -> Result<EstimationRow, sqlx::Error> {
+    sqlx::query_as(
+        r#"
+        INSERT INTO volume_estimations
+            (id, inquiry_id, method, source_data, result_data, total_volume_m3, confidence_score, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        RETURNING id, inquiry_id, method, status, source_data, result_data, total_volume_m3, confidence_score, created_at
+        "#,
+    )
+    .bind(id)
+    .bind(inquiry_id)
+    .bind(method)
+    .bind(source_data)
+    .bind(result_data)
+    .bind(total_volume_m3)
+    .bind(confidence_score)
+    .bind(now)
+    .fetch_one(pool)
+    .await
+}
+
 /// Insert a processing estimation and return the full row.
 ///
 /// **Caller**: `estimates::video_estimate`

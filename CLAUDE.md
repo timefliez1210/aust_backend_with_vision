@@ -522,24 +522,6 @@ Switch providers via `AUST__LLM__DEFAULT_PROVIDER` (claude/openai/ollama)
 
 # TODOs
 
-## High Priority
-
-### Direct API Endpoints (Sources C + D)
-- [x] `POST /api/v1/submit/photo` — multipart form + photos for webapp
-- [x] `POST /api/v1/submit/mobile` — multipart form + photos + depth maps for mobile app
-- [x] Wire both into vision pipeline → offer generation → Telegram approval
-
-### Missing Offer Data
-- [x] Auto-trigger distance calculation when addresses exist (`try_auto_generate_offer` now runs ORS when `distance_km=0`)
-- [x] Add elevator field to addresses table (migration done; form wiring for email path still partial)
-- [x] Salutation detection: form sends M/F/D → stored in DB; name-based heuristic kept as legacy fallback
-
-### Authentication
-- [ ] Implement proper JWT token generation in `crates/api/src/routes/auth.rs`
-- [ ] Implement password hashing with Argon2
-- [ ] Add JWT validation middleware
-- [ ] Protect API routes with auth middleware
-
 ## Medium Priority
 
 ### Volume Estimation
@@ -551,42 +533,21 @@ Switch providers via `AUST__LLM__DEFAULT_PROVIDER` (claude/openai/ollama)
 ### Pricing Engine
 - [ ] Make pricing configurable via database (currently hardcoded rates)
 - [ ] Add seasonal/weekend/holiday pricing (Saturday surcharge exists: +€50)
-- [x] Store services as JSONB on inquiries instead of comma-separated text in `notes`
-
-### Distance Calculator
-- [ ] Add travel time estimation
 
 ## Low Priority
 
 ### API
 - [ ] Add OpenAPI/Swagger documentation
-- [ ] Add rate limiting middleware
+- [ ] Add rate limiting middleware (login endpoint especially)
 - [ ] Add pagination metadata
 
 ### Observability
 - [ ] Structured logging with request IDs
 - [ ] Prometheus metrics endpoint
 
-### Testing
-- [x] Unit tests for pricing engine and volume calculator
-- [x] Integration tests with test database
-- [x] API endpoint tests
-
 ### DevOps
 - [ ] GitHub Actions CI/CD
-- [x] Database backup strategy
-- [x] Deploy script with pre-deploy backup
 
 ## Technical Debt
 
-- [x] Remove legacy `/quotes`, `/offers`, `/distance` route stubs (superseded by `/inquiries`)
-- [x] Delete old `crates/api/src/routes/quotes.rs` and `distance.rs`
-- [x] Delete orphaned frontend `/admin/offers` pages (offers embedded in inquiry detail)
-- [x] Remove dead `status_sync.rs` (sync_quote_* functions never wired; offer status synced inline in customer.rs)
-- [x] Extract repository layer — all SQL centralized in `repositories/*_repo.rs`
-- [x] Split god-files: admin.rs, inquiries.rs, orchestrator.rs, offers.rs
-- [x] Remove legacy Quote type
-- [x] Upgrade to Rust edition 2024
-- [ ] Migrate `/estimates` protected handlers to use repo layer (last route file with inline SQL via `services/db.rs`)
-- [ ] Rename `update_quote_volume` → `update_inquiry_volume` in `services/db.rs`
-- [ ] Restore `/distance/calculate` endpoint or embed route geometry in inquiry response (route map broken)
+No outstanding items.
