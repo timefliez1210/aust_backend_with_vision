@@ -2,7 +2,7 @@
 //! and parse natural-language edit instructions via LLM or regex fallback.
 
 use crate::repositories::{inquiry_repo, offer_repo};
-use crate::routes::offers::{build_offer_with_overrides, GeneratedOffer, OfferOverrides};
+use crate::services::offer_builder::{build_offer_with_overrides, GeneratedOffer, OfferOverrides};
 use crate::AppState;
 use aust_core::config::TelegramConfig;
 use aust_llm_providers::{LlmMessage, LlmProvider};

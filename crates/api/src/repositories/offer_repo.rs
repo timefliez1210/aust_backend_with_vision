@@ -323,7 +323,7 @@ pub(crate) async fn insert_returning(
 pub(crate) async fn fetch_inquiry_for_offer(
     pool: &PgPool,
     inquiry_id: Uuid,
-) -> Result<Option<crate::routes::shared::InquiryRow>, sqlx::Error> {
+) -> Result<Option<crate::types::InquiryRow>, sqlx::Error> {
     sqlx::query_as(
         r#"
         SELECT id, customer_id, origin_address_id, destination_address_id, stop_address_id,

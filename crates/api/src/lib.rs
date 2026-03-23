@@ -5,6 +5,7 @@ pub(crate) mod repositories;
 pub mod routes;
 pub mod services;
 pub mod state;
+pub(crate) mod types;
 
 #[cfg(test)]
 pub(crate) mod test_helpers;

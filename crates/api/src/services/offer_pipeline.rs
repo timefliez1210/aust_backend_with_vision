@@ -4,7 +4,7 @@
 //! then calls `build_offer` and forwards the PDF to Telegram.
 
 use crate::repositories::{address_repo, inquiry_repo, offer_repo};
-use crate::routes::offers::build_offer;
+use crate::services::offer_builder::build_offer;
 use crate::services::telegram_service::{notify_telegram_error, send_offer_to_telegram};
 use crate::AppState;
 use aust_distance_calculator::{RouteCalculator, RouteRequest};

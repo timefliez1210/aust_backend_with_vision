@@ -15,7 +15,7 @@ use aust_core::models::{
 use crate::repositories::{
     address_repo, customer_repo, estimation_repo, inquiry_repo, offer_repo,
 };
-use crate::routes::offers::{parse_detected_items, VolumeEstimationRow};
+use crate::services::offer_builder::{parse_detected_items, VolumeEstimationRow};
 use crate::ApiError;
 
 // ---------------------------------------------------------------------------

@@ -33,7 +33,7 @@ impl CustomerRow {
             (Some("D"), Some(ln)) => format!("Sehr geehrte Person {ln},"),
             _ => {
                 let name = self.name.as_deref().unwrap_or(&self.email);
-                crate::routes::offers::detect_salutation_and_greeting(name).1
+                crate::services::offer_builder::detect_salutation_and_greeting(name).1
             }
         }
     }
@@ -46,7 +46,7 @@ impl CustomerRow {
             Some("D") => "Divers".to_string(),
             _ => {
                 let name = self.name.as_deref().unwrap_or(&self.email);
-                crate::routes::offers::detect_salutation_and_greeting(name).0
+                crate::services::offer_builder::detect_salutation_and_greeting(name).0
             }
         }
     }

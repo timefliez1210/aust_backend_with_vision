@@ -4,7 +4,7 @@ use uuid::Uuid;
 use crate::ApiError;
 use crate::repositories::{AddressRow, CustomerRow};
 use crate::repositories::{address_repo, customer_repo, offer_repo};
-use crate::routes::shared::InquiryRow;
+use crate::types::InquiryRow;
 use aust_core::config::Config;
 use aust_core::models::{
     DepthSensorResult, DetectedItem, Inquiry, Offer, OfferStatus, PricingInput, Services,
