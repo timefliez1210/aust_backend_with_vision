@@ -660,7 +660,7 @@ mod integration_tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
 
-        // Quote should have synced to "accepted"
+        // Inquiry should have synced to "accepted"
         let status = get_quote_status(&pool, inquiry_id).await;
         assert_eq!(status, "accepted");
     }
@@ -682,7 +682,7 @@ mod integration_tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
 
-        // Quote should sync to "rejected" (no active bookings remain)
+        // Inquiry should sync to "rejected" (no active bookings remain)
         let status = get_quote_status(&pool, inquiry_id).await;
         assert_eq!(status, "rejected");
     }
