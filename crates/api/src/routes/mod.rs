@@ -1,4 +1,6 @@
 pub mod admin;
+pub(crate) mod admin_customers;
+pub(crate) mod admin_emails;
 pub mod auth;
 pub mod calendar;
 pub mod calendar_items;
@@ -8,9 +10,11 @@ pub mod employee;
 pub mod estimates;
 pub mod health;
 pub mod inquiries;
+pub mod inquiry_actions;
 pub mod invoices;
 pub mod offers;
 pub(crate) mod shared;
+pub mod submissions;
 
 use crate::AppState;
 use axum::{routing::post, Router};
@@ -20,7 +24,7 @@ use std::sync::Arc;
 pub fn public_api_router() -> Router<Arc<AppState>> {
     Router::new()
         .nest("/auth", auth::router())
-        .nest("/submit", inquiries::submit_router())
+        .nest("/submit", submissions::submit_router())
         .nest("/customer", customer::auth_router())
         .nest("/employee", employee::auth_router())
         .nest("/estimates", estimates::public_router())
