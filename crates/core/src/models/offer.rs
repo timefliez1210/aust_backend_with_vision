@@ -44,6 +44,35 @@ impl OfferStatus {
     }
 }
 
+impl std::fmt::Display for OfferStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for OfferStatus {
+    type Err = String;
+
+    /// Parse the lowercase database string back into an `OfferStatus` variant.
+    ///
+    /// **Caller**: DB row-to-model converters (`offer_builder`, `offer_repo`).
+    /// **Why**: Replaces duplicated manual `match row.status.as_str()` blocks.
+    ///
+    /// # Errors
+    /// Returns `Err(String)` for any unrecognised status string.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "draft" => Ok(Self::Draft),
+            "sent" => Ok(Self::Sent),
+            "viewed" => Ok(Self::Viewed),
+            "accepted" => Ok(Self::Accepted),
+            "rejected" => Ok(Self::Rejected),
+            "expired" => Ok(Self::Expired),
+            other => Err(format!("unknown OfferStatus: {other}")),
+        }
+    }
+}
+
 /// A generated price offer for a moving job.
 ///
 /// Created by `offer-generator` after the orchestrator has assembled a quote.

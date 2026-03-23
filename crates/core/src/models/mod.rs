@@ -5,7 +5,6 @@ mod employee;
 mod inquiry;
 mod note;
 mod offer;
-mod quote;
 pub mod snapshots;
 mod user;
 mod volume;
@@ -17,7 +16,6 @@ pub use employee::*;
 pub use inquiry::*;
 pub use note::*;
 pub use offer::*;
-pub use quote::*;
 pub use snapshots::{
     AddressSnapshot, CustomerSnapshot, EmployeeAssignmentSnapshot, EstimationSnapshot,
     InquiryDaySnapshot, InquiryListItem, InquiryResponse, ItemSnapshot, LineItemSnapshot,

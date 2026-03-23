@@ -20,13 +20,13 @@ use uuid::Uuid;
 /// Alex. The function is idempotent — it exits early if an offer already exists.
 ///
 /// # Readiness criteria
-/// - Quote must have `estimated_volume_m3 > 0`.
+/// - Inquiry must have `estimated_volume_m3 > 0`.
 /// - Distance is not required; if missing and both addresses are present, this function
-///   automatically runs the route calculator and writes `distance_km` to the quote first.
+///   automatically runs the route calculator and writes `distance_km` to the inquiry first.
 ///
 /// # Parameters
 /// - `state` — shared application state (DB, storage, config)
-/// - `inquiry_id` — the quote to check and potentially generate an offer for
+/// - `inquiry_id` — the inquiry to check and potentially generate an offer for
 ///
 /// # Returns
 /// Nothing. Errors are logged and, if critical, forwarded to the admin via Telegram.
@@ -49,7 +49,7 @@ pub async fn try_auto_generate_offer(state: Arc<AppState>, inquiry_id: Uuid) {
     let q = match readiness {
         Some(r) if r.estimated_volume_m3.unwrap_or(0.0) > 0.0 => r,
         _ => {
-            info!("Quote {inquiry_id} not ready for offer (no volume estimate)");
+            info!("Inquiry {inquiry_id} not ready for offer (no volume estimate)");
             return;
         }
     };
@@ -101,10 +101,10 @@ pub async fn try_auto_generate_offer(state: Arc<AppState>, inquiry_id: Uuid) {
             send_offer_to_telegram(&state.config.telegram, &generated).await;
         }
         Err(e) => {
-            error!("Auto-offer generation failed for quote {inquiry_id}: {e}");
+            error!("Auto-offer generation failed for inquiry {inquiry_id}: {e}");
             notify_telegram_error(
                 &state.config.telegram,
-                &format!("Angebotserstellung fehlgeschlagen für Quote {inquiry_id}: {e}"),
+                &format!("Angebotserstellung fehlgeschlagen für Anfrage {inquiry_id}: {e}"),
             )
             .await;
         }

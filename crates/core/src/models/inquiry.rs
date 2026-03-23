@@ -1,10 +1,12 @@
-use chrono::NaiveDate;
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::snapshots::Services;
+
 /// Status state machine for the unified inquiry lifecycle.
 ///
-/// **Why**: Replaces separate QuoteStatus + OfferStatus with one enum.
+/// **Why**: Replaces the old QuoteStatus + OfferStatus split with one unified enum.
 ///
 /// Pre-sales: pending -> info_requested -> estimating -> estimated -> offer_ready -> offer_sent
 ///   -> accepted | rejected | expired | cancelled
@@ -158,6 +160,46 @@ impl std::str::FromStr for InquiryStatus {
     }
 }
 
+/// A persisted moving inquiry — the central DB record linking customer, addresses,
+/// volume estimation, and generated offers.
+///
+/// Created by the orchestrator when a complete or near-complete `MovingInquiry` is received.
+/// All downstream records (volume estimations, offers, bookings) reference this record via
+/// their `inquiry_id` foreign key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Inquiry {
+    /// UUID v7 primary key.
+    pub id: Uuid,
+    /// Customer who submitted the inquiry.
+    pub customer_id: Uuid,
+    /// Departure address (Auszug); `None` until the orchestrator creates it.
+    pub origin_address_id: Option<Uuid>,
+    /// Destination address (Einzug); `None` until the orchestrator creates it.
+    pub destination_address_id: Option<Uuid>,
+    /// Optional intermediate stop (Zwischenstopp) address.
+    pub stop_address_id: Option<Uuid>,
+    pub status: InquiryStatus,
+    /// Agreed total moving volume in cubic metres; set after volume estimation
+    /// completes or when the inventory form is used.
+    pub estimated_volume_m3: Option<f64>,
+    /// Total driving distance in kilometres for the full route (depot->origin->
+    /// [stop]->destination); `None` until the distance calculator runs.
+    pub distance_km: Option<f64>,
+    pub preferred_date: Option<DateTime<Utc>>,
+    /// Free-text customer message (e.g., `"Bitte vorsichtig mit dem Klavier"`).
+    pub notes: Option<String>,
+    /// How this inquiry entered the system (email_form, contact_form, direct_email, photo_api, etc.).
+    pub source: Option<String>,
+    /// Structured service flags; replaces comma-separated notes parsing in the new schema.
+    pub services: Option<Services>,
+    /// Timestamp when the offer was emailed to the customer.
+    pub offer_sent_at: Option<DateTime<Utc>>,
+    /// Timestamp when the customer accepted the offer.
+    pub accepted_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// Aggregated moving inquiry state collected from one or more emails or API calls.
 ///
 /// This is the central hand-off structure between the email agent / API routes
@@ -171,7 +213,7 @@ impl std::str::FromStr for InquiryStatus {
 pub struct MovingInquiry {
     /// In-memory correlation ID (UUID v7); not persisted to the database.
     pub id: Uuid,
-    /// Set by the orchestrator once it has created the corresponding `Quote` record.
+    /// Set by the orchestrator once it has created the corresponding `Inquiry` record.
     pub inquiry_id: Option<Uuid>,
     /// How this inquiry reached the system.
     pub source: InquirySource,

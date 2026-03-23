@@ -1,6 +1,6 @@
 use sqlx::FromRow;
 use uuid::Uuid;
-use aust_core::models::{InquiryStatus, Quote, Services};
+use aust_core::models::{Inquiry, InquiryStatus, Services};
 
 #[derive(Debug, FromRow)]
 pub(crate) struct InquiryRow {
@@ -27,30 +27,14 @@ pub(crate) struct InquiryRow {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
-impl From<InquiryRow> for Quote {
+impl From<InquiryRow> for Inquiry {
     fn from(row: InquiryRow) -> Self {
-        let status = match row.status.as_str() {
-            "pending" => InquiryStatus::Pending,
-            "info_requested" => InquiryStatus::InfoRequested,
-            "estimating" => InquiryStatus::Estimating,
-            "estimated" => InquiryStatus::Estimated,
-            "offer_ready" => InquiryStatus::OfferReady,
-            "offer_sent" => InquiryStatus::OfferSent,
-            "accepted" => InquiryStatus::Accepted,
-            "rejected" => InquiryStatus::Rejected,
-            "expired" => InquiryStatus::Expired,
-            "cancelled" => InquiryStatus::Cancelled,
-            "scheduled" => InquiryStatus::Scheduled,
-            "completed" => InquiryStatus::Completed,
-            "invoiced" => InquiryStatus::Invoiced,
-            "paid" => InquiryStatus::Paid,
-            _ => InquiryStatus::Pending,
-        };
+        let status: InquiryStatus = row.status.parse().unwrap_or_default();
 
         let services: Option<Services> =
             serde_json::from_value(row.services).ok();
 
-        Quote {
+        Inquiry {
             id: row.id,
             customer_id: row.customer_id,
             origin_address_id: row.origin_address_id,
@@ -120,9 +104,9 @@ mod tests {
 
         for (status_str, expected) in cases {
             let row = make_test_inquiry_row(status_str);
-            let quote = Quote::from(row);
+            let inquiry = Inquiry::from(row);
             assert_eq!(
-                quote.status, expected,
+                inquiry.status, expected,
                 "status '{}' should map to {:?}",
                 status_str, expected
             );

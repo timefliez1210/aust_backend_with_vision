@@ -34,6 +34,34 @@ impl EstimationMethod {
     }
 }
 
+impl std::fmt::Display for EstimationMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for EstimationMethod {
+    type Err = String;
+
+    /// Parse the lowercase snake_case database string back into an enum variant.
+    ///
+    /// **Caller**: DB row-to-model converters (`From<VolumeEstimationRow>`).
+    /// **Why**: Replaces duplicated manual `match row.method.as_str()` blocks.
+    ///
+    /// # Errors
+    /// Returns `Err(String)` for any unrecognised method string.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "vision" => Ok(Self::Vision),
+            "inventory" => Ok(Self::Inventory),
+            "depth_sensor" => Ok(Self::DepthSensor),
+            "video" => Ok(Self::Video),
+            "manual" => Ok(Self::Manual),
+            other => Err(format!("unknown EstimationMethod: {other}")),
+        }
+    }
+}
+
 /// Stored volume estimation record linked to a quote.
 ///
 /// The `source_data` JSONB column captures what was sent to the pipeline

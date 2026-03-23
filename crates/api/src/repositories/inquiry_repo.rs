@@ -37,7 +37,7 @@ pub(crate) struct InquiryDbRow {
 
 /// Readiness check projection for auto-offer generation.
 #[derive(Debug, FromRow)]
-pub(crate) struct QuoteReadiness {
+pub(crate) struct InquiryReadiness {
     pub estimated_volume_m3: Option<f64>,
     pub distance_km: Option<f64>,
     pub origin_address_id: Option<Uuid>,
@@ -86,7 +86,7 @@ pub(crate) async fn fetch_by_id(
 pub(crate) async fn fetch_readiness(
     pool: &PgPool,
     inquiry_id: Uuid,
-) -> Result<Option<QuoteReadiness>, sqlx::Error> {
+) -> Result<Option<InquiryReadiness>, sqlx::Error> {
     sqlx::query_as(
         "SELECT estimated_volume_m3, distance_km, origin_address_id, destination_address_id, stop_address_id FROM inquiries WHERE id = $1",
     )

@@ -7,7 +7,7 @@ use crate::repositories::{address_repo, customer_repo, offer_repo};
 use crate::routes::shared::InquiryRow;
 use aust_core::config::Config;
 use aust_core::models::{
-    DepthSensorResult, DetectedItem, Offer, OfferStatus, PricingInput, Quote, Services,
+    DepthSensorResult, DetectedItem, Inquiry, Offer, OfferStatus, PricingInput, Services,
     VisionAnalysisResult,
 };
 use aust_distance_calculator::{RouteCalculator, RouteRequest};
@@ -106,7 +106,7 @@ pub(crate) struct OfferOverrides {
 /// - `db` — live PostgreSQL connection pool
 /// - `storage` — S3-compatible storage for uploading the PDF
 /// - `config` — application config (company depot address, rate per km, etc.)
-/// - `inquiry_id` — the quote to generate an offer for
+/// - `inquiry_id` — the inquiry to generate an offer for
 /// - `valid_days` — optional number of days until the offer expires
 ///
 /// # Returns
@@ -129,7 +129,7 @@ pub(crate) async fn build_offer(
 ///
 /// **Caller**: `build_offer` (no overrides), `generate_offer` route handler (API),
 /// `orchestrator::try_auto_generate_offer` (background), `admin::regenerate_offer` (dashboard).
-/// **Why**: Central function for the entire quote-to-offer pipeline: fetches all required
+/// **Why**: Central function for the entire inquiry-to-offer pipeline: fetches all required
 /// data, computes pricing, builds XLSX via template, converts to PDF via LibreOffice,
 /// uploads to S3, and inserts (or updates in-place) the offer DB record.
 ///
@@ -137,7 +137,7 @@ pub(crate) async fn build_offer(
 /// - `db` — live PostgreSQL connection pool
 /// - `storage` — S3-compatible storage provider
 /// - `config` — application config including depot address, km rate, JWT secret, etc.
-/// - `inquiry_id` — the quote to generate an offer for; must have `estimated_volume_m3`
+/// - `inquiry_id` — the inquiry to generate an offer for; must have `estimated_volume_m3`
 /// - `valid_days` — optional offer validity period; stored in `offers.valid_until`
 /// - `overrides` — optional manual overrides for price, persons, hours, rate, or line items;
 ///   when `existing_offer_id` is set, the existing offer record is updated in-place
@@ -148,8 +148,8 @@ pub(crate) async fn build_offer(
 /// a `TelegramSummary` for the approval message caption.
 ///
 /// # Errors
-/// - 404 if quote or customer not found
-/// - 400 if quote has no volume estimate
+/// - 404 if inquiry or customer not found
+/// - 400 if inquiry has no volume estimate
 /// - 500 on XLSX generation, PDF conversion, S3 upload, or DB errors
 ///
 /// # Math
@@ -164,27 +164,27 @@ pub(crate) async fn build_offer_with_overrides(
     valid_days: Option<i64>,
     overrides: &OfferOverrides,
 ) -> Result<GeneratedOffer, ApiError> {
-    // 1. Fetch quote
-    let quote_row: InquiryRow = offer_repo::fetch_inquiry_for_offer(db, inquiry_id)
+    // 1. Fetch inquiry
+    let inquiry_row: InquiryRow = offer_repo::fetch_inquiry_for_offer(db, inquiry_id)
         .await
         .map_err(ApiError::Database)?
-        .ok_or_else(|| ApiError::NotFound("Quote not found".into()))?;
+        .ok_or_else(|| ApiError::NotFound("Inquiry not found".into()))?;
 
-    let quote = Quote::from(quote_row);
+    let inquiry = Inquiry::from(inquiry_row);
 
-    let volume = quote
+    let volume = inquiry
         .estimated_volume_m3
-        .ok_or_else(|| ApiError::BadRequest("Quote has no volume estimate".into()))?;
+        .ok_or_else(|| ApiError::BadRequest("Inquiry has no volume estimate".into()))?;
 
-    let distance = quote.distance_km.unwrap_or(0.0);
+    let distance = inquiry.distance_km.unwrap_or(0.0);
 
     // 2. Fetch customer
-    let customer: CustomerRow = customer_repo::fetch_by_id(db, quote.customer_id).await?;
+    let customer: CustomerRow = customer_repo::fetch_by_id(db, inquiry.customer_id).await?;
 
     // 3. Fetch addresses
-    let origin: Option<AddressRow> = address_repo::fetch_optional(db, quote.origin_address_id).await?;
-    let destination: Option<AddressRow> = address_repo::fetch_optional(db, quote.destination_address_id).await?;
-    let stop_address: Option<AddressRow> = address_repo::fetch_optional(db, quote.stop_address_id).await?;
+    let origin: Option<AddressRow> = address_repo::fetch_optional(db, inquiry.origin_address_id).await?;
+    let destination: Option<AddressRow> = address_repo::fetch_optional(db, inquiry.destination_address_id).await?;
+    let stop_address: Option<AddressRow> = address_repo::fetch_optional(db, inquiry.stop_address_id).await?;
 
     // 4. Fetch latest volume estimation for detected items
     let repo_estimation = offer_repo::fetch_latest_estimation(db, inquiry_id)
@@ -218,7 +218,7 @@ pub(crate) async fn build_offer_with_overrides(
     let pricing_input = PricingInput {
         volume_m3: volume,
         distance_km: distance,
-        preferred_date: quote.preferred_date,
+        preferred_date: inquiry.preferred_date,
         floor_origin: origin_floor,
         floor_destination: dest_floor,
         has_elevator_origin: origin.as_ref().and_then(|a| a.elevator),
@@ -246,7 +246,7 @@ pub(crate) async fn build_offer_with_overrides(
     //    a) overrides.fahrt_flat_total is Some  → admin explicitly set it (persisted to DB)
     //    b) overrides.line_items contains entry → admin set it via line_items (also persisted)
     //    c) neither                             → re-compute from ORS (NOT persisted as override)
-    let quote_services = quote.services.clone().unwrap_or_default();
+    let inquiry_services = inquiry.services.clone().unwrap_or_default();
 
     // Resolved fahrt value: Some(euros) if admin-set (or previously admin-set), None if ORS should calculate.
     // Resolution order (first match wins):
@@ -306,7 +306,7 @@ pub(crate) async fn build_offer_with_overrides(
         result
     } else {
         let mut items = vec![fahrt_item];
-        items.extend(build_line_items(&quote_services));
+        items.extend(build_line_items(&inquiry_services));
         items
     };
 
@@ -326,7 +326,7 @@ pub(crate) async fn build_offer_with_overrides(
     let customer_salutation = customer.address_salutation();
     let greeting = customer.formal_greeting();
 
-    let moving_date = quote
+    let moving_date = inquiry
         .preferred_date
         .map(|d| d.format("%d.%m.%Y").to_string())
         .unwrap_or_else(|| "nach Vereinbarung".to_string());
@@ -367,8 +367,8 @@ pub(crate) async fn build_offer_with_overrides(
     };
 
     // Build services display string from structured Services and use notes as customer message
-    let services_str = format_services_display(&quote_services);
-    let customer_message = quote.notes.clone().unwrap_or_default();
+    let services_str = format_services_display(&inquiry_services);
+    let customer_message = inquiry.notes.clone().unwrap_or_default();
 
     let valid_until_date =
         valid_days.map(|days| (now + chrono::Duration::days(days)).date_naive());
@@ -514,15 +514,7 @@ pub(crate) async fn build_offer_with_overrides(
             hours_estimated: repo_row.hours_estimated, rate_per_hour_cents: repo_row.rate_per_hour_cents,
             line_items_json: repo_row.line_items_json, fahrt_override_cents: repo_row.fahrt_override_cents,
         };
-        let status = match row.status.as_str() {
-            "draft" => OfferStatus::Draft,
-            "sent" => OfferStatus::Sent,
-            "viewed" => OfferStatus::Viewed,
-            "accepted" => OfferStatus::Accepted,
-            "rejected" => OfferStatus::Rejected,
-            "expired" => OfferStatus::Expired,
-            _ => OfferStatus::Draft,
-        };
+        let status: OfferStatus = row.status.parse().unwrap_or_default();
         Offer {
             id: row.id,
             inquiry_id: row.inquiry_id,
@@ -541,7 +533,7 @@ pub(crate) async fn build_offer_with_overrides(
         }
     };
 
-    // Update quote status
+    // Update inquiry status
     crate::repositories::inquiry_repo::update_status(db, inquiry_id, "offer_ready", now)
         .await
         .map_err(|e| ApiError::Database(e))?;

@@ -58,15 +58,7 @@ struct VolumeEstimationRow {
 
 impl From<VolumeEstimationRow> for VolumeEstimation {
     fn from(row: VolumeEstimationRow) -> Self {
-        let method = match row.method.as_str() {
-            "vision" => EstimationMethod::Vision,
-            "inventory" => EstimationMethod::Inventory,
-            "depth_sensor" => EstimationMethod::DepthSensor,
-            "video" => EstimationMethod::Video,
-            "manual" => EstimationMethod::Manual,
-            _ => EstimationMethod::Manual,
-        };
-
+        let method: EstimationMethod = row.method.parse().unwrap_or(EstimationMethod::Manual);
         VolumeEstimation {
             id: row.id,
             inquiry_id: row.inquiry_id,
@@ -83,15 +75,7 @@ impl From<VolumeEstimationRow> for VolumeEstimation {
 
 impl From<crate::services::db::EstimationRow> for VolumeEstimation {
     fn from(row: crate::services::db::EstimationRow) -> Self {
-        let method = match row.method.as_str() {
-            "vision" => EstimationMethod::Vision,
-            "inventory" => EstimationMethod::Inventory,
-            "depth_sensor" => EstimationMethod::DepthSensor,
-            "video" => EstimationMethod::Video,
-            "manual" => EstimationMethod::Manual,
-            _ => EstimationMethod::Manual,
-        };
-
+        let method: EstimationMethod = row.method.parse().unwrap_or(EstimationMethod::Manual);
         VolumeEstimation {
             id: row.id,
             inquiry_id: row.inquiry_id,
@@ -108,15 +92,7 @@ impl From<crate::services::db::EstimationRow> for VolumeEstimation {
 
 impl From<estimation_repo::EstimationRow> for VolumeEstimation {
     fn from(row: estimation_repo::EstimationRow) -> Self {
-        let method = match row.method.as_str() {
-            "vision" => EstimationMethod::Vision,
-            "inventory" => EstimationMethod::Inventory,
-            "depth_sensor" => EstimationMethod::DepthSensor,
-            "video" => EstimationMethod::Video,
-            "manual" => EstimationMethod::Manual,
-            _ => EstimationMethod::Manual,
-        };
-
+        let method: EstimationMethod = row.method.parse().unwrap_or(EstimationMethod::Manual);
         VolumeEstimation {
             id: row.id,
             inquiry_id: row.inquiry_id,
