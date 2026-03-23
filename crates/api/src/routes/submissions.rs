@@ -14,8 +14,9 @@ use serde::Serialize;
 use std::sync::Arc;
 use uuid::Uuid;
 
+use crate::repositories::{address_repo, customer_repo, estimation_repo, inquiry_repo};
 use crate::services::offer_pipeline::try_auto_generate_offer;
-use crate::{orchestrator, services, ApiError, AppState};
+use crate::{services, ApiError, AppState};
 use aust_core::models::{EstimationMethod, Services};
 use aust_storage::StorageProvider;
 
@@ -195,39 +196,42 @@ async fn video_inquiry(
     let now = chrono::Utc::now();
 
     // Upsert customer
-    let customer_id: Uuid = sqlx::query_as::<_, (Uuid,)>(
-        r#"INSERT INTO customers (id, email, name, salutation, first_name, last_name, phone, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
-           ON CONFLICT (email) DO UPDATE SET
-               name = COALESCE(EXCLUDED.name, customers.name),
-               salutation = COALESCE(EXCLUDED.salutation, customers.salutation),
-               first_name = COALESCE(EXCLUDED.first_name, customers.first_name),
-               last_name = COALESCE(EXCLUDED.last_name, customers.last_name),
-               phone = COALESCE(EXCLUDED.phone, customers.phone),
-               updated_at = $8
-           RETURNING id"#,
+    let customer_id = customer_repo::upsert(
+        &state.db,
+        &email,
+        Some(&name),
+        salutation.as_deref(),
+        first_name.as_deref(),
+        last_name.as_deref(),
+        phone.as_deref(),
+        now,
     )
-    .bind(Uuid::now_v7()).bind(&email).bind(&name).bind(&salutation).bind(&first_name).bind(&last_name).bind(&phone).bind(now)
-    .fetch_one(&state.db).await.map(|(id,)| id)
+    .await
     .map_err(|e| ApiError::Internal(format!("Kunde konnte nicht erstellt werden: {e}")))?;
 
     // Create addresses
     let (dep_street, dep_city, dep_postal) = services::vision::parse_address(&departure_address);
-    let origin_id: Uuid = sqlx::query_as::<_, (Uuid,)>(
-        "INSERT INTO addresses (id, street, city, postal_code, floor, elevator) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id",
+    let origin_id = address_repo::create(
+        &state.db,
+        &dep_street,
+        &dep_city,
+        Some(dep_postal.as_str()).filter(|s| !s.is_empty()),
+        departure_floor.as_deref(),
+        departure_elevator,
     )
-    .bind(Uuid::now_v7()).bind(&dep_street).bind(&dep_city).bind(&dep_postal)
-    .bind(&departure_floor).bind(departure_elevator)
-    .fetch_one(&state.db).await.map(|(id,)| id)
+    .await
     .map_err(|e| ApiError::Internal(format!("Auszugsadresse konnte nicht erstellt werden: {e}")))?;
 
     let (arr_street, arr_city, arr_postal) = services::vision::parse_address(&arrival_address);
-    let dest_id: Uuid = sqlx::query_as::<_, (Uuid,)>(
-        "INSERT INTO addresses (id, street, city, postal_code, floor, elevator) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id",
+    let dest_id = address_repo::create(
+        &state.db,
+        &arr_street,
+        &arr_city,
+        Some(arr_postal.as_str()).filter(|s| !s.is_empty()),
+        arrival_floor.as_deref(),
+        arrival_elevator,
     )
-    .bind(Uuid::now_v7()).bind(&arr_street).bind(&arr_city).bind(&arr_postal)
-    .bind(&arrival_floor).bind(arrival_elevator)
-    .fetch_one(&state.db).await.map(|(id,)| id)
+    .await
     .map_err(|e| ApiError::Internal(format!("Einzugsadresse konnte nicht erstellt werden: {e}")))?;
 
     let preferred_date_ts = preferred_date.as_deref()
@@ -244,14 +248,20 @@ async fn video_inquiry(
 
     // Create inquiry
     let inquiry_id = Uuid::now_v7();
-    sqlx::query(
-        r#"INSERT INTO inquiries (id, customer_id, origin_address_id, destination_address_id,
-                               status, preferred_date, notes, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)"#,
+    inquiry_repo::create_minimal(
+        &state.db,
+        inquiry_id,
+        customer_id,
+        Some(origin_id),
+        Some(dest_id),
+        "pending",
+        preferred_date_ts,
+        Some(&notes),
+        None,
+        "video_webapp",
+        now,
     )
-    .bind(inquiry_id).bind(customer_id).bind(Some(origin_id)).bind(Some(dest_id))
-    .bind("pending").bind(preferred_date_ts).bind(&notes).bind(now)
-    .execute(&state.db).await
+    .await
     .map_err(|e| ApiError::Internal(format!("Anfrage konnte nicht erstellt werden: {e}")))?;
 
     // Pre-create one estimation row per uploaded video and upload each video to S3
@@ -261,12 +271,9 @@ async fn video_inquiry(
     let mut s3_keys_per_video: Vec<String> = Vec::new();
     for (video_bytes, mime_type) in &video_files {
         let eid = Uuid::now_v7();
-        sqlx::query(
-            "INSERT INTO volume_estimations (id, inquiry_id, method, status, source_data, created_at) \
-             VALUES ($1, $2, 'video', 'processing', '{}', NOW())",
-        )
-        .bind(eid).bind(inquiry_id).execute(&state.db).await
-        .map_err(|e| ApiError::Internal(format!("Schätzung konnte nicht erstellt werden: {e}")))?;
+        estimation_repo::create_processing(&state.db, eid, inquiry_id, "video")
+            .await
+            .map_err(|e| ApiError::Internal(format!("Schätzung konnte nicht erstellt werden: {e}")))?;
         estimation_ids.push(eid);
 
         // Upload video to S3
@@ -277,8 +284,7 @@ async fn video_inquiry(
         } else {
             // Update source_data immediately so the admin UI can show the video
             let source_data = serde_json::json!({ "video_s3_key": &s3_key });
-            let _ = sqlx::query("UPDATE volume_estimations SET source_data = $1 WHERE id = $2")
-                .bind(&source_data).bind(eid).execute(&state.db).await;
+            let _ = estimation_repo::update_source_data(&state.db, eid, &source_data).await;
             s3_keys_per_video.push(s3_key);
         }
     }
@@ -301,9 +307,7 @@ async fn video_inquiry(
             let req = aust_distance_calculator::RouteRequest { addresses: vec![dep_addr, arr_addr] };
             match calc.calculate(&req).await {
                 Ok(r) => {
-                    let _ = sqlx::query("UPDATE inquiries SET distance_km = $1, updated_at = $2 WHERE id = $3")
-                        .bind(r.total_distance_km).bind(chrono::Utc::now()).bind(inquiry_id)
-                        .execute(&state_bg.db).await;
+                    let _ = inquiry_repo::update_distance(&state_bg.db, inquiry_id, r.total_distance_km).await;
                 }
                 Err(e) => tracing::warn!(inquiry_id = %inquiry_id, error = %e, "Distance calculation failed"),
             }
@@ -316,10 +320,7 @@ async fn video_inquiry(
                 state_bg.clone(), inquiry_id, estimation_id, video_bytes, mime_type, s3_key,
             ).await {
                 tracing::error!(inquiry_id = %inquiry_id, estimation_id = %estimation_id, error = %e, "Background video estimation failed");
-                let _ = sqlx::query(
-                    "UPDATE volume_estimations SET status = 'failed' WHERE id = $1 AND status = 'processing'",
-                )
-                .bind(estimation_id).execute(&state_bg.db).await;
+                let _ = estimation_repo::mark_failed(&state_bg.db, estimation_id).await;
             }
         }
     });
@@ -489,31 +490,17 @@ pub(crate) async fn handle_submission(
     let now = chrono::Utc::now();
 
     // 1. Create or update customer by email
-    let customer_id: Uuid = sqlx::query_as::<_, (Uuid,)>(
-        r#"
-        INSERT INTO customers (id, email, name, salutation, first_name, last_name, phone, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
-        ON CONFLICT (email) DO UPDATE SET
-            name = COALESCE(EXCLUDED.name, customers.name),
-            salutation = COALESCE(EXCLUDED.salutation, customers.salutation),
-            first_name = COALESCE(EXCLUDED.first_name, customers.first_name),
-            last_name = COALESCE(EXCLUDED.last_name, customers.last_name),
-            phone = COALESCE(EXCLUDED.phone, customers.phone),
-            updated_at = $8
-        RETURNING id
-        "#,
+    let customer_id = customer_repo::upsert(
+        &state.db,
+        &email,
+        Some(&name),
+        form.salutation.as_deref(),
+        form.first_name.as_deref(),
+        form.last_name.as_deref(),
+        form.phone.as_deref(),
+        now,
     )
-    .bind(Uuid::now_v7())
-    .bind(&email)
-    .bind(&name)
-    .bind(&form.salutation)
-    .bind(&form.first_name)
-    .bind(&form.last_name)
-    .bind(&form.phone)
-    .bind(now)
-    .fetch_one(&state.db)
     .await
-    .map(|(id,)| id)
     .map_err(|e| ApiError::Internal(format!("Kunde konnte nicht erstellt werden: {e}")))?;
 
     tracing::info!(customer_id = %customer_id, email = %email, "Customer created/updated");
@@ -521,40 +508,30 @@ pub(crate) async fn handle_submission(
     // 2. Create origin address
     let (dep_street, dep_city, dep_postal) =
         services::vision::parse_address(&departure_address);
-    let origin_id: Uuid = sqlx::query_as::<_, (Uuid,)>(
-        "INSERT INTO addresses (id, street, city, postal_code, floor, elevator) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+    let origin_id = address_repo::create(
+        &state.db,
+        &dep_street,
+        &dep_city,
+        Some(dep_postal.as_str()).filter(|s| !s.is_empty()),
+        form.departure_floor.as_deref(),
+        form.departure_elevator,
     )
-    .bind(Uuid::now_v7())
-    .bind(&dep_street)
-    .bind(&dep_city)
-    .bind(&dep_postal)
-    .bind(&form.departure_floor)
-    .bind(form.departure_elevator)
-    .fetch_one(&state.db)
     .await
-    .map(|(id,)| id)
-    .map_err(|e| {
-        ApiError::Internal(format!("Auszugsadresse konnte nicht erstellt werden: {e}"))
-    })?;
+    .map_err(|e| ApiError::Internal(format!("Auszugsadresse konnte nicht erstellt werden: {e}")))?;
 
     // 3. Create destination address
     let (arr_street, arr_city, arr_postal) =
         services::vision::parse_address(&arrival_address);
-    let dest_id: Uuid = sqlx::query_as::<_, (Uuid,)>(
-        "INSERT INTO addresses (id, street, city, postal_code, floor, elevator) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+    let dest_id = address_repo::create(
+        &state.db,
+        &arr_street,
+        &arr_city,
+        Some(arr_postal.as_str()).filter(|s| !s.is_empty()),
+        form.arrival_floor.as_deref(),
+        form.arrival_elevator,
     )
-    .bind(Uuid::now_v7())
-    .bind(&arr_street)
-    .bind(&arr_city)
-    .bind(&arr_postal)
-    .bind(&form.arrival_floor)
-    .bind(form.arrival_elevator)
-    .fetch_one(&state.db)
     .await
-    .map(|(id,)| id)
-    .map_err(|e| {
-        ApiError::Internal(format!("Einzugsadresse konnte nicht erstellt werden: {e}"))
-    })?;
+    .map_err(|e| ApiError::Internal(format!("Einzugsadresse konnte nicht erstellt werden: {e}")))?;
 
     // 4. Parse preferred date
     let preferred_date_ts = form
@@ -582,24 +559,19 @@ pub(crate) async fn handle_submission(
 
     // 6. Create inquiry
     let inquiry_id = Uuid::now_v7();
-    sqlx::query(
-        r#"
-        INSERT INTO inquiries (id, customer_id, origin_address_id, destination_address_id,
-                           status, preferred_date, notes, services, source, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)
-        "#,
+    inquiry_repo::create_minimal(
+        &state.db,
+        inquiry_id,
+        customer_id,
+        Some(origin_id),
+        Some(dest_id),
+        "pending",
+        preferred_date_ts,
+        Some(&notes),
+        Some(&services_json),
+        source,
+        now,
     )
-    .bind(inquiry_id)
-    .bind(customer_id)
-    .bind(Some(origin_id))
-    .bind(Some(dest_id))
-    .bind("pending")
-    .bind(preferred_date_ts)
-    .bind(&notes)
-    .bind(&services_json)
-    .bind(source)
-    .bind(now)
-    .execute(&state.db)
     .await
     .map_err(|e| ApiError::Internal(format!("Anfrage konnte nicht erstellt werden: {e}")))?;
 
@@ -610,15 +582,9 @@ pub(crate) async fn handle_submission(
     let estimation_id = Uuid::now_v7();
 
     // Pre-create estimation record with status='processing' so polling works immediately.
-    sqlx::query(
-        "INSERT INTO volume_estimations (id, inquiry_id, method, status, source_data, created_at) \
-         VALUES ($1, $2, 'depth_sensor', 'processing', '{}', NOW())",
-    )
-    .bind(estimation_id)
-    .bind(inquiry_id)
-    .execute(&state.db)
-    .await
-    .map_err(|e| ApiError::Internal(format!("Schätzung konnte nicht erstellt werden: {e}")))?;
+    estimation_repo::create_processing(&state.db, estimation_id, inquiry_id, "depth_sensor")
+        .await
+        .map_err(|e| ApiError::Internal(format!("Schätzung konnte nicht erstellt werden: {e}")))?;
 
     // Upload images to S3 synchronously — frontend can display them while Modal processes.
     let s3_keys = if !form.images.is_empty() {
@@ -648,13 +614,7 @@ pub(crate) async fn handle_submission(
     // while Modal is still processing.
     if !s3_keys.is_empty() {
         let source_data = serde_json::json!({ "s3_keys": &s3_keys, "image_count": s3_keys.len() });
-        let _ = sqlx::query(
-            "UPDATE volume_estimations SET source_data = $1 WHERE id = $2",
-        )
-        .bind(&source_data)
-        .bind(estimation_id)
-        .execute(&state.db)
-        .await;
+        let _ = estimation_repo::update_source_data(&state.db, estimation_id, &source_data).await;
     }
 
     // 8. Spawn background processing: distance calc → semaphore → Modal → offer.
@@ -735,14 +695,7 @@ pub(crate) async fn process_submission_background(
                     distance_km = result.total_distance_km,
                     "Distance calculated"
                 );
-                let _ = sqlx::query(
-                    "UPDATE inquiries SET distance_km = $1, updated_at = $2 WHERE id = $3",
-                )
-                .bind(result.total_distance_km)
-                .bind(chrono::Utc::now())
-                .bind(inquiry_id)
-                .execute(&state.db)
-                .await;
+                let _ = inquiry_repo::update_distance(&state.db, inquiry_id, result.total_distance_km).await;
             }
             Err(e) => {
                 tracing::warn!(inquiry_id = %inquiry_id, error = %e, "Distance calculation failed, continuing without");
@@ -811,42 +764,24 @@ pub(crate) async fn process_submission_background(
     // 5. Store volume_estimation record — UPSERT so it works whether the row was
     //    pre-created as 'processing' (admin trigger) or is brand-new (public submission).
     let now_update = chrono::Utc::now();
-    sqlx::query(
-        r#"
-        INSERT INTO volume_estimations
-            (id, inquiry_id, method, status, source_data, result_data, total_volume_m3, confidence_score, created_at)
-        VALUES ($1, $2, $3, 'completed', $4, $5, $6, $7, $8)
-        ON CONFLICT (id) DO UPDATE SET
-            method            = EXCLUDED.method,
-            status            = 'completed',
-            source_data       = EXCLUDED.source_data,
-            result_data       = EXCLUDED.result_data,
-            total_volume_m3   = EXCLUDED.total_volume_m3,
-            confidence_score  = EXCLUDED.confidence_score
-        "#,
+    estimation_repo::upsert(
+        &state.db,
+        estimation_id,
+        inquiry_id,
+        method.as_str(),
+        &source_data,
+        result_data.as_ref(),
+        total_volume,
+        confidence,
+        now,
     )
-    .bind(estimation_id)
-    .bind(inquiry_id)
-    .bind(method.as_str())
-    .bind(&source_data)
-    .bind(result_data.as_ref())
-    .bind(total_volume)
-    .bind(confidence)
-    .bind(now)
-    .execute(&state.db)
     .await
     .map_err(|e| format!("Failed to store estimation: {e}"))?;
 
     // 6. Update inquiry with estimated volume
-    crate::services::db::update_quote_volume(
-        &state.db,
-        inquiry_id,
-        total_volume,
-        "estimated",
-        now_update,
-    )
-    .await
-    .map_err(|e| format!("Failed to update inquiry: {e}"))?;
+    inquiry_repo::update_volume_and_status(&state.db, inquiry_id, total_volume, "estimated", now_update)
+        .await
+        .map_err(|e| format!("Failed to update inquiry: {e}"))?;
 
     tracing::info!(
         inquiry_id = %inquiry_id,
@@ -938,38 +873,25 @@ pub(crate) async fn process_video_background(
     let result_data = serde_json::to_value(&response.detected_items)
         .map_err(|e| format!("Failed to serialize items: {e}"))?;
 
-    sqlx::query(r#"
-        INSERT INTO volume_estimations
-            (id, inquiry_id, method, status, source_data, result_data, total_volume_m3, confidence_score, created_at)
-        VALUES ($1, $2, 'video', 'completed', $3, $4, $5, $6, $7)
-        ON CONFLICT (id) DO UPDATE SET
-            status            = 'completed',
-            source_data       = EXCLUDED.source_data,
-            result_data       = EXCLUDED.result_data,
-            total_volume_m3   = EXCLUDED.total_volume_m3,
-            confidence_score  = EXCLUDED.confidence_score
-    "#)
-    .bind(estimation_id)
-    .bind(inquiry_id)
-    .bind(source_data)
-    .bind(result_data)
-    .bind(response.total_volume_m3)
-    .bind(response.confidence_score)
-    .bind(chrono::Utc::now())
-    .execute(&state.db)
+    estimation_repo::upsert(
+        &state.db,
+        estimation_id,
+        inquiry_id,
+        "video",
+        &source_data,
+        Some(&result_data),
+        response.total_volume_m3,
+        response.confidence_score,
+        chrono::Utc::now(),
+    )
     .await
     .map_err(|e| format!("Failed to store video estimation: {e}"))?;
 
     // 4. Update inquiry status and trigger offer generation
-    sqlx::query(
-        "UPDATE inquiries SET status = 'estimated', volume_m3 = $1, updated_at = $2 WHERE id = $3",
-    )
-    .bind(response.total_volume_m3)
-    .bind(chrono::Utc::now())
-    .bind(inquiry_id)
-    .execute(&state.db)
-    .await
-    .map_err(|e| format!("Failed to update inquiry: {e}"))?;
+    let now_update = chrono::Utc::now();
+    inquiry_repo::update_volume_and_status(&state.db, inquiry_id, response.total_volume_m3, "estimated", now_update)
+        .await
+        .map_err(|e| format!("Failed to update inquiry: {e}"))?;
 
     try_auto_generate_offer(Arc::clone(&state), inquiry_id).await;
 

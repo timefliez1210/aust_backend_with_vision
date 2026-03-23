@@ -21,4 +21,3 @@ pub(crate) mod offer_repo;
 // Re-export row types that are used across multiple modules.
 pub(crate) use address_repo::AddressRow;
 pub(crate) use customer_repo::CustomerRow;
-pub(crate) use inquiry_repo::InquiryDbRow;

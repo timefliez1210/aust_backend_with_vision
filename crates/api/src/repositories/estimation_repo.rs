@@ -18,42 +18,6 @@ pub(crate) struct EstimationRow {
     pub created_at: DateTime<Utc>,
 }
 
-/// Insert a volume estimation record and return the full row.
-///
-/// **Caller**: `estimates::post_depth_sensor`, `estimates::post_vision`
-/// **Why**: Creates a completed estimation with all data in one shot.
-pub(crate) async fn insert(
-    pool: &PgPool,
-    id: Uuid,
-    inquiry_id: Uuid,
-    method: &str,
-    source_data: &serde_json::Value,
-    result_data: Option<&serde_json::Value>,
-    total_volume_m3: f64,
-    confidence_score: f64,
-    now: DateTime<Utc>,
-) -> Result<EstimationRow, sqlx::Error> {
-    let row: EstimationRow = sqlx::query_as(
-        r#"
-        INSERT INTO volume_estimations
-            (id, inquiry_id, method, source_data, result_data, total_volume_m3, confidence_score, created_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        RETURNING id, inquiry_id, method, status, source_data, result_data, total_volume_m3, confidence_score, created_at
-        "#,
-    )
-    .bind(id)
-    .bind(inquiry_id)
-    .bind(method)
-    .bind(source_data)
-    .bind(result_data)
-    .bind(total_volume_m3)
-    .bind(confidence_score)
-    .bind(now)
-    .fetch_one(pool)
-    .await?;
-    Ok(row)
-}
-
 /// Insert a volume estimation record without returning (fire-and-forget style).
 ///
 /// **Caller**: `create_inquiry`, `trigger_estimate`, `handle_complete_inquiry`

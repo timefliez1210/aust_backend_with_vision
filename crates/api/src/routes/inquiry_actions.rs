@@ -10,11 +10,11 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
+use crate::repositories::{email_repo, estimation_repo, inquiry_repo, offer_repo};
 use crate::routes::offers::{build_offer_with_overrides, OfferOverrides};
 use crate::routes::submissions::{
     parse_inquiry_form, process_submission_background, process_video_background,
 };
-use crate::services::db::{insert_estimation_no_return, update_quote_volume};
 use crate::{services, ApiError, AppState};
 use aust_core::models::Offer;
 use aust_llm_providers::LlmMessage;
@@ -121,19 +121,6 @@ pub(crate) struct EstimationItemResponse {
     pub packs_into_boxes: bool,
 }
 
-#[derive(Debug, Serialize, sqlx::FromRow)]
-pub(crate) struct EmployeeAssignmentRow {
-    pub employee_id: Uuid,
-    pub first_name: String,
-    pub last_name: String,
-    pub email: String,
-    pub planned_hours: f64,
-    pub clock_in: Option<chrono::DateTime<chrono::Utc>>,
-    pub clock_out: Option<chrono::DateTime<chrono::Utc>>,
-    pub actual_hours: Option<f64>,
-    pub notes: Option<String>,
-}
-
 // ---------------------------------------------------------------------------
 // Action handlers
 // ---------------------------------------------------------------------------
@@ -149,15 +136,10 @@ pub(crate) async fn update_inquiry_items(
     Json(request): Json<UpdateEstimationItemsRequest>,
 ) -> Result<Json<EstimationDetail>, ApiError> {
     // Get latest estimation for this inquiry
-    let est: Option<(Uuid, String, Option<serde_json::Value>)> = sqlx::query_as(
-        "SELECT id, method, source_data FROM volume_estimations WHERE inquiry_id = $1 ORDER BY created_at DESC LIMIT 1",
-    )
-    .bind(inquiry_id)
-    .fetch_optional(&state.db)
-    .await?;
-
     let (estimation_id, estimation_method, est_source_data) =
-        est.ok_or_else(|| ApiError::NotFound("Keine Schaetzung fuer diese Anfrage".into()))?;
+        estimation_repo::fetch_latest_for_inquiry(&state.db, inquiry_id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound("Keine Schaetzung fuer diese Anfrage".into()))?;
 
     // Calculate new total volume
     let total_volume: f64 = request
@@ -173,22 +155,10 @@ pub(crate) async fn update_inquiry_items(
     let now = chrono::Utc::now();
 
     // Update volume estimation
-    sqlx::query(
-        "UPDATE volume_estimations SET result_data = $1, total_volume_m3 = $2 WHERE id = $3",
-    )
-    .bind(&result_data)
-    .bind(total_volume)
-    .bind(estimation_id)
-    .execute(&state.db)
-    .await?;
+    estimation_repo::update_results(&state.db, estimation_id, &result_data, total_volume).await?;
 
     // Update inquiry volume
-    sqlx::query("UPDATE inquiries SET estimated_volume_m3 = $1, updated_at = $2 WHERE id = $3")
-        .bind(total_volume)
-        .bind(now)
-        .bind(inquiry_id)
-        .execute(&state.db)
-        .await?;
+    inquiry_repo::update_volume(&state.db, inquiry_id, total_volume, now).await?;
 
     // Build response
     let items: Vec<EstimationItemResponse> = request
@@ -250,13 +220,8 @@ pub(crate) async fn trigger_estimate(
     body: Option<Json<serde_json::Value>>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     // Verify inquiry exists
-    let exists: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM inquiries WHERE id = $1")
-            .bind(inquiry_id)
-            .fetch_optional(&state.db)
-            .await?;
-
-    if exists.is_none() {
+    let exists = inquiry_repo::exists(&state.db, inquiry_id).await?;
+    if !exists {
         return Err(ApiError::NotFound(format!(
             "Inquiry {inquiry_id} not found"
         )));
@@ -285,7 +250,7 @@ pub(crate) async fn trigger_estimate(
             let now = chrono::Utc::now();
             let source_data = serde_json::json!({"source": "admin_dashboard"});
 
-            insert_estimation_no_return(
+            estimation_repo::insert_no_return(
                 &state.db,
                 estimation_id,
                 inquiry_id,
@@ -299,7 +264,7 @@ pub(crate) async fn trigger_estimate(
             .await
             .map_err(|e| ApiError::Internal(format!("Estimation insert failed: {e}")))?;
 
-            update_quote_volume(&state.db, inquiry_id, total_volume, "estimated", now)
+            inquiry_repo::update_volume_and_status(&state.db, inquiry_id, total_volume, "estimated", now)
                 .await
                 .map_err(|e| ApiError::Internal(format!("Volume update failed: {e}")))?;
 
@@ -350,13 +315,7 @@ pub(crate) async fn generate_inquiry_offer(
     });
 
     // Reuse any existing active offer so we UPDATE in-place
-    let existing_offer_id: Option<Uuid> = sqlx::query_as(
-        "SELECT id FROM offers WHERE inquiry_id = $1 AND status NOT IN ('rejected', 'cancelled') LIMIT 1",
-    )
-    .bind(inquiry_id)
-    .fetch_optional(&state.db)
-    .await?
-    .map(|(id,): (Uuid,)| id);
+    let existing_offer_id = offer_repo::fetch_active_id_for_inquiry(&state.db, inquiry_id).await?;
 
     // fahrt_flat_total and fahrt_reset are passed straight through to build_offer_with_overrides,
     // which is now the single place responsible for the full resolution order:
@@ -416,20 +375,9 @@ pub(crate) async fn generate_inquiry_offer(
 /// - `inquiry_id` — the inquiry whose offer was just generated
 pub(crate) async fn generate_offer_email_draft(state: &AppState, inquiry_id: Uuid) {
     // Fetch customer name, email, origin/destination city for the LLM prompt
-    let row: Option<(String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
-        r#"
-        SELECT c.name, c.email, a_orig.city, a_dest.city
-        FROM inquiries q
-        JOIN customers c ON q.customer_id = c.id
-        LEFT JOIN addresses a_orig ON q.origin_address_id = a_orig.id
-        LEFT JOIN addresses a_dest ON q.destination_address_id = a_dest.id
-        WHERE q.id = $1
-        "#,
-    )
-    .bind(inquiry_id)
-    .fetch_optional(&state.db)
-    .await
-    .unwrap_or(None);
+    let row = inquiry_repo::fetch_email_draft_context(&state.db, inquiry_id)
+        .await
+        .unwrap_or(None);
 
     let Some((name, Some(email), origin_city, dest_city)) = row else {
         return;
@@ -467,28 +415,21 @@ pub(crate) async fn generate_offer_email_draft(state: &AppState, inquiry_id: Uui
     }
 
     // Discard any previous LLM offer draft in this thread (stale after regeneration)
-    let _ = sqlx::query(
-        "UPDATE email_messages SET status = 'discarded' \
-         WHERE thread_id = $1 AND status = 'draft' AND llm_generated = true",
-    )
-    .bind(thread_id)
-    .execute(&state.db)
-    .await;
+    let _ = email_repo::discard_llm_drafts(&state.db, thread_id).await;
 
     // Insert the new draft
-    let _ = sqlx::query(
-        r#"
-        INSERT INTO email_messages
-            (id, thread_id, direction, from_address, to_address, subject, body_text, llm_generated, status, created_at)
-        VALUES ($1, $2, 'outbound', $3, $4, 'Ihr Umzugsangebot', $5, true, 'draft', NOW())
-        "#,
+    let _ = email_repo::insert_message(
+        &state.db,
+        Uuid::now_v7(),
+        thread_id,
+        "outbound",
+        &state.config.email.from_address,
+        &email,
+        "Ihr Umzugsangebot",
+        &body,
+        true,
+        "draft",
     )
-    .bind(Uuid::now_v7())
-    .bind(thread_id)
-    .bind(&state.config.email.from_address)
-    .bind(&email)
-    .bind(&body)
-    .execute(&state.db)
     .await;
 }
 
@@ -506,37 +447,21 @@ pub(crate) async fn generate_offer_email_draft(state: &AppState, inquiry_id: Uui
 /// The thread UUID, or `Uuid::nil()` if the inquiry record cannot be found.
 pub(crate) async fn find_or_create_inquiry_thread(state: &AppState, inquiry_id: Uuid) -> Uuid {
     // Return existing thread if one already exists
-    if let Ok(Some((id,))) = sqlx::query_as::<_, (Uuid,)>(
-        "SELECT id FROM email_threads WHERE inquiry_id = $1 ORDER BY created_at DESC LIMIT 1",
-    )
-    .bind(inquiry_id)
-    .fetch_optional(&state.db)
-    .await
-    {
+    if let Ok(Some(id)) = email_repo::find_thread_by_inquiry(&state.db, inquiry_id).await {
         return id;
     }
 
     // Look up customer_id from the inquiry
-    let Ok(Some((customer_id,))) = sqlx::query_as::<_, (Uuid,)>(
-        "SELECT customer_id FROM inquiries WHERE id = $1",
-    )
-    .bind(inquiry_id)
-    .fetch_optional(&state.db)
-    .await
+    let Some(customer_id) = inquiry_repo::fetch_customer_id(&state.db, inquiry_id)
+        .await
+        .ok()
+        .flatten()
     else {
         return Uuid::nil();
     };
 
     let thread_id = Uuid::now_v7();
-    let _ = sqlx::query(
-        "INSERT INTO email_threads (id, customer_id, inquiry_id, subject, created_at, updated_at) \
-         VALUES ($1, $2, $3, 'Ihr Umzugsangebot', NOW(), NOW())",
-    )
-    .bind(thread_id)
-    .bind(customer_id)
-    .bind(inquiry_id)
-    .execute(&state.db)
-    .await;
+    let _ = email_repo::create_thread(&state.db, thread_id, customer_id, inquiry_id, "Ihr Umzugsangebot").await;
 
     thread_id
 }
@@ -552,10 +477,7 @@ pub(crate) async fn trigger_estimate_upload(
     multipart: Multipart,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     // Verify inquiry exists
-    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM inquiries WHERE id = $1)")
-        .bind(inquiry_id)
-        .fetch_one(&state.db)
-        .await?;
+    let exists = inquiry_repo::exists(&state.db, inquiry_id).await?;
     if !exists {
         return Err(ApiError::NotFound(format!("Inquiry {inquiry_id} not found")));
     }
@@ -567,22 +489,11 @@ pub(crate) async fn trigger_estimate_upload(
 
     // Update status to estimating
     let now = chrono::Utc::now();
-    sqlx::query("UPDATE inquiries SET status = 'estimating', updated_at = $1 WHERE id = $2")
-        .bind(now)
-        .bind(inquiry_id)
-        .execute(&state.db)
-        .await?;
+    inquiry_repo::update_status(&state.db, inquiry_id, "estimating", now).await?;
 
     // Pre-create the estimation row so the frontend can poll it immediately.
     let estimation_id = Uuid::now_v7();
-    sqlx::query(
-        "INSERT INTO volume_estimations (id, inquiry_id, method, status, source_data, created_at) \
-         VALUES ($1, $2, 'depth_sensor', 'processing', '{}', NOW())",
-    )
-    .bind(estimation_id)
-    .bind(inquiry_id)
-    .execute(&state.db)
-    .await?;
+    estimation_repo::create_processing(&state.db, estimation_id, inquiry_id, "depth_sensor").await?;
 
     // Upload images to S3 synchronously so the frontend can display them while Modal processes.
     let s3_keys = if !parsed.images.is_empty() {
@@ -605,13 +516,7 @@ pub(crate) async fn trigger_estimate_upload(
     // while Modal is still processing.
     if !s3_keys.is_empty() {
         let source_data = serde_json::json!({ "s3_keys": &s3_keys, "image_count": s3_keys.len() });
-        let _ = sqlx::query(
-            "UPDATE volume_estimations SET source_data = $1 WHERE id = $2",
-        )
-        .bind(&source_data)
-        .bind(estimation_id)
-        .execute(&state.db)
-        .await;
+        let _ = estimation_repo::update_source_data(&state.db, estimation_id, &source_data).await;
     }
 
     // Spawn background processing (same pipeline as public submission)
@@ -632,12 +537,7 @@ pub(crate) async fn trigger_estimate_upload(
         .await
         {
             tracing::error!(inquiry_id = %inquiry_id, error = %e, "Background estimation failed");
-            let _ = sqlx::query(
-                "UPDATE volume_estimations SET status = 'failed' WHERE id = $1 AND status = 'processing'",
-            )
-            .bind(estimation_id)
-            .execute(&state_bg.db)
-            .await;
+            let _ = estimation_repo::mark_failed(&state_bg.db, estimation_id).await;
         }
     });
 
@@ -662,10 +562,7 @@ pub(crate) async fn trigger_video_upload(
     Path(inquiry_id): Path<Uuid>,
     mut multipart: Multipart,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM inquiries WHERE id = $1)")
-        .bind(inquiry_id)
-        .fetch_one(&state.db)
-        .await?;
+    let exists = inquiry_repo::exists(&state.db, inquiry_id).await?;
     if !exists {
         return Err(ApiError::NotFound(format!("Inquiry {inquiry_id} not found")));
     }
@@ -709,21 +606,10 @@ pub(crate) async fn trigger_video_upload(
     }
 
     let now = chrono::Utc::now();
-    sqlx::query("UPDATE inquiries SET status = 'estimating', updated_at = $1 WHERE id = $2")
-        .bind(now)
-        .bind(inquiry_id)
-        .execute(&state.db)
-        .await?;
+    inquiry_repo::update_status(&state.db, inquiry_id, "estimating", now).await?;
 
     let estimation_id = Uuid::now_v7();
-    sqlx::query(
-        "INSERT INTO volume_estimations (id, inquiry_id, method, status, source_data, created_at) \
-         VALUES ($1, $2, 'video', 'processing', '{}', NOW())",
-    )
-    .bind(estimation_id)
-    .bind(inquiry_id)
-    .execute(&state.db)
-    .await?;
+    estimation_repo::create_processing(&state.db, estimation_id, inquiry_id, "video").await?;
 
     // Upload video to S3 synchronously so the frontend can reference the file
     // while Modal processes it in the background.
@@ -746,12 +632,7 @@ pub(crate) async fn trigger_video_upload(
             process_video_background(state_bg.clone(), inquiry_id, estimation_id, video_bytes, mime_type, s3_key).await
         {
             tracing::error!(inquiry_id = %inquiry_id, error = %e, "Background video estimation failed");
-            let _ = sqlx::query(
-                "UPDATE volume_estimations SET status = 'failed' WHERE id = $1 AND status = 'processing'",
-            )
-            .bind(estimation_id)
-            .execute(&state_bg.db)
-            .await;
+            let _ = estimation_repo::mark_failed(&state_bg.db, estimation_id).await;
         }
     });
 
@@ -776,25 +657,8 @@ pub(crate) async fn list_inquiry_employees(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let rows: Vec<EmployeeAssignmentRow> = sqlx::query_as(
-        r#"
-        SELECT ie.employee_id, e.first_name, e.last_name, e.email,
-               ie.planned_hours::float8 AS planned_hours,
-               ie.clock_in,
-               ie.clock_out,
-               CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
-                    THEN (EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0)::float8
-                    ELSE NULL END AS actual_hours,
-               ie.notes
-        FROM inquiry_employees ie
-        JOIN employees e ON ie.employee_id = e.id
-        WHERE ie.inquiry_id = $1
-        ORDER BY e.last_name, e.first_name
-        "#,
-    )
-    .bind(id)
-    .fetch_all(&state.db)
-    .await?;
+    let rows: Vec<inquiry_repo::EmployeeAssignmentRow> =
+        inquiry_repo::list_employee_assignments(&state.db, id).await?;
 
     Ok(Json(serde_json::json!({ "assignments": rows })))
 }
@@ -812,41 +676,25 @@ pub(crate) async fn assign_employee(
     Json(body): Json<aust_core::models::AssignEmployee>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     // Verify inquiry exists
-    let exists: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM inquiries WHERE id = $1")
-            .bind(id)
-            .fetch_optional(&state.db)
-            .await?;
-    if exists.is_none() {
+    if !inquiry_repo::exists(&state.db, id).await? {
         return Err(ApiError::NotFound("Anfrage nicht gefunden".into()));
     }
 
     // Verify employee exists and is active
-    let emp: Option<(bool,)> =
-        sqlx::query_as("SELECT active FROM employees WHERE id = $1")
-            .bind(body.employee_id)
-            .fetch_optional(&state.db)
-            .await?;
-    match emp {
+    match inquiry_repo::check_employee_active(&state.db, body.employee_id).await? {
         None => return Err(ApiError::NotFound("Mitarbeiter nicht gefunden".into())),
-        Some((false,)) => {
-            return Err(ApiError::BadRequest("Mitarbeiter ist inaktiv".into()))
-        }
-        _ => {}
+        Some(false) => return Err(ApiError::BadRequest("Mitarbeiter ist inaktiv".into())),
+        Some(true) => {}
     }
 
-    sqlx::query(
-        r#"
-        INSERT INTO inquiry_employees (id, inquiry_id, employee_id, planned_hours, notes)
-        VALUES ($1, $2, $3, $4, $5)
-        "#,
+    inquiry_repo::insert_employee_assignment(
+        &state.db,
+        Uuid::now_v7(),
+        id,
+        body.employee_id,
+        body.planned_hours,
+        body.notes.as_deref(),
     )
-    .bind(Uuid::now_v7())
-    .bind(id)
-    .bind(body.employee_id)
-    .bind(body.planned_hours)
-    .bind(&body.notes)
-    .execute(&state.db)
     .await
     .map_err(|e| {
         if let sqlx::Error::Database(ref db_err) = e {
@@ -882,59 +730,22 @@ pub(crate) async fn update_assignment(
     Path((id, emp_id)): Path<(Uuid, Uuid)>,
     Json(body): Json<aust_core::models::UpdateAssignment>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let result = sqlx::query(
-        r#"
-        UPDATE inquiry_employees SET
-            clock_in  = COALESCE($4, clock_in),
-            clock_out = COALESCE($5, clock_out),
-            planned_hours = CASE
-                WHEN COALESCE($4, clock_in) IS NOT NULL AND COALESCE($5, clock_out) IS NOT NULL
-                THEN (EXTRACT(EPOCH FROM (COALESCE($5, clock_out) - COALESCE($4, clock_in))) / 3600.0)::float8
-                ELSE COALESCE($3, planned_hours)
-            END,
-            notes = COALESCE($6, notes)
-        WHERE inquiry_id = $1 AND employee_id = $2
-        "#,
+    let rows_affected = inquiry_repo::update_employee_assignment(
+        &state.db,
+        id,
+        emp_id,
+        body.planned_hours,
+        body.clock_in,
+        body.clock_out,
+        body.notes.as_deref(),
     )
-    .bind(id)
-    .bind(emp_id)
-    .bind(body.planned_hours)
-    .bind(body.clock_in)
-    .bind(body.clock_out)
-    .bind(&body.notes)
-    .execute(&state.db)
     .await?;
 
-    if result.rows_affected() == 0 {
+    if rows_affected == 0 {
         return Err(ApiError::NotFound("Zuweisung nicht gefunden".into()));
     }
 
-    #[derive(sqlx::FromRow)]
-    struct Updated {
-        planned_hours: f64,
-        clock_in: Option<chrono::DateTime<chrono::Utc>>,
-        clock_out: Option<chrono::DateTime<chrono::Utc>>,
-        actual_hours: Option<f64>,
-        notes: Option<String>,
-    }
-
-    let row: Updated = sqlx::query_as(
-        r#"
-        SELECT planned_hours::float8 AS planned_hours,
-               clock_in,
-               clock_out,
-               CASE WHEN clock_out IS NOT NULL AND clock_in IS NOT NULL
-                    THEN (EXTRACT(EPOCH FROM (clock_out - clock_in)) / 3600.0)::float8
-                    ELSE NULL END AS actual_hours,
-               notes
-        FROM inquiry_employees
-        WHERE inquiry_id = $1 AND employee_id = $2
-        "#,
-    )
-    .bind(id)
-    .bind(emp_id)
-    .fetch_one(&state.db)
-    .await?;
+    let row = inquiry_repo::fetch_updated_assignment(&state.db, id, emp_id).await?;
 
     Ok(Json(serde_json::json!({
         "employee_id": emp_id,
@@ -958,15 +769,10 @@ pub(crate) async fn remove_assignment(
     State(state): State<Arc<AppState>>,
     Path((id, emp_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, ApiError> {
-    let result = sqlx::query(
-        "DELETE FROM inquiry_employees WHERE inquiry_id = $1 AND employee_id = $2",
-    )
-    .bind(id)
-    .bind(emp_id)
-    .execute(&state.db)
-    .await?;
+    let rows_affected =
+        inquiry_repo::delete_employee_assignment(&state.db, id, emp_id).await?;
 
-    if result.rows_affected() == 0 {
+    if rows_affected == 0 {
         return Err(ApiError::NotFound("Zuweisung nicht gefunden".into()));
     }
 

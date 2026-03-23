@@ -15,12 +15,12 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
+use crate::repositories::{address_repo, customer_repo, estimation_repo, inquiry_repo, offer_repo};
 use crate::routes::inquiry_actions::{
     assign_employee, generate_inquiry_offer, list_inquiry_employees, remove_assignment,
     trigger_estimate, trigger_estimate_upload, trigger_video_upload, update_assignment,
     update_inquiry_items,
 };
-use crate::services::db::insert_estimation_no_return;
 use crate::services::inquiry_builder;
 use crate::{ApiError, AppState};
 use aust_core::models::{
@@ -121,14 +121,6 @@ struct UpdateInquiryRequest {
     destination_address_id: Option<Uuid>,
 }
 
-#[derive(Debug, sqlx::FromRow, Serialize)]
-struct EmailThreadSummary {
-    id: Uuid,
-    subject: Option<String>,
-    last_message_at: Option<chrono::DateTime<chrono::Utc>>,
-    message_count: i64,
-}
-
 // ---------------------------------------------------------------------------
 // Protected CRUD handlers
 // ---------------------------------------------------------------------------
@@ -145,11 +137,7 @@ async fn create_inquiry(
     let now = chrono::Utc::now();
 
     // Verify customer exists
-    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM customers WHERE id = $1)")
-        .bind(request.customer_id)
-        .fetch_one(&state.db)
-        .await?;
-    if !exists {
+    if !customer_repo::exists(&state.db, request.customer_id).await? {
         return Err(ApiError::Validation("Kunde nicht gefunden".into()));
     }
 
@@ -158,16 +146,14 @@ async fn create_inquiry(
         let street = addr.street.as_deref().unwrap_or("").trim().to_string();
         let city = addr.city.as_deref().unwrap_or("").trim().to_string();
         if !street.is_empty() || !city.is_empty() {
-            let (id,): (Uuid,) = sqlx::query_as(
-                "INSERT INTO addresses (id, street, city, postal_code, floor, elevator) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+            let id = address_repo::create(
+                &state.db,
+                &street,
+                &city,
+                addr.postal_code.as_deref(),
+                addr.floor.as_deref(),
+                addr.elevator,
             )
-            .bind(Uuid::now_v7())
-            .bind(&street)
-            .bind(&city)
-            .bind(&addr.postal_code)
-            .bind(&addr.floor)
-            .bind(addr.elevator)
-            .fetch_one(&state.db)
             .await?;
             Some(id)
         } else {
@@ -182,16 +168,14 @@ async fn create_inquiry(
         let street = addr.street.as_deref().unwrap_or("").trim().to_string();
         let city = addr.city.as_deref().unwrap_or("").trim().to_string();
         if !street.is_empty() || !city.is_empty() {
-            let (id,): (Uuid,) = sqlx::query_as(
-                "INSERT INTO addresses (id, street, city, postal_code, floor, elevator) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+            let id = address_repo::create(
+                &state.db,
+                &street,
+                &city,
+                addr.postal_code.as_deref(),
+                addr.floor.as_deref(),
+                addr.elevator,
             )
-            .bind(Uuid::now_v7())
-            .bind(&street)
-            .bind(&city)
-            .bind(&addr.postal_code)
-            .bind(&addr.floor)
-            .bind(addr.elevator)
-            .fetch_one(&state.db)
             .await?;
             Some(id)
         } else {
@@ -219,27 +203,22 @@ async fn create_inquiry(
     };
 
     let inquiry_id = Uuid::now_v7();
-    sqlx::query(
-        r#"
-        INSERT INTO inquiries (id, customer_id, origin_address_id, destination_address_id,
-                           status, estimated_volume_m3, preferred_date, notes, services,
-                           distance_km, source, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12)
-        "#,
+    inquiry_repo::create(
+        &state.db,
+        inquiry_id,
+        request.customer_id,
+        origin_id,
+        dest_id,
+        None,
+        initial_status.as_str(),
+        request.estimated_volume_m3,
+        request.distance_km,
+        preferred_date,
+        request.notes.as_deref(),
+        &services_json,
+        "admin_dashboard",
+        now,
     )
-    .bind(inquiry_id)
-    .bind(request.customer_id)
-    .bind(origin_id)
-    .bind(dest_id)
-    .bind(initial_status.as_str())
-    .bind(request.estimated_volume_m3)
-    .bind(preferred_date)
-    .bind(&request.notes)
-    .bind(&services_json)
-    .bind(request.distance_km)
-    .bind("admin_dashboard")
-    .bind(now)
-    .execute(&state.db)
     .await?;
 
     // Store manual volume estimation if provided
@@ -248,7 +227,7 @@ async fn create_inquiry(
         let source_data = serde_json::json!({"source": "admin_dashboard"});
         let items_text = request.items_list.as_deref().unwrap_or("");
         let result_data = serde_json::json!({"items_text": items_text});
-        insert_estimation_no_return(
+        estimation_repo::insert_no_return(
             &state.db,
             estimation_id,
             inquiry_id,
@@ -338,38 +317,22 @@ async fn update_inquiry(
         chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
     });
 
-    sqlx::query(
-        r#"
-        UPDATE inquiries SET
-            status = COALESCE($2, status),
-            notes = COALESCE($3, notes),
-            services = COALESCE($4, services),
-            estimated_volume_m3 = COALESCE($5, estimated_volume_m3),
-            distance_km = COALESCE($6, distance_km),
-            preferred_date = COALESCE($7, preferred_date),
-            scheduled_date = CASE WHEN $7 IS NOT NULL THEN NULL WHEN $11 IS NOT NULL THEN $11 ELSE scheduled_date END,
-            start_time = COALESCE($8, start_time),
-            end_time = COALESCE($9, end_time),
-            origin_address_id = COALESCE($10, origin_address_id),
-            destination_address_id = COALESCE($12, destination_address_id),
-            updated_at = $13
-        WHERE id = $1
-        "#,
+    inquiry_repo::update_fields(
+        &state.db,
+        id,
+        request.status.as_deref(),
+        request.notes.as_deref(),
+        services_json.as_ref(),
+        request.estimated_volume_m3,
+        request.distance_km,
+        preferred_date,
+        request.start_time,
+        request.end_time,
+        request.origin_address_id,
+        scheduled_date,
+        request.destination_address_id,
+        now,
     )
-    .bind(id)
-    .bind(request.status.as_deref())
-    .bind(&request.notes)
-    .bind(&services_json)
-    .bind(request.estimated_volume_m3)
-    .bind(request.distance_km)
-    .bind(preferred_date)
-    .bind(request.start_time)
-    .bind(request.end_time)
-    .bind(request.origin_address_id)
-    .bind(scheduled_date)
-    .bind(request.destination_address_id)
-    .bind(now)
-    .execute(&state.db)
     .await?;
 
     let response = inquiry_builder::build_inquiry_response(&state.db, id).await?;
@@ -391,11 +354,7 @@ async fn delete_inquiry(
             "Diese Aktion erfordert Administrator-Berechtigungen".into(),
         ));
     }
-    let rows_affected = sqlx::query("DELETE FROM inquiries WHERE id = $1")
-        .bind(id)
-        .execute(&state.db)
-        .await?
-        .rows_affected();
+    let rows_affected = inquiry_repo::hard_delete(&state.db, id).await?;
 
     if rows_affected == 0 {
         return Err(ApiError::NotFound(format!("Inquiry {id} not found")));
@@ -413,19 +372,10 @@ async fn get_inquiry_pdf(
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
     // Find latest active offer for this inquiry
-    let row: Option<(Uuid, Option<String>)> = sqlx::query_as(
-        r#"
-        SELECT id, pdf_storage_key FROM offers
-        WHERE inquiry_id = $1 AND status NOT IN ('rejected', 'cancelled')
-        ORDER BY created_at DESC LIMIT 1
-        "#,
-    )
-    .bind(id)
-    .fetch_optional(&state.db)
-    .await?;
-
     let (offer_id, storage_key) =
-        row.ok_or_else(|| ApiError::NotFound("Kein aktives Angebot gefunden".into()))?;
+        offer_repo::fetch_active_pdf_key(&state.db, id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound("Kein aktives Angebot gefunden".into()))?;
 
     let storage_key = storage_key
         .ok_or_else(|| ApiError::NotFound("Angebot hat keine generierte Datei".into()))?;
@@ -465,22 +415,7 @@ async fn get_inquiry_pdf(
 async fn get_inquiry_emails(
     State(state): State<Arc<AppState>>,
     Path(inquiry_id): Path<Uuid>,
-) -> Result<Json<Vec<EmailThreadSummary>>, ApiError> {
-    let threads: Vec<EmailThreadSummary> = sqlx::query_as(
-        r#"
-        SELECT
-            et.id,
-            et.subject,
-            (SELECT MAX(em.created_at) FROM email_messages em WHERE em.thread_id = et.id) AS last_message_at,
-            COALESCE((SELECT COUNT(*) FROM email_messages em WHERE em.thread_id = et.id), 0) AS message_count
-        FROM email_threads et
-        WHERE et.inquiry_id = $1
-        ORDER BY et.created_at DESC
-        "#,
-    )
-    .bind(inquiry_id)
-    .fetch_all(&state.db)
-    .await?;
-
+) -> Result<Json<Vec<inquiry_repo::EmailThreadSummary>>, ApiError> {
+    let threads = inquiry_repo::fetch_email_threads(&state.db, inquiry_id).await?;
     Ok(Json(threads))
 }

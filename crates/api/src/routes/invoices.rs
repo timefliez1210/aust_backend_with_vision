@@ -50,7 +50,7 @@ pub(crate) fn router() -> Router<Arc<AppState>> {
 }
 
 // Row types re-imported from invoice_repo
-use invoice_repo::{ActiveOfferRow, InvoiceAddressRow, InvoiceRow};
+use invoice_repo::{ActiveOfferRow, InvoiceRow};
 
 // ---------------------------------------------------------------------------
 // Request / Response types

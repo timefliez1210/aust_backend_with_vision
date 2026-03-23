@@ -106,19 +106,6 @@ pub(crate) async fn fetch_full(
     .await
 }
 
-/// Fetch an optional full address by ID — returns `None` when the ID itself is `None`.
-///
-/// **Caller**: `inquiry_builder::build_inquiry_response` for origin/destination/stop
-/// **Why**: Convenience wrapper that avoids repeated `if let Some(id)` boilerplate.
-pub(crate) async fn fetch_full_optional(
-    pool: &PgPool,
-    address_id: Option<Uuid>,
-) -> Result<Option<AddressFullRow>, sqlx::Error> {
-    match address_id {
-        Some(id) => fetch_full(pool, id).await,
-        None => Ok(None),
-    }
-}
 
 /// Insert a new address and return its ID.
 ///

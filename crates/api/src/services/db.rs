@@ -71,37 +71,6 @@ pub async fn insert_estimation(
     Ok(row)
 }
 
-/// Insert a volume estimation record without returning (fire-and-forget style).
-pub async fn insert_estimation_no_return(
-    pool: &PgPool,
-    id: Uuid,
-    inquiry_id: Uuid,
-    method: &str,
-    source_data: &serde_json::Value,
-    result_data: Option<&serde_json::Value>,
-    total_volume_m3: f64,
-    confidence_score: f64,
-    now: DateTime<Utc>,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        r#"
-        INSERT INTO volume_estimations
-            (id, inquiry_id, method, source_data, result_data, total_volume_m3, confidence_score, created_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        "#,
-    )
-    .bind(id)
-    .bind(inquiry_id)
-    .bind(method)
-    .bind(source_data)
-    .bind(result_data)
-    .bind(total_volume_m3)
-    .bind(confidence_score)
-    .bind(now)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {

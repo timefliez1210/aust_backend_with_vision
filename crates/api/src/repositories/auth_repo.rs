@@ -18,8 +18,10 @@ pub(crate) struct UserRow {
 #[derive(Debug, FromRow)]
 pub(crate) struct ResetRow {
     pub id: Uuid,
+    #[allow(dead_code)]
     pub user_id: Uuid,
     pub otp_hash: String,
+    #[allow(dead_code)]
     pub expires_at: DateTime<Utc>,
 }
 

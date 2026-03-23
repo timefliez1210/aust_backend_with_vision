@@ -5,8 +5,6 @@ use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
-use crate::ApiError;
-
 // ---------------------------------------------------------------------------
 // Dashboard
 // ---------------------------------------------------------------------------

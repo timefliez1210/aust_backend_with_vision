@@ -23,6 +23,7 @@ use tracing::warn;
 #[derive(Debug, sqlx::FromRow)]
 pub(crate) struct VolumeEstimationRow {
     pub result_data: Option<serde_json::Value>,
+    #[allow(dead_code)]
     pub source_data: Option<serde_json::Value>,
     #[allow(dead_code)]
     pub total_volume_m3: Option<f64>,
@@ -503,6 +504,7 @@ pub(crate) async fn build_offer_with_overrides(
             hours_estimated: Option<f64>,
             rate_per_hour_cents: Option<i64>,
             line_items_json: Option<serde_json::Value>,
+            #[allow(dead_code)]
             fahrt_override_cents: Option<i32>,
         }
         let row = OfferRow {
@@ -632,22 +634,6 @@ pub(crate) fn format_city(addr: &AddressRow) -> String {
     )
 }
 
-/// Return just the greeting line for a customer name (e.g. "Sehr geehrter Herr Müller,").
-///
-/// **Caller**: `admin::build_email_draft` — used when building the default email body for
-/// the offer send flow in the admin dashboard.
-/// **Why**: Convenience wrapper around `detect_salutation_and_greeting` when only the
-/// greeting line is needed (not the address-block salutation).
-///
-/// # Parameters
-/// - `name` — customer display name (may include "Herr"/"Frau" prefix)
-///
-/// # Returns
-/// German greeting string, e.g. `"Sehr geehrte Frau Müller,"` or
-/// `"Sehr geehrte Damen und Herren,"` when gender cannot be determined.
-pub(crate) fn greeting_for_name(name: &str) -> String {
-    detect_salutation_and_greeting(name).1
-}
 
 /// Detect the appropriate salutation and greeting line from a customer name.
 ///
