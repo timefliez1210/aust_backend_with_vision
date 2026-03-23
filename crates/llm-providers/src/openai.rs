@@ -1,5 +1,5 @@
-use crate::{LlmError, LlmMessage, LlmProvider, LlmRole};
 use async_trait::async_trait;
+use crate::{LlmError, LlmMessage, LlmProvider, LlmRole};
 use base64::Engine;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};

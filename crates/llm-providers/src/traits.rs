@@ -1,5 +1,5 @@
-use crate::LlmError;
 use async_trait::async_trait;
+use crate::LlmError;
 use serde::{Deserialize, Serialize};
 
 /// The role of a participant in a multi-turn conversation.

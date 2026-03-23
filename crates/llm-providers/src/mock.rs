@@ -1,6 +1,6 @@
+use async_trait::async_trait;
 use crate::error::LlmError;
 use crate::traits::{LlmMessage, LlmProvider};
-use async_trait::async_trait;
 
 /// Mock LLM provider for testing. Returns preconfigured responses.
 pub struct MockLlmProvider {

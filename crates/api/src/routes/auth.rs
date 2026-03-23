@@ -385,7 +385,7 @@ async fn reset_password_request(
 
     if let Some(user) = user {
         // Generate 6-digit OTP
-        let otp: u32 = rand::thread_rng().gen_range(100_000..=999_999);
+        let otp: u32 = rand::rng().random_range(100_000..=999_999);
         let otp_str = format!("{otp:06}");
 
         // Hash it for storage

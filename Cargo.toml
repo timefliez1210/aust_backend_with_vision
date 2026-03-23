@@ -1,17 +1,16 @@
 [package]
 name = "aust_backend"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 authors = ["AUST Team"]
 license = "MIT"
 
 [workspace]
 members = ["crates/api", "crates/core", "crates/email-agent", "crates/distance-calculator", "crates/llm-providers", "crates/offer-generator", "crates/storage", "crates/volume-estimator"]
-resolver = "2"
 
 [workspace.package]
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 authors = ["AUST Team"]
 license = "MIT"
 
@@ -78,7 +77,7 @@ chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
 anyhow = "1"
 
-# Async traits
+# Async traits (needed for dyn-compatible async trait objects)
 async-trait = "0.1"
 
 # Password hashing

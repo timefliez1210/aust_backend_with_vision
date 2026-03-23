@@ -1,5 +1,5 @@
-use crate::{StorageError, StorageProvider};
 use async_trait::async_trait;
+use crate::{StorageError, StorageProvider};
 use aws_sdk_s3::{
     config::{BehaviorVersion, Credentials, Region},
     primitives::ByteStream,

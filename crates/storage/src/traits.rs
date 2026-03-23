@@ -1,5 +1,5 @@
-use crate::StorageError;
 use async_trait::async_trait;
+use crate::StorageError;
 use bytes::Bytes;
 
 /// Pluggable object storage backend for offer PDFs and vision pipeline images.

@@ -305,13 +305,13 @@ async fn handle_complete_inquiry(
     };
 
     // 3c. Calculate distance if both addresses exist (include intermediate stop in route)
-    let distance_km = if let (Some(ref dep), Some(ref arr)) =
+    let distance_km = if let (Some(dep), Some(arr)) =
         (&inquiry.departure_address, &inquiry.arrival_address)
     {
         let calculator = RouteCalculator::new(state.config.maps.api_key.clone());
         let mut route_addresses = vec![dep.clone()];
         if inquiry.has_intermediate_stop {
-            if let Some(ref stop_addr) = inquiry.intermediate_address {
+            if let Some(stop_addr) = &inquiry.intermediate_address {
                 route_addresses.push(stop_addr.clone());
             }
         }
