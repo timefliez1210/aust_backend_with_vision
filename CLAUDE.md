@@ -532,7 +532,7 @@ Switch providers via `AUST__LLM__DEFAULT_PROVIDER` (claude/openai/ollama)
 ### Missing Offer Data
 - [x] Auto-trigger distance calculation when addresses exist (`try_auto_generate_offer` now runs ORS when `distance_km=0`)
 - [x] Add elevator field to addresses table (migration done; form wiring for email path still partial)
-- [ ] Salutation detection: currently hardcodes "Herrn", should detect from name or store
+- [x] Salutation detection: form sends M/F/D → stored in DB; name-based heuristic kept as legacy fallback
 
 ### Authentication
 - [ ] Implement proper JWT token generation in `crates/api/src/routes/auth.rs`

@@ -333,6 +333,16 @@ impl Config {
             _ => {}
         }
 
+        if self.auth.jwt_secret.len() < 32 {
+            return Err("auth.jwt_secret must be at least 32 characters".to_string());
+        }
+        if self.auth.jwt_secret.contains("change_this") {
+            return Err(
+                "auth.jwt_secret still has the default placeholder — set AUST__AUTH__JWT_SECRET to a strong random string"
+                    .to_string(),
+            );
+        }
+
         Ok(())
     }
 }

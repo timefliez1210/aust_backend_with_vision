@@ -312,8 +312,9 @@ pub(crate) async fn update_offer_status(
     offer_id: Uuid,
     status: &str,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(&format!("UPDATE offers SET status = '{status}' WHERE id = $1"))
+    sqlx::query("UPDATE offers SET status = $2 WHERE id = $1")
         .bind(offer_id)
+        .bind(status)
         .execute(pool)
         .await?;
     Ok(())
