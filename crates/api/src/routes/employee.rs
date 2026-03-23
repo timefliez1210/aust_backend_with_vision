@@ -5,14 +5,17 @@ use axum::{
     Extension, Json, Router,
 };
 use chrono::{DateTime, NaiveDate, Utc};
-use rand::Rng;
 use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::middleware::employee_auth::EmployeeClaims;
 use crate::repositories::employee_repo;
+use crate::services::otp_service::{
+    self, OtpBackend, OtpRequest, OtpResponse, VerifyRequest,
+};
 use crate::{ApiError, AppState};
 
 // ---------------------------------------------------------------------------
@@ -41,80 +44,67 @@ pub fn protected_router() -> Router<Arc<AppState>> {
 }
 
 // ---------------------------------------------------------------------------
-// OTP Auth
+// OTP Auth (delegates to shared otp_service)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
-struct OtpRequest {
-    email: String,
-}
-
-#[derive(Debug, Serialize)]
-struct OtpResponse {
-    message: String,
-}
-
-/// `POST /employee/auth/request` — generate a 6-digit OTP and send to the employee's email.
+/// Employee OTP backend — routes OTP operations to `employee_otps` / `employee_sessions` tables.
 ///
-/// **Caller**: Worker portal login page.
-/// **Why**: Magic-link / OTP login so employees don't need to manage passwords.
-///          Only sends a code if the email matches a known employee — otherwise returns
-///          the same generic message to avoid leaking which emails exist.
-///
-/// # Returns
-/// Always `200 OK` with a generic message (no information leakage).
-async fn request_otp(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<OtpRequest>,
-) -> Result<Json<OtpResponse>, ApiError> {
-    let email = body.email.trim().to_lowercase();
-    if email.is_empty() || !email.contains('@') {
-        return Err(ApiError::Validation("Ungültige E-Mail-Adresse".into()));
+/// **Caller**: `request_otp`, `verify_otp` handlers below.
+/// **Why**: Implements `OtpBackend` so the shared OTP logic works for employee auth.
+///          Employees must exist before a code is sent (`check_existence_before_send` = true)
+///          to avoid leaking whether an email is registered.
+struct EmployeeOtpBackend;
+
+impl OtpBackend for EmployeeOtpBackend {
+    fn check_existence_before_send(&self) -> bool {
+        true
     }
 
-    // Check employee exists — do NOT reveal whether it does via the response
-    let exists = employee_repo::find_active_by_email(&state.db, &email).await?;
-
-    // Rate limit: max 3 OTPs per email in last 10 minutes
-    let recent_count = employee_repo::count_recent_otps(&state.db, &email).await?;
-    if recent_count >= 3 {
-        return Err(ApiError::BadRequest(
-            "Zu viele Anfragen. Bitte warten Sie einige Minuten.".into(),
-        ));
+    async fn user_exists(&self, pool: &PgPool, email: &str) -> Result<bool, sqlx::Error> {
+        Ok(employee_repo::find_active_by_email(pool, email)
+            .await?
+            .is_some())
     }
 
-    // Only actually send if the employee exists
-    if exists.is_some() {
-        let code: String = {
-            let mut rng = rand::rng();
-            format!("{:06}", rng.random_range(0..1_000_000u32))
-        };
-        let expires_at = Utc::now() + chrono::Duration::minutes(10);
-
-        employee_repo::insert_otp(&state.db, &email, &code, expires_at).await?;
-
-        let subject = "Ihr Zugangscode — Aust Umzüge Mitarbeiterportal";
-        let body_text = format!(
-            "Guten Tag,\n\nIhr Zugangscode lautet: {code}\n\nDieser Code ist 10 Minuten gültig.\n\nMit freundlichen Grüßen,\nAust Umzüge"
-        );
-
-        if let Err(e) = send_otp_email(&state.config.email, &email, subject, &body_text).await {
-            tracing::error!("Failed to send employee OTP to {email}: {e}");
-            return Err(ApiError::Internal("E-Mail konnte nicht gesendet werden".into()));
-        }
-
-        tracing::info!(email = %email, "Employee OTP sent");
+    async fn count_recent_otps(&self, pool: &PgPool, email: &str) -> Result<i64, sqlx::Error> {
+        employee_repo::count_recent_otps(pool, email).await
     }
 
-    Ok(Json(OtpResponse {
-        message: "Falls diese E-Mail registriert ist, wurde ein Code gesendet.".to_string(),
-    }))
-}
+    async fn insert_otp(
+        &self,
+        pool: &PgPool,
+        email: &str,
+        code: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<(), sqlx::Error> {
+        employee_repo::insert_otp(pool, email, code, expires_at).await
+    }
 
-#[derive(Debug, Deserialize)]
-struct VerifyRequest {
-    email: String,
-    code: String,
+    async fn find_valid_otp(
+        &self,
+        pool: &PgPool,
+        email: &str,
+        code: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<Uuid>, sqlx::Error> {
+        employee_repo::find_valid_otp(pool, email, code, now).await
+    }
+
+    async fn mark_otp_used(&self, pool: &PgPool, otp_id: Uuid) -> Result<(), sqlx::Error> {
+        employee_repo::mark_otp_used(pool, otp_id).await
+    }
+
+    fn otp_email_subject(&self) -> &str {
+        "Ihr Zugangscode — Aust Umzüge Mitarbeiterportal"
+    }
+
+    fn request_success_message(&self) -> &str {
+        "Falls diese E-Mail registriert ist, wurde ein Code gesendet."
+    }
+
+    fn user_label(&self) -> &str {
+        "Employee"
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -133,6 +123,29 @@ struct EmployeeInfo {
     phone: Option<String>,
 }
 
+/// `POST /employee/auth/request` — generate a 6-digit OTP and send to the employee's email.
+///
+/// **Caller**: Worker portal login page.
+/// **Why**: Magic-link / OTP login so employees don't need to manage passwords.
+///          Only sends a code if the email matches a known employee — otherwise returns
+///          the same generic message to avoid leaking which emails exist.
+///
+/// # Returns
+/// Always `200 OK` with a generic message (no information leakage).
+async fn request_otp(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<OtpRequest>,
+) -> Result<Json<OtpResponse>, ApiError> {
+    let resp = otp_service::handle_request_otp(
+        &EmployeeOtpBackend,
+        &state.db,
+        &state.config.email,
+        &body.email,
+    )
+    .await?;
+    Ok(Json(resp))
+}
+
 /// `POST /employee/auth/verify` — validate OTP, create 30-day session, return token.
 ///
 /// **Caller**: Worker portal login page (code entry step).
@@ -146,20 +159,11 @@ async fn verify_otp(
     Json(body): Json<VerifyRequest>,
 ) -> Result<Json<VerifyResponse>, ApiError> {
     let email = body.email.trim().to_lowercase();
-    let code = body.code.trim().to_string();
 
-    if code.len() != 6 {
-        return Err(ApiError::Validation("Code muss 6 Stellen haben".into()));
-    }
-
-    // Find matching unused, non-expired OTP
-    let now = Utc::now();
-    let otp_id = employee_repo::find_valid_otp(&state.db, &email, &code, now)
-        .await?
-        .ok_or_else(|| ApiError::Unauthorized("Ungültiger oder abgelaufener Code".into()))?;
-
-    // Mark used
-    employee_repo::mark_otp_used(&state.db, otp_id).await?;
+    // Shared OTP validation + token generation
+    let token =
+        otp_service::handle_verify_otp(&EmployeeOtpBackend, &state.db, &body.email, &body.code)
+            .await?;
 
     // Look up employee
     let (emp_id, first_name, last_name, salutation, phone) =
@@ -168,9 +172,8 @@ async fn verify_otp(
             .ok_or_else(|| ApiError::Unauthorized("Mitarbeiter nicht gefunden oder inaktiv".into()))?;
 
     // Create 30-day session
-    let token = generate_session_token();
+    let now = Utc::now();
     let expires_at = now + chrono::Duration::days(30);
-
     employee_repo::create_session(&state.db, emp_id, &token, expires_at).await?;
 
     tracing::info!(employee_id = %emp_id, email = %email, "Employee authenticated via OTP");
@@ -623,14 +626,6 @@ async fn get_hours(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Generate a secure 64-character hex session token.
-fn generate_session_token() -> String {
-    use rand::RngCore;
-    let mut bytes = [0u8; 32];
-    rand::rng().fill_bytes(&mut bytes);
-    hex::encode(bytes)
-}
-
 /// Parse "YYYY-MM" into (first_day, last_day) NaiveDate range.
 fn parse_month_range(month: &str) -> Option<(NaiveDate, NaiveDate)> {
     let parts: Vec<&str> = month.split('-').collect();
@@ -714,31 +709,3 @@ async fn fetch_estimation_items(
     Ok(items)
 }
 
-/// Send OTP email via SMTP.
-async fn send_otp_email(
-    email_config: &aust_core::config::EmailConfig,
-    to: &str,
-    subject: &str,
-    body: &str,
-) -> Result<(), String> {
-    use crate::services::email::{build_plain_email, send_email};
-
-    let message = build_plain_email(
-        &email_config.from_address,
-        &email_config.from_name,
-        to,
-        subject,
-        body,
-    )
-    .map_err(|e| format!("Failed to build email: {e}"))?;
-
-    send_email(
-        &email_config.smtp_host,
-        email_config.smtp_port,
-        &email_config.username,
-        &email_config.password,
-        message,
-    )
-    .await
-    .map_err(|e| e.to_string())
-}

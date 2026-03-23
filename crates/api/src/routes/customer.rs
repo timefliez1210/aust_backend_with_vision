@@ -4,13 +4,16 @@ use axum::{
     Extension, Json, Router,
 };
 use chrono::{DateTime, NaiveDate, Utc};
-use rand::Rng;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
+use sqlx::PgPool;
 use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::middleware::customer_auth::CustomerClaims;
 use crate::repositories::customer_auth_repo;
+use crate::services::otp_service::{
+    self, OtpBackend, OtpRequest, OtpResponse, VerifyRequest,
+};
 use crate::{ApiError, AppState};
 
 /// Protected customer routes (require customer session token).
@@ -32,16 +35,65 @@ pub fn auth_router() -> Router<Arc<AppState>> {
         .route("/auth/verify", post(verify_otp))
 }
 
-// --- OTP Auth ---
+// --- OTP Auth (delegates to shared otp_service) ---
 
-#[derive(Debug, Deserialize)]
-struct OtpRequest {
-    email: String,
-}
+/// Customer OTP backend — routes OTP operations to `customer_otps` / `customer_sessions` tables.
+///
+/// **Caller**: `request_otp`, `verify_otp` handlers below.
+/// **Why**: Implements `OtpBackend` so the shared OTP logic works for customer auth.
+///          Customers are always sent a code (upserted on verify), so `check_existence_before_send`
+///          returns `false`.
+struct CustomerOtpBackend;
 
-#[derive(Debug, Serialize)]
-struct OtpResponse {
-    message: String,
+impl OtpBackend for CustomerOtpBackend {
+    fn check_existence_before_send(&self) -> bool {
+        false
+    }
+
+    async fn user_exists(&self, _pool: &PgPool, _email: &str) -> Result<bool, sqlx::Error> {
+        // Never called because check_existence_before_send is false
+        Ok(true)
+    }
+
+    async fn count_recent_otps(&self, pool: &PgPool, email: &str) -> Result<i64, sqlx::Error> {
+        customer_auth_repo::count_recent_otps(pool, email).await
+    }
+
+    async fn insert_otp(
+        &self,
+        pool: &PgPool,
+        email: &str,
+        code: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<(), sqlx::Error> {
+        customer_auth_repo::insert_otp(pool, email, code, expires_at).await
+    }
+
+    async fn find_valid_otp(
+        &self,
+        pool: &PgPool,
+        email: &str,
+        code: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<Uuid>, sqlx::Error> {
+        customer_auth_repo::find_valid_otp(pool, email, code, now).await
+    }
+
+    async fn mark_otp_used(&self, pool: &PgPool, otp_id: Uuid) -> Result<(), sqlx::Error> {
+        customer_auth_repo::mark_otp_used(pool, otp_id).await
+    }
+
+    fn otp_email_subject(&self) -> &str {
+        "Ihr Zugangscode — Aust Umzüge"
+    }
+
+    fn request_success_message(&self) -> &str {
+        "Code wurde gesendet"
+    }
+
+    fn user_label(&self) -> &str {
+        "Customer"
+    }
 }
 
 /// POST /customer/auth/request — generate 6-digit OTP and send via email.
@@ -49,53 +101,14 @@ async fn request_otp(
     State(state): State<Arc<AppState>>,
     Json(body): Json<OtpRequest>,
 ) -> Result<Json<OtpResponse>, ApiError> {
-    let email = body.email.trim().to_lowercase();
-    if email.is_empty() || !email.contains('@') {
-        return Err(ApiError::Validation("Ungültige E-Mail-Adresse".into()));
-    }
-
-    // Rate limit: max 3 OTPs per email in last 10 minutes
-    let recent_count = customer_auth_repo::count_recent_otps(&state.db, &email).await?;
-    if recent_count >= 3 {
-        return Err(ApiError::BadRequest(
-            "Zu viele Anfragen. Bitte warten Sie einige Minuten.".into(),
-        ));
-    }
-
-    // Generate 6-digit code
-    let code: String = {
-        let mut rng = rand::rng();
-        format!("{:06}", rng.random_range(0..1_000_000u32))
-    };
-
-    let expires_at = Utc::now() + chrono::Duration::minutes(10);
-
-    customer_auth_repo::insert_otp(&state.db, &email, &code, expires_at).await?;
-
-    // Send OTP via SMTP
-    let subject = "Ihr Zugangscode — Aust Umzüge";
-    let body_text = format!(
-        "Guten Tag,\n\nIhr Zugangscode lautet: {code}\n\nDieser Code ist 10 Minuten gültig.\n\nMit freundlichen Grüßen,\nAust Umzüge"
-    );
-
-    send_otp_email(&state.config.email, &email, subject, &body_text)
-        .await
-        .map_err(|e| {
-            tracing::error!("Failed to send OTP email to {email}: {e}");
-            ApiError::Internal("E-Mail konnte nicht gesendet werden".into())
-        })?;
-
-    tracing::info!(email = %email, "OTP sent");
-
-    Ok(Json(OtpResponse {
-        message: "Code wurde gesendet".to_string(),
-    }))
-}
-
-#[derive(Debug, Deserialize)]
-struct VerifyRequest {
-    email: String,
-    code: String,
+    let resp = otp_service::handle_request_otp(
+        &CustomerOtpBackend,
+        &state.db,
+        &state.config.email,
+        &body.email,
+    )
+    .await?;
+    Ok(Json(resp))
 }
 
 #[derive(Debug, Serialize)]
@@ -121,28 +134,18 @@ async fn verify_otp(
     Json(body): Json<VerifyRequest>,
 ) -> Result<Json<VerifyResponse>, ApiError> {
     let email = body.email.trim().to_lowercase();
-    let code = body.code.trim().to_string();
 
-    if code.len() != 6 {
-        return Err(ApiError::Validation("Code muss 6 Stellen haben".into()));
-    }
-
-    // Find matching unused OTP
-    let now = Utc::now();
-    let otp_id = customer_auth_repo::find_valid_otp(&state.db, &email, &code, now)
-        .await?
-        .ok_or_else(|| ApiError::Unauthorized("Ungültiger oder abgelaufener Code".into()))?;
-
-    // Mark OTP as used
-    customer_auth_repo::mark_otp_used(&state.db, otp_id).await?;
+    // Shared OTP validation + token generation
+    let token =
+        otp_service::handle_verify_otp(&CustomerOtpBackend, &state.db, &body.email, &body.code)
+            .await?;
 
     // Upsert customer by email
+    let now = Utc::now();
     let customer = customer_auth_repo::upsert_customer_minimal(&state.db, &email, now).await?;
 
-    // Generate session token (64 random hex chars)
-    let token = generate_session_token();
+    // Create session
     let expires_at = now + chrono::Duration::days(30);
-
     customer_auth_repo::create_session(&state.db, customer.0, &token, expires_at).await?;
 
     tracing::info!(customer_id = %customer.0, email = %email, "Customer authenticated via OTP");
@@ -577,43 +580,6 @@ async fn download_inquiry_pdf(
 }
 
 // --- Helpers ---
-
-/// Generate a secure 64-character hex session token.
-fn generate_session_token() -> String {
-    use rand::RngCore;
-    let mut bytes = [0u8; 32];
-    rand::rng().fill_bytes(&mut bytes);
-    hex::encode(bytes)
-}
-
-/// Send OTP email via SMTP.
-async fn send_otp_email(
-    email_config: &aust_core::config::EmailConfig,
-    to: &str,
-    subject: &str,
-    body: &str,
-) -> Result<(), String> {
-    use crate::services::email::{build_plain_email, send_email};
-
-    let message = build_plain_email(
-        &email_config.from_address,
-        &email_config.from_name,
-        to,
-        subject,
-        body,
-    )
-    .map_err(|e| format!("Failed to build email: {e}"))?;
-
-    send_email(
-        &email_config.smtp_host,
-        email_config.smtp_port,
-        &email_config.username,
-        &email_config.password,
-        message,
-    )
-    .await
-    .map_err(|e| e.to_string())
-}
 
 /// Send a notification to the admin via Telegram.
 async fn notify_admin_telegram(config: &aust_core::config::TelegramConfig, text: &str) {
