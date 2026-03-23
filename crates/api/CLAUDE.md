@@ -5,19 +5,86 @@
 
 HTTP server built on Axum 0.8. Defines all REST endpoints, request/response types, application state, and the offer orchestration pipeline.
 
+## Architecture
+
+```
+routes/           — HTTP handlers (request parsing, response building)
+  ↓ calls
+repositories/     — SQL queries (all sqlx::query calls live here)
+  ↓ reads/writes
+PostgreSQL
+
+services/         — Business logic (no SQL, no HTTP)
+  offer_builder   — offer generation pipeline (pricing → XLSX → PDF → S3)
+  inquiry_builder — canonical InquiryResponse/InquiryListItem builder
+  telegram_service — Telegram approval/edit flow
+  email_dispatch  — SMTP email on offer approval
+  offer_pipeline  — auto-offer triggering after estimation
+```
+
 ## Key Files
 
-- `src/routes/mod.rs` - Route tree assembly
-- `src/routes/inquiries.rs` - Unified inquiry CRUD + estimation + offer generation
-- `src/routes/estimates.rs` - Public image/video proxy + protected estimation CRUD (polling, delete)
-- `src/routes/calendar.rs` - Calendar & booking endpoints
-- `src/routes/admin.rs` - Admin panel (dashboard, customers, emails, users, orders)
-- `src/routes/customer.rs` - Customer-facing endpoints (OTP auth, accept/reject)
-- `src/routes/auth.rs` - Authentication (stub)
-- `src/routes/offers.rs` - Offer generation helpers (`build_offer_with_overrides`, line items, XLSX/PDF)
-- `src/services/inquiry_builder.rs` - Canonical `build_inquiry_response()` and `build_inquiry_list()`
-- `src/orchestrator.rs` - Offer event handler: Telegram approval/edit loop, inquiry pipeline
-- `src/state.rs` - `AppState` shared across handlers
+### Routes (`src/routes/`)
+
+| File | Responsibility |
+|------|---------------|
+| `mod.rs` | Route tree assembly (`public_api_router`, `protected_api_router`) |
+| `inquiries.rs` | Inquiry CRUD (create, list, get, update, delete) |
+| `inquiry_actions.rs` | Estimation, offer generation, items, employee assignments, emails |
+| `submissions.rs` | Public multipart uploads (`/submit/photo`, `/submit/mobile`) |
+| `admin.rs` | Dashboard, employees, router assembly for admin sub-routes |
+| `admin_customers.rs` | Customer CRUD (list, create, get, update, delete) |
+| `admin_emails.rs` | Email thread listing, detail, reply, compose |
+| `estimates.rs` | Public image/video proxy + protected estimation CRUD (polling, delete) |
+| `calendar.rs` | Calendar availability, schedule, bookings, capacity |
+| `calendar_items.rs` | CalendarItem/Termine CRUD |
+| `customer.rs` | Customer-facing endpoints (OTP auth, accept/reject offer) |
+| `auth.rs` | Admin authentication (login, refresh, OTP) |
+| `employee.rs` | Employee auth routes |
+| `invoices.rs` | Invoice endpoints |
+| `offers.rs` | Re-export shim → `services::offer_builder` |
+| `shared.rs` | Shared utilities (pagination, error mapping) |
+| `health.rs` | Health/readiness checks |
+
+### Repositories (`src/repositories/`)
+
+All SQL queries are centralized here. Route handlers call repo functions instead of inline `sqlx::query`.
+
+| File | Queries | Domain |
+|------|---------|--------|
+| `inquiry_repo.rs` | 25 | Inquiry CRUD, status transitions, volume updates |
+| `admin_repo.rs` | 42 | Dashboard KPIs, user listing, orders |
+| `employee_repo.rs` | 33 | Employee CRUD, assignments, hours |
+| `estimation_repo.rs` | 15 | Volume estimation lifecycle |
+| `invoice_repo.rs` | 23 | Invoice CRUD, address snapshots |
+| `customer_auth_repo.rs` | 16 | OTP codes, sessions |
+| `offer_repo.rs` | 15 | Offer storage, active PDF lookup |
+| `auth_repo.rs` | 12 | Admin users, JWT tokens |
+| `calendar_repo.rs` | 12 | Bookings, capacity overrides |
+| `calendar_item_repo.rs` | 12 | CalendarItem/Termine CRUD |
+| `email_repo.rs` | 6 | Email threads, messages |
+| `customer_repo.rs` | 5 | Customer upsert, lookup |
+| `address_repo.rs` | 3 | Address creation |
+
+### Services (`src/services/`)
+
+| File | Responsibility |
+|------|---------------|
+| `offer_builder.rs` | Full offer pipeline: pricing → line items → XLSX → PDF → S3 |
+| `inquiry_builder.rs` | Canonical `build_inquiry_response()` and `build_inquiry_list()` |
+| `telegram_service.rs` | Telegram approval/edit flow (send PDF, handle callbacks) |
+| `email_dispatch.rs` | SMTP email on offer approval |
+| `offer_pipeline.rs` | Auto-offer triggering after estimation completes |
+| `vision.rs` | Vision service client wrapper |
+| `email.rs` | Email service utilities |
+| `db.rs` | Legacy shared SQL helpers (being migrated to repositories) |
+
+### Other
+
+- `src/orchestrator.rs` — Background event handler (receives from email agent via mpsc channel)
+- `src/state.rs` — `AppState` shared across handlers
+- `src/error.rs` — `ApiError` enum with typed variants
+- `src/lib.rs` — Router assembly, middleware stack
 
 ## AppState
 
@@ -36,107 +103,69 @@ pub struct AppState {
 
 ### Inquiries (`/api/v1/inquiries`) — Main Resource
 
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/` | Create inquiry (customer_email + addresses) → 201 |
-| GET | `/` | List with filters: status, search, has_offer, limit, offset |
-| GET | `/{id}` | Full detail with customer, addresses, estimation, items, offer |
-| PATCH | `/{id}` | Update fields / transition status (validated by `can_transition_to()`) |
-| DELETE | `/{id}` | Soft-delete → status=cancelled |
-| GET | `/{id}/pdf` | Download latest active offer PDF |
-| PUT | `/{id}/items` | Replace estimation items + recalculate volume |
-| POST | `/{id}/estimate/{method}` | Trigger estimation (depth, video) |
-| POST | `/{id}/generate-offer` | Generate/regenerate offer |
-| GET | `/{id}/emails` | Email thread for this inquiry |
+| Method | Path | Handler file | Description |
+|--------|------|-------------|-------------|
+| POST | `/` | `inquiries.rs` | Create inquiry (customer_email + addresses) → 201 |
+| GET | `/` | `inquiries.rs` | List with filters: status, search, has_offer, limit, offset |
+| GET | `/{id}` | `inquiries.rs` | Full detail with customer, addresses, estimation, items, offer |
+| PATCH | `/{id}` | `inquiries.rs` | Update fields / transition status |
+| DELETE | `/{id}` | `inquiries.rs` | Soft-delete → status=cancelled |
+| GET | `/{id}/pdf` | `inquiries.rs` | Download latest active offer PDF |
+| PUT | `/{id}/items` | `inquiry_actions.rs` | Replace estimation items + recalculate volume |
+| POST | `/{id}/estimate/{method}` | `inquiry_actions.rs` | Trigger estimation (depth, video) |
+| POST | `/{id}/generate-offer` | `inquiry_actions.rs` | Generate/regenerate offer |
+| GET | `/{id}/emails` | `inquiry_actions.rs` | Email thread for this inquiry |
+| GET | `/{id}/employees` | `inquiry_actions.rs` | List assigned employees |
+| POST | `/{id}/employees` | `inquiry_actions.rs` | Assign employee |
+| PATCH | `/{id}/employees/{emp_id}` | `inquiry_actions.rs` | Update hours/notes |
+| DELETE | `/{id}/employees/{emp_id}` | `inquiry_actions.rs` | Remove assignment |
 
 ### Public Submissions (`/api/v1/submit`)
 
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/photo` | Photo webapp multipart upload (no auth) |
-| POST | `/mobile` | Mobile app multipart upload (no auth) |
-
-### Calendar (`/api/v1/calendar`)
-
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/availability?date=` | Check availability + alternatives |
-| GET | `/schedule?from=&to=` | Date range schedule (max 90 days) |
-| POST | `/bookings` | Create booking (respects capacity) |
-| GET | `/bookings/{id}` | Get booking |
-| PATCH | `/bookings/{id}` | Update status (confirm/cancel) |
-| PUT | `/capacity/{date}` | Override daily capacity |
+| Method | Path | Handler file | Description |
+|--------|------|-------------|-------------|
+| POST | `/photo` | `submissions.rs` | Photo webapp multipart upload (no auth) |
+| POST | `/mobile` | `submissions.rs` | Mobile app multipart upload (no auth) |
 
 ### Admin (`/api/v1/admin`)
 
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/dashboard` | KPIs, recent activity, conflict dates |
-| GET/POST | `/customers` | List / create customers |
-| GET/PATCH | `/customers/{id}` | Detail / update customer |
-| POST | `/customers/{id}/delete` | Delete customer |
-| PATCH | `/addresses/{id}` | Update address fields |
-| GET | `/emails` | List email threads |
-| GET | `/emails/{id}` | Thread detail with messages |
-| POST | `/emails/{id}/reply` | Reply to thread |
-| POST | `/emails/compose` | Send new email |
-| GET | `/users` | List admin users |
-| GET | `/orders` | List orders |
+| Method | Path | Handler file | Description |
+|--------|------|-------------|-------------|
+| GET | `/dashboard` | `admin.rs` | KPIs, recent activity, conflict dates |
+| GET/POST | `/customers` | `admin_customers.rs` | List / create customers |
+| GET/PATCH | `/customers/{id}` | `admin_customers.rs` | Detail / update customer |
+| POST | `/customers/{id}/delete` | `admin_customers.rs` | Delete customer |
+| PATCH | `/addresses/{id}` | `admin_customers.rs` | Update address fields |
+| GET | `/emails` | `admin_emails.rs` | List email threads |
+| GET | `/emails/{id}` | `admin_emails.rs` | Thread detail with messages |
+| POST | `/emails/{id}/reply` | `admin_emails.rs` | Reply to thread |
+| POST | `/emails/compose` | `admin_emails.rs` | Send new email |
+| GET | `/users` | `admin.rs` | List admin users |
+| GET | `/orders` | `admin.rs` | List orders |
+| GET/POST | `/employees` | `admin.rs` | List / create employees |
+| GET/PATCH | `/employees/{id}` | `admin.rs` | Detail / update employee |
 
 ## Orchestrator (`orchestrator.rs`)
 
-Background task that receives events from the email agent's Telegram poller via an `mpsc` channel.
+Background task that receives events from the email agent's Telegram poller via an `mpsc` channel. Heavy lifting is delegated to service modules:
+
+- **`telegram_service.rs`** — Sends formatted offers to Telegram, handles approve/edit/deny callbacks, LLM edit parsing
+- **`email_dispatch.rs`** — Downloads PDF from S3, sends via SMTP on approval
+- **`offer_pipeline.rs`** — Auto-generates offer after estimation completes
 
 ### Event Handling
 
-| Event | Action |
-|-------|--------|
-| `InquiryComplete(inquiry)` | Create customer + addresses + inquiry → auto-generate offer → Telegram |
-| `OfferApprove(id)` | Download PDF from S3 → SMTP email to customer → mark sent |
-| `OfferEdit(id)` | Enter edit mode, prompt Alex for instructions |
-| `OfferEditText(text)` | LLM parse instructions → regenerate offer with overrides → Telegram |
-| `OfferDeny(id)` | Mark offer rejected |
+| Event | Action | Delegated to |
+|-------|--------|-------------|
+| `InquiryComplete(inquiry)` | Create customer + addresses + inquiry → auto-generate offer → Telegram | `orchestrator.rs` |
+| `OfferApprove(id)` | Download PDF from S3 → SMTP email to customer → mark sent | `email_dispatch.rs` |
+| `OfferEdit(id)` | Enter edit mode, prompt Alex for instructions | `telegram_service.rs` |
+| `OfferEditText(text)` | LLM parse instructions → regenerate offer with overrides → Telegram | `telegram_service.rs` |
+| `OfferDeny(id)` | Mark offer rejected | `orchestrator.rs` |
 
-### Inquiry Pipeline (`handle_complete_inquiry`)
+## Offer Generation (`services/offer_builder.rs`)
 
-1. Upsert customer by email
-2. Create origin/destination addresses (parse `"Straße 1, 31157 Sarstedt"` → street, city, postal)
-3. Determine volume: use form-provided `volume_m3`, or rough estimate
-4. Create inquiry with status `"estimated"`, services as JSONB
-5. Store volume estimation with parsed items list in `result_data`
-6. Trigger `try_auto_generate_offer()`
-
-### Items List Parsing (`parse_items_list_text`)
-
-Parses VolumeCalculator text format into structured items:
-- Input: `"2x Sofa, Couch (0.80 m³)\n1x Schreibtisch (1.20 m³)"`
-- Handles both newline-separated and comma-separated formats
-- Extracts: quantity (`2x`), name, volume from parenthesized notation `(0.80 m³)`
-
-### Services JSONB
-
-Services stored as JSONB on `inquiries.services` (replaces comma-separated notes parsing):
-```rust
-pub struct Services {
-    pub packing: bool,                  // Einpackservice
-    pub assembly: bool,                 // Montage
-    pub disassembly: bool,              // Demontage
-    pub storage: bool,                  // Einlagerung
-    pub disposal: bool,                 // Entsorgung
-    pub parking_ban_origin: bool,       // Halteverbot Beladestelle
-    pub parking_ban_destination: bool,  // Halteverbot Entladestelle
-}
-```
-
-### LLM Edit Parsing (`llm_parse_edit_instructions`)
-
-Sends Alex's message + current offer summary to LLM. The LLM returns JSON with overrides:
-- `price_cents_netto` — bare prices default to brutto (÷1.19)
-- `persons`, `hours`, `rate`, `volume_m3`
-
-Falls back to regex-based `parse_edit_instructions()` if LLM fails.
-
-## Offer Generation (`offers.rs`)
+`routes/offers.rs` is a thin re-export shim. All logic lives in `services/offer_builder.rs`.
 
 ### `build_offer_with_overrides()`
 
@@ -163,8 +192,6 @@ Builds `Vec<OfferLineItem>` from `Services` struct, distance, and volume:
 Single source of truth for building `InquiryResponse` and `InquiryListItem`:
 - `build_inquiry_response(pool, inquiry_id)` — full detail with customer, addresses, estimation, items, offer
 - `build_inquiry_list(pool, status, search, has_offer, limit, offset)` — paginated list
-
-Replaces 3 duplicate implementations that existed in quotes.rs, admin.rs, and customer.rs.
 
 ## Dependencies
 

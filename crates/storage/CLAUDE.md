@@ -33,7 +33,7 @@ let storage = create_provider(&storage_config).await?;
 
 S3 key convention for volume estimation images:
 ```
-estimates/{quote_id}/{estimation_id}/{index}.jpg
+estimates/{inquiry_id}/{estimation_id}/{index}.jpg
 ```
 
 ## Configuration

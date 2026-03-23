@@ -863,7 +863,7 @@ Analyze one or more room photos using the LLM vision model. Images are submitted
 **Request body** (`application/json`)
 ```typescript
 {
-  quote_id: string;   // UUID (inquiry ID)
+  inquiry_id: string;   // UUID (inquiry ID)
   images: {
     data: string;       // base64-encoded image bytes
     mime_type: string;  // e.g. "image/jpeg", "image/png"
@@ -875,7 +875,7 @@ Analyze one or more room photos using the LLM vision model. Images are submitted
 ```typescript
 {
   id: string;
-  quote_id: string;
+  inquiry_id: string;
   method: "vision";
   status: "completed";
   source_data: {
@@ -928,7 +928,7 @@ IMAGE_B64=$(base64 -w 0 room.jpg)
 curl -X POST http://localhost:8080/api/v1/estimates/vision \
   -H "Authorization: Bearer <token>" \
   -H "Content-Type: application/json" \
-  -d "{\"quote_id\":\"019500000000000000000000\",\"images\":[{\"data\":\"$IMAGE_B64\",\"mime_type\":\"image/jpeg\"}]}"
+  -d "{\"inquiry_id\":\"019500000000000000000000\",\"images\":[{\"data\":\"$IMAGE_B64\",\"mime_type\":\"image/jpeg\"}]}"
 ```
 
 ---
@@ -942,7 +942,7 @@ Upload photos for 3D ML volume estimation (depth-sensor / photogrammetry pipelin
 **Request** (`multipart/form-data`)
 | Field | Type | Description |
 |---|---|---|
-| `quote_id` | text | UUID of the inquiry |
+| `inquiry_id` | text | UUID of the inquiry |
 | `<any name>` | file | Image files (JPEG, PNG, etc.); one field per image |
 
 **Response** `200 OK` — `VolumeEstimation` object (same shape as vision estimate).
@@ -956,7 +956,7 @@ Upload photos for 3D ML volume estimation (depth-sensor / photogrammetry pipelin
 ```bash
 curl -X POST http://localhost:8080/api/v1/estimates/depth-sensor \
   -H "Authorization: Bearer <token>" \
-  -F "quote_id=019500000000000000000000" \
+  -F "inquiry_id=019500000000000000000000" \
   -F "image1=@living_room.jpg" \
   -F "image2=@bedroom.jpg"
 ```
@@ -972,7 +972,7 @@ Upload a video for 3D reconstruction using MASt3R + SAM 2 on Modal (serverless G
 **Request** (`multipart/form-data`)
 | Field | Type | Description |
 |---|---|---|
-| `quote_id` | text | UUID of the inquiry |
+| `inquiry_id` | text | UUID of the inquiry |
 | `video` | file | Video file (MP4, MOV, WebM, MKV) — one per request |
 | `max_keyframes` | text (optional) | Override number of keyframes to extract |
 | `detection_threshold` | text (optional) | Override object detection confidence threshold |
@@ -990,7 +990,7 @@ The returned estimation has `status: "processing"`. Poll `GET /api/v1/estimates/
 ```bash
 curl -X POST http://localhost:8080/api/v1/estimates/video \
   -H "Authorization: Bearer <token>" \
-  -F "quote_id=019500000000000000000000" \
+  -F "inquiry_id=019500000000000000000000" \
   -F "video=@walkthrough.mp4"
 ```
 
@@ -1005,7 +1005,7 @@ Submit a manual inventory list. Calculates total volume by summing item volumes 
 **Request body** (`application/json`)
 ```typescript
 {
-  quote_id: string;
+  inquiry_id: string;
   inventory: {
     items: {
       name: string;
@@ -1026,7 +1026,7 @@ curl -X POST http://localhost:8080/api/v1/estimates/inventory \
   -H "Authorization: Bearer <token>" \
   -H "Content-Type: application/json" \
   -d '{
-    "quote_id": "019500000000000000000000",
+    "inquiry_id": "019500000000000000000000",
     "inventory": {
       "items": [
         {"name": "Sofa", "quantity": 1, "volume_m3": 0.8, "category": "Seating"},
@@ -1140,7 +1140,7 @@ Get a day-by-day schedule showing availability and bookings for a date range. Ma
   bookings: {
     id: string;
     booking_date: string;
-    quote_id: string | null;
+    inquiry_id: string | null;
     customer_name: string | null;
     customer_email: string | null;
     departure_address: string | null;
@@ -1180,7 +1180,7 @@ Create a new calendar booking. Fails if the date is already at capacity.
 ```typescript
 {
   booking_date: string;             // "YYYY-MM-DD"
-  quote_id?: string;                // UUID — link to an existing inquiry
+  inquiry_id?: string;                // UUID — link to an existing inquiry
   customer_name?: string;
   customer_email?: string;
   departure_address?: string;
@@ -1207,7 +1207,7 @@ curl -X POST http://localhost:8080/api/v1/calendar/bookings \
   -H "Content-Type: application/json" \
   -d '{
     "booking_date": "2026-04-15",
-    "quote_id": "019500000000000000000000",
+    "inquiry_id": "019500000000000000000000",
     "customer_name": "Max Mustermann",
     "departure_address": "Musterstr. 1, 1010 Wien",
     "arrival_address": "Neugasse 5, 1020 Wien"

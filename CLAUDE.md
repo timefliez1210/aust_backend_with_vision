@@ -29,7 +29,7 @@ Full user-facing docs live in the repository root:
 
 | Component | Technology |
 |-----------|------------|
-| Language | Rust 2021 |
+| Language | Rust 2024 (edition 2024, rustc 1.93+) |
 | Web Framework | Axum 0.8 |
 | Database | PostgreSQL 16 + SQLx |
 | Object Storage | S3-compatible (MinIO for dev) |
@@ -47,6 +47,9 @@ Full user-facing docs live in the repository root:
 crates/
 ├── core/                 # Domain models, config, shared errors
 ├── api/                  # REST API, routes, middleware (Axum)
+│   ├── src/routes/       #   18 route files (inquiries, admin, calendar, etc.)
+│   ├── src/repositories/ #   13 repo modules — all SQL queries live here
+│   └── src/services/     #   9 service modules (offer_builder, telegram, etc.)
 ├── llm-providers/        # LLM abstraction (Claude, OpenAI, Ollama)
 ├── storage/              # File storage abstraction (S3, local)
 ├── email-agent/          # Email processing + Telegram approval workflow
@@ -61,11 +64,36 @@ services/
     └── modal_app.py      # Modal serverless deployment
 ```
 
+### API Crate Internal Architecture
+
+Route handlers → Repository functions → Database. Business logic lives in services.
+
+```
+routes/          →  repositories/     →  PostgreSQL
+  inquiries.rs        inquiry_repo.rs
+  admin.rs            admin_repo.rs
+  customer.rs         customer_repo.rs
+  ...                 ...
+
+services/        (business logic, no SQL)
+  offer_builder.rs    — offer generation pipeline
+  inquiry_builder.rs  — canonical response builder
+  telegram_service.rs — Telegram approval/edit flow
+  email_dispatch.rs   — SMTP email on approval
+  offer_pipeline.rs   — auto-offer triggering
+```
+
 ## Key Files
 
 - `src/main.rs` - Application entry point, config loading, service wiring
+- `crates/api/src/routes/mod.rs` - Route tree assembly
+- `crates/api/src/repositories/` - All SQL queries (13 repo modules)
+- `crates/api/src/services/offer_builder.rs` - Offer generation pipeline
+- `crates/api/src/services/inquiry_builder.rs` - Canonical response builder
+- `crates/api/src/orchestrator.rs` - Background event handler (email agent → offer pipeline)
+- `crates/core/src/models/inquiry.rs` - Inquiry status state machine
 - `config/default.toml` - Default configuration
-- `migrations/*.sql` - Database schema (initial + calendar + address_floor)
+- `migrations/*.sql` - Database schema
 - `templates/Angebot_Vorlage.xlsx` - XLSX offer template (embedded at compile time)
 - `docker/docker-compose.yml` - Local dev infrastructure (Postgres, MinIO, Vision)
 - `docker/docker-compose.gpu.yml` - GPU override for vision service
@@ -410,7 +438,8 @@ Examples:
 - **Status enums**: Store as lowercase strings in DB
 - **Traits for abstraction**: `LlmProvider`, `StorageProvider` - pluggable implementations
 - **Factory functions**: `create_provider()` for centralized instantiation
-- **Service/Repository pattern**: Business logic in service layer, SQL in repository layer
+- **Repository pattern**: ALL SQL lives in `crates/api/src/repositories/*_repo.rs` — route handlers never contain inline `sqlx::query`. Services contain business logic, repos contain data access
+- **Adding a new feature**: (1) add repo function in `repositories/`, (2) add route handler in `routes/`, (3) wire route in `mod.rs`
 - **Function-level doc comments required**: Every `pub` function, `pub struct`, `pub enum`, and trait method must have a `///` doc comment. Add them to non-public functions too when the logic is non-obvious. Use this format:
 
   ```rust
@@ -554,7 +583,10 @@ Switch providers via `AUST__LLM__DEFAULT_PROVIDER` (claude/openai/ollama)
 - [x] Delete old `crates/api/src/routes/quotes.rs` and `distance.rs`
 - [x] Delete orphaned frontend `/admin/offers` pages (offers embedded in inquiry detail)
 - [x] Remove dead `status_sync.rs` (sync_quote_* functions never wired; offer status synced inline in customer.rs)
-- [ ] Migrate `/estimates` protected handlers into inquiry-level endpoints (currently re-mounted for frontend polling + delete)
-- [ ] Add multipart upload support to `trigger_estimate` for vision/depth/video methods (currently only inventory works inline)
-- [ ] Restore `/distance/calculate` endpoint or embed route geometry in inquiry response (route map broken)
+- [x] Extract repository layer — all SQL centralized in `repositories/*_repo.rs`
+- [x] Split god-files: admin.rs, inquiries.rs, orchestrator.rs, offers.rs
+- [x] Remove legacy Quote type
+- [x] Upgrade to Rust edition 2024
+- [ ] Migrate `/estimates` protected handlers to use repo layer (last route file with inline SQL via `services/db.rs`)
 - [ ] Rename `update_quote_volume` → `update_inquiry_volume` in `services/db.rs`
+- [ ] Restore `/distance/calculate` endpoint or embed route geometry in inquiry response (route map broken)

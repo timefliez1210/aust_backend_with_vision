@@ -20,7 +20,6 @@ Shared foundation crate used by all other crates. Contains domain models, applic
 |--------|--------|---------|
 | `ServerConfig` | host, port | HTTP server binding |
 | `DatabaseConfig` | url, max_connections | PostgreSQL |
-| `RedisConfig` | url | Redis cache |
 | `StorageConfig` | provider, bucket, endpoint, region, access_key, secret_key | S3/MinIO |
 | `EmailConfig` | imap_*, smtp_*, poll_interval_secs, from_address | Email I/O |
 | `LlmConfig` | default_provider, claude/openai/ollama sub-configs | LLM selection |
@@ -30,12 +29,25 @@ Shared foundation crate used by all other crates. Contains domain models, applic
 | `CalendarConfig` | default_capacity, alternatives_count, search_window_days | Booking |
 | `VisionServiceConfig` | enabled, base_url, timeout_secs, max_retries | ML vision service |
 
+`Config::validate()` runs at startup — checks DB URL non-empty, port non-zero, and LLM API key present for the selected provider.
+
 ## Domain Models
+
+### Inquiry (`models/inquiry.rs`)
+
+- `InquiryStatus` — state machine enum with `can_transition_to()` validation (implements `FromStr`/`Display`)
+- Status flow: `pending → info_requested → estimating → estimated → offer_ready → offer_sent → accepted|rejected|expired|cancelled → scheduled → completed → invoiced → paid`
+- `Services` — JSONB struct (packing, assembly, disassembly, storage, disposal, parking_ban_origin/destination)
+
+### Offer (`models/offer.rs`)
+
+- `OfferStatus` — enum: Draft, Active, Sent, Accepted, Rejected, Expired, Superseded (implements `FromStr`/`Display`)
+
 
 ### Volume Estimation (`models/volume.rs`)
 
 - `EstimationMethod` — enum: Vision, Inventory, DepthSensor, Manual
-- `VolumeEstimation` — full DB record (id, quote_id, method, total_volume_m3, confidence_score, etc.)
+- `VolumeEstimation` — full DB record (id, inquiry_id, method, total_volume_m3, confidence_score, etc.)
 - `VisionAnalysisResult` / `DetectedItem` — LLM vision results
 - `DepthSensorResult` / `DepthSensorItem` — 3D pipeline results
 - `ItemDimensions` — (length_m, width_m, height_m)

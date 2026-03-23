@@ -101,7 +101,7 @@ flowchart TD
 | `InquiryResponse` | core/models/snapshots.rs | Canonical HTTP response for an inquiry |
 | `EmployeeAssignmentSnapshot` | core/models/snapshots.rs | Employee assignment embedded in InquiryResponse |
 | `PricingInput` / `PricingResult` | offer-generator/pricing.rs | Pricing calculation I/O |
-| `OfferLineItem` | api/routes/offers.rs | One row in the XLSX offer |
+| `OfferLineItem` | api/services/offer_builder.rs | One row in the XLSX offer (re-exported via routes/offers.rs) |
 | `DateAvailability` | calendar/models.rs | Availability + alternatives for a date |
 | `RouteResult` | distance-calculator/route.rs | Geocoded route with km + duration |
 
