@@ -1,6 +1,7 @@
 pub mod error;
 pub mod middleware;
 pub mod orchestrator;
+pub(crate) mod repositories;
 pub mod routes;
 pub mod services;
 pub mod state;

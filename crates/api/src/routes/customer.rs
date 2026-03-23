@@ -10,6 +10,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::middleware::customer_auth::CustomerClaims;
+use crate::repositories::customer_auth_repo;
 use crate::{ApiError, AppState};
 
 /// Protected customer routes (require customer session token).
@@ -54,14 +55,8 @@ async fn request_otp(
     }
 
     // Rate limit: max 3 OTPs per email in last 10 minutes
-    let recent_count: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM customer_otps WHERE email = $1 AND created_at > NOW() - INTERVAL '10 minutes'",
-    )
-    .bind(&email)
-    .fetch_one(&state.db)
-    .await?;
-
-    if recent_count.0 >= 3 {
+    let recent_count = customer_auth_repo::count_recent_otps(&state.db, &email).await?;
+    if recent_count >= 3 {
         return Err(ApiError::BadRequest(
             "Zu viele Anfragen. Bitte warten Sie einige Minuten.".into(),
         ));
@@ -75,14 +70,7 @@ async fn request_otp(
 
     let expires_at = Utc::now() + chrono::Duration::minutes(10);
 
-    sqlx::query(
-        "INSERT INTO customer_otps (email, code, expires_at) VALUES ($1, $2, $3)",
-    )
-    .bind(&email)
-    .bind(&code)
-    .bind(expires_at)
-    .execute(&state.db)
-    .await?;
+    customer_auth_repo::insert_otp(&state.db, &email, &code, expires_at).await?;
 
     // Send OTP via SMTP
     let subject = "Ihr Zugangscode — Aust Umzüge";
@@ -140,60 +128,22 @@ async fn verify_otp(
     }
 
     // Find matching unused OTP
-    let otp_row: Option<(Uuid,)> = sqlx::query_as(
-        r#"
-        SELECT id FROM customer_otps
-        WHERE email = $1 AND code = $2 AND used = FALSE AND expires_at > $3
-        ORDER BY created_at DESC
-        LIMIT 1
-        "#,
-    )
-    .bind(&email)
-    .bind(&code)
-    .bind(Utc::now())
-    .fetch_optional(&state.db)
-    .await?;
-
-    let (otp_id,) = otp_row.ok_or_else(|| {
-        ApiError::Unauthorized("Ungültiger oder abgelaufener Code".into())
-    })?;
+    let now = Utc::now();
+    let otp_id = customer_auth_repo::find_valid_otp(&state.db, &email, &code, now)
+        .await?
+        .ok_or_else(|| ApiError::Unauthorized("Ungültiger oder abgelaufener Code".into()))?;
 
     // Mark OTP as used
-    sqlx::query("UPDATE customer_otps SET used = TRUE WHERE id = $1")
-        .bind(otp_id)
-        .execute(&state.db)
-        .await?;
-
-    let now = Utc::now();
+    customer_auth_repo::mark_otp_used(&state.db, otp_id).await?;
 
     // Upsert customer by email
-    let customer: (Uuid, String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>) =
-        sqlx::query_as(
-            r#"
-        INSERT INTO customers (id, email, created_at, updated_at)
-        VALUES ($1, $2, $3, $3)
-        ON CONFLICT (email) DO UPDATE SET updated_at = $3
-        RETURNING id, email, name, salutation, first_name, last_name, phone
-        "#,
-        )
-        .bind(Uuid::now_v7())
-        .bind(&email)
-        .bind(now)
-        .fetch_one(&state.db)
-        .await?;
+    let customer = customer_auth_repo::upsert_customer_minimal(&state.db, &email, now).await?;
 
     // Generate session token (64 random hex chars)
     let token = generate_session_token();
     let expires_at = now + chrono::Duration::days(30);
 
-    sqlx::query(
-        "INSERT INTO customer_sessions (customer_id, token, expires_at) VALUES ($1, $2, $3)",
-    )
-    .bind(customer.0)
-    .bind(&token)
-    .bind(expires_at)
-    .execute(&state.db)
-    .await?;
+    customer_auth_repo::create_session(&state.db, customer.0, &token, expires_at).await?;
 
     tracing::info!(customer_id = %customer.0, email = %email, "Customer authenticated via OTP");
 
@@ -218,14 +168,10 @@ async fn get_profile(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<CustomerClaims>,
 ) -> Result<Json<CustomerInfo>, ApiError> {
-    let row: Option<(Uuid, String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)> =
-        sqlx::query_as("SELECT id, email, name, salutation, first_name, last_name, phone FROM customers WHERE id = $1")
-            .bind(claims.customer_id)
-            .fetch_optional(&state.db)
-            .await?;
-
     let (id, email, name, salutation, first_name, last_name, phone) =
-        row.ok_or_else(|| ApiError::NotFound("Kunde nicht gefunden".into()))?;
+        customer_auth_repo::fetch_customer_profile(&state.db, claims.customer_id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound("Kunde nicht gefunden".into()))?;
 
     Ok(Json(CustomerInfo {
         id,
@@ -257,33 +203,7 @@ async fn list_inquiries(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<CustomerClaims>,
 ) -> Result<Json<Vec<InquirySummary>>, ApiError> {
-    let rows: Vec<(
-        Uuid,
-        String,
-        Option<DateTime<Utc>>,
-        DateTime<Utc>,
-        Option<String>,
-        Option<String>,
-        Option<f64>,
-        Option<i64>,
-    )> = sqlx::query_as(
-        r#"
-        SELECT
-            q.id, q.status, q.preferred_date, q.created_at,
-            oa.city AS origin_city,
-            da.city AS destination_city,
-            q.estimated_volume_m3,
-            (SELECT o.price_cents FROM offers o WHERE o.inquiry_id = q.id ORDER BY o.created_at DESC LIMIT 1)
-        FROM inquiries q
-        LEFT JOIN addresses oa ON q.origin_address_id = oa.id
-        LEFT JOIN addresses da ON q.destination_address_id = da.id
-        WHERE q.customer_id = $1
-        ORDER BY q.created_at DESC
-        "#,
-    )
-    .bind(claims.customer_id)
-    .fetch_all(&state.db)
-    .await?;
+    let rows = customer_auth_repo::list_customer_inquiries(&state.db, claims.customer_id).await?;
 
     let inquiries: Vec<InquirySummary> = rows
         .into_iter()
@@ -357,26 +277,7 @@ async fn get_inquiry_detail(
     Path(id): Path<Uuid>,
 ) -> Result<Json<InquiryDetail>, ApiError> {
     // Fetch inquiry with ownership check
-    let inquiry_row: Option<(
-        Uuid,
-        String,
-        Option<f64>,
-        Option<f64>,
-        Option<DateTime<Utc>>,
-        Option<Uuid>,
-        Option<Uuid>,
-    )> = sqlx::query_as(
-        r#"
-        SELECT id, status, estimated_volume_m3, distance_km, preferred_date,
-               origin_address_id, destination_address_id
-        FROM inquiries
-        WHERE id = $1 AND customer_id = $2
-        "#,
-    )
-    .bind(id)
-    .bind(claims.customer_id)
-    .fetch_optional(&state.db)
-    .await?;
+    let inquiry_row = customer_auth_repo::fetch_inquiry_owned(&state.db, id, claims.customer_id).await?;
 
     let (qid, status, volume, distance, pdate, origin_id, dest_id) =
         inquiry_row.ok_or_else(|| ApiError::NotFound("Anfrage nicht gefunden".into()))?;
@@ -398,18 +299,7 @@ async fn get_inquiry_detail(
     let estimation = fetch_estimation(&state.db, id).await?;
 
     // Fetch offers
-    let offer_rows: Vec<(Uuid, i64, String, Option<NaiveDate>, Option<i32>, Option<f64>)> =
-        sqlx::query_as(
-            r#"
-            SELECT id, price_cents, status, valid_until, persons, hours_estimated
-            FROM offers
-            WHERE inquiry_id = $1
-            ORDER BY created_at DESC
-            "#,
-        )
-        .bind(id)
-        .fetch_all(&state.db)
-        .await?;
+    let offer_rows = customer_auth_repo::fetch_inquiry_offers(&state.db, id).await?;
 
     let offers: Vec<OfferInfo> = offer_rows
         .into_iter()
@@ -440,13 +330,7 @@ async fn fetch_address(
     db: &sqlx::PgPool,
     id: Uuid,
 ) -> Result<Option<AddressInfo>, ApiError> {
-    let row: Option<(String, String, String, Option<String>)> = sqlx::query_as(
-        "SELECT COALESCE(street, ''), COALESCE(city, ''), COALESCE(postal_code, ''), floor FROM addresses WHERE id = $1",
-    )
-    .bind(id)
-    .fetch_optional(db)
-    .await?;
-
+    let row = customer_auth_repo::fetch_address_display(db, id).await?;
     Ok(row.map(|(street, city, postal_code, floor)| AddressInfo {
         street,
         city,
@@ -459,18 +343,7 @@ async fn fetch_estimation(
     db: &sqlx::PgPool,
     inquiry_id: Uuid,
 ) -> Result<Option<EstimationInfo>, ApiError> {
-    let row: Option<(f64, f64, Option<serde_json::Value>)> = sqlx::query_as(
-        r#"
-        SELECT total_volume_m3, confidence_score, result_data
-        FROM volume_estimations
-        WHERE inquiry_id = $1
-        ORDER BY created_at DESC
-        LIMIT 1
-        "#,
-    )
-    .bind(inquiry_id)
-    .fetch_optional(db)
-    .await?;
+    let row = customer_auth_repo::fetch_latest_estimation(db, inquiry_id).await?;
 
     let Some((total_volume_m3, confidence_score, result_data)) = row else {
         return Ok(None);
@@ -557,38 +430,16 @@ async fn accept_inquiry(
     Path(inquiry_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // Validate ownership: inquiry must belong to this customer
-    let inquiry_row: Option<(Uuid, String)> = sqlx::query_as(
-        r#"
-        SELECT q.id, COALESCE(c.name, c.email)
-        FROM inquiries q
-        JOIN customers c ON q.customer_id = c.id
-        WHERE q.id = $1 AND q.customer_id = $2
-        "#,
-    )
-    .bind(inquiry_id)
-    .bind(claims.customer_id)
-    .fetch_optional(&state.db)
-    .await?;
-
     let (_inq_id, customer_name) =
-        inquiry_row.ok_or_else(|| ApiError::NotFound("Anfrage nicht gefunden".into()))?;
+        customer_auth_repo::validate_inquiry_ownership(&state.db, inquiry_id, claims.customer_id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound("Anfrage nicht gefunden".into()))?;
 
     // Find the active offer (latest non-rejected/non-cancelled) for this inquiry
-    let offer_row: Option<(Uuid, String)> = sqlx::query_as(
-        r#"
-        SELECT id, status
-        FROM offers
-        WHERE inquiry_id = $1 AND status NOT IN ('rejected', 'cancelled')
-        ORDER BY created_at DESC
-        LIMIT 1
-        "#,
-    )
-    .bind(inquiry_id)
-    .fetch_optional(&state.db)
-    .await?;
-
     let (offer_id, offer_status) =
-        offer_row.ok_or_else(|| ApiError::NotFound("Kein aktives Angebot gefunden".into()))?;
+        customer_auth_repo::fetch_active_offer_with_status(&state.db, inquiry_id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound("Kein aktives Angebot gefunden".into()))?;
 
     if !["draft", "sent"].contains(&offer_status.as_str()) {
         return Err(ApiError::BadRequest(format!(
@@ -600,17 +451,10 @@ async fn accept_inquiry(
     let now = Utc::now();
 
     // Update offer → accepted
-    sqlx::query("UPDATE offers SET status = 'accepted' WHERE id = $1")
-        .bind(offer_id)
-        .execute(&state.db)
-        .await?;
+    customer_auth_repo::update_offer_status(&state.db, offer_id, "accepted").await?;
 
     // Update inquiry → accepted
-    sqlx::query("UPDATE inquiries SET status = 'accepted', updated_at = $1 WHERE id = $2")
-        .bind(now)
-        .bind(inquiry_id)
-        .execute(&state.db)
-        .await?;
+    crate::repositories::inquiry_repo::update_status(&state.db, inquiry_id, "accepted", now).await?;
 
     // Notify admin via Telegram
     notify_admin_telegram(
@@ -644,38 +488,16 @@ async fn reject_inquiry(
     Path(inquiry_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // Validate ownership: inquiry must belong to this customer
-    let inquiry_row: Option<(Uuid, String)> = sqlx::query_as(
-        r#"
-        SELECT q.id, COALESCE(c.name, c.email)
-        FROM inquiries q
-        JOIN customers c ON q.customer_id = c.id
-        WHERE q.id = $1 AND q.customer_id = $2
-        "#,
-    )
-    .bind(inquiry_id)
-    .bind(claims.customer_id)
-    .fetch_optional(&state.db)
-    .await?;
-
     let (_inq_id, customer_name) =
-        inquiry_row.ok_or_else(|| ApiError::NotFound("Anfrage nicht gefunden".into()))?;
+        customer_auth_repo::validate_inquiry_ownership(&state.db, inquiry_id, claims.customer_id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound("Anfrage nicht gefunden".into()))?;
 
     // Find the active offer (latest non-rejected/non-cancelled) for this inquiry
-    let offer_row: Option<(Uuid, String)> = sqlx::query_as(
-        r#"
-        SELECT id, status
-        FROM offers
-        WHERE inquiry_id = $1 AND status NOT IN ('rejected', 'cancelled')
-        ORDER BY created_at DESC
-        LIMIT 1
-        "#,
-    )
-    .bind(inquiry_id)
-    .fetch_optional(&state.db)
-    .await?;
-
     let (offer_id, offer_status) =
-        offer_row.ok_or_else(|| ApiError::NotFound("Kein aktives Angebot gefunden".into()))?;
+        customer_auth_repo::fetch_active_offer_with_status(&state.db, inquiry_id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound("Kein aktives Angebot gefunden".into()))?;
 
     if !["draft", "sent"].contains(&offer_status.as_str()) {
         return Err(ApiError::BadRequest(format!(
@@ -687,17 +509,10 @@ async fn reject_inquiry(
     let now = Utc::now();
 
     // Update offer → rejected
-    sqlx::query("UPDATE offers SET status = 'rejected' WHERE id = $1")
-        .bind(offer_id)
-        .execute(&state.db)
-        .await?;
+    customer_auth_repo::update_offer_status(&state.db, offer_id, "rejected").await?;
 
     // Update inquiry → rejected
-    sqlx::query("UPDATE inquiries SET status = 'rejected', updated_at = $1 WHERE id = $2")
-        .bind(now)
-        .bind(inquiry_id)
-        .execute(&state.db)
-        .await?;
+    crate::repositories::inquiry_repo::update_status(&state.db, inquiry_id, "rejected", now).await?;
 
     // Notify admin via Telegram
     notify_admin_telegram(
@@ -731,29 +546,13 @@ async fn download_inquiry_pdf(
     Path(inquiry_id): Path<Uuid>,
 ) -> Result<axum::response::Response, ApiError> {
     // Validate ownership: inquiry must belong to this customer
-    let inquiry_row: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT id FROM inquiries WHERE id = $1 AND customer_id = $2",
-    )
-    .bind(inquiry_id)
-    .bind(claims.customer_id)
-    .fetch_optional(&state.db)
-    .await?;
-
-    inquiry_row.ok_or_else(|| ApiError::NotFound("Anfrage nicht gefunden".into()))?;
+    let owns = customer_auth_repo::check_inquiry_ownership(&state.db, inquiry_id, claims.customer_id).await?;
+    if !owns {
+        return Err(ApiError::NotFound("Anfrage nicht gefunden".into()));
+    }
 
     // Find the active offer's PDF storage key
-    let offer_row: Option<(Uuid, Option<String>)> = sqlx::query_as(
-        r#"
-        SELECT id, pdf_storage_key
-        FROM offers
-        WHERE inquiry_id = $1 AND status NOT IN ('rejected', 'cancelled')
-        ORDER BY created_at DESC
-        LIMIT 1
-        "#,
-    )
-    .bind(inquiry_id)
-    .fetch_optional(&state.db)
-    .await?;
+    let offer_row = crate::repositories::offer_repo::fetch_active_pdf_key(&state.db, inquiry_id).await?;
 
     let (offer_id, storage_key) =
         offer_row.ok_or_else(|| ApiError::NotFound("Kein aktives Angebot gefunden".into()))?;

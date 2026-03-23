@@ -16,11 +16,10 @@ use axum::{
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use sqlx::FromRow;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::routes::offers::CustomerRow;
+use crate::repositories::{invoice_repo, CustomerRow};
 use crate::ApiError;
 use crate::AppState;
 use aust_offer_generator::{
@@ -50,38 +49,8 @@ pub(crate) fn router() -> Router<Arc<AppState>> {
         .route("/{id}/invoices/{inv_id}/send", post(send_invoice))
 }
 
-// ---------------------------------------------------------------------------
-// DB projection rows
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, FromRow)]
-struct InvoiceRow {
-    id: Uuid,
-    inquiry_id: Uuid,
-    invoice_number: String,
-    invoice_type: String,
-    partial_group_id: Option<Uuid>,
-    partial_percent: Option<i32>,
-    status: String,
-    extra_services: serde_json::Value,
-    pdf_s3_key: Option<String>,
-    sent_at: Option<chrono::DateTime<Utc>>,
-    paid_at: Option<chrono::DateTime<Utc>>,
-    created_at: chrono::DateTime<Utc>,
-}
-
-#[derive(Debug, FromRow)]
-struct AddressRow {
-    street: Option<String>,
-    city: Option<String>,
-    postal_code: Option<String>,
-}
-
-#[derive(Debug, FromRow)]
-struct ActiveOfferRow {
-    price_cents: i64,
-    offer_number: Option<String>,
-}
+// Row types re-imported from invoice_repo
+use invoice_repo::{ActiveOfferRow, InvoiceAddressRow, InvoiceRow};
 
 // ---------------------------------------------------------------------------
 // Request / Response types
@@ -149,24 +118,10 @@ async fn list_invoices(
     State(state): State<Arc<AppState>>,
     Path(inquiry_id): Path<Uuid>,
 ) -> Result<Json<Vec<InvoiceResponse>>, ApiError> {
-    let rows: Vec<InvoiceRow> = sqlx::query_as(
-        "SELECT id, inquiry_id, invoice_number, invoice_type, partial_group_id,
-                partial_percent, status, extra_services, pdf_s3_key, sent_at, paid_at, created_at
-         FROM invoices WHERE inquiry_id = $1 ORDER BY created_at",
-    )
-    .bind(inquiry_id)
-    .fetch_all(&state.db)
-    .await?;
+    let rows = invoice_repo::list_by_inquiry(&state.db, inquiry_id).await?;
 
     // Need the active offer to compute display amounts
-    let offer: Option<ActiveOfferRow> = sqlx::query_as(
-        "SELECT price_cents, offer_number FROM offers WHERE inquiry_id = $1
-         ORDER BY created_at DESC LIMIT 1",
-    )
-    .bind(inquiry_id)
-    .fetch_optional(&state.db)
-    .await?;
-
+    let offer = invoice_repo::fetch_active_offer(&state.db, inquiry_id).await?;
     let offer_netto = offer.map(|o| o.price_cents).unwrap_or(0);
 
     let responses: Vec<InvoiceResponse> = rows
@@ -221,13 +176,11 @@ async fn create_invoice(
     };
 
     // Load inquiry and validate status
-    let inquiry_status: (String,) = sqlx::query_as("SELECT status FROM inquiries WHERE id = $1")
-        .bind(inquiry_id)
-        .fetch_optional(&state.db)
+    let status_str = invoice_repo::fetch_inquiry_status(&state.db, inquiry_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Inquiry {inquiry_id} not found")))?;
 
-    let status = inquiry_status.0.as_str();
+    let status = status_str.as_str();
     let allowed = matches!(
         status,
         "accepted" | "scheduled" | "completed" | "invoiced" | "paid"
@@ -239,11 +192,7 @@ async fn create_invoice(
     }
 
     // Guard: only one invoice (or pair) per inquiry
-    let (existing_count,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM invoices WHERE inquiry_id = $1")
-            .bind(inquiry_id)
-            .fetch_one(&state.db)
-            .await?;
+    let existing_count = invoice_repo::count_by_inquiry(&state.db, inquiry_id).await?;
     if existing_count > 0 {
         return Err(ApiError::BadRequest(
             "Invoices already exist for this inquiry".into(),
@@ -277,14 +226,10 @@ async fn create_invoice(
 
         // Generate invoice numbers — single round-trip to avoid sequence gaps on failure
         let (first_num, final_num) = {
-            let (seq1, seq2): (i64, i64) = sqlx::query_as(
-                "SELECT nextval('invoice_number_seq'), nextval('invoice_number_seq')",
-            )
-            .fetch_one(&state.db)
-            .await?;
+            let seqs = invoice_repo::next_invoice_numbers(&state.db, 2).await?;
             (
-                format!("{}-{:04}", today.format("%Y"), seq1),
-                format!("{}-{:04}", today.format("%Y"), seq2),
+                format!("{}-{:04}", today.format("%Y"), seqs[0]),
+                format!("{}-{:04}", today.format("%Y"), seqs[1]),
             )
         };
 
@@ -332,35 +277,12 @@ async fn create_invoice(
 
         // Insert both rows atomically so a partial failure can't leave an orphaned first row
         let mut tx = state.db.begin().await?;
-        sqlx::query(
-            "INSERT INTO invoices (id, inquiry_id, invoice_number, invoice_type,
-                partial_group_id, partial_percent, status, extra_services, pdf_s3_key, created_at)
-             VALUES ($1,$2,$3,'partial_first',$4,$5,'ready','[]',$6,$7)",
-        )
-        .bind(first_id)
-        .bind(inquiry_id)
-        .bind(&first_num)
-        .bind(group_id)
-        .bind(percent as i32)
-        .bind(&first_key)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
-
-        sqlx::query(
-            "INSERT INTO invoices (id, inquiry_id, invoice_number, invoice_type,
-                partial_group_id, partial_percent, status, extra_services, pdf_s3_key, created_at)
-             VALUES ($1,$2,$3,'partial_final',$4,$5,'draft','[]',$6,$7)",
-        )
-        .bind(final_id)
-        .bind(inquiry_id)
-        .bind(&final_num)
-        .bind(group_id)
-        .bind(percent as i32) // stored on both rows so build_invoice_response needs no sibling lookup
-        .bind(&final_key)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
+        invoice_repo::insert_partial_first(
+            &mut tx, first_id, inquiry_id, &first_num, group_id, percent as i32, &first_key, now,
+        ).await?;
+        invoice_repo::insert_partial_final(
+            &mut tx, final_id, inquiry_id, &final_num, group_id, percent as i32, &final_key, now,
+        ).await?;
         tx.commit().await?;
 
         let first_row = fetch_invoice_row(&state.db, first_id).await?;
@@ -372,10 +294,8 @@ async fn create_invoice(
         ]))
     } else {
         // Single full invoice
-        let (seq_val,): (i64,) = sqlx::query_as("SELECT nextval('invoice_number_seq')")
-            .fetch_one(&state.db)
-            .await?;
-        let invoice_num = format!("{}-{:04}", today.format("%Y"), seq_val);
+        let seqs = invoice_repo::next_invoice_numbers(&state.db, 1).await?;
+        let invoice_num = format!("{}-{:04}", today.format("%Y"), seqs[0]);
         let inv_id = Uuid::now_v7();
 
         let data = build_invoice_data(
@@ -391,18 +311,7 @@ async fn create_invoice(
         let pdf = generate_pdf_bytes(&xlsx).await;
         let s3_key = upload_invoice_pdf(&*state.storage, inv_id, &pdf).await?;
 
-        sqlx::query(
-            "INSERT INTO invoices (id, inquiry_id, invoice_number, invoice_type,
-                status, extra_services, pdf_s3_key, created_at)
-             VALUES ($1,$2,$3,'full','ready','[]',$4,$5)",
-        )
-        .bind(inv_id)
-        .bind(inquiry_id)
-        .bind(&invoice_num)
-        .bind(&s3_key)
-        .bind(now)
-        .execute(&state.db)
-        .await?;
+        invoice_repo::insert_full(&state.db, inv_id, inquiry_id, &invoice_num, &s3_key, now).await?;
 
         let row = fetch_invoice_row(&state.db, inv_id).await?;
         Ok(Json(vec![build_invoice_response(row, offer_netto)]))
@@ -414,16 +323,9 @@ async fn get_invoice(
     State(state): State<Arc<AppState>>,
     Path((inquiry_id, inv_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<InvoiceResponse>, ApiError> {
-    let row: InvoiceRow = sqlx::query_as(
-        "SELECT id, inquiry_id, invoice_number, invoice_type, partial_group_id,
-                partial_percent, status, extra_services, pdf_s3_key, sent_at, paid_at, created_at
-         FROM invoices WHERE id = $1 AND inquiry_id = $2",
-    )
-    .bind(inv_id)
-    .bind(inquiry_id)
-    .fetch_optional(&state.db)
-    .await?
-    .ok_or_else(|| ApiError::NotFound(format!("Invoice {inv_id} not found")))?;
+    let row = invoice_repo::fetch_by_id_and_inquiry(&state.db, inv_id, inquiry_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Invoice {inv_id} not found")))?;
 
     let offer_netto = get_offer_netto(&state.db, inquiry_id).await?;
     Ok(Json(build_invoice_response(row, offer_netto)))
@@ -437,16 +339,9 @@ async fn get_invoice_pdf(
     State(state): State<Arc<AppState>>,
     Path((inquiry_id, inv_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Response, ApiError> {
-    let row: (Option<String>, String) = sqlx::query_as(
-        "SELECT pdf_s3_key, invoice_number FROM invoices WHERE id = $1 AND inquiry_id = $2",
-    )
-    .bind(inv_id)
-    .bind(inquiry_id)
-    .fetch_optional(&state.db)
-    .await?
-    .ok_or_else(|| ApiError::NotFound(format!("Invoice {inv_id} not found")))?;
-
-    let (key_opt, invoice_number) = row;
+    let (key_opt, invoice_number) = invoice_repo::fetch_pdf_key(&state.db, inv_id, inquiry_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Invoice {inv_id} not found")))?;
     let key = key_opt
         .ok_or_else(|| ApiError::NotFound("Invoice PDF not yet generated".into()))?;
 
@@ -506,30 +401,12 @@ async fn update_invoice(
     // Handle status update
     if let Some(ref new_status) = req.status {
         if new_status == "paid" {
-            sqlx::query(
-                "UPDATE invoices SET status = 'paid', paid_at = $1 WHERE id = $2",
-            )
-            .bind(now)
-            .bind(inv_id)
-            .execute(&state.db)
-            .await?;
+            invoice_repo::mark_paid(&state.db, inv_id, now).await?;
 
             // Auto-transition inquiry to 'paid' when all invoices are paid
-            let unpaid: (i64,) = sqlx::query_as(
-                "SELECT COUNT(*) FROM invoices WHERE inquiry_id = $1 AND status != 'paid'",
-            )
-            .bind(inquiry_id)
-            .fetch_one(&state.db)
-            .await?;
-            if unpaid.0 == 0 {
-                sqlx::query(
-                    "UPDATE inquiries SET status = 'paid', updated_at = $1 WHERE id = $2
-                     AND status != 'paid'",
-                )
-                .bind(now)
-                .bind(inquiry_id)
-                .execute(&state.db)
-                .await?;
+            let unpaid = invoice_repo::count_unpaid(&state.db, inquiry_id).await?;
+            if unpaid == 0 {
+                invoice_repo::transition_inquiry_to_paid(&state.db, inquiry_id, now).await?;
             }
         }
     }
@@ -560,11 +437,7 @@ async fn update_invoice(
             .map_err(|e| ApiError::Internal(format!("JSON error: {e}")))?;
 
         // Persist extra services
-        sqlx::query("UPDATE invoices SET extra_services = $1 WHERE id = $2")
-            .bind(&extra_services_json)
-            .bind(inv_id)
-            .execute(&state.db)
-            .await?;
+        invoice_repo::update_extra_services(&state.db, inv_id, &extra_services_json).await?;
 
         // Regenerate PDF with updated extras
         let invoice_context = load_invoice_context(&state.db, inquiry_id).await?;
@@ -599,11 +472,7 @@ async fn update_invoice(
         let pdf = generate_pdf_bytes(&xlsx).await;
         let new_key = upload_invoice_pdf(&*state.storage, inv_id, &pdf).await?;
 
-        sqlx::query("UPDATE invoices SET pdf_s3_key = $1 WHERE id = $2")
-            .bind(&new_key)
-            .bind(inv_id)
-            .execute(&state.db)
-            .await?;
+        invoice_repo::update_pdf_key(&state.db, inv_id, &new_key).await?;
     }
 
     let updated_row = fetch_invoice_row(&state.db, inv_id).await?;
@@ -640,11 +509,9 @@ async fn send_invoice(
             ));
         }
     } else {
-        let (inq_status,): (String,) =
-            sqlx::query_as("SELECT status FROM inquiries WHERE id = $1")
-                .bind(inquiry_id)
-                .fetch_one(&state.db)
-                .await?;
+        let inq_status = invoice_repo::fetch_inquiry_status(&state.db, inquiry_id)
+            .await?
+            .unwrap_or_default();
         if inq_status != "completed" {
             return Err(ApiError::BadRequest(
                 "Diese Rechnung kann erst nach Auftragsabschluss (Status: abgeschlossen) gesendet werden".into(),
@@ -665,15 +532,10 @@ async fn send_invoice(
         .map_err(|e| ApiError::Internal(format!("Failed to load invoice PDF: {e}")))?;
 
     // Load customer email
-    let (customer_email, customer_name): (String, Option<String>) = sqlx::query_as(
-        "SELECT c.email, c.name FROM customers c
-         JOIN inquiries i ON i.customer_id = c.id
-         WHERE i.id = $1",
-    )
-    .bind(inquiry_id)
-    .fetch_one(&state.db)
-    .await
-    .map_err(|_| ApiError::NotFound("Customer not found for inquiry".into()))?;
+    let (customer_email, customer_name) = invoice_repo::fetch_customer_for_invoice(&state.db, inquiry_id)
+        .await
+        .map_err(|_| ApiError::NotFound("Customer not found for inquiry".into()))?
+        .ok_or_else(|| ApiError::NotFound("Customer not found for inquiry".into()))?;
 
     let display_name = customer_name.as_deref().unwrap_or("Kunde");
     let invoice_num = &row.invoice_number;
@@ -712,21 +574,10 @@ async fn send_invoice(
 
     // Update invoice status
     let now = Utc::now();
-    sqlx::query("UPDATE invoices SET status = 'sent', sent_at = $1 WHERE id = $2")
-        .bind(now)
-        .bind(inv_id)
-        .execute(&state.db)
-        .await?;
+    invoice_repo::mark_sent(&state.db, inv_id, now).await?;
 
     // Auto-transition inquiry to 'invoiced' if still in an earlier stage
-    sqlx::query(
-        "UPDATE inquiries SET status = 'invoiced', updated_at = $1 WHERE id = $2
-         AND status IN ('accepted','scheduled','completed')",
-    )
-    .bind(now)
-    .bind(inquiry_id)
-    .execute(&state.db)
-    .await?;
+    invoice_repo::transition_inquiry_to_invoiced(&state.db, inquiry_id, now).await?;
 
     let updated_row = fetch_invoice_row(&state.db, inv_id).await?;
     let offer_netto = get_offer_netto(&state.db, inquiry_id).await?;
@@ -757,47 +608,18 @@ async fn load_invoice_context(
     inquiry_id: Uuid,
 ) -> Result<InvoiceContext, ApiError> {
     // Active offer (most recent)
-    let offer: ActiveOfferRow = sqlx::query_as(
-        "SELECT price_cents, offer_number FROM offers WHERE inquiry_id = $1
-         ORDER BY created_at DESC LIMIT 1",
-    )
-    .bind(inquiry_id)
-    .fetch_optional(db)
-    .await?
-    .ok_or_else(|| ApiError::NotFound("No offer found for inquiry — generate an offer first".into()))?;
+    let offer: ActiveOfferRow = invoice_repo::fetch_active_offer(db, inquiry_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("No offer found for inquiry — generate an offer first".into()))?;
 
     // Customer + moving date
-    let customer: CustomerRow = sqlx::query_as(
-        "SELECT c.id, c.email, c.name, c.salutation, c.first_name, c.last_name, c.phone
-         FROM customers c
-         JOIN inquiries i ON i.customer_id = c.id
-         WHERE i.id = $1",
-    )
-    .bind(inquiry_id)
-    .fetch_one(db)
-    .await
-    .map_err(|_| ApiError::NotFound("Customer not found for inquiry".into()))?;
+    let customer: CustomerRow =
+        crate::repositories::customer_repo::fetch_by_inquiry_id(db, inquiry_id).await?;
 
-    let moving_date: Option<chrono::NaiveDate> = sqlx::query_as::<_, (Option<chrono::DateTime<Utc>>,)>(
-        "SELECT preferred_date FROM inquiries WHERE id = $1",
-    )
-    .bind(inquiry_id)
-    .fetch_one(db)
-    .await
-    .ok()
-    .and_then(|(dt,)| dt)
-    .map(|dt| dt.date_naive());
+    let moving_date = invoice_repo::fetch_moving_date(db, inquiry_id).await?;
 
     // Origin address
-    let origin: Option<AddressRow> = sqlx::query_as(
-        "SELECT a.street, a.city, a.postal_code
-         FROM addresses a
-         JOIN inquiries i ON i.origin_address_id = a.id
-         WHERE i.id = $1",
-    )
-    .bind(inquiry_id)
-    .fetch_optional(db)
-    .await?;
+    let origin = invoice_repo::fetch_origin_address(db, inquiry_id).await?;
 
     let origin_street = origin
         .as_ref()
@@ -876,14 +698,9 @@ async fn compute_invoice_amounts(
             let pct = if let Some(p) = partial_percent {
                 p as u8
             } else if let Some(gid) = partial_group_id {
-                let row: Option<(Option<i32>,)> = sqlx::query_as(
-                    "SELECT partial_percent FROM invoices
-                     WHERE partial_group_id = $1 AND invoice_type = 'partial_first'",
-                )
-                .bind(gid)
-                .fetch_optional(db)
-                .await?;
-                row.and_then(|(p,)| p).unwrap_or(0) as u8
+                invoice_repo::fetch_sibling_percent(db, gid)
+                    .await?
+                    .unwrap_or(0) as u8
             } else {
                 0
             };
@@ -910,15 +727,9 @@ async fn compute_invoice_amounts(
 // ---------------------------------------------------------------------------
 
 async fn fetch_invoice_row(db: &sqlx::PgPool, inv_id: Uuid) -> Result<InvoiceRow, ApiError> {
-    sqlx::query_as(
-        "SELECT id, inquiry_id, invoice_number, invoice_type, partial_group_id,
-                partial_percent, status, extra_services, pdf_s3_key, sent_at, paid_at, created_at
-         FROM invoices WHERE id = $1",
-    )
-    .bind(inv_id)
-    .fetch_one(db)
-    .await
-    .map_err(|_| ApiError::NotFound(format!("Invoice {inv_id} not found")))
+    invoice_repo::fetch_by_id(db, inv_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Invoice {inv_id} not found")))
 }
 
 async fn fetch_invoice_by_inquiry(
@@ -926,25 +737,15 @@ async fn fetch_invoice_by_inquiry(
     inv_id: Uuid,
     inquiry_id: Uuid,
 ) -> Result<InvoiceRow, ApiError> {
-    sqlx::query_as(
-        "SELECT id, inquiry_id, invoice_number, invoice_type, partial_group_id,
-                partial_percent, status, extra_services, pdf_s3_key, sent_at, paid_at, created_at
-         FROM invoices WHERE id = $1 AND inquiry_id = $2",
-    )
-    .bind(inv_id)
-    .bind(inquiry_id)
-    .fetch_optional(db)
-    .await?
-    .ok_or_else(|| ApiError::NotFound(format!("Invoice {inv_id} not found")))
+    invoice_repo::fetch_by_id_and_inquiry(db, inv_id, inquiry_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Invoice {inv_id} not found")))
 }
 
 async fn get_offer_netto(db: &sqlx::PgPool, inquiry_id: Uuid) -> Result<i64, ApiError> {
-    let row: Option<(i64,)> =
-        sqlx::query_as("SELECT price_cents FROM offers WHERE inquiry_id = $1 ORDER BY created_at DESC LIMIT 1")
-            .bind(inquiry_id)
-            .fetch_optional(db)
-            .await?;
-    Ok(row.map(|(c,)| c).unwrap_or(0))
+    invoice_repo::fetch_offer_netto(db, inquiry_id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))
 }
 
 // ---------------------------------------------------------------------------

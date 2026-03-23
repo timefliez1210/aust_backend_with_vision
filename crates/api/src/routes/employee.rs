@@ -12,6 +12,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::middleware::employee_auth::EmployeeClaims;
+use crate::repositories::employee_repo;
 use crate::{ApiError, AppState};
 
 // ---------------------------------------------------------------------------
@@ -72,21 +73,11 @@ async fn request_otp(
     }
 
     // Check employee exists — do NOT reveal whether it does via the response
-    let exists: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM employees WHERE LOWER(email) = $1 AND active = TRUE")
-            .bind(&email)
-            .fetch_optional(&state.db)
-            .await?;
+    let exists = employee_repo::find_active_by_email(&state.db, &email).await?;
 
     // Rate limit: max 3 OTPs per email in last 10 minutes
-    let recent: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM employee_otps WHERE email = $1 AND created_at > NOW() - INTERVAL '10 minutes'",
-    )
-    .bind(&email)
-    .fetch_one(&state.db)
-    .await?;
-
-    if recent.0 >= 3 {
+    let recent_count = employee_repo::count_recent_otps(&state.db, &email).await?;
+    if recent_count >= 3 {
         return Err(ApiError::BadRequest(
             "Zu viele Anfragen. Bitte warten Sie einige Minuten.".into(),
         ));
@@ -100,14 +91,7 @@ async fn request_otp(
         };
         let expires_at = Utc::now() + chrono::Duration::minutes(10);
 
-        sqlx::query(
-            "INSERT INTO employee_otps (email, code, expires_at) VALUES ($1, $2, $3)",
-        )
-        .bind(&email)
-        .bind(&code)
-        .bind(expires_at)
-        .execute(&state.db)
-        .await?;
+        employee_repo::insert_otp(&state.db, &email, &code, expires_at).await?;
 
         let subject = "Ihr Zugangscode — Aust Umzüge Mitarbeiterportal";
         let body_text = format!(
@@ -169,54 +153,25 @@ async fn verify_otp(
     }
 
     // Find matching unused, non-expired OTP
-    let otp_row: Option<(Uuid,)> = sqlx::query_as(
-        r#"
-        SELECT id FROM employee_otps
-        WHERE email = $1 AND code = $2 AND used = FALSE AND expires_at > $3
-        ORDER BY created_at DESC
-        LIMIT 1
-        "#,
-    )
-    .bind(&email)
-    .bind(&code)
-    .bind(Utc::now())
-    .fetch_optional(&state.db)
-    .await?;
-
-    let (otp_id,) = otp_row.ok_or_else(|| {
-        ApiError::Unauthorized("Ungültiger oder abgelaufener Code".into())
-    })?;
+    let now = Utc::now();
+    let otp_id = employee_repo::find_valid_otp(&state.db, &email, &code, now)
+        .await?
+        .ok_or_else(|| ApiError::Unauthorized("Ungültiger oder abgelaufener Code".into()))?;
 
     // Mark used
-    sqlx::query("UPDATE employee_otps SET used = TRUE WHERE id = $1")
-        .bind(otp_id)
-        .execute(&state.db)
-        .await?;
+    employee_repo::mark_otp_used(&state.db, otp_id).await?;
 
     // Look up employee
-    let emp: Option<(Uuid, String, String, Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT id, first_name, last_name, salutation, phone FROM employees WHERE LOWER(email) = $1 AND active = TRUE",
-    )
-    .bind(&email)
-    .fetch_optional(&state.db)
-    .await?;
-
-    let (emp_id, first_name, last_name, salutation, phone) = emp.ok_or_else(|| {
-        ApiError::Unauthorized("Mitarbeiter nicht gefunden oder inaktiv".into())
-    })?;
+    let (emp_id, first_name, last_name, salutation, phone) =
+        employee_repo::fetch_by_email(&state.db, &email)
+            .await?
+            .ok_or_else(|| ApiError::Unauthorized("Mitarbeiter nicht gefunden oder inaktiv".into()))?;
 
     // Create 30-day session
     let token = generate_session_token();
-    let expires_at = Utc::now() + chrono::Duration::days(30);
+    let expires_at = now + chrono::Duration::days(30);
 
-    sqlx::query(
-        "INSERT INTO employee_sessions (employee_id, token, expires_at) VALUES ($1, $2, $3)",
-    )
-    .bind(emp_id)
-    .bind(&token)
-    .bind(expires_at)
-    .execute(&state.db)
-    .await?;
+    employee_repo::create_session(&state.db, emp_id, &token, expires_at).await?;
 
     tracing::info!(employee_id = %emp_id, email = %email, "Employee authenticated via OTP");
 
@@ -245,15 +200,11 @@ async fn get_profile(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<EmployeeClaims>,
 ) -> Result<Json<EmployeeInfo>, ApiError> {
-    let row: Option<(Uuid, String, String, Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT id, first_name, last_name, salutation, phone FROM employees WHERE id = $1",
-    )
-    .bind(claims.employee_id)
-    .fetch_optional(&state.db)
-    .await?;
+    let profile = employee_repo::fetch_profile(&state.db, claims.employee_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Mitarbeiter nicht gefunden".into()))?;
 
-    let (id, first_name, last_name, salutation, phone) =
-        row.ok_or_else(|| ApiError::NotFound("Mitarbeiter nicht gefunden".into()))?;
+    let (id, first_name, last_name, salutation, phone) = profile;
 
     Ok(Json(EmployeeInfo {
         id,
@@ -325,59 +276,7 @@ async fn get_schedule(
     // Fetch moving inquiry assignments
     // -----------------------------------------------------------------------
 
-    #[derive(sqlx::FromRow)]
-    struct JobRow {
-        inquiry_id: Uuid,
-        job_date: Option<NaiveDate>,
-        status: String,
-        origin_street: Option<String>,
-        origin_city: Option<String>,
-        origin_postal_code: Option<String>,
-        destination_street: Option<String>,
-        destination_city: Option<String>,
-        destination_postal_code: Option<String>,
-        estimated_volume_m3: Option<f64>,
-        customer_name: Option<String>,
-        customer_phone: Option<String>,
-        planned_hours: f64,
-        actual_hours: Option<f64>,
-    }
-
-    let job_rows: Vec<JobRow> = sqlx::query_as(
-        r#"
-        SELECT
-            ie.inquiry_id,
-            COALESCE(i.scheduled_date, i.preferred_date::date) AS job_date,
-            i.status,
-            oa.street      AS origin_street,
-            oa.city        AS origin_city,
-            oa.postal_code AS origin_postal_code,
-            da.street      AS destination_street,
-            da.city        AS destination_city,
-            da.postal_code AS destination_postal_code,
-            i.estimated_volume_m3,
-            COALESCE(c.first_name || ' ' || c.last_name, c.name) AS customer_name,
-            c.phone AS customer_phone,
-            ie.planned_hours::float8 AS planned_hours,
-            CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
-                 THEN (EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0)::float8
-                 ELSE NULL END AS actual_hours
-        FROM inquiry_employees ie
-        JOIN inquiries  i  ON ie.inquiry_id = i.id
-        JOIN customers  c  ON i.customer_id = c.id
-        LEFT JOIN addresses oa ON i.origin_address_id      = oa.id
-        LEFT JOIN addresses da ON i.destination_address_id = da.id
-        WHERE ie.employee_id = $1
-          AND COALESCE(i.scheduled_date, i.preferred_date::date, ie.created_at::date)
-              BETWEEN $2 AND $3
-        ORDER BY COALESCE(i.scheduled_date, i.preferred_date::date) ASC NULLS LAST
-        "#,
-    )
-    .bind(claims.employee_id)
-    .bind(from_date)
-    .bind(to_date)
-    .fetch_all(&state.db)
-    .await?;
+    let job_rows = employee_repo::fetch_schedule_jobs(&state.db, claims.employee_id, from_date, to_date).await?;
 
     // Fetch colleague names for each job in one batch query
     let inquiry_ids: Vec<Uuid> = job_rows.iter().map(|r| r.inquiry_id).collect();
@@ -388,7 +287,7 @@ async fn get_schedule(
         .map(|r| {
             let colleagues = colleague_map.get(&r.inquiry_id).cloned().unwrap_or_default();
             ScheduleJob {
-                entry_type: "job".to_string(),
+                entry_type: "job".into(),
                 inquiry_id: Some(r.inquiry_id),
                 calendar_item_id: None,
                 title: None,
@@ -416,43 +315,7 @@ async fn get_schedule(
     // Fetch calendar item assignments
     // -----------------------------------------------------------------------
 
-    #[derive(sqlx::FromRow)]
-    struct ItemRow {
-        calendar_item_id: Uuid,
-        title: String,
-        location: Option<String>,
-        category: String,
-        scheduled_date: Option<NaiveDate>,
-        status: String,
-        planned_hours: f64,
-        actual_hours: Option<f64>,
-    }
-
-    let item_rows: Vec<ItemRow> = sqlx::query_as(
-        r#"
-        SELECT
-            cie.calendar_item_id,
-            ci.title,
-            ci.location,
-            ci.category,
-            ci.scheduled_date,
-            ci.status,
-            cie.planned_hours::float8 AS planned_hours,
-            CASE WHEN cie.clock_out IS NOT NULL AND cie.clock_in IS NOT NULL
-                 THEN (EXTRACT(EPOCH FROM (cie.clock_out - cie.clock_in)) / 3600.0)::float8
-                 ELSE NULL END AS actual_hours
-        FROM calendar_item_employees cie
-        JOIN calendar_items ci ON ci.id = cie.calendar_item_id
-        WHERE cie.employee_id = $1
-          AND ci.scheduled_date BETWEEN $2 AND $3
-        ORDER BY ci.scheduled_date ASC NULLS LAST
-        "#,
-    )
-    .bind(claims.employee_id)
-    .bind(from_date)
-    .bind(to_date)
-    .fetch_all(&state.db)
-    .await?;
+    let item_rows = employee_repo::fetch_schedule_items(&state.db, claims.employee_id, from_date, to_date).await?;
 
     // Fetch colleague names for each calendar item (same batch pattern)
     let item_ids: Vec<Uuid> = item_rows.iter().map(|r| r.calendar_item_id).collect();
@@ -556,83 +419,14 @@ async fn get_job_detail(
     Path(inquiry_id): Path<Uuid>,
 ) -> Result<Json<JobDetail>, ApiError> {
     // Verify assignment + fetch assignment fields (including employee self-reported times)
-    #[derive(sqlx::FromRow)]
-    struct AssignRow {
-        planned_hours: f64,
-        notes: Option<String>,
-        employee_clock_in: Option<DateTime<Utc>>,
-        employee_clock_out: Option<DateTime<Utc>>,
-    }
+    let assign = employee_repo::fetch_assignment(&state.db, inquiry_id, claims.employee_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Einsatz nicht gefunden oder keine Berechtigung".into()))?;
 
-    let assign: Option<AssignRow> = sqlx::query_as(
-        r#"
-        SELECT planned_hours::float8,
-               notes,
-               employee_clock_in,
-               employee_clock_out
-        FROM inquiry_employees
-        WHERE inquiry_id = $1 AND employee_id = $2
-        "#,
-    )
-    .bind(inquiry_id)
-    .bind(claims.employee_id)
-    .fetch_optional(&state.db)
-    .await?;
-
-    let assign = assign.ok_or_else(|| {
-        ApiError::NotFound("Einsatz nicht gefunden oder keine Berechtigung".into())
-    })?;
-
-    // Fetch inquiry + addresses + customer (floor stored as VARCHAR in DB)
-    #[derive(sqlx::FromRow)]
-    struct InquiryRow {
-        job_date: Option<NaiveDate>,
-        status: String,
-        estimated_volume_m3: Option<f64>,
-        origin_street: Option<String>,
-        origin_city: Option<String>,
-        origin_postal_code: Option<String>,
-        origin_floor: Option<String>,
-        origin_elevator: Option<bool>,
-        destination_street: Option<String>,
-        destination_city: Option<String>,
-        destination_postal_code: Option<String>,
-        destination_floor: Option<String>,
-        destination_elevator: Option<bool>,
-        customer_name: Option<String>,
-        customer_phone: Option<String>,
-    }
-
-    let row: Option<InquiryRow> = sqlx::query_as(
-        r#"
-        SELECT
-            COALESCE(i.scheduled_date, i.preferred_date::date) AS job_date,
-            i.status,
-            i.estimated_volume_m3,
-            oa.street      AS origin_street,
-            oa.city        AS origin_city,
-            oa.postal_code AS origin_postal_code,
-            oa.floor       AS origin_floor,
-            oa.elevator    AS origin_elevator,
-            da.street      AS destination_street,
-            da.city        AS destination_city,
-            da.postal_code AS destination_postal_code,
-            da.floor       AS destination_floor,
-            da.elevator    AS destination_elevator,
-            COALESCE(c.first_name || ' ' || c.last_name, c.name) AS customer_name,
-            c.phone  AS customer_phone
-        FROM inquiries i
-        JOIN customers c ON i.customer_id = c.id
-        LEFT JOIN addresses oa ON i.origin_address_id      = oa.id
-        LEFT JOIN addresses da ON i.destination_address_id = da.id
-        WHERE i.id = $1
-        "#,
-    )
-    .bind(inquiry_id)
-    .fetch_optional(&state.db)
-    .await?;
-
-    let row = row.ok_or_else(|| ApiError::NotFound("Anfrage nicht gefunden".into()))?;
+    // Fetch inquiry + addresses + customer
+    let row = employee_repo::fetch_job_inquiry(&state.db, inquiry_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Anfrage nicht gefunden".into()))?;
 
     // Compute employee actual hours from their self-reported times
     let employee_actual_hours = match (assign.employee_clock_in, assign.employee_clock_out) {
@@ -723,23 +517,9 @@ async fn patch_employee_clock(
     let clock_in = parse_dt(body.employee_clock_in)?;
     let clock_out = parse_dt(body.employee_clock_out)?;
 
-    let rows = sqlx::query(
-        r#"
-        UPDATE inquiry_employees
-        SET employee_clock_in  = $1,
-            employee_clock_out = $2,
-            updated_at         = NOW()
-        WHERE inquiry_id = $3 AND employee_id = $4
-        "#,
-    )
-    .bind(clock_in)
-    .bind(clock_out)
-    .bind(inquiry_id)
-    .bind(claims.employee_id)
-    .execute(&state.db)
-    .await?;
+    let rows_affected = employee_repo::update_clock_times(&state.db, inquiry_id, claims.employee_id, clock_in, clock_out).await?;
 
-    if rows.rows_affected() == 0 {
+    if rows_affected == 0 {
         return Err(ApiError::NotFound(
             "Einsatz nicht gefunden oder keine Berechtigung".into(),
         ));
@@ -797,83 +577,11 @@ async fn get_hours(
         .ok_or_else(|| ApiError::BadRequest("Ungueltiges Monatsformat (erwartet: YYYY-MM)".into()))?;
 
     // Employee's monthly target
-    let target: Option<(f64,)> = sqlx::query_as(
-        "SELECT monthly_hours_target::float8 FROM employees WHERE id = $1",
-    )
-    .bind(claims.employee_id)
-    .fetch_optional(&state.db)
-    .await?;
+    let target_hours = employee_repo::fetch_monthly_target(&state.db, claims.employee_id)
+        .await?
+        .unwrap_or(0.0);
 
-    let target_hours = target.map(|t| t.0).unwrap_or(0.0);
-
-    #[derive(sqlx::FromRow)]
-    struct HoursRow {
-        entry_type: String,
-        inquiry_id: Option<Uuid>,
-        calendar_item_id: Option<Uuid>,
-        title: Option<String>,
-        location: Option<String>,
-        job_date: Option<NaiveDate>,
-        origin_city: Option<String>,
-        destination_city: Option<String>,
-        planned_hours: f64,
-        actual_hours: Option<f64>,
-        status: String,
-    }
-
-    let rows: Vec<HoursRow> = sqlx::query_as(
-        r#"
-        SELECT
-            'job'                                              AS entry_type,
-            ie.inquiry_id                                     AS inquiry_id,
-            NULL::uuid                                        AS calendar_item_id,
-            NULL::text                                        AS title,
-            NULL::text                                        AS location,
-            COALESCE(i.scheduled_date, i.preferred_date::date) AS job_date,
-            oa.city                                           AS origin_city,
-            da.city                                           AS destination_city,
-            ie.planned_hours::float8                          AS planned_hours,
-            CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
-                 THEN (EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0)::float8
-                 ELSE NULL END                                AS actual_hours,
-            i.status                                          AS status
-        FROM inquiry_employees ie
-        JOIN inquiries i ON ie.inquiry_id = i.id
-        LEFT JOIN addresses oa ON i.origin_address_id      = oa.id
-        LEFT JOIN addresses da ON i.destination_address_id = da.id
-        WHERE ie.employee_id = $1
-          AND COALESCE(i.scheduled_date, i.preferred_date::date, ie.created_at::date)
-              BETWEEN $2 AND $3
-
-        UNION ALL
-
-        SELECT
-            'item'                   AS entry_type,
-            NULL::uuid               AS inquiry_id,
-            cie.calendar_item_id     AS calendar_item_id,
-            ci.title                 AS title,
-            ci.location              AS location,
-            ci.scheduled_date        AS job_date,
-            NULL::text               AS origin_city,
-            NULL::text               AS destination_city,
-            cie.planned_hours::float8 AS planned_hours,
-            CASE WHEN cie.clock_out IS NOT NULL AND cie.clock_in IS NOT NULL
-                 THEN (EXTRACT(EPOCH FROM (cie.clock_out - cie.clock_in)) / 3600.0)::float8
-                 ELSE NULL END        AS actual_hours,
-            ci.status                AS status
-        FROM calendar_item_employees cie
-        JOIN calendar_items ci ON ci.id = cie.calendar_item_id
-        WHERE cie.employee_id = $1
-          AND ci.scheduled_date BETWEEN $2 AND $3
-
-        ORDER BY job_date ASC NULLS LAST
-        "#,
-    )
-    .bind(claims.employee_id)
-    .bind(from_date)
-    .bind(to_date)
-    .fetch_all(&state.db)
-    .await?;
+    let rows = employee_repo::fetch_hours_entries(&state.db, claims.employee_id, from_date, to_date).await?;
 
     let mut planned_sum = 0.0_f64;
     let mut actual_sum = 0.0_f64;
@@ -954,38 +662,8 @@ async fn fetch_item_colleague_names(
     item_ids: &[Uuid],
     exclude_employee_id: Uuid,
 ) -> Result<HashMap<Uuid, Vec<String>>, ApiError> {
-    if item_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    #[derive(sqlx::FromRow)]
-    struct ColleagueRow {
-        calendar_item_id: Uuid,
-        first_name: String,
-        last_name: String,
-    }
-
-    let rows: Vec<ColleagueRow> = sqlx::query_as(
-        r#"
-        SELECT cie.calendar_item_id, e.first_name, e.last_name
-        FROM calendar_item_employees cie
-        JOIN employees e ON cie.employee_id = e.id
-        WHERE cie.calendar_item_id = ANY($1) AND cie.employee_id != $2
-        ORDER BY e.last_name, e.first_name
-        "#,
-    )
-    .bind(item_ids)
-    .bind(exclude_employee_id)
-    .fetch_all(pool)
-    .await?;
-
-    let mut map: HashMap<Uuid, Vec<String>> = HashMap::new();
-    for r in rows {
-        map.entry(r.calendar_item_id)
-            .or_default()
-            .push(format!("{} {}", r.first_name, r.last_name));
-    }
-    Ok(map)
+    employee_repo::fetch_item_colleague_names(pool, item_ids, exclude_employee_id).await
+        .map_err(|e| ApiError::Internal(e.to_string()))
 }
 
 /// Fetch colleague names (other employees assigned to the same inquiries, excluding self).
@@ -996,38 +674,8 @@ async fn fetch_colleague_names(
     inquiry_ids: &[Uuid],
     exclude_employee_id: Uuid,
 ) -> Result<HashMap<Uuid, Vec<String>>, ApiError> {
-    if inquiry_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    #[derive(sqlx::FromRow)]
-    struct ColleagueRow {
-        inquiry_id: Uuid,
-        first_name: String,
-        last_name: String,
-    }
-
-    let rows: Vec<ColleagueRow> = sqlx::query_as(
-        r#"
-        SELECT ie.inquiry_id, e.first_name, e.last_name
-        FROM inquiry_employees ie
-        JOIN employees e ON ie.employee_id = e.id
-        WHERE ie.inquiry_id = ANY($1) AND ie.employee_id != $2
-        ORDER BY e.last_name, e.first_name
-        "#,
-    )
-    .bind(inquiry_ids)
-    .bind(exclude_employee_id)
-    .fetch_all(pool)
-    .await?;
-
-    let mut map: HashMap<Uuid, Vec<String>> = HashMap::new();
-    for r in rows {
-        map.entry(r.inquiry_id)
-            .or_default()
-            .push(format!("{} {}", r.first_name, r.last_name));
-    }
-    Ok(map)
+    employee_repo::fetch_colleague_names(pool, inquiry_ids, exclude_employee_id).await
+        .map_err(|e| ApiError::Internal(e.to_string()))
 }
 
 /// Fetch and parse items from the latest volume estimation for an inquiry.
@@ -1038,19 +686,9 @@ async fn fetch_estimation_items(
     pool: &sqlx::PgPool,
     inquiry_id: Uuid,
 ) -> Result<Vec<ItemInfo>, ApiError> {
-    let row: Option<(serde_json::Value,)> = sqlx::query_as(
-        r#"
-        SELECT result_data FROM volume_estimations
-        WHERE inquiry_id = $1
-        ORDER BY created_at DESC
-        LIMIT 1
-        "#,
-    )
-    .bind(inquiry_id)
-    .fetch_optional(pool)
-    .await?;
+    let data = employee_repo::fetch_estimation_result_data(pool, inquiry_id).await?;
 
-    let Some((data,)) = row else {
+    let Some(data) = data else {
         return Ok(vec![]);
     };
 

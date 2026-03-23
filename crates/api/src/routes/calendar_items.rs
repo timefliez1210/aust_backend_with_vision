@@ -6,11 +6,11 @@ use axum::{
 };
 use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::FromRow;
 use std::sync::Arc;
 use uuid::Uuid;
 
 use aust_core::models::TokenClaims;
+use crate::repositories::calendar_item_repo;
 use crate::{error::ApiError, AppState};
 
 /// Register all calendar-items routes (protected under admin JWT middleware).
@@ -42,40 +42,6 @@ struct ListQuery {
     month: Option<String>,
 }
 
-/// A single calendar item row as returned from the database.
-#[derive(Debug, Serialize, FromRow)]
-struct CalendarItemRow {
-    id: Uuid,
-    title: String,
-    description: Option<String>,
-    category: String,
-    location: Option<String>,
-    scheduled_date: Option<NaiveDate>,
-    start_time: NaiveTime,
-    end_time: Option<NaiveTime>,
-    duration_hours: f64,
-    status: String,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
-    #[sqlx(default)]
-    customer_id: Option<Uuid>,
-    #[sqlx(default)]
-    customer_name: Option<String>,
-}
-
-/// Employee assignment record for a calendar item.
-#[derive(Debug, Serialize, FromRow)]
-struct CalendarItemEmployee {
-    employee_id: Uuid,
-    first_name: String,
-    last_name: String,
-    planned_hours: f64,
-    clock_in: Option<DateTime<Utc>>,
-    clock_out: Option<DateTime<Utc>>,
-    actual_hours: Option<f64>,
-    notes: Option<String>,
-}
-
 /// Full calendar item detail with the list of assigned employees.
 #[derive(Debug, Serialize)]
 struct CalendarItemDetail {
@@ -93,7 +59,7 @@ struct CalendarItemDetail {
     updated_at: DateTime<Utc>,
     customer_id: Option<Uuid>,
     customer_name: Option<String>,
-    employees: Vec<CalendarItemEmployee>,
+    employees: Vec<calendar_item_repo::CalendarItemEmployee>,
 }
 
 /// Body for creating a new calendar item.
@@ -178,37 +144,6 @@ fn parse_month_bounds(month: &str) -> Option<(NaiveDate, NaiveDate)> {
 }
 
 // ---------------------------------------------------------------------------
-// Helper: fetch single item row with customer join
-// ---------------------------------------------------------------------------
-
-/// Fetch a single `CalendarItemRow` by id, LEFT JOINing the customer name.
-///
-/// **Caller**: `create_item`, `get_item`, `update_item`
-/// **Why**: RETURNING clauses cannot do JOINs in PostgreSQL; this centralises
-/// the post-write SELECT with customer data.
-///
-/// # Errors
-/// `404 Not Found` when no item with the given UUID exists.
-async fn fetch_item_row(pool: &sqlx::PgPool, id: Uuid) -> Result<CalendarItemRow, ApiError> {
-    sqlx::query_as(
-        r#"
-        SELECT ci.id, ci.title, ci.description, ci.category, ci.location,
-               ci.scheduled_date, ci.start_time, ci.end_time,
-               ci.duration_hours::float8 AS duration_hours,
-               ci.status, ci.created_at, ci.updated_at,
-               ci.customer_id, c.name AS customer_name
-        FROM calendar_items ci
-        LEFT JOIN customers c ON c.id = ci.customer_id
-        WHERE ci.id = $1
-        "#,
-    )
-    .bind(id)
-    .fetch_optional(pool)
-    .await?
-    .ok_or_else(|| ApiError::NotFound("Kalendereintrag nicht gefunden".into()))
-}
-
-// ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
 
@@ -227,43 +162,14 @@ async fn list_items(
     State(state): State<Arc<AppState>>,
     Extension(_claims): Extension<TokenClaims>,
     Query(query): Query<ListQuery>,
-) -> Result<Json<Vec<CalendarItemRow>>, ApiError> {
-    let rows: Vec<CalendarItemRow> = if let Some(month) = query.month {
+) -> Result<Json<Vec<calendar_item_repo::CalendarItemRow>>, ApiError> {
+    let rows = if let Some(month) = query.month {
         let (start, end) = parse_month_bounds(&month)
             .ok_or_else(|| ApiError::BadRequest("Ungueltiges Monatsformat (erwartet: YYYY-MM)".into()))?;
 
-        sqlx::query_as(
-            r#"
-            SELECT ci.id, ci.title, ci.description, ci.category, ci.location,
-                   ci.scheduled_date, ci.start_time, ci.end_time,
-                   ci.duration_hours::float8 AS duration_hours,
-                   ci.status, ci.created_at, ci.updated_at,
-                   ci.customer_id, c.name AS customer_name
-            FROM calendar_items ci
-            LEFT JOIN customers c ON c.id = ci.customer_id
-            WHERE ci.scheduled_date >= $1 AND ci.scheduled_date < $2
-            ORDER BY ci.scheduled_date ASC NULLS LAST
-            "#,
-        )
-        .bind(start)
-        .bind(end)
-        .fetch_all(&state.db)
-        .await?
+        calendar_item_repo::list_items_by_month(&state.db, start, end).await?
     } else {
-        sqlx::query_as(
-            r#"
-            SELECT ci.id, ci.title, ci.description, ci.category, ci.location,
-                   ci.scheduled_date, ci.start_time, ci.end_time,
-                   ci.duration_hours::float8 AS duration_hours,
-                   ci.status, ci.created_at, ci.updated_at,
-                   ci.customer_id, c.name AS customer_name
-            FROM calendar_items ci
-            LEFT JOIN customers c ON c.id = ci.customer_id
-            ORDER BY ci.scheduled_date ASC NULLS LAST
-            "#,
-        )
-        .fetch_all(&state.db)
-        .await?
+        calendar_item_repo::list_items_all(&state.db).await?
     };
 
     Ok(Json(rows))
@@ -281,7 +187,7 @@ async fn create_item(
     State(state): State<Arc<AppState>>,
     Extension(_claims): Extension<TokenClaims>,
     Json(body): Json<CreateItemBody>,
-) -> Result<(StatusCode, Json<CalendarItemRow>), ApiError> {
+) -> Result<(StatusCode, Json<calendar_item_repo::CalendarItemRow>), ApiError> {
     if body.title.trim().is_empty() {
         return Err(ApiError::Validation("Titel darf nicht leer sein".into()));
     }
@@ -289,26 +195,20 @@ async fn create_item(
     let category = body.category.unwrap_or_else(|| "internal".to_string());
     let duration_hours = body.duration_hours.unwrap_or(0.0);
 
-    let (new_id,): (Uuid,) = sqlx::query_as(
-        r#"
-        INSERT INTO calendar_items (title, description, category, location, scheduled_date, start_time, end_time, duration_hours, customer_id)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        RETURNING id
-        "#,
-    )
-    .bind(body.title.trim())
-    .bind(body.description)
-    .bind(category)
-    .bind(body.location)
-    .bind(body.scheduled_date)
-    .bind(body.start_time)
-    .bind(body.end_time)
-    .bind(duration_hours)
-    .bind(body.customer_id)
-    .fetch_one(&state.db)
-    .await?;
+    let new_id = calendar_item_repo::insert_item(
+        &state.db,
+        body.title.trim(),
+        body.description.as_deref(),
+        &category,
+        body.location.as_deref(),
+        body.scheduled_date,
+        body.start_time,
+        body.end_time,
+        duration_hours,
+        body.customer_id,
+    ).await?;
 
-    let row = fetch_item_row(&state.db, new_id).await?;
+    let row = calendar_item_repo::fetch_item_row(&state.db, new_id).await?;
     Ok((StatusCode::CREATED, Json(row)))
 }
 
@@ -328,8 +228,8 @@ async fn get_item(
     Extension(_claims): Extension<TokenClaims>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<CalendarItemDetail>, ApiError> {
-    let item = fetch_item_row(&state.db, id).await?;
-    let employees = fetch_item_employees(&state.db, id).await?;
+    let item = calendar_item_repo::fetch_item_row(&state.db, id).await?;
+    let employees = calendar_item_repo::fetch_item_employees(&state.db, id).await?;
 
     Ok(Json(CalendarItemDetail {
         id: item.id,
@@ -366,15 +266,13 @@ async fn update_item(
     Extension(_claims): Extension<TokenClaims>,
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateItemBody>,
-) -> Result<Json<CalendarItemRow>, ApiError> {
+) -> Result<Json<calendar_item_repo::CalendarItemRow>, ApiError> {
     // Verify the item exists before building the dynamic update
-    let existing: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM calendar_items WHERE id = $1")
-        .bind(id)
-        .fetch_optional(&state.db)
-        .await?;
-    existing.ok_or_else(|| ApiError::NotFound("Kalendereintrag nicht gefunden".into()))?;
+    if !calendar_item_repo::item_exists(&state.db, id).await? {
+        return Err(ApiError::NotFound("Kalendereintrag nicht gefunden".into()));
+    }
 
-    // Build dynamic SET clause
+    // Build dynamic SET clause — kept inline because SQL is dynamically constructed
     let mut sets: Vec<String> = Vec::new();
     let mut idx = 1usize;
 
@@ -426,7 +324,7 @@ async fn update_item(
 
     if sets.len() == 1 {
         // Only updated_at would be set — nothing actually changed
-        return Ok(Json(fetch_item_row(&state.db, id).await?));
+        return Ok(Json(calendar_item_repo::fetch_item_row(&state.db, id).await?));
     }
 
     let sql = format!(
@@ -473,7 +371,7 @@ async fn update_item(
     q = q.bind(id);         // WHERE id
 
     q.execute(&state.db).await?;
-    Ok(Json(fetch_item_row(&state.db, id).await?))
+    Ok(Json(calendar_item_repo::fetch_item_row(&state.db, id).await?))
 }
 
 /// `DELETE /api/v1/admin/calendar-items/{id}` — Delete a calendar item and all its assignments.
@@ -492,15 +390,10 @@ async fn delete_item(
     Extension(_claims): Extension<TokenClaims>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
-    let result = sqlx::query("DELETE FROM calendar_items WHERE id = $1")
-        .bind(id)
-        .execute(&state.db)
-        .await?;
-
-    if result.rows_affected() == 0 {
+    let rows = calendar_item_repo::delete_item(&state.db, id).await?;
+    if rows == 0 {
         return Err(ApiError::NotFound("Kalendereintrag nicht gefunden".into()));
     }
-
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -518,15 +411,13 @@ async fn list_item_employees(
     State(state): State<Arc<AppState>>,
     Extension(_claims): Extension<TokenClaims>,
     Path(id): Path<Uuid>,
-) -> Result<Json<Vec<CalendarItemEmployee>>, ApiError> {
+) -> Result<Json<Vec<calendar_item_repo::CalendarItemEmployee>>, ApiError> {
     // Verify item exists
-    let exists: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM calendar_items WHERE id = $1")
-        .bind(id)
-        .fetch_optional(&state.db)
-        .await?;
-    exists.ok_or_else(|| ApiError::NotFound("Kalendereintrag nicht gefunden".into()))?;
+    if !calendar_item_repo::item_exists(&state.db, id).await? {
+        return Err(ApiError::NotFound("Kalendereintrag nicht gefunden".into()));
+    }
 
-    let employees = fetch_item_employees(&state.db, id).await?;
+    let employees = calendar_item_repo::fetch_item_employees(&state.db, id).await?;
     Ok(Json(employees))
 }
 
@@ -547,42 +438,29 @@ async fn assign_employee(
     Extension(_claims): Extension<TokenClaims>,
     Path(id): Path<Uuid>,
     Json(body): Json<AssignEmployeeBody>,
-) -> Result<(StatusCode, Json<Vec<CalendarItemEmployee>>), ApiError> {
+) -> Result<(StatusCode, Json<Vec<calendar_item_repo::CalendarItemEmployee>>), ApiError> {
     // Verify item exists
-    let item_exists: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM calendar_items WHERE id = $1")
-        .bind(id)
-        .fetch_optional(&state.db)
-        .await?;
-    item_exists.ok_or_else(|| ApiError::NotFound("Kalendereintrag nicht gefunden".into()))?;
+    if !calendar_item_repo::item_exists(&state.db, id).await? {
+        return Err(ApiError::NotFound("Kalendereintrag nicht gefunden".into()));
+    }
 
     // Verify employee exists
-    let emp_exists: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM employees WHERE id = $1")
-        .bind(body.employee_id)
-        .fetch_optional(&state.db)
-        .await?;
-    emp_exists.ok_or_else(|| ApiError::NotFound("Mitarbeiter nicht gefunden".into()))?;
+    if !calendar_item_repo::employee_exists(&state.db, body.employee_id).await? {
+        return Err(ApiError::NotFound("Mitarbeiter nicht gefunden".into()));
+    }
 
-    sqlx::query(
-        r#"
-        INSERT INTO calendar_item_employees (calendar_item_id, employee_id, planned_hours)
-        VALUES ($1, $2, $3)
-        "#,
-    )
-    .bind(id)
-    .bind(body.employee_id)
-    .bind(body.planned_hours)
-    .execute(&state.db)
-    .await
-    .map_err(|e| {
-        if let sqlx::Error::Database(ref db_err) = e {
-            if db_err.constraint() == Some("calendar_item_employees_calendar_item_id_employee_id_key") {
-                return ApiError::Conflict("Mitarbeiter ist bereits zugewiesen".into());
+    calendar_item_repo::insert_item_employee(&state.db, id, body.employee_id, body.planned_hours)
+        .await
+        .map_err(|e| {
+            if let sqlx::Error::Database(ref db_err) = e {
+                if db_err.constraint() == Some("calendar_item_employees_calendar_item_id_employee_id_key") {
+                    return ApiError::Conflict("Mitarbeiter ist bereits zugewiesen".into());
+                }
             }
-        }
-        ApiError::from(e)
-    })?;
+            ApiError::from(e)
+        })?;
 
-    let employees = fetch_item_employees(&state.db, id).await?;
+    let employees = calendar_item_repo::fetch_item_employees(&state.db, id).await?;
     Ok((StatusCode::CREATED, Json(employees)))
 }
 
@@ -601,57 +479,24 @@ async fn update_item_employee(
     Extension(_claims): Extension<TokenClaims>,
     Path((id, emp_id)): Path<(Uuid, Uuid)>,
     Json(body): Json<UpdateEmployeeBody>,
-) -> Result<Json<CalendarItemEmployee>, ApiError> {
-    let result = sqlx::query(
-        r#"
-        UPDATE calendar_item_employees SET
-            clock_in  = COALESCE($4, clock_in),
-            clock_out = COALESCE($5, clock_out),
-            planned_hours = CASE
-                WHEN COALESCE($4, clock_in) IS NOT NULL AND COALESCE($5, clock_out) IS NOT NULL
-                THEN (EXTRACT(EPOCH FROM (COALESCE($5, clock_out) - COALESCE($4, clock_in))) / 3600.0)::float8
-                ELSE COALESCE($3, planned_hours)
-            END,
-            notes = COALESCE($6, notes)
-        WHERE calendar_item_id = $1 AND employee_id = $2
-        "#,
-    )
-    .bind(id)
-    .bind(emp_id)
-    .bind(body.planned_hours)
-    .bind(body.clock_in)
-    .bind(body.clock_out)
-    .bind(&body.notes)
-    .execute(&state.db)
-    .await?;
+) -> Result<Json<calendar_item_repo::CalendarItemEmployee>, ApiError> {
+    let rows = calendar_item_repo::update_item_employee(
+        &state.db,
+        id,
+        emp_id,
+        body.planned_hours,
+        body.clock_in,
+        body.clock_out,
+        body.notes.as_deref(),
+    ).await?;
 
-    if result.rows_affected() == 0 {
+    if rows == 0 {
         return Err(ApiError::NotFound("Zuweisung nicht gefunden".into()));
     }
 
-    let row: Option<CalendarItemEmployee> = sqlx::query_as(
-        r#"
-        SELECT cie.employee_id,
-               e.first_name,
-               e.last_name,
-               cie.planned_hours::float8 AS planned_hours,
-               cie.clock_in,
-               cie.clock_out,
-               CASE WHEN cie.clock_out IS NOT NULL AND cie.clock_in IS NOT NULL
-                    THEN (EXTRACT(EPOCH FROM (cie.clock_out - cie.clock_in)) / 3600.0)::float8
-                    ELSE NULL END AS actual_hours,
-               cie.notes
-        FROM calendar_item_employees cie
-        JOIN employees e ON e.id = cie.employee_id
-        WHERE cie.calendar_item_id = $1 AND cie.employee_id = $2
-        "#,
-    )
-    .bind(id)
-    .bind(emp_id)
-    .fetch_optional(&state.db)
-    .await?;
-
-    row.map(Json)
+    calendar_item_repo::fetch_item_employee(&state.db, id, emp_id)
+        .await?
+        .map(Json)
         .ok_or_else(|| ApiError::NotFound("Zuweisung nicht gefunden".into()))
 }
 
@@ -670,62 +515,9 @@ async fn remove_item_employee(
     Extension(_claims): Extension<TokenClaims>,
     Path((id, emp_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, ApiError> {
-    let result = sqlx::query(
-        "DELETE FROM calendar_item_employees WHERE calendar_item_id = $1 AND employee_id = $2",
-    )
-    .bind(id)
-    .bind(emp_id)
-    .execute(&state.db)
-    .await?;
-
-    if result.rows_affected() == 0 {
+    let rows = calendar_item_repo::delete_item_employee(&state.db, id, emp_id).await?;
+    if rows == 0 {
         return Err(ApiError::NotFound("Zuweisung nicht gefunden".into()));
     }
-
     Ok(StatusCode::NO_CONTENT)
-}
-
-// ---------------------------------------------------------------------------
-// Internal helper
-// ---------------------------------------------------------------------------
-
-/// Fetch all employee assignments for a calendar item, joined with employee names.
-///
-/// **Caller**: `get_item`, `list_item_employees`, `assign_employee`.
-/// **Why**: Centralises the join query so the result shape is consistent across all
-/// handlers that need the employee list.
-///
-/// # Parameters
-/// - `pool` — database connection pool
-/// - `item_id` — UUID of the calendar item
-///
-/// # Returns
-/// Ordered list of `CalendarItemEmployee` (by last_name, first_name).
-async fn fetch_item_employees(
-    pool: &sqlx::PgPool,
-    item_id: Uuid,
-) -> Result<Vec<CalendarItemEmployee>, ApiError> {
-    let employees: Vec<CalendarItemEmployee> = sqlx::query_as(
-        r#"
-        SELECT cie.employee_id,
-               e.first_name,
-               e.last_name,
-               cie.planned_hours::float8 AS planned_hours,
-               cie.clock_in,
-               cie.clock_out,
-               CASE WHEN cie.clock_out IS NOT NULL AND cie.clock_in IS NOT NULL
-                    THEN (EXTRACT(EPOCH FROM (cie.clock_out - cie.clock_in)) / 3600.0)::float8
-                    ELSE NULL END AS actual_hours,
-               cie.notes
-        FROM calendar_item_employees cie
-        JOIN employees e ON e.id = cie.employee_id
-        WHERE cie.calendar_item_id = $1
-        ORDER BY e.last_name, e.first_name
-        "#,
-    )
-    .bind(item_id)
-    .fetch_all(pool)
-    .await?;
-
-    Ok(employees)
 }

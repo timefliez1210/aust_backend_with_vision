@@ -1,0 +1,170 @@
+//! Customer repository — centralised queries for the `customers` table.
+
+use chrono::{DateTime, Utc};
+use sqlx::{FromRow, PgPool};
+use uuid::Uuid;
+
+use crate::ApiError;
+
+/// SQLx projection row for the `customers` table.
+///
+/// Used by offer generation (greeting, address block), inquiry builder (snapshot),
+/// and admin endpoints (detail, list).
+#[derive(Debug, FromRow)]
+pub(crate) struct CustomerRow {
+    #[allow(dead_code)]
+    pub id: Uuid,
+    pub email: String,
+    pub name: Option<String>,
+    pub salutation: Option<String>,
+    pub first_name: Option<String>,
+    pub last_name: Option<String>,
+    pub phone: Option<String>,
+}
+
+impl CustomerRow {
+    /// Formal greeting line using stored salutation + last name.
+    /// Falls back to the `detect_salutation_and_greeting` heuristic for legacy
+    /// customers who pre-date the structured name fields.
+    pub fn formal_greeting(&self) -> String {
+        match (self.salutation.as_deref(), self.last_name.as_deref()) {
+            (Some("Herr"), Some(ln)) => format!("Sehr geehrter Herr {ln},"),
+            (Some("Frau"), Some(ln)) => format!("Sehr geehrte Frau {ln},"),
+            (Some("D"), Some(ln)) => format!("Sehr geehrte Person {ln},"),
+            _ => {
+                let name = self.name.as_deref().unwrap_or(&self.email);
+                crate::routes::offers::detect_salutation_and_greeting(name).1
+            }
+        }
+    }
+
+    /// Address-block salutation for XLSX cell A8 ("Herrn", "Frau", "Divers", or "").
+    pub fn address_salutation(&self) -> String {
+        match self.salutation.as_deref() {
+            Some("Herr") => "Herrn".to_string(),
+            Some("Frau") => "Frau".to_string(),
+            Some("D") => "Divers".to_string(),
+            _ => {
+                let name = self.name.as_deref().unwrap_or(&self.email);
+                crate::routes::offers::detect_salutation_and_greeting(name).0
+            }
+        }
+    }
+
+    /// Full display name: first + last, or the legacy `name` field, or email.
+    pub fn display_name(&self) -> String {
+        match (self.first_name.as_deref(), self.last_name.as_deref()) {
+            (Some(f), Some(l)) => format!("{f} {l}"),
+            (Some(f), None) => f.to_string(),
+            (None, Some(l)) => l.to_string(),
+            _ => self.name.clone().unwrap_or_else(|| self.email.clone()),
+        }
+    }
+}
+
+/// Fetch a customer by primary key.
+///
+/// **Caller**: `build_offer_with_overrides`, `inquiry_builder::build_inquiry_response`
+/// **Why**: Multiple modules need the full customer row for greeting, snapshot, etc.
+pub(crate) async fn fetch_by_id(pool: &PgPool, customer_id: Uuid) -> Result<CustomerRow, ApiError> {
+    sqlx::query_as(
+        "SELECT id, email, name, salutation, first_name, last_name, phone FROM customers WHERE id = $1",
+    )
+    .bind(customer_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Customer not found".into()))
+}
+
+/// Fetch a customer by email address.
+///
+/// **Caller**: `orchestrator::find_or_create_offer_thread`
+/// **Why**: Thread creation requires the customer_id which is looked up by email.
+pub(crate) async fn fetch_by_email(
+    pool: &PgPool,
+    email: &str,
+) -> Result<Option<CustomerRow>, ApiError> {
+    let row = sqlx::query_as(
+        "SELECT id, email, name, salutation, first_name, last_name, phone FROM customers WHERE email = $1",
+    )
+    .bind(email)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
+/// Upsert a customer by email — insert if new, merge non-null fields if existing.
+///
+/// **Caller**: `handle_submission`, `handle_complete_inquiry`, `video_inquiry`
+/// **Why**: Multiple entry points create customers; upsert avoids duplicates while
+///          filling in missing fields from later submissions.
+///
+/// # Returns
+/// The customer's UUID (either newly created or existing).
+pub(crate) async fn upsert(
+    pool: &PgPool,
+    email: &str,
+    name: Option<&str>,
+    salutation: Option<&str>,
+    first_name: Option<&str>,
+    last_name: Option<&str>,
+    phone: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<Uuid, sqlx::Error> {
+    let (id,): (Uuid,) = sqlx::query_as(
+        r#"
+        INSERT INTO customers (id, email, name, salutation, first_name, last_name, phone, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
+        ON CONFLICT (email) DO UPDATE SET
+            name       = COALESCE(EXCLUDED.name,       customers.name),
+            salutation = COALESCE(EXCLUDED.salutation, customers.salutation),
+            first_name = COALESCE(EXCLUDED.first_name, customers.first_name),
+            last_name  = COALESCE(EXCLUDED.last_name,  customers.last_name),
+            phone      = COALESCE(EXCLUDED.phone,      customers.phone),
+            updated_at = $8
+        RETURNING id
+        "#,
+    )
+    .bind(Uuid::now_v7())
+    .bind(email)
+    .bind(name)
+    .bind(salutation)
+    .bind(first_name)
+    .bind(last_name)
+    .bind(phone)
+    .bind(now)
+    .fetch_one(pool)
+    .await?;
+    Ok(id)
+}
+
+/// Fetch a customer by inquiry ID (joins through inquiries table).
+///
+/// **Caller**: `invoices::build_invoice_data`
+/// **Why**: Invoice generation needs customer data but only has the inquiry ID.
+pub(crate) async fn fetch_by_inquiry_id(
+    pool: &PgPool,
+    inquiry_id: Uuid,
+) -> Result<CustomerRow, ApiError> {
+    sqlx::query_as(
+        "SELECT c.id, c.email, c.name, c.salutation, c.first_name, c.last_name, c.phone
+         FROM customers c
+         JOIN inquiries i ON i.customer_id = c.id
+         WHERE i.id = $1",
+    )
+    .bind(inquiry_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Customer not found for inquiry".into()))
+}
+
+/// Check whether a customer with the given ID exists.
+///
+/// **Caller**: `create_inquiry`
+/// **Why**: Validates customer_id before creating an inquiry.
+pub(crate) async fn exists(pool: &PgPool, customer_id: Uuid) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM customers WHERE id = $1)")
+        .bind(customer_id)
+        .fetch_one(pool)
+        .await
+}

@@ -3,7 +3,6 @@ use chrono::{Duration, Utc};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use rand::Rng;
 use serde::Deserialize;
-use sqlx::FromRow;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -16,6 +15,7 @@ use validator::Validate;
 
 use aust_core::models::{AuthToken, CreateUser, LoginRequest, TokenClaims, UserRole};
 
+use crate::repositories::auth_repo;
 use crate::{ApiError, AppState};
 
 /// Register the public authentication routes (login and token refresh).
@@ -40,14 +40,6 @@ pub fn protected_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/register", post(register))
         .route("/change-password", post(change_password))
-}
-
-#[derive(Debug, FromRow)]
-struct UserRow {
-    id: Uuid,
-    email: String,
-    password_hash: String,
-    role: String,
 }
 
 /// Mint a new access token and refresh token pair for a user.
@@ -145,16 +137,11 @@ async fn login(
         ));
     }
 
-    let user: Option<UserRow> = sqlx::query_as(
-        "SELECT id, email, password_hash, role FROM users WHERE email = $1",
-    )
-    .bind(&request.email)
-    .fetch_optional(&state.db)
-    .await?;
-
-    let user = user.ok_or_else(|| {
-        ApiError::Unauthorized("Ungültige E-Mail oder Passwort".into())
-    })?;
+    let user = auth_repo::fetch_user_by_email(&state.db, &request.email)
+        .await?
+        .ok_or_else(|| {
+            ApiError::Unauthorized("Ungültige E-Mail oder Passwort".into())
+        })?;
 
     let parsed_hash = PasswordHash::new(&user.password_hash)
         .map_err(|_| ApiError::Internal("Passwort-Hash ungültig".into()))?;
@@ -213,13 +200,8 @@ async fn refresh_token(
     let claims = token_data.claims;
 
     // Verify user still exists
-    let exists: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM users WHERE id = $1")
-            .bind(claims.sub)
-            .fetch_optional(&state.db)
-            .await?;
-
-    if exists.is_none() {
+    let exists = auth_repo::user_exists(&state.db, claims.sub).await?;
+    if !exists {
         return Err(ApiError::Unauthorized("Benutzer nicht gefunden".into()));
     }
 
@@ -293,13 +275,8 @@ async fn register(
         .map_err(|e| ApiError::Validation(e.to_string()))?;
 
     // Check if email already taken
-    let exists: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM users WHERE email = $1")
-            .bind(&request.email)
-            .fetch_optional(&state.db)
-            .await?;
-
-    if exists.is_some() {
+    let exists = auth_repo::email_exists(&state.db, &request.email).await?;
+    if exists {
         return Err(ApiError::Validation(
             "E-Mail-Adresse bereits vergeben".into(),
         ));
@@ -310,20 +287,7 @@ async fn register(
     let id = Uuid::now_v7();
     let now = Utc::now();
 
-    sqlx::query(
-        r#"
-        INSERT INTO users (id, email, password_hash, name, role, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $6)
-        "#,
-    )
-    .bind(id)
-    .bind(&request.email)
-    .bind(&password_hash)
-    .bind(&request.name)
-    .bind(role.as_str())
-    .bind(now)
-    .execute(&state.db)
-    .await?;
+    auth_repo::insert_user(&state.db, id, &request.email, &password_hash, &request.name, role.as_str(), now).await?;
 
     Ok(Json(RegisterResponse {
         id,
@@ -370,14 +334,9 @@ async fn change_password(
         ));
     }
 
-    let user: Option<UserRow> = sqlx::query_as(
-        "SELECT id, email, password_hash, role FROM users WHERE id = $1",
-    )
-    .bind(claims.sub)
-    .fetch_optional(&state.db)
-    .await?;
-
-    let user = user.ok_or_else(|| ApiError::NotFound("Benutzer nicht gefunden".into()))?;
+    let user = auth_repo::fetch_user_by_id(&state.db, claims.sub)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Benutzer nicht gefunden".into()))?;
 
     // Verify current password
     let parsed_hash = PasswordHash::new(&user.password_hash)
@@ -390,12 +349,7 @@ async fn change_password(
     // Hash and store new password
     let new_hash = hash_password(&request.new_password)?;
 
-    sqlx::query("UPDATE users SET password_hash = $1, updated_at = $2 WHERE id = $3")
-        .bind(&new_hash)
-        .bind(Utc::now())
-        .bind(claims.sub)
-        .execute(&state.db)
-        .await?;
+    auth_repo::update_password(&state.db, claims.sub, &new_hash, Utc::now()).await?;
 
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -427,12 +381,7 @@ async fn reset_password_request(
     let email = body.email.trim().to_lowercase();
 
     // Look up user — if not found, return 200 silently (no enumeration)
-    let user: Option<UserRow> = sqlx::query_as(
-        "SELECT id, email, password_hash, role FROM users WHERE LOWER(email) = $1",
-    )
-    .bind(&email)
-    .fetch_optional(&state.db)
-    .await?;
+    let user = auth_repo::fetch_user_by_email_lower(&state.db, &email).await?;
 
     if let Some(user) = user {
         // Generate 6-digit OTP
@@ -444,22 +393,10 @@ async fn reset_password_request(
         let expires_at = Utc::now() + Duration::minutes(15);
 
         // Invalidate any existing unused tokens for this user
-        sqlx::query(
-            "UPDATE admin_password_resets SET used_at = now() WHERE user_id = $1 AND used_at IS NULL",
-        )
-        .bind(user.id)
-        .execute(&state.db)
-        .await?;
+        auth_repo::invalidate_resets(&state.db, user.id).await?;
 
         // Store new token
-        sqlx::query(
-            "INSERT INTO admin_password_resets (user_id, otp_hash, expires_at) VALUES ($1, $2, $3)",
-        )
-        .bind(user.id)
-        .bind(&otp_hash)
-        .bind(expires_at)
-        .execute(&state.db)
-        .await?;
+        auth_repo::insert_reset_token(&state.db, user.id, &otp_hash, expires_at).await?;
 
         // Send email (best-effort — don't fail the request if SMTP is down)
         let body_text = format!(
@@ -492,14 +429,6 @@ struct ResetVerifyBody {
     new_password: String,
 }
 
-#[derive(Debug, FromRow)]
-struct ResetRow {
-    id: Uuid,
-    user_id: Uuid,
-    otp_hash: String,
-    expires_at: chrono::DateTime<Utc>,
-}
-
 /// `POST /api/v1/auth/reset-password/verify` — Validate OTP and set a new password.
 ///
 /// **Caller**: Axum public router / admin login page OTP entry step.
@@ -528,31 +457,14 @@ async fn reset_password_verify(
 
     let email = body.email.trim().to_lowercase();
 
-    let user: Option<UserRow> = sqlx::query_as(
-        "SELECT id, email, password_hash, role FROM users WHERE LOWER(email) = $1",
-    )
-    .bind(&email)
-    .fetch_optional(&state.db)
-    .await?;
-
-    let user = user.ok_or_else(|| ApiError::Validation("Ungültiger oder abgelaufener Code".into()))?;
+    let user = auth_repo::fetch_user_by_email_lower(&state.db, &email)
+        .await?
+        .ok_or_else(|| ApiError::Validation("Ungültiger oder abgelaufener Code".into()))?;
 
     // Fetch the latest unused, unexpired token for this user
-    let reset: Option<ResetRow> = sqlx::query_as(
-        r#"
-        SELECT id, user_id, otp_hash, expires_at
-        FROM admin_password_resets
-        WHERE user_id = $1 AND used_at IS NULL AND expires_at > now()
-        ORDER BY created_at DESC
-        LIMIT 1
-        "#,
-    )
-    .bind(user.id)
-    .fetch_optional(&state.db)
-    .await?;
-
-    let reset =
-        reset.ok_or_else(|| ApiError::Validation("Ungültiger oder abgelaufener Code".into()))?;
+    let reset = auth_repo::fetch_valid_reset(&state.db, user.id)
+        .await?
+        .ok_or_else(|| ApiError::Validation("Ungültiger oder abgelaufener Code".into()))?;
 
     // Verify OTP
     let parsed_hash = PasswordHash::new(&reset.otp_hash)
@@ -568,18 +480,8 @@ async fn reset_password_verify(
 
     let mut tx = state.db.begin().await?;
 
-    sqlx::query("UPDATE admin_password_resets SET used_at = $1 WHERE id = $2")
-        .bind(now)
-        .bind(reset.id)
-        .execute(&mut *tx)
-        .await?;
-
-    sqlx::query("UPDATE users SET password_hash = $1, updated_at = $2 WHERE id = $3")
-        .bind(&new_hash)
-        .bind(now)
-        .bind(user.id)
-        .execute(&mut *tx)
-        .await?;
+    auth_repo::mark_reset_used(&mut tx, reset.id, now).await?;
+    auth_repo::update_password_tx(&mut tx, user.id, &new_hash, now).await?;
 
     tx.commit().await?;
 

@@ -3,6 +3,7 @@
 //! Supports edit loop: Alex can press ✏️, type adjustment instructions,
 //! and get a regenerated offer.
 
+use crate::repositories::{address_repo, customer_repo, email_repo, estimation_repo, inquiry_repo, offer_repo};
 use crate::routes::offers::{build_offer, build_offer_with_overrides, GeneratedOffer, OfferOverrides};
 use crate::{services, AppState};
 use aust_core::config::TelegramConfig;
@@ -69,34 +70,19 @@ fn format_address_line(address: &str, floor: &str, elevator: Option<bool>) -> St
 /// Nothing. Errors are logged and, if critical, forwarded to the admin via Telegram.
 pub async fn try_auto_generate_offer(state: Arc<AppState>, inquiry_id: Uuid) {
     // Check if an offer already exists for this quote
-    let existing: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM offers WHERE inquiry_id = $1 LIMIT 1")
-            .bind(inquiry_id)
-            .fetch_optional(&state.db)
-            .await
-            .unwrap_or(None);
+    let already_exists = offer_repo::any_exists_for_inquiry(&state.db, inquiry_id)
+        .await
+        .unwrap_or(false);
 
-    if existing.is_some() {
+    if already_exists {
         info!("Offer already exists for quote {inquiry_id}, skipping auto-generation");
         return;
     }
 
     // Check that the quote has a volume estimate (minimum requirement); also fetch distance/addresses
-    #[derive(sqlx::FromRow)]
-    struct QuoteReadiness {
-        estimated_volume_m3: Option<f64>,
-        distance_km: Option<f64>,
-        origin_address_id: Option<Uuid>,
-        destination_address_id: Option<Uuid>,
-        stop_address_id: Option<Uuid>,
-    }
-    let readiness: Option<QuoteReadiness> = sqlx::query_as(
-        "SELECT estimated_volume_m3, distance_km, origin_address_id, destination_address_id, stop_address_id FROM inquiries WHERE id = $1",
-    )
-    .bind(inquiry_id)
-    .fetch_optional(&state.db)
-    .await
-    .unwrap_or(None);
+    let readiness = inquiry_repo::fetch_readiness(&state.db, inquiry_id)
+        .await
+        .unwrap_or(None);
 
     let q = match readiness {
         Some(r) if r.estimated_volume_m3.unwrap_or(0.0) > 0.0 => r,
@@ -109,30 +95,20 @@ pub async fn try_auto_generate_offer(state: Arc<AppState>, inquiry_id: Uuid) {
     // Auto-calculate distance if both addresses are present and distance is still 0/missing
     if q.distance_km.unwrap_or(0.0) == 0.0 {
         if let (Some(origin_id), Some(dest_id)) = (q.origin_address_id, q.destination_address_id) {
-            #[derive(sqlx::FromRow)]
-            struct AddrStr { street: String, city: String, postal_code: Option<String> }
-            let fetch_addr = |id: Uuid| {
-                let db = state.db.clone();
-                async move {
-                    sqlx::query_as::<_, AddrStr>("SELECT street, city, postal_code FROM addresses WHERE id = $1")
-                        .bind(id)
-                        .fetch_optional(&db)
-                        .await
-                        .ok()
-                        .flatten()
-                }
-            };
-            let fmt_addr = |a: &AddrStr| format!(
+            let fmt_addr = |a: &address_repo::AddressStrRow| format!(
                 "{}, {}{}",
                 a.street,
                 a.postal_code.as_deref().map(|p| format!("{p} ")).unwrap_or_default(),
                 a.city
             );
 
-            if let (Some(origin), Some(dest)) = (fetch_addr(origin_id).await, fetch_addr(dest_id).await) {
+            let origin = address_repo::fetch_street_city(&state.db, origin_id).await.ok().flatten();
+            let dest = address_repo::fetch_street_city(&state.db, dest_id).await.ok().flatten();
+
+            if let (Some(origin), Some(dest)) = (origin, dest) {
                 let mut route_addresses = vec![fmt_addr(&origin)];
                 if let Some(stop_id) = q.stop_address_id {
-                    if let Some(stop) = fetch_addr(stop_id).await {
+                    if let Some(stop) = address_repo::fetch_street_city(&state.db, stop_id).await.ok().flatten() {
                         route_addresses.push(fmt_addr(&stop));
                     }
                 }
@@ -142,11 +118,7 @@ pub async fn try_auto_generate_offer(state: Arc<AppState>, inquiry_id: Uuid) {
                 match calculator.calculate(&RouteRequest { addresses: route_addresses }).await {
                     Ok(result) => {
                         info!("Distance calculated for quote {inquiry_id}: {:.1} km", result.total_distance_km);
-                        let _ = sqlx::query("UPDATE inquiries SET distance_km = $1, updated_at = NOW() WHERE id = $2")
-                            .bind(result.total_distance_km)
-                            .bind(inquiry_id)
-                            .execute(&state.db)
-                            .await;
+                        let _ = inquiry_repo::update_distance(&state.db, inquiry_id, result.total_distance_km).await;
                     }
                     Err(e) => warn!("Distance calculation for quote {inquiry_id} failed: {e}"),
                 }
@@ -396,14 +368,11 @@ pub async fn run_offer_event_handler(
             }
             ApprovalDecision::OfferEdit(id_str) => {
                 if let Ok(offer_id) = Uuid::parse_str(&id_str) {
-                    let inquiry_id: Option<(Uuid,)> =
-                        sqlx::query_as("SELECT inquiry_id FROM offers WHERE id = $1")
-                            .bind(offer_id)
-                            .fetch_optional(&state.db)
-                            .await
-                            .unwrap_or(None);
+                    let inquiry_id = offer_repo::fetch_inquiry_id(&state.db, offer_id)
+                        .await
+                        .unwrap_or(None);
 
-                    if let Some((qid,)) = inquiry_id {
+                    if let Some(qid) = inquiry_id {
                         editing = Some(EditingOffer {
                             offer_id,
                             inquiry_id: qid,
@@ -533,32 +502,19 @@ async fn handle_complete_inquiry(
         })
         .unwrap_or((None, None));
 
-    let customer_id: Uuid = match sqlx::query_as::<_, (Uuid,)>(
-        r#"
-        INSERT INTO customers (id, email, name, salutation, first_name, last_name, phone, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
-        ON CONFLICT (email) DO UPDATE SET
-            name       = COALESCE(EXCLUDED.name,       customers.name),
-            salutation = COALESCE(EXCLUDED.salutation, customers.salutation),
-            first_name = COALESCE(EXCLUDED.first_name, customers.first_name),
-            last_name  = COALESCE(EXCLUDED.last_name,  customers.last_name),
-            phone      = COALESCE(EXCLUDED.phone,      customers.phone),
-            updated_at = $8
-        RETURNING id
-        "#,
+    let customer_id: Uuid = match customer_repo::upsert(
+        &state.db,
+        &inquiry.email,
+        inquiry.name.as_deref(),
+        inquiry.salutation.as_deref(),
+        inq_first_name.as_deref(),
+        inq_last_name.as_deref(),
+        inquiry.phone.as_deref(),
+        now,
     )
-    .bind(Uuid::now_v7())
-    .bind(&inquiry.email)
-    .bind(&inquiry.name)
-    .bind(&inquiry.salutation)
-    .bind(&inq_first_name)
-    .bind(&inq_last_name)
-    .bind(&inquiry.phone)
-    .bind(now)
-    .fetch_one(&state.db)
     .await
     {
-        Ok((id,)) => id,
+        Ok(id) => id,
         Err(e) => {
             error!("Failed to create customer: {e}");
             return;
@@ -568,19 +524,18 @@ async fn handle_complete_inquiry(
     // 2. Create origin address (if we have departure address)
     let origin_id = if let Some(ref addr) = inquiry.departure_address {
         let (street, city, postal) = services::vision::parse_address(addr);
-        match sqlx::query_as::<_, (Uuid,)>(
-            "INSERT INTO addresses (id, street, city, postal_code, floor, elevator) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+        let postal_opt = if postal.is_empty() { None } else { Some(postal.as_str()) };
+        match address_repo::create(
+            &state.db,
+            &street,
+            &city,
+            postal_opt,
+            inquiry.departure_floor.as_deref(),
+            inquiry.departure_elevator,
         )
-        .bind(Uuid::now_v7())
-        .bind(&street)
-        .bind(&city)
-        .bind(&postal)
-        .bind(&inquiry.departure_floor)
-        .bind(inquiry.departure_elevator)
-        .fetch_one(&state.db)
         .await
         {
-            Ok((id,)) => Some(id),
+            Ok(id) => Some(id),
             Err(e) => {
                 warn!("Failed to create origin address: {e}");
                 None
@@ -593,19 +548,18 @@ async fn handle_complete_inquiry(
     // 3. Create destination address (if we have arrival address)
     let dest_id = if let Some(ref addr) = inquiry.arrival_address {
         let (street, city, postal) = services::vision::parse_address(addr);
-        match sqlx::query_as::<_, (Uuid,)>(
-            "INSERT INTO addresses (id, street, city, postal_code, floor, elevator) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+        let postal_opt = if postal.is_empty() { None } else { Some(postal.as_str()) };
+        match address_repo::create(
+            &state.db,
+            &street,
+            &city,
+            postal_opt,
+            inquiry.arrival_floor.as_deref(),
+            inquiry.arrival_elevator,
         )
-        .bind(Uuid::now_v7())
-        .bind(&street)
-        .bind(&city)
-        .bind(&postal)
-        .bind(&inquiry.arrival_floor)
-        .bind(inquiry.arrival_elevator)
-        .fetch_one(&state.db)
         .await
         {
-            Ok((id,)) => Some(id),
+            Ok(id) => Some(id),
             Err(e) => {
                 warn!("Failed to create destination address: {e}");
                 None
@@ -619,19 +573,18 @@ async fn handle_complete_inquiry(
     let stop_id = if inquiry.has_intermediate_stop {
         if let Some(ref addr) = inquiry.intermediate_address {
             let (street, city, postal) = services::vision::parse_address(addr);
-            match sqlx::query_as::<_, (Uuid,)>(
-                "INSERT INTO addresses (id, street, city, postal_code, floor, elevator) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+            let postal_opt = if postal.is_empty() { None } else { Some(postal.as_str()) };
+            match address_repo::create(
+                &state.db,
+                &street,
+                &city,
+                postal_opt,
+                inquiry.intermediate_floor.as_deref(),
+                inquiry.intermediate_elevator,
             )
-            .bind(Uuid::now_v7())
-            .bind(&street)
-            .bind(&city)
-            .bind(&postal)
-            .bind(&inquiry.intermediate_floor)
-            .bind(inquiry.intermediate_elevator)
-            .fetch_one(&state.db)
             .await
             {
-                Ok((id,)) => Some(id),
+                Ok(id) => Some(id),
                 Err(e) => {
                     warn!("Failed to create stop address: {e}");
                     None
@@ -717,27 +670,22 @@ async fn handle_complete_inquiry(
         .and_then(|v| v.as_str().map(String::from))
         .unwrap_or_else(|| "direct_email".to_string());
 
-    if let Err(e) = sqlx::query(
-        r#"
-        INSERT INTO inquiries (id, customer_id, origin_address_id, destination_address_id, stop_address_id,
-                           status, estimated_volume_m3, distance_km, preferred_date, notes, services, source, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $13)
-        "#,
+    if let Err(e) = inquiry_repo::create(
+        &state.db,
+        inquiry_id,
+        customer_id,
+        origin_id,
+        dest_id,
+        stop_id,
+        "estimated",
+        Some(volume_m3),
+        distance_km,
+        preferred_date_ts,
+        notes.as_deref(),
+        &services_json,
+        &source,
+        now,
     )
-    .bind(inquiry_id)
-    .bind(customer_id)
-    .bind(origin_id)
-    .bind(dest_id)
-    .bind(stop_id)
-    .bind("estimated")
-    .bind(volume_m3)
-    .bind(distance_km)
-    .bind(preferred_date_ts)
-    .bind(&notes)
-    .bind(&services_json)
-    .bind(&source)
-    .bind(now)
-    .execute(&state.db)
     .await
     {
         error!("Failed to create quote: {e}");
@@ -762,21 +710,17 @@ async fn handle_complete_inquiry(
         })
         .flatten();
 
-    if let Err(e) = sqlx::query(
-        r#"
-        INSERT INTO volume_estimations (id, inquiry_id, method, source_data, result_data, total_volume_m3, confidence_score, created_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        "#,
+    if let Err(e) = estimation_repo::insert_no_return(
+        &state.db,
+        estimation_id,
+        inquiry_id,
+        "manual",
+        &source_data,
+        result_data.as_ref(),
+        volume_m3,
+        0.5f64, // lower confidence for rough estimate
+        now,
     )
-    .bind(estimation_id)
-    .bind(inquiry_id)
-    .bind("manual")
-    .bind(source_data)
-    .bind(result_data)
-    .bind(volume_m3)
-    .bind(0.5f64) // lower confidence for rough estimate
-    .bind(now)
-    .execute(&state.db)
     .await
     {
         warn!("Failed to insert volume_estimations for quote {inquiry_id}: {e}");
@@ -790,20 +734,7 @@ async fn handle_complete_inquiry(
     );
 
     // Link email thread to quote (if thread exists for this customer)
-    let _ = sqlx::query(
-        r#"
-        UPDATE email_threads SET inquiry_id = $1
-        WHERE id = (
-            SELECT id FROM email_threads
-            WHERE customer_id = $2 AND inquiry_id IS NULL
-            ORDER BY created_at DESC LIMIT 1
-        )
-        "#,
-    )
-    .bind(inquiry_id)
-    .bind(customer_id)
-    .execute(&state.db)
-    .await;
+    let _ = inquiry_repo::link_email_thread(&state.db, inquiry_id, customer_id).await;
 
     // 7. Generate offer → PDF → Telegram
     try_auto_generate_offer(Arc::clone(state), inquiry_id).await;
@@ -1019,11 +950,7 @@ async fn handle_offer_edit(
 
     // Apply numeric overrides directly to the quote if needed
     if let Some(volume) = overrides.volume_m3 {
-        let _ = sqlx::query("UPDATE inquiries SET estimated_volume_m3 = $1 WHERE id = $2")
-            .bind(volume)
-            .bind(inquiry_id)
-            .execute(&state.db)
-            .await;
+        let _ = inquiry_repo::update_volume(&state.db, inquiry_id, volume, chrono::Utc::now()).await;
     }
 
     // Regenerate with overrides baked into the xlsx/PDF, preserving the existing offer ID and number
@@ -1103,23 +1030,18 @@ impl std::fmt::Display for OfferSummary {
 /// An `OfferSummary` with sensible defaults (`0` price, `25.0` m³) if the rows are missing.
 async fn fetch_current_offer_summary(db: &PgPool, offer_id: Uuid, inquiry_id: Uuid) -> OfferSummary {
     // Get offer price
-    let price: Option<(i64,)> = sqlx::query_as("SELECT price_cents FROM offers WHERE id = $1")
-        .bind(offer_id)
-        .fetch_optional(db)
+    let price_cents = offer_repo::fetch_price(db, offer_id)
         .await
-        .unwrap_or(None);
+        .unwrap_or(None)
+        .unwrap_or(0);
 
     // Get quote details
-    let quote: Option<(Option<f64>, Option<f64>)> = sqlx::query_as(
-        "SELECT estimated_volume_m3, distance_km FROM inquiries WHERE id = $1",
-    )
-    .bind(inquiry_id)
-    .fetch_optional(db)
-    .await
-    .unwrap_or(None);
-
-    let price_cents = price.map(|(p,)| p).unwrap_or(0);
-    let (volume, distance) = quote.unwrap_or((None, None));
+    let readiness = inquiry_repo::fetch_readiness(db, inquiry_id)
+        .await
+        .unwrap_or(None);
+    let (volume, distance) = readiness
+        .map(|r| (r.estimated_volume_m3, r.distance_km))
+        .unwrap_or((None, None));
 
     // Estimate persons/hours from price (reverse of pricing engine)
     // price_cents = persons * hours * rate_per_person_hour (3000 = €30)
@@ -1413,19 +1335,9 @@ async fn handle_offer_approval(
 ) {
     info!("Offer {offer_id} approved — creating email draft for admin to review and send");
 
-    let row: Option<(String, Uuid)> = sqlx::query_as(
-        r#"
-        SELECT c.email, o.inquiry_id
-        FROM offers o
-        JOIN inquiries q ON o.inquiry_id = q.id
-        JOIN customers c ON q.customer_id = c.id
-        WHERE o.id = $1
-        "#,
-    )
-    .bind(offer_id)
-    .fetch_optional(&state.db)
-    .await
-    .unwrap_or(None);
+    let row = offer_repo::fetch_approval_context(&state.db, offer_id)
+        .await
+        .unwrap_or(None);
 
     let Some((customer_email, inquiry_id)) = row else {
         send_telegram_message(
@@ -1458,19 +1370,18 @@ async fn handle_offer_approval(
         Mit freundlichen Grüßen,\n\
         Ihr AUST Umzüge Team";
 
-    let _ = sqlx::query(
-        r#"
-        INSERT INTO email_messages (id, thread_id, direction, from_address, to_address, subject, body_text, llm_generated, status, created_at)
-        VALUES ($1, $2, 'outbound', $3, $4, $5, $6, false, 'draft', NOW())
-        "#,
+    let _ = email_repo::insert_message(
+        &state.db,
+        Uuid::now_v7(),
+        thread_id,
+        "outbound",
+        &state.config.email.from_address,
+        &customer_email,
+        "Ihr Umzugsangebot — AUST Umzüge",
+        body,
+        false,
+        "draft",
     )
-    .bind(Uuid::now_v7())
-    .bind(thread_id)
-    .bind(&state.config.email.from_address)
-    .bind(&customer_email)
-    .bind("Ihr Umzugsangebot — AUST Umzüge")
-    .bind(body)
-    .execute(&state.db)
     .await;
 
     send_telegram_message(
@@ -1504,66 +1415,36 @@ async fn find_or_create_offer_thread(
     customer_email: &str,
 ) -> Option<Uuid> {
     // 1. Thread already directly linked to this inquiry
-    let existing: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT id FROM email_threads WHERE inquiry_id = $1 ORDER BY created_at DESC LIMIT 1",
-    )
-    .bind(inquiry_id)
-    .fetch_optional(&state.db)
-    .await
-    .unwrap_or(None);
-
-    if let Some((tid,)) = existing {
+    if let Ok(Some(tid)) = email_repo::find_thread_by_inquiry(&state.db, inquiry_id).await {
         return Some(tid);
     }
 
     // 2. Thread linked by customer (not yet linked to this inquiry)
-    let existing: Option<(Uuid,)> = sqlx::query_as(
-        r#"
-        SELECT et.id FROM email_threads et
-        JOIN inquiries q ON et.customer_id = q.customer_id
-        WHERE q.id = $1
-        ORDER BY et.created_at DESC LIMIT 1
-        "#,
-    )
-    .bind(inquiry_id)
-    .fetch_optional(&state.db)
-    .await
-    .unwrap_or(None);
-
-    if let Some((tid,)) = existing {
+    if let Ok(Some(tid)) = email_repo::find_thread_by_inquiry_customer(&state.db, inquiry_id).await
+    {
         // Link thread to inquiry while we're here
-        let _ = sqlx::query(
-            "UPDATE email_threads SET inquiry_id = $1, updated_at = NOW() WHERE id = $2",
-        )
-        .bind(inquiry_id)
-        .bind(tid)
-        .execute(&state.db)
-        .await;
+        let _ = email_repo::link_thread_to_inquiry(&state.db, tid, inquiry_id).await;
         return Some(tid);
     }
 
     // 3. No thread exists — create one (e.g. manually-created admin inquiry)
-    let customer_id: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM customers WHERE email = $1")
-            .bind(customer_email)
-            .fetch_optional(&state.db)
-            .await
-            .unwrap_or(None);
+    let customer = customer_repo::fetch_by_email(&state.db, customer_email)
+        .await
+        .unwrap_or(None);
 
-    let Some((customer_id,)) = customer_id else {
+    let Some(customer) = customer else {
         warn!("Cannot create email thread: customer not found for {customer_email}");
         return None;
     };
 
     let thread_id = Uuid::now_v7();
-    match sqlx::query(
-        "INSERT INTO email_threads (id, customer_id, inquiry_id, subject, created_at, updated_at) VALUES ($1, $2, $3, $4, NOW(), NOW())",
+    match email_repo::create_thread(
+        &state.db,
+        thread_id,
+        customer.id,
+        inquiry_id,
+        "Ihr Umzugsangebot — AUST Umzüge",
     )
-    .bind(thread_id)
-    .bind(customer_id)
-    .bind(inquiry_id)
-    .bind("Ihr Umzugsangebot — AUST Umzüge")
-    .execute(&state.db)
     .await
     {
         Ok(_) => Some(thread_id),
@@ -1597,26 +1478,16 @@ async fn handle_offer_denial(
     info!("Offer {offer_id} denied");
 
     // Fetch inquiry_id before updating
-    let quote_row: Option<(Uuid,)> =
-        sqlx::query_as("SELECT inquiry_id FROM offers WHERE id = $1")
-            .bind(offer_id)
-            .fetch_optional(&state.db)
-            .await
-            .unwrap_or(None);
+    let inq_id = offer_repo::fetch_inquiry_id(&state.db, offer_id)
+        .await
+        .unwrap_or(None);
 
-    let _ = sqlx::query("UPDATE offers SET status = 'rejected' WHERE id = $1")
-        .bind(offer_id)
-        .execute(&state.db)
-        .await;
+    let _ = offer_repo::reject(&state.db, offer_id).await;
 
     // Also update quote status to rejected
-    if let Some((inquiry_id,)) = quote_row {
+    if let Some(inquiry_id) = inq_id {
         let now = chrono::Utc::now();
-        let _ = sqlx::query("UPDATE inquiries SET status = 'rejected', updated_at = $1 WHERE id = $2")
-            .bind(now)
-            .bind(inquiry_id)
-            .execute(&state.db)
-            .await;
+        let _ = inquiry_repo::update_status(&state.db, inquiry_id, "rejected", now).await;
     }
 
     send_telegram_message(client, bot_token, chat_id, "❌ Angebot verworfen.").await;

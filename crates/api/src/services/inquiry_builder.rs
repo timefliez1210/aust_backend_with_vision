@@ -2,8 +2,8 @@
 //! from the database, replacing duplicate implementations in quotes.rs, admin.rs,
 //! and customer.rs.
 
-use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
-use sqlx::{FromRow, PgPool};
+use chrono::{DateTime, Utc};
+use sqlx::PgPool;
 use uuid::Uuid;
 
 use aust_core::models::{
@@ -12,113 +12,11 @@ use aust_core::models::{
     LineItemSnapshot, OfferSnapshot, Services,
 };
 
+use crate::repositories::{
+    address_repo, customer_repo, estimation_repo, inquiry_repo, offer_repo,
+};
 use crate::routes::offers::{parse_detected_items, VolumeEstimationRow};
 use crate::ApiError;
-
-// ---------------------------------------------------------------------------
-// Internal DB row types
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, FromRow)]
-struct InquiryDbRow {
-    id: Uuid,
-    customer_id: Uuid,
-    origin_address_id: Option<Uuid>,
-    destination_address_id: Option<Uuid>,
-    #[sqlx(default)]
-    stop_address_id: Option<Uuid>,
-    status: String,
-    estimated_volume_m3: Option<f64>,
-    distance_km: Option<f64>,
-    preferred_date: Option<DateTime<Utc>>,
-    scheduled_date: Option<NaiveDate>,
-    start_time: NaiveTime,
-    end_time: NaiveTime,
-    notes: Option<String>,
-    #[sqlx(default)]
-    services: serde_json::Value,
-    #[sqlx(default)]
-    source: String,
-    #[sqlx(default)]
-    offer_sent_at: Option<DateTime<Utc>>,
-    #[sqlx(default)]
-    accepted_at: Option<DateTime<Utc>>,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, FromRow)]
-struct CustomerDbRow {
-    id: Uuid,
-    email: String,
-    name: Option<String>,
-    salutation: Option<String>,
-    first_name: Option<String>,
-    last_name: Option<String>,
-    phone: Option<String>,
-}
-
-#[derive(Debug, FromRow)]
-struct AddressDbRow {
-    id: Uuid,
-    street: String,
-    city: String,
-    postal_code: Option<String>,
-    #[sqlx(default)]
-    country: String,
-    floor: Option<String>,
-    elevator: Option<bool>,
-    #[sqlx(default)]
-    latitude: Option<f64>,
-    #[sqlx(default)]
-    longitude: Option<f64>,
-}
-
-#[derive(Debug, FromRow)]
-struct EstimationDbRow {
-    id: Uuid,
-    method: String,
-    status: String,
-    total_volume_m3: Option<f64>,
-    #[sqlx(default)]
-    confidence_score: Option<f64>,
-    result_data: Option<serde_json::Value>,
-    source_data: Option<serde_json::Value>,
-    created_at: DateTime<Utc>,
-}
-
-#[derive(Debug, FromRow)]
-struct OfferDbRow {
-    id: Uuid,
-    #[sqlx(default)]
-    offer_number: Option<String>,
-    price_cents: i64,
-    status: String,
-    persons: Option<i32>,
-    hours_estimated: Option<f64>,
-    rate_per_hour_cents: Option<i64>,
-    line_items_json: Option<serde_json::Value>,
-    pdf_storage_key: Option<String>,
-    #[sqlx(default)]
-    valid_until: Option<chrono::NaiveDate>,
-    created_at: DateTime<Utc>,
-}
-
-#[derive(Debug, FromRow)]
-struct ListItemDbRow {
-    id: Uuid,
-    customer_name: Option<String>,
-    customer_email: String,
-    customer_salutation: Option<String>,
-    origin_city: Option<String>,
-    destination_city: Option<String>,
-    volume_m3: Option<f64>,
-    distance_km: Option<f64>,
-    status: String,
-    has_offer: bool,
-    offer_status: Option<String>,
-    created_at: DateTime<Utc>,
-}
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -147,31 +45,13 @@ pub async fn build_inquiry_response(
     inquiry_id: Uuid,
 ) -> Result<InquiryResponse, ApiError> {
     // 1. Fetch inquiry row
-    let row: InquiryDbRow = sqlx::query_as(
-        r#"
-        SELECT id, customer_id, origin_address_id, destination_address_id, stop_address_id,
-               status, estimated_volume_m3, distance_km, preferred_date, scheduled_date,
-               start_time, end_time, notes,
-               services, source, offer_sent_at, accepted_at, created_at, updated_at
-        FROM inquiries WHERE id = $1
-        "#,
-    )
-    .bind(inquiry_id)
-    .fetch_optional(pool)
-    .await?
-    .ok_or_else(|| ApiError::NotFound(format!("Inquiry {inquiry_id} not found")))?;
+    let row = inquiry_repo::fetch_by_id(pool, inquiry_id).await?;
 
     let status: InquiryStatus = row.status.parse().unwrap_or_default();
     let services: Services = serde_json::from_value(row.services).unwrap_or_default();
 
     // 2. Fetch customer
-    let customer: CustomerDbRow = sqlx::query_as(
-        "SELECT id, email, name, salutation, first_name, last_name, phone FROM customers WHERE id = $1",
-    )
-    .bind(row.customer_id)
-    .fetch_optional(pool)
-    .await?
-    .ok_or_else(|| ApiError::NotFound("Customer not found".into()))?;
+    let customer = customer_repo::fetch_by_id(pool, row.customer_id).await?;
 
     // 3. Fetch addresses
     let origin_address = fetch_address(pool, row.origin_address_id).await?;
@@ -179,18 +59,7 @@ pub async fn build_inquiry_response(
     let stop_address = fetch_address(pool, row.stop_address_id).await?;
 
     // 4. Fetch latest completed estimation + items
-    let est: Option<EstimationDbRow> = sqlx::query_as(
-        r#"
-        SELECT id, method, status, total_volume_m3, confidence_score,
-               result_data, source_data, created_at
-        FROM volume_estimations
-        WHERE inquiry_id = $1 AND status = 'completed'
-        ORDER BY created_at DESC LIMIT 1
-        "#,
-    )
-    .bind(inquiry_id)
-    .fetch_optional(pool)
-    .await?;
+    let est = estimation_repo::fetch_completed_for_inquiry(pool, inquiry_id).await?;
 
     let (estimation, items) = if let Some(ref e) = est {
         let source_s3_keys = extract_s3_keys(e.source_data.as_ref());
@@ -285,27 +154,38 @@ pub async fn build_inquiry_response(
     };
 
     // 5. Fetch latest active offer
-    let offer_row: Option<OfferDbRow> = sqlx::query_as(
-        r#"
-        SELECT id, offer_number, price_cents, status, persons, hours_estimated,
-               rate_per_hour_cents, line_items_json, pdf_storage_key, valid_until,
-               created_at
-        FROM offers
-        WHERE inquiry_id = $1 AND status NOT IN ('rejected', 'cancelled')
-        ORDER BY created_at DESC LIMIT 1
-        "#,
-    )
-    .bind(inquiry_id)
-    .fetch_optional(pool)
-    .await?;
-
+    let offer_row = offer_repo::fetch_active_for_builder(pool, inquiry_id).await?;
     let offer = offer_row.map(|r| build_offer_snapshot(&r, inquiry_id));
 
     // 6. Fetch employee assignments
-    let employees = fetch_employee_assignments(pool, inquiry_id).await?;
+    let emp_rows = inquiry_repo::fetch_employee_assignments_snapshot(pool, inquiry_id).await?;
+    let employees: Vec<EmployeeAssignmentSnapshot> = emp_rows
+        .into_iter()
+        .map(|r| EmployeeAssignmentSnapshot {
+            employee_id: r.employee_id,
+            first_name: r.first_name,
+            last_name: r.last_name,
+            planned_hours: r.planned_hours,
+            clock_in: r.clock_in,
+            clock_out: r.clock_out,
+            actual_hours: r.actual_hours,
+            employee_clock_in: r.employee_clock_in,
+            employee_clock_out: r.employee_clock_out,
+            employee_actual_hours: r.employee_actual_hours,
+            notes: r.notes,
+        })
+        .collect();
 
     // 6b. Fetch scheduled days (empty for single-day inquiries)
-    let scheduled_days = fetch_scheduled_days(pool, inquiry_id).await?;
+    let day_rows = inquiry_repo::fetch_scheduled_days(pool, inquiry_id).await?;
+    let scheduled_days: Vec<InquiryDaySnapshot> = day_rows
+        .into_iter()
+        .map(|r| InquiryDaySnapshot {
+            day_date: r.day_date,
+            day_number: r.day_number,
+            notes: r.notes,
+        })
+        .collect();
     let is_multi_day = scheduled_days.len() > 1;
 
     // 7. Extract customer message from notes
@@ -383,71 +263,22 @@ pub async fn build_inquiry_list(
     let limit = limit.min(100);
     let search_pattern = search.map(|s| format!("%{s}%"));
 
-    let items: Vec<ListItemDbRow> = sqlx::query_as(
-        r#"
-        SELECT
-            i.id,
-            c.name AS customer_name,
-            c.email AS customer_email,
-            c.salutation AS customer_salutation,
-            oa.city AS origin_city,
-            da.city AS destination_city,
-            i.estimated_volume_m3 AS volume_m3,
-            i.distance_km,
-            i.status,
-            EXISTS (
-                SELECT 1 FROM offers
-                WHERE inquiry_id = i.id AND status NOT IN ('rejected', 'cancelled')
-            ) AS has_offer,
-            (
-                SELECT o2.status FROM offers o2
-                WHERE o2.inquiry_id = i.id AND o2.status NOT IN ('rejected', 'cancelled')
-                ORDER BY o2.created_at DESC LIMIT 1
-            ) AS offer_status,
-            i.created_at
-        FROM inquiries i
-        LEFT JOIN customers c ON i.customer_id = c.id
-        LEFT JOIN addresses oa ON i.origin_address_id = oa.id
-        LEFT JOIN addresses da ON i.destination_address_id = da.id
-        WHERE ($1::text IS NULL OR i.status = $1)
-          AND ($2::text IS NULL OR c.name ILIKE $2 OR c.email ILIKE $2)
-          AND ($3::bool IS NULL OR
-               (CASE WHEN $3 THEN EXISTS (
-                   SELECT 1 FROM offers WHERE inquiry_id = i.id AND status NOT IN ('rejected', 'cancelled')
-               ) ELSE NOT EXISTS (
-                   SELECT 1 FROM offers WHERE inquiry_id = i.id AND status NOT IN ('rejected', 'cancelled')
-               ) END))
-        ORDER BY i.created_at DESC
-        LIMIT $4 OFFSET $5
-        "#,
+    let items = inquiry_repo::list_items(
+        pool,
+        status,
+        search_pattern.as_deref(),
+        has_offer,
+        limit,
+        offset,
     )
-    .bind(status)
-    .bind(&search_pattern)
-    .bind(has_offer)
-    .bind(limit)
-    .bind(offset)
-    .fetch_all(pool)
     .await?;
 
-    let (total,): (i64,) = sqlx::query_as(
-        r#"
-        SELECT COUNT(*)
-        FROM inquiries i
-        LEFT JOIN customers c ON i.customer_id = c.id
-        WHERE ($1::text IS NULL OR i.status = $1)
-          AND ($2::text IS NULL OR c.name ILIKE $2 OR c.email ILIKE $2)
-          AND ($3::bool IS NULL OR
-               (CASE WHEN $3 THEN EXISTS (
-                   SELECT 1 FROM offers WHERE inquiry_id = i.id AND status NOT IN ('rejected', 'cancelled')
-               ) ELSE NOT EXISTS (
-                   SELECT 1 FROM offers WHERE inquiry_id = i.id AND status NOT IN ('rejected', 'cancelled')
-               ) END))
-        "#,
+    let total = inquiry_repo::count_items(
+        pool,
+        status,
+        search_pattern.as_deref(),
+        has_offer,
     )
-    .bind(status)
-    .bind(&search_pattern)
-    .bind(has_offer)
-    .fetch_one(pool)
     .await?;
 
     let result = items
@@ -483,15 +314,7 @@ async fn fetch_address(
     let Some(id) = address_id else {
         return Ok(None);
     };
-    let row: Option<AddressDbRow> = sqlx::query_as(
-        r#"
-        SELECT id, street, city, postal_code, country, floor, elevator, latitude, longitude
-        FROM addresses WHERE id = $1
-        "#,
-    )
-    .bind(id)
-    .fetch_optional(pool)
-    .await?;
+    let row = address_repo::fetch_full(pool, id).await?;
 
     Ok(row.map(|a| AddressSnapshot {
         id: a.id,
@@ -512,7 +335,7 @@ async fn fetch_address(
 }
 
 /// Build an OfferSnapshot from a DB row, parsing line items.
-fn build_offer_snapshot(r: &OfferDbRow, inquiry_id: Uuid) -> OfferSnapshot {
+fn build_offer_snapshot(r: &offer_repo::OfferBuilderRow, inquiry_id: Uuid) -> OfferSnapshot {
     let persons = r.persons.unwrap_or(2);
     let netto = r.price_cents;
     let brutto = (netto as f64 * 1.19).round() as i64;
@@ -541,7 +364,7 @@ fn build_offer_snapshot(r: &OfferDbRow, inquiry_id: Uuid) -> OfferSnapshot {
         line_items,
         pdf_url,
         valid_until: r.valid_until.map(|d| {
-            chrono::DateTime::<Utc>::from_naive_utc_and_offset(
+            DateTime::<Utc>::from_naive_utc_and_offset(
                 d.and_hms_opt(23, 59, 59).unwrap_or_default(),
                 Utc,
             )
@@ -592,114 +415,6 @@ fn extract_s3_keys(source_data: Option<&serde_json::Value>) -> Vec<String> {
                 .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         })
         .unwrap_or_default()
-}
-
-/// Fetch employee assignments for an inquiry.
-///
-/// **Caller**: `build_inquiry_response`
-/// **Why**: Embeds assigned employees in the canonical inquiry detail response.
-async fn fetch_employee_assignments(
-    pool: &PgPool,
-    inquiry_id: Uuid,
-) -> Result<Vec<EmployeeAssignmentSnapshot>, crate::ApiError> {
-    #[derive(Debug, FromRow)]
-    struct Row {
-        employee_id: Uuid,
-        first_name: String,
-        last_name: String,
-        planned_hours: f64,
-        clock_in: Option<DateTime<Utc>>,
-        clock_out: Option<DateTime<Utc>>,
-        actual_hours: Option<f64>,
-        employee_clock_in: Option<DateTime<Utc>>,
-        employee_clock_out: Option<DateTime<Utc>>,
-        employee_actual_hours: Option<f64>,
-        notes: Option<String>,
-    }
-
-    let rows: Vec<Row> = sqlx::query_as(
-        r#"
-        SELECT ie.employee_id, e.first_name, e.last_name,
-               ie.planned_hours::float8 AS planned_hours,
-               ie.clock_in,
-               ie.clock_out,
-               CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
-                    THEN (EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0)::float8
-                    ELSE NULL END AS actual_hours,
-               ie.employee_clock_in,
-               ie.employee_clock_out,
-               CASE WHEN ie.employee_clock_out IS NOT NULL AND ie.employee_clock_in IS NOT NULL
-                    THEN (EXTRACT(EPOCH FROM (ie.employee_clock_out - ie.employee_clock_in)) / 3600.0)::float8
-                    ELSE NULL END AS employee_actual_hours,
-               ie.notes
-        FROM inquiry_employees ie
-        JOIN employees e ON ie.employee_id = e.id
-        WHERE ie.inquiry_id = $1
-        ORDER BY e.last_name, e.first_name
-        "#,
-    )
-    .bind(inquiry_id)
-    .fetch_all(pool)
-    .await?;
-
-    Ok(rows
-        .into_iter()
-        .map(|r| EmployeeAssignmentSnapshot {
-            employee_id: r.employee_id,
-            first_name: r.first_name,
-            last_name: r.last_name,
-            planned_hours: r.planned_hours,
-            clock_in: r.clock_in,
-            clock_out: r.clock_out,
-            actual_hours: r.actual_hours,
-            employee_clock_in: r.employee_clock_in,
-            employee_clock_out: r.employee_clock_out,
-            employee_actual_hours: r.employee_actual_hours,
-            notes: r.notes,
-        })
-        .collect())
-}
-
-/// Fetch all scheduled day records for an inquiry, ordered by day_number.
-///
-/// **Caller**: `build_inquiry_response`
-/// **Why**: Multi-day inquiries need all their dates embedded in the canonical
-/// detail response so the frontend calendar can display them on every day.
-///
-/// # Returns
-/// Empty vec for single-day inquiries (no rows in `inquiry_days`).
-/// Ordered list of `InquiryDaySnapshot` for multi-day inquiries.
-async fn fetch_scheduled_days(
-    pool: &PgPool,
-    inquiry_id: Uuid,
-) -> Result<Vec<InquiryDaySnapshot>, crate::ApiError> {
-    #[derive(FromRow)]
-    struct Row {
-        day_date: NaiveDate,
-        day_number: i16,
-        notes: Option<String>,
-    }
-
-    let rows: Vec<Row> = sqlx::query_as(
-        r#"
-        SELECT day_date, day_number, notes
-        FROM inquiry_days
-        WHERE inquiry_id = $1
-        ORDER BY day_number ASC
-        "#,
-    )
-    .bind(inquiry_id)
-    .fetch_all(pool)
-    .await?;
-
-    Ok(rows
-        .into_iter()
-        .map(|r| InquiryDaySnapshot {
-            day_date: r.day_date,
-            day_number: r.day_number,
-            notes: r.notes,
-        })
-        .collect())
 }
 
 /// Extract free-text customer remarks from notes, stripping known service keywords.

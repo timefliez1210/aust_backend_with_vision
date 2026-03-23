@@ -2,6 +2,8 @@ use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
 use crate::ApiError;
+use crate::repositories::{AddressRow, CustomerRow};
+use crate::repositories::{address_repo, customer_repo, offer_repo};
 use crate::routes::shared::InquiryRow;
 use aust_core::config::Config;
 use aust_core::models::{
@@ -66,71 +68,7 @@ impl From<OfferRow> for Offer {
     }
 }
 
-/// SQLx projection row for the `customers` table used within offer generation.
-#[derive(Debug, FromRow)]
-pub(crate) struct CustomerRow {
-    #[allow(dead_code)]
-    pub id: Uuid,
-    pub email: String,
-    pub name: Option<String>,
-    pub salutation: Option<String>,
-    pub first_name: Option<String>,
-    pub last_name: Option<String>,
-    pub phone: Option<String>,
-}
-
-impl CustomerRow {
-    /// Formal greeting line using stored salutation + last name.
-    /// Falls back to the `detect_salutation_and_greeting` heuristic for legacy
-    /// customers who pre-date the structured name fields.
-    pub fn formal_greeting(&self) -> String {
-        match (self.salutation.as_deref(), self.last_name.as_deref()) {
-            (Some("Herr"), Some(ln)) => format!("Sehr geehrter Herr {ln},"),
-            (Some("Frau"), Some(ln)) => format!("Sehr geehrte Frau {ln},"),
-            (Some("D"),    Some(ln)) => format!("Sehr geehrte Person {ln},"),
-            _ => {
-                // Legacy fallback: derive from name string
-                let name = self.name.as_deref().unwrap_or(&self.email);
-                detect_salutation_and_greeting(name).1
-            }
-        }
-    }
-
-    /// Address-block salutation for XLSX cell A8 ("Herrn", "Frau", "Divers", or "").
-    pub fn address_salutation(&self) -> String {
-        match self.salutation.as_deref() {
-            Some("Herr") => "Herrn".to_string(),
-            Some("Frau") => "Frau".to_string(),
-            Some("D")    => "Divers".to_string(),
-            _ => {
-                let name = self.name.as_deref().unwrap_or(&self.email);
-                detect_salutation_and_greeting(name).0
-            }
-        }
-    }
-
-    /// Full display name: first + last, or the legacy `name` field, or email.
-    pub fn display_name(&self) -> String {
-        match (self.first_name.as_deref(), self.last_name.as_deref()) {
-            (Some(f), Some(l)) => format!("{f} {l}"),
-            (Some(f), None)    => f.to_string(),
-            (None,    Some(l)) => l.to_string(),
-            _ => self.name.clone().unwrap_or_else(|| self.email.clone()),
-        }
-    }
-}
-
-/// SQLx projection row for the `addresses` table used within offer generation.
-#[derive(Debug, FromRow)]
-pub(crate) struct AddressRow {
-    #[allow(dead_code)]
-    pub id: Uuid,
-    pub street: String,
-    pub city: String,
-    pub postal_code: Option<String>,
-    pub floor: Option<String>,
-    pub elevator: Option<bool>,
-}
+// CustomerRow and AddressRow are now defined in crate::repositories
 
 /// Minimal SQLx projection of `volume_estimations` used by `parse_detected_items` and
 /// re-exported to `admin` and `quotes` modules for the same purpose.
@@ -279,18 +217,10 @@ pub async fn build_offer_with_overrides(
     overrides: &OfferOverrides,
 ) -> Result<GeneratedOffer, ApiError> {
     // 1. Fetch quote
-    let quote_row: InquiryRow = sqlx::query_as(
-        r#"
-        SELECT id, customer_id, origin_address_id, destination_address_id, stop_address_id,
-               status, estimated_volume_m3, distance_km, preferred_date, notes, services,
-               source, offer_sent_at, accepted_at, created_at, updated_at
-        FROM inquiries WHERE id = $1
-        "#,
-    )
-    .bind(inquiry_id)
-    .fetch_optional(db)
-    .await?
-    .ok_or_else(|| ApiError::NotFound("Quote not found".into()))?;
+    let quote_row: InquiryRow = offer_repo::fetch_inquiry_for_offer(db, inquiry_id)
+        .await
+        .map_err(ApiError::Database)?
+        .ok_or_else(|| ApiError::NotFound("Quote not found".into()))?;
 
     let quote = Quote::from(quote_row);
 
@@ -301,54 +231,23 @@ pub async fn build_offer_with_overrides(
     let distance = quote.distance_km.unwrap_or(0.0);
 
     // 2. Fetch customer
-    let customer: CustomerRow =
-        sqlx::query_as("SELECT id, email, name, salutation, first_name, last_name, phone FROM customers WHERE id = $1")
-            .bind(quote.customer_id)
-            .fetch_optional(db)
-            .await?
-            .ok_or_else(|| ApiError::NotFound("Customer not found".into()))?;
+    let customer: CustomerRow = customer_repo::fetch_by_id(db, quote.customer_id).await?;
 
     // 3. Fetch addresses
-    let origin: Option<AddressRow> = if let Some(addr_id) = quote.origin_address_id {
-        sqlx::query_as("SELECT id, street, city, postal_code, floor, elevator FROM addresses WHERE id = $1")
-            .bind(addr_id)
-            .fetch_optional(db)
-            .await?
-    } else {
-        None
-    };
-
-    let destination: Option<AddressRow> = if let Some(addr_id) = quote.destination_address_id {
-        sqlx::query_as("SELECT id, street, city, postal_code, floor, elevator FROM addresses WHERE id = $1")
-            .bind(addr_id)
-            .fetch_optional(db)
-            .await?
-    } else {
-        None
-    };
-
-    let stop_address: Option<AddressRow> = if let Some(addr_id) = quote.stop_address_id {
-        sqlx::query_as("SELECT id, street, city, postal_code, floor, elevator FROM addresses WHERE id = $1")
-            .bind(addr_id)
-            .fetch_optional(db)
-            .await?
-    } else {
-        None
-    };
+    let origin: Option<AddressRow> = address_repo::fetch_optional(db, quote.origin_address_id).await?;
+    let destination: Option<AddressRow> = address_repo::fetch_optional(db, quote.destination_address_id).await?;
+    let stop_address: Option<AddressRow> = address_repo::fetch_optional(db, quote.stop_address_id).await?;
 
     // 4. Fetch latest volume estimation for detected items
-    let estimation: Option<VolumeEstimationRow> = sqlx::query_as(
-        r#"
-        SELECT result_data, source_data, total_volume_m3, method
-        FROM volume_estimations
-        WHERE inquiry_id = $1
-        ORDER BY created_at DESC
-        LIMIT 1
-        "#,
-    )
-    .bind(inquiry_id)
-    .fetch_optional(db)
-    .await?;
+    let repo_estimation = offer_repo::fetch_latest_estimation(db, inquiry_id)
+        .await
+        .map_err(ApiError::Database)?;
+    let estimation: Option<VolumeEstimationRow> = repo_estimation.map(|e| VolumeEstimationRow {
+        result_data: e.result_data,
+        source_data: e.source_data,
+        total_volume_m3: e.total_volume_m3,
+        method: e.method,
+    });
 
     // 5. Parse detected items from result_data
     let detected_items = parse_detected_items(estimation.as_ref());
@@ -419,12 +318,9 @@ pub async fn build_offer_with_overrides(
             .map(|li| li.flat_total.unwrap_or(li.quantity * li.unit_price))
     } else if let Some(existing_id) = overrides.existing_offer_id {
         // Admin override was set before — carry it forward unconditionally.
-        let row: Option<(Option<i32>,)> =
-            sqlx::query_as("SELECT fahrt_override_cents FROM offers WHERE id = $1")
-                .bind(existing_id)
-                .fetch_optional(db)
-                .await?;
-        row.and_then(|(c,)| c).map(|c| c as f64 / 100.0)
+        offer_repo::fetch_fahrt_override(db, existing_id)
+            .await?
+            .map(|c| c as f64 / 100.0)
     } else {
         None
     };
@@ -512,19 +408,13 @@ pub async fn build_offer_with_overrides(
 
     // Get or generate offer ID and number (UPDATE-in-place when existing_offer_id is set)
     let (offer_id, offer_number) = if let Some(existing_id) = overrides.existing_offer_id {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT offer_number FROM offers WHERE id = $1"
-        )
-        .bind(existing_id)
-        .fetch_optional(db)
-        .await?;
-        let (offer_number,) = row.ok_or_else(|| ApiError::NotFound(format!("Offer {existing_id} not found")))?;
+        let offer_number = offer_repo::fetch_offer_number(db, existing_id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("Offer {existing_id} not found")))?;
         (existing_id, offer_number)
     } else {
-        let (seq_val,): (i64,) = sqlx::query_as("SELECT nextval('offer_number_seq')")
-            .fetch_one(db)
-            .await?;
-        let offer_number = format!("{}-{:04}", today.format("%Y"), seq_val);
+        let offer_number = offer_repo::next_offer_number(db, today).await
+            .map_err(|e| ApiError::Database(e))?;
         (Uuid::now_v7(), offer_number)
     };
 
@@ -628,67 +518,38 @@ pub async fn build_offer_with_overrides(
     }).sum();
     let actual_netto_cents = (actual_netto * 100.0).round() as i64;
 
-    let row: OfferRow = if overrides.existing_offer_id.is_some() {
-        sqlx::query_as(
-            r#"
-            UPDATE offers
-            SET price_cents = $1, pdf_storage_key = $2, status = $3,
-                persons = $4, hours_estimated = $5, rate_per_hour_cents = $6,
-                line_items_json = $7,
-                fahrt_override_cents = $8
-            WHERE id = $9
-            RETURNING id, inquiry_id, price_cents, currency, valid_until, pdf_storage_key, status,
-                      created_at, sent_at, offer_number, persons, hours_estimated,
-                      rate_per_hour_cents, line_items_json, fahrt_override_cents
-            "#,
+    let repo_row = if overrides.existing_offer_id.is_some() {
+        offer_repo::update_returning(
+            db, offer_id, actual_netto_cents, Some(&s3_key), OfferStatus::Draft.as_str(),
+            pricing_result.estimated_helpers as i32, pricing_result.estimated_hours,
+            rate_cents, &line_items_json, fahrt_override_cents,
         )
-        .bind(actual_netto_cents)
-        .bind(Some(&s3_key))
-        .bind(OfferStatus::Draft.as_str())
-        .bind(pricing_result.estimated_helpers as i32)
-        .bind(pricing_result.estimated_hours)
-        .bind(rate_cents)
-        .bind(&line_items_json)
-        .bind(fahrt_override_cents)
-        .bind(offer_id)
-        .fetch_one(db)
-        .await?
+        .await
+        .map_err(ApiError::Database)?
     } else {
-        sqlx::query_as(
-            r#"
-            INSERT INTO offers (id, inquiry_id, price_cents, currency, valid_until, pdf_storage_key, status, created_at,
-                                offer_number, persons, hours_estimated, rate_per_hour_cents, line_items_json,
-                                fahrt_override_cents)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-            RETURNING id, inquiry_id, price_cents, currency, valid_until, pdf_storage_key, status, created_at, sent_at,
-                      offer_number, persons, hours_estimated, rate_per_hour_cents, line_items_json, fahrt_override_cents
-            "#,
+        offer_repo::insert_returning(
+            db, offer_id, inquiry_id, actual_netto_cents, "EUR", valid_until_date,
+            Some(&s3_key), OfferStatus::Draft.as_str(), now, &offer_number,
+            pricing_result.estimated_helpers as i32, pricing_result.estimated_hours,
+            rate_cents, &line_items_json, fahrt_override_cents,
         )
-        .bind(offer_id)
-        .bind(inquiry_id)
-        .bind(actual_netto_cents)
-        .bind("EUR")
-        .bind(valid_until_date)
-        .bind(Some(&s3_key))
-        .bind(OfferStatus::Draft.as_str())
-        .bind(now)
-        .bind(&offer_number)
-        .bind(pricing_result.estimated_helpers as i32)
-        .bind(pricing_result.estimated_hours)
-        .bind(rate_cents)
-        .bind(&line_items_json)
-        .bind(fahrt_override_cents)
-        .fetch_one(db)
-        .await?
+        .await
+        .map_err(ApiError::Database)?
+    };
+    let row = OfferRow {
+        id: repo_row.id, inquiry_id: repo_row.inquiry_id, price_cents: repo_row.price_cents,
+        currency: repo_row.currency, valid_until: repo_row.valid_until,
+        pdf_storage_key: repo_row.pdf_storage_key, status: repo_row.status,
+        created_at: repo_row.created_at, sent_at: repo_row.sent_at,
+        offer_number: repo_row.offer_number, persons: repo_row.persons,
+        hours_estimated: repo_row.hours_estimated, rate_per_hour_cents: repo_row.rate_per_hour_cents,
+        line_items_json: repo_row.line_items_json, fahrt_override_cents: repo_row.fahrt_override_cents,
     };
 
     // Update quote status
-    sqlx::query("UPDATE inquiries SET status = $1, updated_at = $2 WHERE id = $3")
-        .bind("offer_ready")
-        .bind(now)
-        .bind(inquiry_id)
-        .execute(db)
-        .await?;
+    crate::repositories::inquiry_repo::update_status(db, inquiry_id, "offer_ready", now)
+        .await
+        .map_err(|e| ApiError::Database(e))?;
 
     // Build full address strings for Telegram summary
     let origin_full = if origin_street.is_empty() {
@@ -814,7 +675,7 @@ pub fn greeting_for_name(name: &str) -> String {
 /// # Returns
 /// `(salutation, greeting)` — e.g. `("Herrn", "Sehr geehrter Herr Müller,")` or
 /// `("", "Sehr geehrte Damen und Herren,")` for single-word names
-fn detect_salutation_and_greeting(name: &str) -> (String, String) {
+pub(crate) fn detect_salutation_and_greeting(name: &str) -> (String, String) {
     // If the name contains "Frau" or "Herr" prefix, use that directly
     let name_trimmed = name.trim();
     if name_trimmed.starts_with("Frau ") {

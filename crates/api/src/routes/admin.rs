@@ -2,17 +2,18 @@ use axum::{
     extract::{Multipart, Path, Query, State},
     http::header,
     response::Response,
-    routing::{delete, get, patch, post},
+    routing::{get, patch, post},
     Extension, Json, Router,
 };
 use bytes::Bytes;
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::FromRow;
+
 use std::sync::Arc;
 use uuid::Uuid;
 
 use aust_core::models::TokenClaims;
+use crate::repositories::{admin_repo, employee_repo};
 use crate::{ApiError, AppState};
 
 /// Register all admin-panel routes (protected under JWT middleware).
@@ -71,7 +72,7 @@ struct ConflictDate {
     capacity: i32,
 }
 
-#[derive(Debug, Serialize, FromRow)]
+#[derive(Debug, Serialize)]
 struct ActivityItem {
     #[serde(rename = "type")]
     activity_type: String,
@@ -99,146 +100,45 @@ async fn dashboard(
     State(state): State<Arc<AppState>>,
     Extension(_claims): Extension<TokenClaims>,
 ) -> Result<Json<DashboardResponse>, ApiError> {
-    let (open_quotes,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM inquiries WHERE status IN ('pending', 'info_requested', 'estimated')",
-    )
-    .fetch_one(&state.db)
-    .await?;
-
-    let (pending_offers,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM offers WHERE status = 'draft'")
-            .fetch_one(&state.db)
-            .await?;
-
+    let open_quotes = admin_repo::count_open_inquiries(&state.db).await?;
+    let pending_offers = admin_repo::count_pending_offers(&state.db).await?;
     let today = Utc::now().date_naive();
-    let (todays_bookings,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM inquiries WHERE COALESCE(scheduled_date, preferred_date::date) = $1 AND status NOT IN ('cancelled', 'rejected', 'expired')",
-    )
-    .bind(today)
-    .fetch_optional(&state.db)
-    .await
-    .unwrap_or(Some((0,)))
-    .unwrap_or((0,));
+    let todays_bookings = admin_repo::count_todays_bookings(&state.db, today).await?;
+    let total_customers = admin_repo::count_total_customers(&state.db).await?;
 
-    let (total_customers,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM customers")
-            .fetch_one(&state.db)
-            .await?;
-
-    // Unified recent activity: recent inquiry updates, unanswered emails, upcoming Termine.
-    let recent_offers: Vec<ActivityItem> = sqlx::query_as(
-        r#"
-        SELECT activity_type, description, created_at, id, status
-        FROM (
-            -- Recently updated inquiries (not terminal)
-            SELECT
-                'inquiry' AS activity_type,
-                COALESCE(c.name, c.email) || ' — ' || i.status AS description,
-                i.updated_at AS created_at,
-                i.id AS id,
-                i.status AS status
-            FROM inquiries i
-            JOIN customers c ON i.customer_id = c.id
-            WHERE i.status NOT IN ('cancelled', 'rejected', 'expired', 'paid')
-
-            UNION ALL
-
-            -- Recent offers (link goes to inquiry)
-            SELECT
-                'offer_' || o.status AS activity_type,
-                COALESCE(c.name, c.email) || ' — ' || round((o.price_cents::numeric / 100 * 1.19), 2)::text || ' € brutto' AS description,
-                o.created_at AS created_at,
-                q.id AS id,
-                o.status AS status
-            FROM offers o
-            JOIN inquiries q ON o.inquiry_id = q.id
-            JOIN customers c ON q.customer_id = c.id
-
-            UNION ALL
-
-            -- Email threads awaiting reply (last message is inbound)
-            SELECT
-                'email' AS activity_type,
-                COALESCE(c.name, c.email) || ': ' || COALESCE(et.subject, '(kein Betreff)') AS description,
-                et.updated_at AS created_at,
-                et.id AS id,
-                'unanswered' AS status
-            FROM email_threads et
-            JOIN customers c ON et.customer_id = c.id
-            WHERE (
-                SELECT direction FROM email_messages
-                WHERE thread_id = et.id
-                ORDER BY created_at DESC LIMIT 1
-            ) = 'inbound'
-
-            UNION ALL
-
-            -- Upcoming / recently created calendar items
-            SELECT
-                'calendar_item' AS activity_type,
-                ci.title || COALESCE(' @ ' || ci.location, '') AS description,
-                ci.created_at AS created_at,
-                ci.id AS id,
-                ci.status AS status
-            FROM calendar_items ci
-            WHERE ci.status = 'scheduled'
-              AND (ci.scheduled_date IS NULL OR ci.scheduled_date >= CURRENT_DATE)
-        ) combined
-        ORDER BY created_at DESC
-        LIMIT 15
-        "#,
-    )
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
+    let recent_activity_rows = admin_repo::fetch_recent_activity(&state.db)
+        .await
+        .unwrap_or_default();
+    let recent_activity: Vec<ActivityItem> = recent_activity_rows
+        .into_iter()
+        .map(|r| ActivityItem {
+            activity_type: r.activity_type,
+            description: r.description,
+            created_at: r.created_at,
+            id: r.id,
+            status: r.status,
+        })
+        .collect();
 
     // Find dates in the next 30 days where bookings >= capacity
     let from_date = today;
     let to_date = today + chrono::Days::new(30);
     let default_capacity = state.config.calendar.default_capacity;
 
-    #[derive(FromRow)]
-    struct ConflictRow {
-        booking_date: NaiveDate,
-        booking_count: i64,
-    }
-
-    let conflict_rows: Vec<ConflictRow> = sqlx::query_as(
-        r#"
-        SELECT COALESCE(scheduled_date, preferred_date::date) AS booking_date, COUNT(*) AS booking_count
-        FROM inquiries
-        WHERE COALESCE(scheduled_date, preferred_date::date) BETWEEN $1 AND $2
-          AND status NOT IN ('cancelled', 'rejected', 'expired')
-        GROUP BY COALESCE(scheduled_date, preferred_date::date)
-        HAVING COUNT(*) > COALESCE(
-            (SELECT capacity FROM calendar_capacity_overrides WHERE override_date = COALESCE(scheduled_date, preferred_date::date)),
-            $3
-        )
-        ORDER BY booking_date
-        "#,
-    )
-    .bind(from_date)
-    .bind(to_date)
-    .bind(default_capacity)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
+    let conflict_rows = admin_repo::fetch_conflict_dates(&state.db, from_date, to_date, default_capacity)
+        .await
+        .unwrap_or_default();
 
     let mut conflict_dates = Vec::new();
     for row in conflict_rows {
-        // Fetch actual capacity for this date
-        let cap: Option<(i32,)> = sqlx::query_as(
-            "SELECT capacity FROM calendar_capacity_overrides WHERE override_date = $1",
-        )
-        .bind(row.booking_date)
-        .fetch_optional(&state.db)
-        .await
-        .unwrap_or(None);
+        let cap = admin_repo::fetch_capacity_override(&state.db, row.booking_date)
+            .await
+            .unwrap_or(None);
 
         conflict_dates.push(ConflictDate {
             date: row.booking_date,
             booked: row.booking_count,
-            capacity: cap.map(|c| c.0).unwrap_or(default_capacity),
+            capacity: cap.unwrap_or(default_capacity),
         });
     }
 
@@ -247,7 +147,7 @@ async fn dashboard(
         pending_offers,
         todays_bookings,
         total_customers,
-        recent_activity: recent_offers,
+        recent_activity,
         conflict_dates,
     }))
 }
@@ -261,7 +161,7 @@ struct ListCustomersQuery {
     offset: Option<i64>,
 }
 
-#[derive(Debug, Serialize, FromRow)]
+#[derive(Debug, Serialize)]
 struct CustomerListItem {
     id: Uuid,
     email: String,
@@ -302,27 +202,16 @@ async fn list_customers(
         .map(|s| format!("%{s}%"))
         .unwrap_or_else(|| "%".to_string());
 
-    let customers: Vec<CustomerListItem> = sqlx::query_as(
-        r#"
-        SELECT id, email, name, salutation, first_name, last_name, phone, created_at
-        FROM customers
-        WHERE name ILIKE $1 OR email ILIKE $1
-        ORDER BY created_at DESC
-        LIMIT $2 OFFSET $3
-        "#,
-    )
-    .bind(&search)
-    .bind(limit)
-    .bind(offset)
-    .fetch_all(&state.db)
-    .await?;
+    let repo_customers = admin_repo::list_customers(&state.db, &search, limit, offset).await?;
+    let customers: Vec<CustomerListItem> = repo_customers
+        .into_iter()
+        .map(|c| CustomerListItem {
+            id: c.id, email: c.email, name: c.name, salutation: c.salutation,
+            first_name: c.first_name, last_name: c.last_name, phone: c.phone, created_at: c.created_at,
+        })
+        .collect();
 
-    let (total,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM customers WHERE name ILIKE $1 OR email ILIKE $1",
-    )
-    .bind(&search)
-    .fetch_one(&state.db)
-    .await?;
+    let total = admin_repo::count_customers(&state.db, &search).await?;
 
     Ok(Json(CustomerListResponse { customers, total }))
 }
@@ -342,7 +231,7 @@ struct CustomerDetailResponse {
     termine: Vec<CustomerTermin>,
 }
 
-#[derive(Debug, Serialize, FromRow)]
+#[derive(Debug, Serialize)]
 struct CustomerQuote {
     id: Uuid,
     status: String,
@@ -351,7 +240,7 @@ struct CustomerQuote {
     created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Serialize, FromRow)]
+#[derive(Debug, Serialize)]
 struct CustomerOffer {
     id: Uuid,
     inquiry_id: Uuid,
@@ -361,7 +250,7 @@ struct CustomerOffer {
     sent_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Serialize, FromRow)]
+#[derive(Debug, Serialize)]
 struct CustomerTermin {
     id: Uuid,
     title: String,
@@ -390,60 +279,46 @@ async fn get_customer(
     Extension(_claims): Extension<TokenClaims>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<CustomerDetailResponse>, ApiError> {
-    let customer: Option<CustomerListItem> = sqlx::query_as(
-        "SELECT id, email, name, salutation, first_name, last_name, phone, created_at FROM customers WHERE id = $1",
-    )
-    .bind(id)
-    .fetch_optional(&state.db)
-    .await?;
+    let repo_customer = admin_repo::fetch_customer(&state.db, id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Kunde {id} nicht gefunden")))?;
 
-    let customer =
-        customer.ok_or_else(|| ApiError::NotFound(format!("Kunde {id} nicht gefunden")))?;
+    let repo_quotes = admin_repo::fetch_customer_quotes(&state.db, id).await?;
+    let quotes: Vec<CustomerQuote> = repo_quotes
+        .into_iter()
+        .map(|q| CustomerQuote {
+            id: q.id, status: q.status, estimated_volume_m3: q.estimated_volume_m3,
+            preferred_date: q.preferred_date, created_at: q.created_at,
+        })
+        .collect();
 
-    let quotes: Vec<CustomerQuote> = sqlx::query_as(
-        r#"
-        SELECT id, status, estimated_volume_m3, preferred_date, created_at
-        FROM inquiries WHERE customer_id = $1
-        ORDER BY created_at DESC
-        "#,
-    )
-    .bind(id)
-    .fetch_all(&state.db)
-    .await?;
+    let repo_offers = admin_repo::fetch_customer_offers(&state.db, id).await?;
+    let offers: Vec<CustomerOffer> = repo_offers
+        .into_iter()
+        .map(|o| CustomerOffer {
+            id: o.id, inquiry_id: o.inquiry_id, price_cents: o.price_cents,
+            status: o.status, created_at: o.created_at, sent_at: o.sent_at,
+        })
+        .collect();
 
-    let offers: Vec<CustomerOffer> = sqlx::query_as(
-        r#"
-        SELECT o.id, o.inquiry_id, o.price_cents, o.status, o.created_at, o.sent_at
-        FROM offers o
-        JOIN inquiries q ON o.inquiry_id = q.id
-        WHERE q.customer_id = $1
-        ORDER BY o.created_at DESC
-        "#,
-    )
-    .bind(id)
-    .fetch_all(&state.db)
-    .await?;
-
-    let termine: Vec<CustomerTermin> = sqlx::query_as(
-        r#"
-        SELECT id, title, category, scheduled_date, status
-        FROM calendar_items WHERE customer_id = $1
-        ORDER BY scheduled_date DESC NULLS LAST
-        "#,
-    )
-    .bind(id)
-    .fetch_all(&state.db)
-    .await?;
+    let repo_termine = admin_repo::fetch_customer_termine(&state.db, id).await?;
+    let termine: Vec<CustomerTermin> = repo_termine
+        .into_iter()
+        .map(|t| CustomerTermin {
+            id: t.id, title: t.title, category: t.category,
+            scheduled_date: t.scheduled_date, status: t.status,
+        })
+        .collect();
 
     Ok(Json(CustomerDetailResponse {
-        id: customer.id,
-        email: customer.email,
-        name: customer.name,
-        salutation: customer.salutation,
-        first_name: customer.first_name,
-        last_name: customer.last_name,
-        phone: customer.phone,
-        created_at: customer.created_at,
+        id: repo_customer.id,
+        email: repo_customer.email,
+        name: repo_customer.name,
+        salutation: repo_customer.salutation,
+        first_name: repo_customer.first_name,
+        last_name: repo_customer.last_name,
+        phone: repo_customer.phone,
+        created_at: repo_customer.created_at,
         quotes,
         offers,
         termine,
@@ -482,31 +357,20 @@ async fn update_customer(
     Path(id): Path<Uuid>,
     Json(request): Json<UpdateCustomerRequest>,
 ) -> Result<Json<CustomerListItem>, ApiError> {
-    let row: Option<CustomerListItem> = sqlx::query_as(
-        r#"
-        UPDATE customers SET
-            name = COALESCE($2, name),
-            salutation = COALESCE($3, salutation),
-            first_name = COALESCE($4, first_name),
-            last_name = COALESCE($5, last_name),
-            phone = COALESCE($6, phone),
-            email = COALESCE($7, email)
-        WHERE id = $1
-        RETURNING id, email, name, salutation, first_name, last_name, phone, created_at
-        "#,
+    let repo_row = admin_repo::update_customer(
+        &state.db, id,
+        request.name.as_deref(), request.salutation.as_deref(),
+        request.first_name.as_deref(), request.last_name.as_deref(),
+        request.phone.as_deref(), request.email.as_deref(),
     )
-    .bind(id)
-    .bind(&request.name)
-    .bind(&request.salutation)
-    .bind(&request.first_name)
-    .bind(&request.last_name)
-    .bind(&request.phone)
-    .bind(&request.email)
-    .fetch_optional(&state.db)
     .await?;
 
-    row.ok_or_else(|| ApiError::NotFound(format!("Kunde {id} nicht gefunden")))
-        .map(Json)
+    repo_row
+        .map(|c| Json(CustomerListItem {
+            id: c.id, email: c.email, name: c.name, salutation: c.salutation,
+            first_name: c.first_name, last_name: c.last_name, phone: c.phone, created_at: c.created_at,
+        }))
+        .ok_or_else(|| ApiError::NotFound(format!("Kunde {id} nicht gefunden")))
 }
 
 // --- Create Customer ---
@@ -545,22 +409,12 @@ async fn create_customer(
     let id = Uuid::now_v7();
     let now = Utc::now();
 
-    let row: Option<CustomerListItem> = sqlx::query_as(
-        r#"
-        INSERT INTO customers (id, email, name, salutation, first_name, last_name, phone, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
-        RETURNING id, email, name, salutation, first_name, last_name, phone, created_at
-        "#,
+    let repo_row = admin_repo::create_customer(
+        &state.db, id, &request.email,
+        request.name.as_deref(), request.salutation.as_deref(),
+        request.first_name.as_deref(), request.last_name.as_deref(),
+        request.phone.as_deref(), now,
     )
-    .bind(id)
-    .bind(&request.email)
-    .bind(&request.name)
-    .bind(&request.salutation)
-    .bind(&request.first_name)
-    .bind(&request.last_name)
-    .bind(&request.phone)
-    .bind(now)
-    .fetch_optional(&state.db)
     .await
     .map_err(|e| {
         if let sqlx::Error::Database(ref db_err) = e {
@@ -571,7 +425,11 @@ async fn create_customer(
         ApiError::Database(e)
     })?;
 
-    row.map(|c| (axum::http::StatusCode::CREATED, Json(c)))
+    repo_row
+        .map(|c| (axum::http::StatusCode::CREATED, Json(CustomerListItem {
+            id: c.id, email: c.email, name: c.name, salutation: c.salutation,
+            first_name: c.first_name, last_name: c.last_name, phone: c.phone, created_at: c.created_at,
+        })))
         .ok_or_else(|| ApiError::Internal("Kunde konnte nicht erstellt werden".into()))
 }
 
@@ -585,7 +443,7 @@ struct ListOrdersQuery {
     offset: Option<i64>,
 }
 
-#[derive(Debug, Serialize, FromRow)]
+#[derive(Debug, Serialize)]
 struct OrderListItem {
     id: Uuid,
     customer_name: Option<String>,
@@ -641,106 +499,29 @@ async fn list_orders(
         _ => &["accepted", "scheduled", "completed", "invoiced", "paid"],
     };
 
-    let orders: Vec<OrderListItem> = if statuses.is_empty() {
-        // Single status filter
-        sqlx::query_as(
-            r#"
-            SELECT q.id,
-                   c.name AS customer_name,
-                   c.email AS customer_email,
-                   oa.city AS origin_city,
-                   da.city AS destination_city,
-                   q.estimated_volume_m3,
-                   q.status,
-                   q.preferred_date,
-                   (SELECT ROUND(o.price_cents * 1.19)::bigint FROM offers o WHERE o.inquiry_id = q.id ORDER BY o.created_at DESC LIMIT 1) AS offer_price_brutto,
-                   q.scheduled_date AS booking_date,
-                   q.created_at,
-                   (SELECT COUNT(*)::bigint FROM inquiry_employees WHERE inquiry_id = q.id) AS employees_assigned,
-                   (SELECT o.persons FROM offers o WHERE o.inquiry_id = q.id ORDER BY o.created_at DESC LIMIT 1) AS employees_quoted
-            FROM inquiries q
-            JOIN customers c ON q.customer_id = c.id
-            LEFT JOIN addresses oa ON q.origin_address_id = oa.id
-            LEFT JOIN addresses da ON q.destination_address_id = da.id
-            WHERE q.status = $1
-              AND (c.name ILIKE $2 OR c.email ILIKE $2)
-            ORDER BY COALESCE(q.preferred_date, q.created_at) ASC
-            LIMIT $3 OFFSET $4
-            "#,
-        )
-        .bind(status_filter.unwrap())
-        .bind(&search)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&state.db)
-        .await?
+    let (repo_orders, total) = if statuses.is_empty() {
+        let rows = admin_repo::list_orders_single_status(&state.db, status_filter.unwrap(), &search, limit, offset).await?;
+        let cnt = admin_repo::count_orders_single_status(&state.db, status_filter.unwrap(), &search).await?;
+        (rows, cnt)
     } else {
-        // All order statuses
-        sqlx::query_as(
-            r#"
-            SELECT q.id,
-                   c.name AS customer_name,
-                   c.email AS customer_email,
-                   oa.city AS origin_city,
-                   da.city AS destination_city,
-                   q.estimated_volume_m3,
-                   q.status,
-                   q.preferred_date,
-                   (SELECT ROUND(o.price_cents * 1.19)::bigint FROM offers o WHERE o.inquiry_id = q.id ORDER BY o.created_at DESC LIMIT 1) AS offer_price_brutto,
-                   q.scheduled_date AS booking_date,
-                   q.created_at,
-                   (SELECT COUNT(*)::bigint FROM inquiry_employees WHERE inquiry_id = q.id) AS employees_assigned,
-                   (SELECT o.persons FROM offers o WHERE o.inquiry_id = q.id ORDER BY o.created_at DESC LIMIT 1) AS employees_quoted
-            FROM inquiries q
-            JOIN customers c ON q.customer_id = c.id
-            LEFT JOIN addresses oa ON q.origin_address_id = oa.id
-            LEFT JOIN addresses da ON q.destination_address_id = da.id
-            WHERE q.status IN ('accepted', 'scheduled', 'completed', 'invoiced', 'paid')
-              AND (c.name ILIKE $1 OR c.email ILIKE $1)
-            ORDER BY COALESCE(q.preferred_date, q.created_at) ASC
-            LIMIT $2 OFFSET $3
-            "#,
-        )
-        .bind(&search)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&state.db)
-        .await?
+        let rows = admin_repo::list_orders_all_statuses(&state.db, &search, limit, offset).await?;
+        let cnt = admin_repo::count_orders_all_statuses(&state.db, &search).await?;
+        (rows, cnt)
     };
 
-    let total: (i64,) = if statuses.is_empty() {
-        sqlx::query_as(
-            r#"
-            SELECT COUNT(*)
-            FROM inquiries q
-            JOIN customers c ON q.customer_id = c.id
-            WHERE q.status = $1
-              AND (c.name ILIKE $2 OR c.email ILIKE $2)
-            "#,
-        )
-        .bind(status_filter.unwrap())
-        .bind(&search)
-        .fetch_one(&state.db)
-        .await?
-    } else {
-        sqlx::query_as(
-            r#"
-            SELECT COUNT(*)
-            FROM inquiries q
-            JOIN customers c ON q.customer_id = c.id
-            WHERE q.status IN ('accepted', 'scheduled', 'completed', 'invoiced', 'paid')
-              AND (c.name ILIKE $1 OR c.email ILIKE $1)
-            "#,
-        )
-        .bind(&search)
-        .fetch_one(&state.db)
-        .await?
-    };
+    let orders: Vec<OrderListItem> = repo_orders
+        .into_iter()
+        .map(|r| OrderListItem {
+            id: r.id, customer_name: r.customer_name, customer_email: r.customer_email,
+            origin_city: r.origin_city, destination_city: r.destination_city,
+            estimated_volume_m3: r.estimated_volume_m3, status: r.status,
+            preferred_date: r.preferred_date, offer_price_brutto: r.offer_price_brutto,
+            booking_date: r.booking_date, created_at: r.created_at,
+            employees_assigned: r.employees_assigned, employees_quoted: r.employees_quoted,
+        })
+        .collect();
 
-    Ok(Json(OrdersListResponse {
-        orders,
-        total: total.0,
-    }))
+    Ok(Json(OrdersListResponse { orders, total }))
 }
 
 // --- Addresses ---
@@ -754,7 +535,7 @@ struct UpdateAddressRequest {
     elevator: Option<bool>,
 }
 
-#[derive(Debug, Serialize, FromRow)]
+#[derive(Debug, Serialize)]
 struct AddressResponse {
     id: Uuid,
     street: String,
@@ -787,34 +568,25 @@ async fn update_address(
     Path(id): Path<Uuid>,
     Json(request): Json<UpdateAddressRequest>,
 ) -> Result<Json<AddressResponse>, ApiError> {
-    let row: Option<AddressResponse> = sqlx::query_as(
-        r#"
-        UPDATE addresses SET
-            street = COALESCE($2, street),
-            city = COALESCE($3, city),
-            postal_code = COALESCE($4, postal_code),
-            floor = COALESCE($5, floor),
-            elevator = COALESCE($6, elevator)
-        WHERE id = $1
-        RETURNING id, street, city, postal_code, floor, elevator
-        "#,
+    let repo_row = admin_repo::update_address(
+        &state.db, id,
+        request.street.as_deref(), request.city.as_deref(),
+        request.postal_code.as_deref(), request.floor.as_deref(),
+        request.elevator,
     )
-    .bind(id)
-    .bind(&request.street)
-    .bind(&request.city)
-    .bind(&request.postal_code)
-    .bind(&request.floor)
-    .bind(request.elevator)
-    .fetch_optional(&state.db)
     .await?;
 
-    row.ok_or_else(|| ApiError::NotFound(format!("Adresse {id} nicht gefunden")))
-        .map(Json)
+    repo_row
+        .map(|a| Json(AddressResponse {
+            id: a.id, street: a.street, city: a.city,
+            postal_code: a.postal_code, floor: a.floor, elevator: a.elevator,
+        }))
+        .ok_or_else(|| ApiError::NotFound(format!("Adresse {id} nicht gefunden")))
 }
 
 // --- Users ---
 
-#[derive(Debug, Serialize, FromRow)]
+#[derive(Debug, Serialize)]
 struct UserListItem {
     id: Uuid,
     email: String,
@@ -843,11 +615,13 @@ async fn list_users(
     Extension(claims): Extension<TokenClaims>,
 ) -> Result<Json<UserListResponse>, ApiError> {
     require_admin(&claims)?;
-    let users: Vec<UserListItem> = sqlx::query_as(
-        "SELECT id, email, name, role, created_at FROM users ORDER BY created_at ASC",
-    )
-    .fetch_all(&state.db)
-    .await?;
+    let repo_users = admin_repo::list_users(&state.db).await?;
+    let users: Vec<UserListItem> = repo_users
+        .into_iter()
+        .map(|u| UserListItem {
+            id: u.id, email: u.email, name: u.name, role: u.role, created_at: u.created_at,
+        })
+        .collect();
 
     Ok(Json(UserListResponse { users }))
 }
@@ -881,12 +655,8 @@ async fn delete_user(
         ));
     }
 
-    let result = sqlx::query("DELETE FROM users WHERE id = $1")
-        .bind(id)
-        .execute(&state.db)
-        .await?;
-
-    if result.rows_affected() == 0 {
+    let rows = admin_repo::delete_user(&state.db, id).await?;
+    if rows == 0 {
         return Err(ApiError::NotFound(format!("Benutzer {id} nicht gefunden")));
     }
 
@@ -918,11 +688,8 @@ async fn delete_customer(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin(&claims)?;
     // Cascades: inquiries, offers, volume_estimations, email_threads, email_messages
-    let result = sqlx::query("DELETE FROM customers WHERE id = $1")
-        .bind(id)
-        .execute(&state.db)
-        .await?;
-    if result.rows_affected() == 0 {
+    let rows = admin_repo::delete_customer(&state.db, id).await?;
+    if rows == 0 {
         return Err(ApiError::NotFound(format!("Kunde {id} nicht gefunden")));
     }
     Ok(Json(serde_json::json!({ "ok": true })))
@@ -937,7 +704,7 @@ struct ListEmailThreadsQuery {
     offset: Option<i64>,
 }
 
-#[derive(Debug, Serialize, FromRow)]
+#[derive(Debug, Serialize)]
 struct EmailThreadListItem {
     id: Uuid,
     customer_id: Uuid,
@@ -982,46 +749,18 @@ async fn list_email_threads(
         .map(|s| format!("%{s}%"))
         .unwrap_or_else(|| "%".to_string());
 
-    let threads: Vec<EmailThreadListItem> = sqlx::query_as(
-        r#"
-        SELECT
-            et.id,
-            et.customer_id,
-            c.email AS customer_email,
-            c.name AS customer_name,
-            et.inquiry_id,
-            et.subject,
-            COUNT(em.id) AS message_count,
-            MAX(em.created_at) AS last_message_at,
-            (SELECT direction FROM email_messages
-             WHERE thread_id = et.id ORDER BY created_at DESC LIMIT 1) AS last_direction,
-            et.created_at
-        FROM email_threads et
-        JOIN customers c ON et.customer_id = c.id
-        LEFT JOIN email_messages em ON em.thread_id = et.id
-        WHERE c.name ILIKE $1 OR c.email ILIKE $1 OR et.subject ILIKE $1
-        GROUP BY et.id, c.email, c.name
-        ORDER BY MAX(em.created_at) DESC NULLS LAST
-        LIMIT $2 OFFSET $3
-        "#,
-    )
-    .bind(&search)
-    .bind(limit)
-    .bind(offset)
-    .fetch_all(&state.db)
-    .await?;
+    let repo_threads = admin_repo::list_email_threads(&state.db, &search, limit, offset).await?;
+    let threads: Vec<EmailThreadListItem> = repo_threads
+        .into_iter()
+        .map(|t| EmailThreadListItem {
+            id: t.id, customer_id: t.customer_id, customer_email: t.customer_email,
+            customer_name: t.customer_name, inquiry_id: t.inquiry_id, subject: t.subject,
+            message_count: t.message_count, last_message_at: t.last_message_at,
+            last_direction: t.last_direction, created_at: t.created_at,
+        })
+        .collect();
 
-    let (total,): (i64,) = sqlx::query_as(
-        r#"
-        SELECT COUNT(DISTINCT et.id)
-        FROM email_threads et
-        JOIN customers c ON et.customer_id = c.id
-        WHERE c.name ILIKE $1 OR c.email ILIKE $1 OR et.subject ILIKE $1
-        "#,
-    )
-    .bind(&search)
-    .fetch_one(&state.db)
-    .await?;
+    let total = admin_repo::count_email_threads(&state.db, &search).await?;
 
     Ok(Json(EmailThreadListResponse { threads, total }))
 }
@@ -1032,7 +771,7 @@ struct EmailThreadDetailResponse {
     messages: Vec<EmailMessageItem>,
 }
 
-#[derive(Debug, Serialize, FromRow)]
+#[derive(Debug, Serialize)]
 struct EmailThreadDetail {
     id: Uuid,
     customer_id: Uuid,
@@ -1043,7 +782,7 @@ struct EmailThreadDetail {
     created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Serialize, FromRow)]
+#[derive(Debug, Serialize)]
 struct EmailMessageItem {
     id: Uuid,
     direction: String,
@@ -1076,33 +815,25 @@ async fn get_email_thread(
     Extension(_claims): Extension<TokenClaims>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<EmailThreadDetailResponse>, ApiError> {
-    let thread: Option<EmailThreadDetail> = sqlx::query_as(
-        r#"
-        SELECT et.id, et.customer_id, c.email AS customer_email, c.name AS customer_name,
-               et.inquiry_id, et.subject, et.created_at
-        FROM email_threads et
-        JOIN customers c ON et.customer_id = c.id
-        WHERE et.id = $1
-        "#,
-    )
-    .bind(id)
-    .fetch_optional(&state.db)
-    .await?;
+    let repo_thread = admin_repo::fetch_email_thread(&state.db, id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("E-Mail-Thread {id} nicht gefunden")))?;
 
-    let thread =
-        thread.ok_or_else(|| ApiError::NotFound(format!("E-Mail-Thread {id} nicht gefunden")))?;
+    let thread = EmailThreadDetail {
+        id: repo_thread.id, customer_id: repo_thread.customer_id,
+        customer_email: repo_thread.customer_email, customer_name: repo_thread.customer_name,
+        inquiry_id: repo_thread.inquiry_id, subject: repo_thread.subject, created_at: repo_thread.created_at,
+    };
 
-    let messages: Vec<EmailMessageItem> = sqlx::query_as(
-        r#"
-        SELECT id, direction, from_address, to_address, subject, body_text, llm_generated, status, created_at
-        FROM email_messages
-        WHERE thread_id = $1 AND status != 'discarded'
-        ORDER BY created_at ASC
-        "#,
-    )
-    .bind(id)
-    .fetch_all(&state.db)
-    .await?;
+    let repo_messages = admin_repo::fetch_thread_messages(&state.db, id).await?;
+    let messages: Vec<EmailMessageItem> = repo_messages
+        .into_iter()
+        .map(|m| EmailMessageItem {
+            id: m.id, direction: m.direction, from_address: m.from_address,
+            to_address: m.to_address, subject: m.subject, body_text: m.body_text,
+            llm_generated: m.llm_generated, status: m.status, created_at: m.created_at,
+        })
+        .collect();
 
     Ok(Json(EmailThreadDetailResponse { thread, messages }))
 }
@@ -1130,22 +861,7 @@ async fn send_draft_email(
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // Fetch draft + customer email + optional offer PDF key (when thread belongs to an inquiry with an active offer)
-    let row: Option<(Option<String>, Option<String>, String, Option<String>, Option<Uuid>, Option<Uuid>)> =
-        sqlx::query_as(
-            r#"
-            SELECT em.subject, em.body_text, c.email,
-                   o.pdf_storage_key, o.id AS offer_id, et.inquiry_id
-            FROM email_messages em
-            JOIN email_threads et ON em.thread_id = et.id
-            JOIN customers c ON et.customer_id = c.id
-            LEFT JOIN offers o ON o.inquiry_id = et.inquiry_id
-                AND o.status NOT IN ('rejected', 'cancelled')
-            WHERE em.id = $1 AND em.status = 'draft'
-            "#,
-        )
-        .bind(id)
-        .fetch_optional(&state.db)
-        .await?;
+    let row = admin_repo::fetch_draft_for_send(&state.db, id).await?;
 
     let (subject, body_text, customer_email, pdf_key, offer_id, inquiry_id) =
         row.ok_or_else(|| ApiError::NotFound("Entwurf nicht gefunden oder bereits gesendet".into()))?;
@@ -1189,17 +905,8 @@ async fn send_draft_email(
         let now = chrono::Utc::now();
 
         // Update offer and inquiry status
-        sqlx::query("UPDATE offers SET status = 'sent', sent_at = $1 WHERE id = $2")
-            .bind(now)
-            .bind(oid)
-            .execute(&state.db)
-            .await?;
-
-        sqlx::query("UPDATE inquiries SET status = 'offer_sent', updated_at = $1 WHERE id = $2")
-            .bind(now)
-            .bind(iid)
-            .execute(&state.db)
-            .await?;
+        admin_repo::mark_offer_sent(&state.db, oid, now).await?;
+        admin_repo::mark_inquiry_offer_sent(&state.db, iid, now).await?;
     } else {
         // Plain email — no offer PDF attached (e.g. general inquiry reply)
         send_plain_email(&state.config.email, &customer_email, &subject, &body)
@@ -1208,11 +915,7 @@ async fn send_draft_email(
     }
 
     // Mark draft as sent + fix to_address
-    sqlx::query("UPDATE email_messages SET status = 'sent', to_address = $2 WHERE id = $1")
-        .bind(id)
-        .bind(&customer_email)
-        .execute(&state.db)
-        .await?;
+    admin_repo::mark_message_sent(&state.db, id, &customer_email).await?;
 
     Ok(Json(serde_json::json!({
         "message": format!("E-Mail an {customer_email} gesendet"),
@@ -1239,14 +942,8 @@ async fn discard_draft_email(
     Extension(_claims): Extension<TokenClaims>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let result = sqlx::query(
-        "UPDATE email_messages SET status = 'discarded' WHERE id = $1 AND status = 'draft'",
-    )
-    .bind(id)
-    .execute(&state.db)
-    .await?;
-
-    if result.rows_affected() == 0 {
+    let rows = admin_repo::discard_draft(&state.db, id).await?;
+    if rows == 0 {
         return Err(ApiError::NotFound("Entwurf nicht gefunden oder bereits verarbeitet".into()));
     }
 
@@ -1283,16 +980,8 @@ async fn update_draft_email(
     Path(id): Path<Uuid>,
     Json(request): Json<UpdateDraftRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let result = sqlx::query(
-        "UPDATE email_messages SET subject = COALESCE($2, subject), body_text = COALESCE($3, body_text) WHERE id = $1 AND status = 'draft'",
-    )
-    .bind(id)
-    .bind(&request.subject)
-    .bind(&request.body_text)
-    .execute(&state.db)
-    .await?;
-
-    if result.rows_affected() == 0 {
+    let rows = admin_repo::update_draft(&state.db, id, request.subject.as_deref(), request.body_text.as_deref()).await?;
+    if rows == 0 {
         return Err(ApiError::NotFound(
             "Entwurf nicht gefunden oder bereits gesendet".into(),
         ));
@@ -1332,18 +1021,7 @@ async fn reply_to_thread(
     Path(thread_id): Path<Uuid>,
     Json(request): Json<ReplyRequest>,
 ) -> Result<(axum::http::StatusCode, Json<serde_json::Value>), ApiError> {
-    let row: Option<(Uuid, String, Option<String>)> = sqlx::query_as(
-        r#"
-        SELECT et.customer_id, c.email, et.subject
-        FROM email_threads et
-        JOIN customers c ON et.customer_id = c.id
-        WHERE et.id = $1
-        "#,
-    )
-    .bind(thread_id)
-    .fetch_optional(&state.db)
-    .await?;
-
+    let row = admin_repo::fetch_thread_for_reply(&state.db, thread_id).await?;
     let (_customer_id, customer_email, thread_subject) = row.ok_or_else(|| {
         ApiError::NotFound(format!("E-Mail-Thread {thread_id} nicht gefunden"))
     })?;
@@ -1353,20 +1031,10 @@ async fn reply_to_thread(
     let id = Uuid::now_v7();
     let now = Utc::now();
 
-    sqlx::query(
-        r#"
-        INSERT INTO email_messages (id, thread_id, direction, from_address, to_address, subject, body_text, llm_generated, status, created_at)
-        VALUES ($1, $2, 'outbound', $3, $4, $5, $6, false, 'draft', $7)
-        "#,
+    admin_repo::insert_reply_draft(
+        &state.db, id, thread_id, from_address, &customer_email,
+        subject.as_deref(), &request.body_text, now,
     )
-    .bind(id)
-    .bind(thread_id)
-    .bind(from_address)
-    .bind(&customer_email)
-    .bind(&subject)
-    .bind(&request.body_text)
-    .bind(now)
-    .execute(&state.db)
     .await?;
 
     Ok((
@@ -1408,49 +1076,19 @@ async fn compose_email(
     let now = Utc::now();
 
     // Upsert customer by email
-    let customer_id: Uuid = sqlx::query_scalar(
-        r#"
-        INSERT INTO customers (id, email, created_at, updated_at)
-        VALUES ($1, $2, $3, $3)
-        ON CONFLICT (email) DO UPDATE SET updated_at = $3
-        RETURNING id
-        "#,
-    )
-    .bind(Uuid::now_v7())
-    .bind(&request.customer_email)
-    .bind(now)
-    .fetch_one(&state.db)
-    .await?;
+    let customer_id = admin_repo::upsert_customer_for_compose(&state.db, &request.customer_email, now).await?;
 
     // Create thread
     let thread_id = Uuid::now_v7();
-    sqlx::query(
-        "INSERT INTO email_threads (id, customer_id, subject, created_at) VALUES ($1, $2, $3, $4)",
-    )
-    .bind(thread_id)
-    .bind(customer_id)
-    .bind(&request.subject)
-    .bind(now)
-    .execute(&state.db)
-    .await?;
+    admin_repo::create_compose_thread(&state.db, thread_id, customer_id, &request.subject, now).await?;
 
     // Create draft message
     let message_id = Uuid::now_v7();
     let from_address = &state.config.email.from_address;
-    sqlx::query(
-        r#"
-        INSERT INTO email_messages (id, thread_id, direction, from_address, to_address, subject, body_text, llm_generated, status, created_at)
-        VALUES ($1, $2, 'outbound', $3, $4, $5, $6, false, 'draft', $7)
-        "#,
+    admin_repo::insert_compose_draft(
+        &state.db, message_id, thread_id, from_address,
+        &request.customer_email, &request.subject, &request.body_text, now,
     )
-    .bind(message_id)
-    .bind(thread_id)
-    .bind(from_address)
-    .bind(&request.customer_email)
-    .bind(&request.subject)
-    .bind(&request.body_text)
-    .bind(now)
-    .execute(&state.db)
     .await?;
 
     Ok((
@@ -1532,21 +1170,6 @@ struct ListEmployeesQuery {
     offset: Option<i64>,
 }
 
-#[derive(Debug, Serialize, FromRow)]
-struct EmployeeDbRow {
-    id: Uuid,
-    salutation: Option<String>,
-    first_name: String,
-    last_name: String,
-    email: String,
-    phone: Option<String>,
-    monthly_hours_target: f64,
-    active: bool,
-    arbeitsvertrag_key: Option<String>,
-    mitarbeiterfragebogen_key: Option<String>,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
-}
 
 #[derive(Debug, Serialize)]
 struct EmployeeListItem {
@@ -1592,44 +1215,14 @@ async fn list_employees(
     let search = query.search.map(|s| format!("%{s}%"));
     let active_filter = query.active;
 
-    let rows: Vec<EmployeeDbRow> = sqlx::query_as(
-        r#"
-        SELECT id, salutation, first_name, last_name, email, phone,
-               monthly_hours_target::float8 AS monthly_hours_target,
-               active, created_at, updated_at,
-               arbeitsvertrag_key, mitarbeiterfragebogen_key
-        FROM employees
-        WHERE ($1::text IS NULL OR first_name ILIKE $1 OR last_name ILIKE $1 OR email ILIKE $1)
-          AND ($2::bool IS NULL OR active = $2)
-        ORDER BY last_name, first_name
-        LIMIT $3 OFFSET $4
-        "#,
-    )
-    .bind(&search)
-    .bind(active_filter)
-    .bind(limit)
-    .bind(offset)
-    .fetch_all(&state.db)
-    .await?;
-
-    let (total,): (i64,) = sqlx::query_as(
-        r#"
-        SELECT COUNT(*)
-        FROM employees
-        WHERE ($1::text IS NULL OR first_name ILIKE $1 OR last_name ILIKE $1 OR email ILIKE $1)
-          AND ($2::bool IS NULL OR active = $2)
-        "#,
-    )
-    .bind(&search)
-    .bind(active_filter)
-    .fetch_one(&state.db)
-    .await?;
+    let repo_rows = employee_repo::list(&state.db, &search, active_filter, limit, offset).await?;
+    let total = employee_repo::count(&state.db, &search, active_filter).await?;
 
     // Parse month range for hours aggregation
     let month_range = query.month.as_ref().and_then(|m| parse_month_range(m));
 
-    let mut employees = Vec::with_capacity(rows.len());
-    for row in rows {
+    let mut employees = Vec::with_capacity(repo_rows.len());
+    for row in repo_rows {
         let (planned, actual) = if let Some((from, to)) = &month_range {
             fetch_employee_month_hours(&state.db, row.id, *from, *to).await?
         } else {
@@ -1669,20 +1262,11 @@ async fn create_employee(
     let target = body.monthly_hours_target.unwrap_or(160.0);
     let id = uuid::Uuid::now_v7();
 
-    sqlx::query(
-        r#"
-        INSERT INTO employees (id, salutation, first_name, last_name, email, phone, monthly_hours_target)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-        "#,
+    employee_repo::create(
+        &state.db, id,
+        body.salutation.as_deref(), &body.first_name, &body.last_name,
+        &body.email, body.phone.as_deref(), target,
     )
-    .bind(id)
-    .bind(&body.salutation)
-    .bind(&body.first_name)
-    .bind(&body.last_name)
-    .bind(&body.email)
-    .bind(&body.phone)
-    .bind(target)
-    .execute(&state.db)
     .await
     .map_err(|e| {
         if let sqlx::Error::Database(ref db_err) = e {
@@ -1711,45 +1295,7 @@ async fn get_employee(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let employee = fetch_employee_json(&state.db, id).await?;
 
-    #[derive(Debug, Serialize, FromRow)]
-    struct AssignmentRow {
-        inquiry_id: Uuid,
-        customer_name: Option<String>,
-        origin_city: Option<String>,
-        destination_city: Option<String>,
-        booking_date: Option<NaiveDate>,
-        planned_hours: f64,
-        actual_hours: Option<f64>,
-        notes: Option<String>,
-        inquiry_status: String,
-    }
-
-    let assignments: Vec<AssignmentRow> = sqlx::query_as(
-        r#"
-        SELECT ie.inquiry_id,
-               COALESCE(c.first_name || ' ' || c.last_name, c.name) AS customer_name,
-               oa.city AS origin_city,
-               da.city AS destination_city,
-               COALESCE(i.scheduled_date, i.preferred_date::date) AS booking_date,
-               ie.planned_hours::float8 AS planned_hours,
-               CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
-                    THEN (EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0)::float8
-                    ELSE NULL END AS actual_hours,
-               ie.notes,
-               i.status AS inquiry_status
-        FROM inquiry_employees ie
-        JOIN inquiries i ON ie.inquiry_id = i.id
-        JOIN customers c ON i.customer_id = c.id
-        LEFT JOIN addresses oa ON i.origin_address_id = oa.id
-        LEFT JOIN addresses da ON i.destination_address_id = da.id
-        WHERE ie.employee_id = $1
-        ORDER BY COALESCE(i.scheduled_date, i.preferred_date::date) DESC NULLS LAST
-        LIMIT 50
-        "#,
-    )
-    .bind(id)
-    .fetch_all(&state.db)
-    .await?;
+    let assignments = employee_repo::fetch_admin_assignments(&state.db, id).await?;
 
     let assignments_json: Vec<serde_json::Value> = assignments
         .into_iter()
@@ -1767,6 +1313,7 @@ async fn get_employee(
             })
         })
         .collect();
+
 
     let mut result = employee;
     result["assignments"] = serde_json::Value::Array(assignments_json);
@@ -1787,12 +1334,7 @@ async fn update_employee(
     Json(body): Json<aust_core::models::UpdateEmployee>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // Verify exists
-    let exists: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM employees WHERE id = $1")
-            .bind(id)
-            .fetch_optional(&state.db)
-            .await?;
-    if exists.is_none() {
+    if !employee_repo::exists(&state.db, id).await? {
         return Err(ApiError::NotFound("Mitarbeiter nicht gefunden".into()));
     }
 
@@ -1802,28 +1344,12 @@ async fn update_employee(
         }
     }
 
-    sqlx::query(
-        r#"
-        UPDATE employees SET
-            salutation = COALESCE($2, salutation),
-            first_name = COALESCE($3, first_name),
-            last_name = COALESCE($4, last_name),
-            email = COALESCE($5, email),
-            phone = COALESCE($6, phone),
-            monthly_hours_target = COALESCE($7, monthly_hours_target),
-            active = COALESCE($8, active)
-        WHERE id = $1
-        "#,
+    employee_repo::update(
+        &state.db, id,
+        body.salutation.as_deref(), body.first_name.as_deref(), body.last_name.as_deref(),
+        body.email.as_deref(), body.phone.as_deref(),
+        body.monthly_hours_target, body.active,
     )
-    .bind(id)
-    .bind(&body.salutation)
-    .bind(&body.first_name)
-    .bind(&body.last_name)
-    .bind(&body.email)
-    .bind(&body.phone)
-    .bind(body.monthly_hours_target)
-    .bind(body.active)
-    .execute(&state.db)
     .await?;
 
     let employee = fetch_employee_json(&state.db, id).await?;
@@ -1843,12 +1369,8 @@ async fn delete_employee(
     Path(id): Path<Uuid>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     require_admin(&claims)?;
-    let result = sqlx::query("UPDATE employees SET active = false WHERE id = $1")
-        .bind(id)
-        .execute(&state.db)
-        .await?;
-
-    if result.rows_affected() == 0 {
+    let rows = employee_repo::soft_delete(&state.db, id).await?;
+    if rows == 0 {
         return Err(ApiError::NotFound("Mitarbeiter nicht gefunden".into()));
     }
 
@@ -1876,105 +1398,15 @@ async fn employee_hours_summary(
         .ok_or_else(|| ApiError::BadRequest("Ungueltiges Monatsformat. Erwartet: YYYY-MM".into()))?;
 
     // Fetch employee target
-    #[derive(FromRow)]
-    struct TargetRow {
-        monthly_hours_target: f64,
-    }
-    let target_row: TargetRow = sqlx::query_as(
-        "SELECT monthly_hours_target::float8 AS monthly_hours_target FROM employees WHERE id = $1",
-    )
-    .bind(id)
-    .fetch_optional(&state.db)
-    .await?
-    .ok_or_else(|| ApiError::NotFound("Mitarbeiter nicht gefunden".into()))?;
+    let target = employee_repo::fetch_hours_target(&state.db, id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Mitarbeiter nicht gefunden".into()))?;
 
-    #[derive(Debug, Serialize, FromRow)]
-    struct HoursRow {
-        inquiry_id: Uuid,
-        customer_name: Option<String>,
-        origin_city: Option<String>,
-        destination_city: Option<String>,
-        booking_date: Option<NaiveDate>,
-        planned_hours: f64,
-        clock_in: Option<chrono::DateTime<chrono::Utc>>,
-        clock_out: Option<chrono::DateTime<chrono::Utc>>,
-        actual_hours: Option<f64>,
-        inquiry_status: String,
-    }
-
-    let rows: Vec<HoursRow> = sqlx::query_as(
-        r#"
-        SELECT ie.inquiry_id,
-               COALESCE(c.first_name || ' ' || c.last_name, c.name) AS customer_name,
-               oa.city AS origin_city,
-               da.city AS destination_city,
-               COALESCE(i.scheduled_date, i.preferred_date::date) AS booking_date,
-               ie.planned_hours::float8 AS planned_hours,
-               ie.clock_in,
-               ie.clock_out,
-               CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
-                    THEN (EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0)::float8
-                    ELSE NULL END AS actual_hours,
-               i.status AS inquiry_status
-        FROM inquiry_employees ie
-        JOIN inquiries i ON ie.inquiry_id = i.id
-        JOIN customers c ON i.customer_id = c.id
-        LEFT JOIN addresses oa ON i.origin_address_id = oa.id
-        LEFT JOIN addresses da ON i.destination_address_id = da.id
-        WHERE ie.employee_id = $1
-          AND COALESCE(i.scheduled_date, i.preferred_date::date, ie.created_at::date) BETWEEN $2 AND $3
-        ORDER BY COALESCE(i.scheduled_date, i.preferred_date::date, ie.created_at::date)
-        "#,
-    )
-    .bind(id)
-    .bind(from_date)
-    .bind(to_date)
-    .fetch_all(&state.db)
-    .await?;
+    let rows = employee_repo::fetch_admin_hours(&state.db, id, from_date, to_date).await?;
 
     // Also fetch calendar item assignments for this employee in the same month.
-    #[derive(Debug, Serialize, FromRow)]
-    struct CalendarItemHoursRow {
-        calendar_item_id: Uuid,
-        title: String,
-        category: String,
-        location: Option<String>,
-        scheduled_date: Option<NaiveDate>,
-        planned_hours: f64,
-        clock_in: Option<chrono::DateTime<chrono::Utc>>,
-        clock_out: Option<chrono::DateTime<chrono::Utc>>,
-        actual_hours: Option<f64>,
-        status: String,
-    }
+    let item_rows = employee_repo::fetch_admin_calendar_item_hours(&state.db, id, from_date, to_date).await?;
 
-    let item_rows: Vec<CalendarItemHoursRow> = sqlx::query_as(
-        r#"
-        SELECT cie.calendar_item_id,
-               ci.title,
-               ci.category,
-               ci.location,
-               ci.scheduled_date,
-               cie.planned_hours::float8 AS planned_hours,
-               cie.clock_in,
-               cie.clock_out,
-               CASE WHEN cie.clock_out IS NOT NULL AND cie.clock_in IS NOT NULL
-                    THEN (EXTRACT(EPOCH FROM (cie.clock_out - cie.clock_in)) / 3600.0)::float8
-                    ELSE NULL END AS actual_hours,
-               ci.status
-        FROM calendar_item_employees cie
-        JOIN calendar_items ci ON ci.id = cie.calendar_item_id
-        WHERE cie.employee_id = $1
-          AND ci.scheduled_date BETWEEN $2 AND $3
-        ORDER BY ci.scheduled_date
-        "#,
-    )
-    .bind(id)
-    .bind(from_date)
-    .bind(to_date)
-    .fetch_all(&state.db)
-    .await?;
-
-    let target = target_row.monthly_hours_target;
     let mut planned_sum = 0.0_f64;
     let mut actual_sum = 0.0_f64;
 
@@ -2058,45 +1490,7 @@ async fn fetch_employee_month_hours(
     from: NaiveDate,
     to: NaiveDate,
 ) -> Result<(Option<f64>, Option<f64>), ApiError> {
-    #[derive(FromRow)]
-    struct HoursSums {
-        planned: Option<f64>,
-        actual: Option<f64>,
-    }
-
-    let sums: HoursSums = sqlx::query_as(
-        r#"
-        SELECT
-            COALESCE(SUM(planned_hours), 0.0)::float8 AS planned,
-            COALESCE(SUM(COALESCE(actual_hours, planned_hours)), 0.0)::float8 AS actual
-        FROM (
-            SELECT ie.planned_hours::float8,
-                   CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
-                        THEN (EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0)::float8
-                        ELSE NULL END AS actual_hours
-            FROM inquiry_employees ie
-            JOIN inquiries i ON i.id = ie.inquiry_id
-            WHERE ie.employee_id = $1
-              AND COALESCE(i.scheduled_date, i.preferred_date::date, ie.created_at::date)
-                  BETWEEN $2 AND $3
-            UNION ALL
-            SELECT cie.planned_hours::float8,
-                   CASE WHEN cie.clock_out IS NOT NULL AND cie.clock_in IS NOT NULL
-                        THEN (EXTRACT(EPOCH FROM (cie.clock_out - cie.clock_in)) / 3600.0)::float8
-                        ELSE NULL END AS actual_hours
-            FROM calendar_item_employees cie
-            JOIN calendar_items ci ON ci.id = cie.calendar_item_id
-            WHERE cie.employee_id = $1
-              AND ci.scheduled_date BETWEEN $2 AND $3
-        ) combined
-        "#,
-    )
-    .bind(employee_id)
-    .bind(from)
-    .bind(to)
-    .fetch_one(pool)
-    .await?;
-
+    let sums = employee_repo::fetch_month_hours(pool, employee_id, from, to).await?;
     Ok((sums.planned, sums.actual))
 }
 
@@ -2105,19 +1499,9 @@ async fn fetch_employee_json(
     pool: &sqlx::PgPool,
     id: Uuid,
 ) -> Result<serde_json::Value, ApiError> {
-    let row: EmployeeDbRow = sqlx::query_as(
-        r#"
-        SELECT id, salutation, first_name, last_name, email, phone,
-               monthly_hours_target::float8 AS monthly_hours_target,
-               active, arbeitsvertrag_key, mitarbeiterfragebogen_key,
-               created_at, updated_at
-        FROM employees WHERE id = $1
-        "#,
-    )
-    .bind(id)
-    .fetch_optional(pool)
-    .await?
-    .ok_or_else(|| ApiError::NotFound("Mitarbeiter nicht gefunden".into()))?;
+    let row = employee_repo::fetch_by_id(pool, id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Mitarbeiter nicht gefunden".into()))?;
 
     Ok(serde_json::json!({
         "id": row.id,
@@ -2184,11 +1568,7 @@ async fn upload_employee_document(
         .ok_or_else(|| ApiError::BadRequest("Unbekannter Dokumenttyp".into()))?;
 
     // Verify employee exists
-    let exists: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM employees WHERE id = $1")
-        .bind(id)
-        .fetch_optional(&state.db)
-        .await?;
-    if exists.is_none() {
+    if !employee_repo::exists(&state.db, id).await? {
         return Err(ApiError::NotFound("Mitarbeiter nicht gefunden".into()));
     }
 
@@ -2229,11 +1609,7 @@ async fn upload_employee_document(
     })?;
 
     // Persist key in DB (safe: col is from the allow-list above, not user input)
-    sqlx::query(&format!("UPDATE employees SET {col} = $2 WHERE id = $1"))
-        .bind(id)
-        .bind(&key)
-        .execute(&state.db)
-        .await?;
+    employee_repo::set_document_key(&state.db, id, col, &key).await?;
 
     tracing::info!("Employee {id}: uploaded {doc_type} → {key}");
     let employee = fetch_employee_json(&state.db, id).await?;
@@ -2260,15 +1636,10 @@ async fn download_employee_document(
         .ok_or_else(|| ApiError::BadRequest("Unbekannter Dokumenttyp".into()))?;
 
     // Fetch the stored S3 key
-    let key: Option<String> = sqlx::query_scalar(&format!(
-        "SELECT {}_key FROM employees WHERE id = $1",
-        doc_type.replace('-', "_")
-    ))
-    .bind(id)
-    .fetch_optional(&state.db)
-    .await?;
-
-    let key = key.ok_or_else(|| ApiError::NotFound("Dokument nicht vorhanden".into()))?;
+    let col = &format!("{}_key", doc_type.replace('-', "_"));
+    let key = employee_repo::fetch_document_key(&state.db, id, col)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Dokument nicht vorhanden".into()))?;
 
     let data = state.storage.download(&key).await.map_err(|e| {
         tracing::error!("S3 download error for employee document: {e}");
@@ -2308,12 +1679,7 @@ async fn delete_employee_document(
         .ok_or_else(|| ApiError::BadRequest("Unbekannter Dokumenttyp".into()))?;
 
     // Fetch stored key
-    let key: Option<String> = sqlx::query_scalar(&format!(
-        "SELECT {col} FROM employees WHERE id = $1"
-    ))
-    .bind(id)
-    .fetch_optional(&state.db)
-    .await?;
+    let key = employee_repo::fetch_document_key(&state.db, id, col).await?;
 
     if let Some(ref k) = key {
         // Best-effort S3 delete — log but don't fail if the object is already gone
@@ -2322,10 +1688,7 @@ async fn delete_employee_document(
         }
     }
 
-    sqlx::query(&format!("UPDATE employees SET {col} = NULL WHERE id = $1"))
-        .bind(id)
-        .execute(&state.db)
-        .await?;
+    employee_repo::clear_document_key(&state.db, id, col).await?;
 
     tracing::info!("Employee {id}: deleted {doc_type}");
     let employee = fetch_employee_json(&state.db, id).await?;
@@ -2334,7 +1697,7 @@ async fn delete_employee_document(
 
 // --- Notes (Notepad) ---
 
-#[derive(Debug, Serialize, FromRow)]
+#[derive(Debug, Serialize)]
 struct NoteRow {
     id: Uuid,
     title: String,
@@ -2356,12 +1719,14 @@ async fn list_notes(
     State(state): State<Arc<AppState>>,
     Extension(_claims): Extension<TokenClaims>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let notes: Vec<NoteRow> = sqlx::query_as(
-        "SELECT id, title, content, color, pinned, created_at, updated_at
-         FROM notes ORDER BY pinned DESC, created_at DESC",
-    )
-    .fetch_all(&state.db)
-    .await?;
+    let repo_notes = admin_repo::list_notes(&state.db).await?;
+    let notes: Vec<NoteRow> = repo_notes
+        .into_iter()
+        .map(|n| NoteRow {
+            id: n.id, title: n.title, content: n.content, color: n.color,
+            pinned: n.pinned, created_at: n.created_at, updated_at: n.updated_at,
+        })
+        .collect();
 
     Ok(Json(serde_json::json!({ "notes": notes })))
 }
@@ -2384,18 +1749,12 @@ async fn create_note(
     let color = body.color.unwrap_or_else(|| "default".into());
     let pinned = body.pinned.unwrap_or(false);
 
-    let note: NoteRow = sqlx::query_as(
-        "INSERT INTO notes (id, title, content, color, pinned)
-         VALUES ($1, $2, $3, $4, $5)
-         RETURNING id, title, content, color, pinned, created_at, updated_at",
-    )
-    .bind(id)
-    .bind(&title)
-    .bind(&content)
-    .bind(&color)
-    .bind(pinned)
-    .fetch_one(&state.db)
-    .await?;
+    let repo_note = admin_repo::create_note(&state.db, id, &title, &content, &color, pinned).await?;
+    let note = NoteRow {
+        id: repo_note.id, title: repo_note.title, content: repo_note.content,
+        color: repo_note.color, pinned: repo_note.pinned,
+        created_at: repo_note.created_at, updated_at: repo_note.updated_at,
+    };
 
     Ok((axum::http::StatusCode::CREATED, Json(note)))
 }
@@ -2413,25 +1772,18 @@ async fn update_note(
     Path(id): Path<Uuid>,
     Json(body): Json<aust_core::models::UpdateNote>,
 ) -> Result<Json<NoteRow>, ApiError> {
-    let note: NoteRow = sqlx::query_as(
-        "UPDATE notes
-         SET title   = COALESCE($2, title),
-             content = COALESCE($3, content),
-             color   = COALESCE($4, color),
-             pinned  = COALESCE($5, pinned)
-         WHERE id = $1
-         RETURNING id, title, content, color, pinned, created_at, updated_at",
+    let repo_note = admin_repo::update_note(
+        &state.db, id,
+        body.title.as_deref(), body.content.as_deref(), body.color.as_deref(), body.pinned,
     )
-    .bind(id)
-    .bind(&body.title)
-    .bind(&body.content)
-    .bind(&body.color)
-    .bind(body.pinned)
-    .fetch_optional(&state.db)
     .await?
     .ok_or_else(|| ApiError::NotFound("Notiz nicht gefunden.".into()))?;
 
-    Ok(Json(note))
+    Ok(Json(NoteRow {
+        id: repo_note.id, title: repo_note.title, content: repo_note.content,
+        color: repo_note.color, pinned: repo_note.pinned,
+        created_at: repo_note.created_at, updated_at: repo_note.updated_at,
+    }))
 }
 
 /// `DELETE /api/v1/admin/notes/{id}` — Delete a note.
@@ -2446,12 +1798,8 @@ async fn delete_note(
     Extension(_claims): Extension<TokenClaims>,
     Path(id): Path<Uuid>,
 ) -> Result<axum::http::StatusCode, ApiError> {
-    let result = sqlx::query("DELETE FROM notes WHERE id = $1")
-        .bind(id)
-        .execute(&state.db)
-        .await?;
-
-    if result.rows_affected() == 0 {
+    let rows = admin_repo::delete_note(&state.db, id).await?;
+    if rows == 0 {
         return Err(ApiError::NotFound("Notiz nicht gefunden.".into()));
     }
 

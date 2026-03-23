@@ -11,6 +11,7 @@ use sqlx::FromRow;
 use std::sync::Arc;
 use uuid::Uuid;
 
+use crate::repositories::estimation_repo;
 use crate::services::db::{insert_estimation, update_quote_volume};
 use crate::{orchestrator, services, ApiError, AppState};
 use aust_core::models::{EstimationMethod, InventoryForm, VolumeEstimation};
@@ -81,6 +82,31 @@ impl From<VolumeEstimationRow> for VolumeEstimation {
 
 impl From<crate::services::db::EstimationRow> for VolumeEstimation {
     fn from(row: crate::services::db::EstimationRow) -> Self {
+        let method = match row.method.as_str() {
+            "vision" => EstimationMethod::Vision,
+            "inventory" => EstimationMethod::Inventory,
+            "depth_sensor" => EstimationMethod::DepthSensor,
+            "video" => EstimationMethod::Video,
+            "manual" => EstimationMethod::Manual,
+            _ => EstimationMethod::Manual,
+        };
+
+        VolumeEstimation {
+            id: row.id,
+            inquiry_id: row.inquiry_id,
+            method,
+            status: row.status,
+            source_data: row.source_data,
+            result_data: row.result_data,
+            total_volume_m3: row.total_volume_m3,
+            confidence_score: row.confidence_score,
+            created_at: row.created_at,
+        }
+    }
+}
+
+impl From<estimation_repo::EstimationRow> for VolumeEstimation {
+    fn from(row: estimation_repo::EstimationRow) -> Self {
         let method = match row.method.as_str() {
             "vision" => EstimationMethod::Vision,
             "inventory" => EstimationMethod::Inventory,
@@ -454,20 +480,9 @@ async fn video_estimate(
             "video_mime": video_mime,
         });
 
-        let row: VolumeEstimationRow = sqlx::query_as(
-            r#"
-            INSERT INTO volume_estimations (id, inquiry_id, method, status, source_data, total_volume_m3, confidence_score, created_at)
-            VALUES ($1, $2, $3, 'processing', $4, NULL, NULL, $5)
-            RETURNING id, inquiry_id, method, status, source_data, result_data, total_volume_m3, confidence_score, created_at
-            "#
-        )
-        .bind(id)
-        .bind(inquiry_id)
-        .bind(EstimationMethod::Video.as_str())
-        .bind(&source_data)
-        .bind(now)
-        .fetch_one(&state.db)
-        .await?;
+        let row = estimation_repo::insert_processing_returning(
+            &state.db, id, inquiry_id, EstimationMethod::Video.as_str(), &source_data, now,
+        ).await?;
 
         tracing::info!(
             %inquiry_id,
@@ -486,11 +501,7 @@ async fn video_estimate(
     }
 
     // Update quote status to show processing is underway (once for all videos)
-    sqlx::query("UPDATE inquiries SET status = 'processing', updated_at = $1 WHERE id = $2")
-        .bind(now)
-        .bind(inquiry_id)
-        .execute(&state.db)
-        .await?;
+    estimation_repo::update_inquiry_processing(&state.db, inquiry_id, now).await?;
 
     Ok(Json(estimations))
 }
@@ -531,10 +542,7 @@ async fn process_video_background(
         Some(c) => c,
         None => {
             tracing::error!(%estimation_id, "Vision service not configured in background task");
-            let _ = sqlx::query("UPDATE volume_estimations SET status = 'failed' WHERE id = $1")
-                .bind(estimation_id)
-                .execute(&state.db)
-                .await;
+            let _ = estimation_repo::mark_failed(&state.db, estimation_id).await;
             return;
         }
     };
@@ -567,10 +575,7 @@ async fn process_video_background(
         Ok(r) => r,
         Err(e) => {
             tracing::error!(%inquiry_id, %estimation_id, error = %e, "Background: video estimation failed after all retries");
-            let _ = sqlx::query("UPDATE volume_estimations SET status = 'failed' WHERE id = $1")
-                .bind(estimation_id)
-                .execute(&state.db)
-                .await;
+            let _ = estimation_repo::mark_failed(&state.db, estimation_id).await;
             return;
         }
     };
@@ -589,10 +594,7 @@ async fn process_video_background(
         Ok(v) => v,
         Err(e) => {
             tracing::error!(%estimation_id, error = %e, "Background: failed to serialize items");
-            let _ = sqlx::query("UPDATE volume_estimations SET status = 'failed' WHERE id = $1")
-                .bind(estimation_id)
-                .execute(&state.db)
-                .await;
+            let _ = estimation_repo::mark_failed(&state.db, estimation_id).await;
             return;
         }
     };
@@ -629,55 +631,33 @@ async fn process_video_background(
     let now = chrono::Utc::now();
 
     // Update estimation with results
-    let _ = sqlx::query(
-        r#"
-        UPDATE volume_estimations
-        SET status = 'completed', result_data = $1, total_volume_m3 = $2, confidence_score = $3
-        WHERE id = $4
-        "#,
-    )
-    .bind(Some(&items_value))
-    .bind(response.total_volume_m3)
-    .bind(response.confidence_score)
-    .bind(estimation_id)
-    .execute(&state.db)
-    .await;
+    let _ = estimation_repo::mark_completed(
+        &state.db, estimation_id, Some(&items_value), response.total_volume_m3, response.confidence_score,
+    ).await;
 
     // Check if other videos for this quote are still processing
-    let still_processing: (i64,) = match sqlx::query_as(
-        "SELECT COUNT(*) FROM volume_estimations WHERE inquiry_id = $1 AND status = 'processing'",
-    )
-    .bind(inquiry_id)
-    .fetch_one(&state.db)
-    .await
-    {
-        Ok(row) => row,
+    let still_processing = match estimation_repo::count_processing(&state.db, inquiry_id).await {
+        Ok(count) => count,
         Err(e) => {
             tracing::error!(%inquiry_id, error = %e, "Background: failed to check processing count");
-            (0,)
+            0
         }
     };
 
-    if still_processing.0 > 0 {
+    if still_processing > 0 {
         tracing::info!(
             %inquiry_id,
             %estimation_id,
-            still_processing = still_processing.0,
+            still_processing = still_processing,
             "Background: other videos still processing, skipping offer generation"
         );
         return;
     }
 
     // All videos done — sum volumes from all completed estimations
-    let total_volume: (Option<f64>,) = sqlx::query_as(
-        "SELECT SUM(total_volume_m3) FROM volume_estimations WHERE inquiry_id = $1 AND status = 'completed'",
-    )
-    .bind(inquiry_id)
-    .fetch_one(&state.db)
-    .await
-    .unwrap_or((None,));
-
-    let combined_volume = total_volume.0.unwrap_or(0.0);
+    let combined_volume = estimation_repo::sum_completed_volume(&state.db, inquiry_id)
+        .await
+        .unwrap_or(0.0);
 
     // Update quote with combined estimated volume
     let _ = update_quote_volume(&state.db, inquiry_id, combined_volume, "volume_estimated", now).await;
@@ -767,17 +747,9 @@ async fn get_estimate(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<VolumeEstimation>, ApiError> {
-    let row: Option<VolumeEstimationRow> = sqlx::query_as(
-        r#"
-        SELECT id, inquiry_id, method, status, source_data, result_data, total_volume_m3, confidence_score, created_at
-        FROM volume_estimations WHERE id = $1
-        "#
-    )
-    .bind(id)
-    .fetch_optional(&state.db)
-    .await?;
-
-    let row = row.ok_or_else(|| ApiError::NotFound(format!("Estimation {id} not found")))?;
+    let row = estimation_repo::fetch_by_id(&state.db, id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Estimation {id} not found")))?;
     Ok(Json(VolumeEstimation::from(row)))
 }
 
@@ -851,17 +823,9 @@ async fn delete_estimate(
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
     // Fetch the estimation to collect S3 keys and inquiry_id
-    let row: Option<VolumeEstimationRow> = sqlx::query_as(
-        r#"
-        SELECT id, inquiry_id, method, status, source_data, result_data, total_volume_m3, confidence_score, created_at
-        FROM volume_estimations WHERE id = $1
-        "#,
-    )
-    .bind(id)
-    .fetch_optional(&state.db)
-    .await?;
-
-    let row = row.ok_or_else(|| ApiError::NotFound(format!("Estimation {id} not found")))?;
+    let row = estimation_repo::fetch_by_id(&state.db, id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Estimation {id} not found")))?;
     let inquiry_id = row.inquiry_id;
 
     // Collect S3 keys and delete objects (best-effort — don't fail the request on storage errors)
@@ -873,32 +837,17 @@ async fn delete_estimate(
     }
 
     // Delete estimation from DB
-    sqlx::query("DELETE FROM volume_estimations WHERE id = $1")
-        .bind(id)
-        .execute(&state.db)
-        .await?;
+    estimation_repo::delete_by_id(&state.db, id).await?;
 
     // Recalculate quote volume from remaining completed estimations and update quote
-    let total: (Option<f64>,) = sqlx::query_as(
-        "SELECT SUM(total_volume_m3) FROM volume_estimations WHERE inquiry_id = $1 AND status = 'completed'",
-    )
-    .bind(inquiry_id)
-    .fetch_one(&state.db)
-    .await
-    .unwrap_or((None,));
-
-    let combined_volume = total.0.unwrap_or(0.0);
+    let combined_volume = estimation_repo::sum_completed_volume(&state.db, inquiry_id)
+        .await
+        .unwrap_or(0.0);
     let now = chrono::Utc::now();
 
     // Only update volume/status if there are still estimations; otherwise reset to new
     let new_status = if combined_volume > 0.0 { "volume_estimated" } else { "new" };
-    sqlx::query("UPDATE inquiries SET estimated_volume_m3 = $1, status = $2, updated_at = $3 WHERE id = $4")
-        .bind(combined_volume)
-        .bind(new_status)
-        .bind(now)
-        .bind(inquiry_id)
-        .execute(&state.db)
-        .await?;
+    estimation_repo::update_inquiry_volume_status(&state.db, inquiry_id, combined_volume, new_status, now).await?;
 
     Ok(StatusCode::NO_CONTENT)
 }

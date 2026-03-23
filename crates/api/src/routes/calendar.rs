@@ -11,6 +11,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use aust_core::models::TokenClaims;
+use crate::repositories::calendar_repo;
 use crate::{ApiError, AppState};
 
 /// Register the calendar routes.
@@ -107,17 +108,7 @@ pub struct CapacityOverride {
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 async fn count_active_on_date(pool: &sqlx::PgPool, date: NaiveDate) -> Result<i32, sqlx::Error> {
-    let (count,): (i64,) = sqlx::query_as(
-        r#"
-        SELECT COUNT(*) FROM inquiries
-        WHERE COALESCE(scheduled_date, preferred_date::date) = $1
-          AND status NOT IN ('cancelled', 'rejected', 'expired')
-        "#,
-    )
-    .bind(date)
-    .fetch_one(pool)
-    .await?;
-    Ok(count as i32)
+    Ok(calendar_repo::count_active_on_date(pool, date).await? as i32)
 }
 
 async fn effective_capacity(
@@ -125,13 +116,7 @@ async fn effective_capacity(
     date: NaiveDate,
     default: i32,
 ) -> Result<i32, sqlx::Error> {
-    let row: Option<(i32,)> = sqlx::query_as(
-        "SELECT capacity FROM calendar_capacity_overrides WHERE override_date = $1",
-    )
-    .bind(date)
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.map(|(c,)| c).unwrap_or(default))
+    Ok(calendar_repo::fetch_capacity_override(pool, date).await?.unwrap_or(default))
 }
 
 async fn build_date_availability(
@@ -246,160 +231,48 @@ async fn get_schedule(
     let default_capacity = state.config.calendar.default_capacity;
 
     // Fetch all active inquiries in range — single-day and multi-day via UNION ALL.
-    // Single-day: no rows in inquiry_days, use scheduled_date / preferred_date.
-    // Multi-day: one row per day from inquiry_days.
-    #[derive(FromRow)]
-    struct InquiryRow {
-        effective_date: NaiveDate,
-        inquiry_id: Uuid,
-        customer_name: Option<String>,
-        departure_address: Option<String>,
-        arrival_address: Option<String>,
-        volume_m3: Option<f64>,
-        status: String,
-        notes: Option<String>,
-        start_time: NaiveTime,
-        end_time: NaiveTime,
-        employees_assigned: i64,
-        employee_names: Option<String>,
-        day_number: Option<i16>,
-        total_days: Option<i16>,
-        day_notes: Option<String>,
-    }
-
-    let inquiry_rows: Vec<InquiryRow> = sqlx::query_as(
-        r#"
-        -- Single-day branch: inquiry has no rows in inquiry_days
-        SELECT
-            COALESCE(i.scheduled_date, i.preferred_date::date) AS effective_date,
-            i.id AS inquiry_id,
-            COALESCE(
-                NULLIF(TRIM(COALESCE(c.first_name,'') || ' ' || COALESCE(c.last_name,'')), ''),
-                c.name, c.email
-            ) AS customer_name,
-            CASE WHEN ao.id IS NOT NULL THEN ao.street || ', ' || ao.city END AS departure_address,
-            CASE WHEN ad.id IS NOT NULL THEN ad.street || ', ' || ad.city END AS arrival_address,
-            i.estimated_volume_m3 AS volume_m3,
-            i.status,
-            i.notes,
-            i.start_time,
-            i.end_time,
-            COUNT(ie.id) AS employees_assigned,
-            NULLIF(STRING_AGG(
-                e.first_name || ' ' || LEFT(e.last_name, 1) || '.',
-                ', ' ORDER BY e.last_name, e.first_name
-            ), '') AS employee_names,
-            NULL::smallint AS day_number,
-            NULL::smallint AS total_days,
-            NULL::text AS day_notes
-        FROM inquiries i
-        JOIN customers c ON i.customer_id = c.id
-        LEFT JOIN addresses ao ON i.origin_address_id = ao.id
-        LEFT JOIN addresses ad ON i.destination_address_id = ad.id
-        LEFT JOIN inquiry_employees ie ON ie.inquiry_id = i.id
-        LEFT JOIN employees e ON ie.employee_id = e.id
-        WHERE NOT EXISTS (SELECT 1 FROM inquiry_days WHERE inquiry_id = i.id)
-          AND COALESCE(i.scheduled_date, i.preferred_date::date) BETWEEN $1 AND $2
-          AND i.status NOT IN ('cancelled', 'rejected', 'expired')
-        GROUP BY i.id, c.id, ao.id, ad.id
-
-        UNION ALL
-
-        -- Multi-day branch: one row per day from inquiry_days
-        SELECT
-            id2.day_date AS effective_date,
-            i.id AS inquiry_id,
-            COALESCE(
-                NULLIF(TRIM(COALESCE(c.first_name,'') || ' ' || COALESCE(c.last_name,'')), ''),
-                c.name, c.email
-            ) AS customer_name,
-            CASE WHEN ao.id IS NOT NULL THEN ao.street || ', ' || ao.city END AS departure_address,
-            CASE WHEN ad.id IS NOT NULL THEN ad.street || ', ' || ad.city END AS arrival_address,
-            i.estimated_volume_m3 AS volume_m3,
-            i.status,
-            i.notes,
-            i.start_time,
-            i.end_time,
-            COUNT(ie.id) AS employees_assigned,
-            NULLIF(STRING_AGG(
-                e.first_name || ' ' || LEFT(e.last_name, 1) || '.',
-                ', ' ORDER BY e.last_name, e.first_name
-            ), '') AS employee_names,
-            id2.day_number,
-            total.total_days,
-            id2.notes AS day_notes
-        FROM inquiries i
-        JOIN customers c ON i.customer_id = c.id
-        LEFT JOIN addresses ao ON i.origin_address_id = ao.id
-        LEFT JOIN addresses ad ON i.destination_address_id = ad.id
-        JOIN inquiry_days id2 ON id2.inquiry_id = i.id
-        JOIN (
-            SELECT inquiry_id, COUNT(*)::smallint AS total_days
-            FROM inquiry_days
-            GROUP BY inquiry_id
-        ) total ON total.inquiry_id = i.id
-        LEFT JOIN inquiry_employees ie ON ie.inquiry_id = i.id
-        LEFT JOIN employees e ON ie.employee_id = e.id
-        WHERE id2.day_date BETWEEN $1 AND $2
-          AND i.status NOT IN ('cancelled', 'rejected', 'expired')
-        GROUP BY i.id, c.id, ao.id, ad.id, id2.day_date, id2.day_number, id2.notes, total.total_days
-
-        ORDER BY effective_date
-        "#,
-    )
-    .bind(query.from)
-    .bind(query.to)
-    .fetch_all(&state.db)
-    .await
-    .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let inquiry_rows = calendar_repo::fetch_schedule_inquiries(&state.db, query.from, query.to)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     // Fetch offer prices for all inquiry_ids in one query
     let inquiry_ids: Vec<Uuid> = inquiry_rows.iter().map(|r| r.inquiry_id).collect();
     let mut price_map: HashMap<Uuid, i64> = HashMap::new();
     if !inquiry_ids.is_empty() {
-        let price_rows: Vec<(Uuid, i64)> = sqlx::query_as(
-            "SELECT inquiry_id, price_cents FROM offers WHERE inquiry_id = ANY($1) AND status != 'rejected' ORDER BY created_at DESC",
-        )
-        .bind(&inquiry_ids)
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_default();
+        let price_rows = calendar_repo::fetch_offer_prices(&state.db, &inquiry_ids)
+            .await
+            .unwrap_or_default();
         for (id, price) in price_rows {
             price_map.entry(id).or_insert(price);
         }
     }
 
     // Fetch capacity overrides for range
-    let override_rows: Vec<(NaiveDate, i32)> = sqlx::query_as(
-        "SELECT override_date, capacity FROM calendar_capacity_overrides WHERE override_date BETWEEN $1 AND $2",
-    )
-    .bind(query.from)
-    .bind(query.to)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
+    let override_rows = calendar_repo::fetch_capacity_overrides_range(&state.db, query.from, query.to)
+        .await
+        .unwrap_or_default();
     let override_map: HashMap<NaiveDate, i32> = override_rows.into_iter().collect();
 
     // Group inquiries by date
     let mut inquiry_map: HashMap<NaiveDate, Vec<ScheduleInquiry>> = HashMap::new();
-    for row in inquiry_rows {
-        let price = price_map.get(&row.inquiry_id).copied();
-        inquiry_map.entry(row.effective_date).or_default().push(ScheduleInquiry {
-            inquiry_id: row.inquiry_id,
-            customer_name: row.customer_name,
-            departure_address: row.departure_address,
-            arrival_address: row.arrival_address,
-            volume_m3: row.volume_m3,
-            status: row.status,
-            notes: row.notes,
+    for r in inquiry_rows {
+        let price = price_map.get(&r.inquiry_id).copied();
+        inquiry_map.entry(r.effective_date).or_default().push(ScheduleInquiry {
+            inquiry_id: r.inquiry_id,
+            customer_name: r.customer_name,
+            departure_address: r.departure_address,
+            arrival_address: r.arrival_address,
+            volume_m3: r.volume_m3,
+            status: r.status,
+            notes: r.notes,
             offer_price_cents: price,
-            start_time: row.start_time,
-            end_time: row.end_time,
-            employees_assigned: row.employees_assigned,
-            employee_names: row.employee_names,
-            day_number: row.day_number,
-            total_days: row.total_days,
-            day_notes: row.day_notes,
+            start_time: r.start_time,
+            end_time: r.end_time,
+            employees_assigned: r.employees_assigned,
+            employee_names: r.employee_names,
+            day_number: r.day_number,
+            total_days: r.total_days,
+            day_notes: r.day_notes,
         });
     }
 
@@ -443,18 +316,9 @@ async fn set_capacity(
         return Err(ApiError::BadRequest("Capacity must be >= 0".into()));
     }
 
-    sqlx::query(
-        r#"
-        INSERT INTO calendar_capacity_overrides (id, override_date, capacity, created_at)
-        VALUES (gen_random_uuid(), $1, $2, NOW())
-        ON CONFLICT (override_date) DO UPDATE SET capacity = EXCLUDED.capacity
-        "#,
-    )
-    .bind(date)
-    .bind(request.capacity)
-    .execute(&state.db)
-    .await
-    .map_err(|e| ApiError::Internal(e.to_string()))?;
+    calendar_repo::upsert_capacity(&state.db, date, request.capacity)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     Ok(Json(CapacityOverride { override_date: date, capacity: request.capacity }))
 }
@@ -492,13 +356,9 @@ async fn get_inquiry_days(
     Extension(_claims): Extension<TokenClaims>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<DayResponse>>, ApiError> {
-    let rows: Vec<(NaiveDate, i16, Option<String>)> = sqlx::query_as(
-        "SELECT day_date, day_number, notes FROM inquiry_days WHERE inquiry_id = $1 ORDER BY day_number",
-    )
-    .bind(id)
-    .fetch_all(&state.db)
-    .await
-    .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let rows = calendar_repo::fetch_inquiry_days(&state.db, id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     Ok(Json(rows.into_iter().map(|(day_date, day_number, notes)| DayResponse { day_date, day_number, notes }).collect()))
 }
@@ -530,23 +390,14 @@ async fn put_inquiry_days(
 
     let mut tx = state.db.begin().await.map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    sqlx::query("DELETE FROM inquiry_days WHERE inquiry_id = $1")
-        .bind(id)
-        .execute(&mut *tx)
+    calendar_repo::delete_inquiry_days(&mut tx, id)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     for d in &body.days {
-        sqlx::query(
-            "INSERT INTO inquiry_days (inquiry_id, day_date, day_number, notes) VALUES ($1, $2, $3, $4)",
-        )
-        .bind(id)
-        .bind(d.day_date)
-        .bind(d.day_number)
-        .bind(&d.notes)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+        calendar_repo::insert_inquiry_day(&mut tx, id, d.day_date, d.day_number, d.notes.as_deref())
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
     }
 
     tx.commit().await.map_err(|e| ApiError::Internal(e.to_string()))?;
@@ -563,13 +414,9 @@ async fn get_calendar_item_days(
     Extension(_claims): Extension<TokenClaims>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<DayResponse>>, ApiError> {
-    let rows: Vec<(NaiveDate, i16, Option<String>)> = sqlx::query_as(
-        "SELECT day_date, day_number, notes FROM calendar_item_days WHERE calendar_item_id = $1 ORDER BY day_number",
-    )
-    .bind(id)
-    .fetch_all(&state.db)
-    .await
-    .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let rows = calendar_repo::fetch_calendar_item_days(&state.db, id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     Ok(Json(rows.into_iter().map(|(day_date, day_number, notes)| DayResponse { day_date, day_number, notes }).collect()))
 }
@@ -599,23 +446,14 @@ async fn put_calendar_item_days(
 
     let mut tx = state.db.begin().await.map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    sqlx::query("DELETE FROM calendar_item_days WHERE calendar_item_id = $1")
-        .bind(id)
-        .execute(&mut *tx)
+    calendar_repo::delete_calendar_item_days(&mut tx, id)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     for d in &body.days {
-        sqlx::query(
-            "INSERT INTO calendar_item_days (calendar_item_id, day_date, day_number, notes) VALUES ($1, $2, $3, $4)",
-        )
-        .bind(id)
-        .bind(d.day_date)
-        .bind(d.day_number)
-        .bind(&d.notes)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+        calendar_repo::insert_calendar_item_day(&mut tx, id, d.day_date, d.day_number, d.notes.as_deref())
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
     }
 
     tx.commit().await.map_err(|e| ApiError::Internal(e.to_string()))?;
