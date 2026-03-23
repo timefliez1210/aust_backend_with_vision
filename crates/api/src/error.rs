@@ -23,6 +23,9 @@ pub enum ApiError {
     #[error("Conflict: {0}")]
     Conflict(String),
 
+    #[error("Invalid status transition from {from} to {to}")]
+    InvalidStatusTransition { from: String, to: String },
+
     #[error("Internal error: {0}")]
     Internal(String),
 
@@ -47,6 +50,11 @@ impl IntoResponse for ApiError {
             ApiError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, "unauthorized", msg.clone()),
             ApiError::Forbidden(msg) => (StatusCode::FORBIDDEN, "forbidden", msg.clone()),
             ApiError::Conflict(msg) => (StatusCode::CONFLICT, "conflict", msg.clone()),
+            ApiError::InvalidStatusTransition { from, to } => (
+                StatusCode::CONFLICT,
+                "invalid_status_transition",
+                format!("Invalid status transition from {from} to {to}"),
+            ),
             ApiError::Internal(msg) => {
                 tracing::error!("Internal error: {}", msg);
                 (

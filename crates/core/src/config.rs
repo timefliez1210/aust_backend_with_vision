@@ -275,3 +275,64 @@ impl Default for CompanyConfig {
         }
     }
 }
+
+impl Config {
+    /// Validates required configuration values at startup.
+    ///
+    /// **Caller**: `src/main.rs` immediately after `load_config()`, before `AppState` is built.
+    /// **Why**: Fail fast with a clear error message rather than panicking deep inside a
+    /// provider constructor or receiving a cryptic HTTP 401 from an external API.
+    ///
+    /// # Returns
+    /// `Ok(())` when all checks pass.
+    ///
+    /// # Errors
+    /// Returns `Err(String)` with a human-readable description of the first failing check:
+    /// - `database.url` is empty
+    /// - `server.port` is 0 (port 0 means "pick any free port", which is unintentional here)
+    /// - `llm.default_provider` is `"claude"` but `llm.claude` is missing or has an empty `api_key`
+    /// - `llm.default_provider` is `"openai"` but `llm.openai` is missing or has an empty `api_key`
+    pub fn validate(&self) -> Result<(), String> {
+        if self.database.url.trim().is_empty() {
+            return Err("database.url must not be empty".to_string());
+        }
+
+        if self.server.port == 0 {
+            return Err("server.port must be in range 1..=65535".to_string());
+        }
+
+        match self.llm.default_provider.as_str() {
+            "claude" => {
+                let ok = self
+                    .llm
+                    .claude
+                    .as_ref()
+                    .map(|c| !c.api_key.trim().is_empty())
+                    .unwrap_or(false);
+                if !ok {
+                    return Err(
+                        "llm.default_provider is \"claude\" but llm.claude.api_key is missing or empty"
+                            .to_string(),
+                    );
+                }
+            }
+            "openai" => {
+                let ok = self
+                    .llm
+                    .openai
+                    .as_ref()
+                    .map(|o| !o.api_key.trim().is_empty())
+                    .unwrap_or(false);
+                if !ok {
+                    return Err(
+                        "llm.default_provider is \"openai\" but llm.openai.api_key is missing or empty"
+                            .to_string(),
+                    );
+                }
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+}

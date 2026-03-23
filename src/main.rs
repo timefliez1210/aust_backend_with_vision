@@ -24,6 +24,7 @@ async fn main() -> Result<()> {
 
     // Load configuration
     let config = load_config()?;
+    config.validate().map_err(|e| anyhow::anyhow!("Configuration error: {e}"))?;
     tracing::info!("Configuration loaded");
 
     // Create database pool
