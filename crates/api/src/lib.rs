@@ -10,7 +10,8 @@ pub mod state;
 pub(crate) mod test_helpers;
 
 pub use error::ApiError;
-pub use orchestrator::{run_offer_event_handler, try_auto_generate_offer};
+pub use orchestrator::run_offer_event_handler;
+pub use services::offer_pipeline::try_auto_generate_offer;
 pub use state::AppState;
 
 use axum::{http::HeaderValue, Router};

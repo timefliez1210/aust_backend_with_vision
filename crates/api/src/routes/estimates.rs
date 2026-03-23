@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::repositories::estimation_repo;
 use crate::services::db::{insert_estimation, update_quote_volume};
+use crate::services::offer_pipeline::try_auto_generate_offer;
 use crate::{orchestrator, services, ApiError, AppState};
 use aust_core::models::{EstimationMethod, InventoryForm, VolumeEstimation};
 use aust_volume_estimator::VisionAnalyzer;
@@ -234,7 +235,7 @@ async fn vision_estimate(
     // Auto-generate offer in background
     let state_clone = state.clone();
     let qid = request.inquiry_id;
-    tokio::spawn(async move { orchestrator::try_auto_generate_offer(state_clone, qid).await });
+    tokio::spawn(async move { try_auto_generate_offer(state_clone, qid).await });
 
     Ok(Json(VolumeEstimation::from(est)))
 }
@@ -347,7 +348,7 @@ async fn depth_sensor_estimate(
 
     // Auto-generate offer in background
     let state_clone = state.clone();
-    tokio::spawn(async move { orchestrator::try_auto_generate_offer(state_clone, inquiry_id).await });
+    tokio::spawn(async move { try_auto_generate_offer(state_clone, inquiry_id).await });
 
     Ok(Json(VolumeEstimation::from(est)))
 }
@@ -665,7 +666,7 @@ async fn process_video_background(
     tracing::info!(%inquiry_id, %estimation_id, combined_volume, "Background: all video estimations completed, triggering offer generation");
 
     // Auto-generate offer
-    orchestrator::try_auto_generate_offer(state, inquiry_id).await;
+    try_auto_generate_offer(state, inquiry_id).await;
 }
 
 
@@ -723,7 +724,7 @@ async fn inventory_estimate(
     // Auto-generate offer in background
     let state_clone = state.clone();
     let qid = request.inquiry_id;
-    tokio::spawn(async move { orchestrator::try_auto_generate_offer(state_clone, qid).await });
+    tokio::spawn(async move { try_auto_generate_offer(state_clone, qid).await });
 
     Ok(Json(VolumeEstimation::from(est)))
 }

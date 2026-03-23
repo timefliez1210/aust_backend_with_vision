@@ -14,6 +14,7 @@ use serde::Serialize;
 use std::sync::Arc;
 use uuid::Uuid;
 
+use crate::services::offer_pipeline::try_auto_generate_offer;
 use crate::{orchestrator, services, ApiError, AppState};
 use aust_core::models::{EstimationMethod, Services};
 use aust_storage::StorageProvider;
@@ -855,7 +856,7 @@ pub(crate) async fn process_submission_background(
     );
 
     // 7. Auto-generate offer (XLSX -> PDF -> Telegram)
-    orchestrator::try_auto_generate_offer(Arc::clone(&state), inquiry_id).await;
+    try_auto_generate_offer(Arc::clone(&state), inquiry_id).await;
 
     Ok(())
 }
@@ -970,7 +971,7 @@ pub(crate) async fn process_video_background(
     .await
     .map_err(|e| format!("Failed to update inquiry: {e}"))?;
 
-    orchestrator::try_auto_generate_offer(Arc::clone(&state), inquiry_id).await;
+    try_auto_generate_offer(Arc::clone(&state), inquiry_id).await;
 
     Ok(())
 }
