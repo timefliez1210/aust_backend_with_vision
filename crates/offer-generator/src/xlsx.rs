@@ -46,7 +46,7 @@ pub struct OfferData {
     pub customer_city: String,
     /// Customer phone number (cell B18).
     pub customer_phone: String,
-    /// Customer e-mail address (cell A12 — rendered as plain text, not hyperlink).
+    /// Customer e-mail address (cell F18, same row as phone — rendered as plain text).
     pub customer_email: String,
     /// Opening salutation line, e.g. `"Sehr geehrter Herr Müller,"` (cell A20).
     pub greeting: String,
@@ -329,13 +329,12 @@ fn build_cell_modifications(
     mods.push(("A9".into(), CellValue::Text(data.customer_name.clone())));
     mods.push(("A10".into(), CellValue::Text(data.customer_street.clone())));
     mods.push(("A11".into(), CellValue::Text(data.customer_city.clone())));
-    mods.push(("A12".into(), CellValue::StyledText(data.customer_email.clone(), "0")));
 
-    // Replace the TODAY() formula in G14 with the actual formatted date string.
-    // Writing as plain text avoids any dependency on the template's date-format styles
-    // (none of which are a proper dd.mm.yyyy style in this template).
-    mods.push(("G14".into(), CellValue::Text(data.date.format("%d.%m.%Y").to_string())));
-    mods.push(("G15".into(), CellValue::Text(String::new())));
+    // The drawing text box (company contact block) anchors to rows 9–14 in the template,
+    // overlapping cell G14. Writing the date to G15 (just below) keeps it visible and
+    // prevents it from being obscured by the text box border.
+    mods.push(("G14".into(), CellValue::Text(String::new()))); // clear the TODAY() formula
+    mods.push(("G15".into(), CellValue::Text(data.date.format("%d.%m.%Y").to_string())));
     // G16 is the title row — do not write the date there.
 
     // Title
@@ -350,9 +349,8 @@ fn build_cell_modifications(
     // Moving date & contact
     mods.push(("B17".into(), CellValue::Text(data.moving_date.clone())));
     mods.push(("B18".into(), CellValue::Text(data.customer_phone.clone())));
-    // Clear the template's email cells (moved to A12 in the address block).
-    mods.push(("E18".into(), CellValue::StyledText(String::new(), "0")));
-    mods.push(("F18".into(), CellValue::StyledText(String::new(), "0")));
+    // E-Mail on the same row as the phone number (F18), matching the template label at E18.
+    mods.push(("F18".into(), CellValue::StyledText(data.customer_email.clone(), "0")));
 
     // Greeting
     mods.push(("A20".into(), CellValue::Text(data.greeting.clone())));

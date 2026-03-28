@@ -39,6 +39,54 @@ pub(crate) async fn fetch_active_id_for_inquiry(
     Ok(row.map(|(id,)| id))
 }
 
+/// Fetch the offer number and customer last name for building a human-readable filename.
+///
+/// **Caller**: `get_inquiry_pdf`, `send_draft_email`
+/// **Why**: The download filename should be `{seq}-{year} {last_name}` (e.g. `131-2026 Krause`)
+///          rather than a raw UUID. This provides the two pieces needed to build that string.
+///
+/// # Returns
+/// `Some((offer_number, last_name))` when the offer and its customer exist, `None` otherwise.
+/// `last_name` may be an empty string if the customer has no last_name on record.
+pub(crate) async fn fetch_offer_filename_parts(
+    pool: &PgPool,
+    offer_id: Uuid,
+) -> Result<Option<(String, String)>, ApiError> {
+    let row: Option<(String, String)> = sqlx::query_as(
+        r#"
+        SELECT COALESCE(o.offer_number, ''), COALESCE(c.last_name, '')
+        FROM offers o
+        JOIN inquiries q ON o.inquiry_id = q.id
+        JOIN customers c ON q.customer_id = c.id
+        WHERE o.id = $1
+        "#,
+    )
+    .bind(offer_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
+/// Format an offer filename from offer_number and customer last name.
+///
+/// **Caller**: any route that serves or attaches an offer PDF
+/// **Why**: Converts the internal `{year}-{seq:04}` offer_number (e.g. "2026-0131") into
+///          the human-readable `{seq}-{year} {last_name}` format (e.g. "131-2026 Krause").
+///
+/// Falls back to `{offer_number} {last_name}` when offer_number cannot be parsed.
+pub(crate) fn build_offer_filename(offer_number: &str, last_name: &str, ext: &str) -> String {
+    let parts: Vec<&str> = offer_number.splitn(2, '-').collect();
+    if parts.len() == 2 {
+        let year = parts[0];
+        let seq: u64 = parts[1].trim_start_matches('0').parse().unwrap_or(0);
+        let name = if last_name.is_empty() { "Angebot" } else { last_name };
+        format!("{seq}-{year} {name}.{ext}")
+    } else {
+        let name = if last_name.is_empty() { "Angebot" } else { last_name };
+        format!("{offer_number} {name}.{ext}")
+    }
+}
+
 /// Fetch the active offer's ID and PDF storage key for PDF download.
 ///
 /// **Caller**: `get_inquiry_pdf`

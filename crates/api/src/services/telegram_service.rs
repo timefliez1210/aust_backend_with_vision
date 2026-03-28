@@ -154,8 +154,11 @@ pub(crate) async fn send_offer_to_telegram(config: &TelegramConfig, generated: &
         ]]
     });
 
+    let tg_last_name = generated.customer_name.split_whitespace().last().unwrap_or("Angebot");
+    let tg_offer_num = offer.offer_number.as_deref().unwrap_or("");
+    let tg_filename = crate::repositories::offer_repo::build_offer_filename(tg_offer_num, tg_last_name, "pdf");
     let pdf_part = Part::bytes(generated.pdf_bytes.clone())
-        .file_name(format!("Angebot-{}.pdf", offer.id))
+        .file_name(tg_filename)
         .mime_str("application/pdf")
         .unwrap();
 

@@ -394,7 +394,13 @@ async fn get_inquiry_pdf(
             "xlsx",
         )
     };
-    let filename = format!("Angebot-{}.{ext}", offer_id);
+    let filename = if let Ok(Some((offer_num, last_name))) =
+        offer_repo::fetch_offer_filename_parts(&state.db, offer_id).await
+    {
+        offer_repo::build_offer_filename(&offer_num, &last_name, ext)
+    } else {
+        format!("Angebot-{offer_id}.{ext}")
+    };
 
     Ok((
         [

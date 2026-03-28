@@ -48,7 +48,7 @@ pub async fn send_offer_email(
         "Ihr Umzugsangebot",
         body_text,
         pdf_bytes,
-        &format!("Angebot-{offer_id}.pdf"),
+        &format!("Angebot-{offer_id}.pdf"), // fallback: callers with full context use admin_emails route
         "application/pdf",
     )
     .map_err(|e| format!("Failed to build email: {e}"))?;
@@ -107,7 +107,7 @@ pub async fn send_offer_email_custom(
         subject,
         body,
         pdf_bytes,
-        &format!("Angebot-{offer_id}.pdf"),
+        &format!("Angebot-{offer_id}.pdf"), // fallback: callers with full context use admin_emails route
         "application/pdf",
     )
     .map_err(|e| format!("Failed to build email: {e}"))?;

@@ -188,6 +188,7 @@ pub(super) async fn send_draft_email(
 
     // If the thread is tied to an inquiry with a PDF offer, send with attachment
     if let (Some(key), Some(oid), Some(iid)) = (&pdf_key, offer_id, inquiry_id) {
+        use crate::repositories::offer_repo;
         use crate::services::email::{build_email_with_attachment, send_email};
 
         let pdf_bytes = state
@@ -195,6 +196,14 @@ pub(super) async fn send_draft_email(
             .download(key)
             .await
             .map_err(|e| ApiError::Internal(format!("PDF-Download fehlgeschlagen: {e}")))?;
+
+        let attach_filename = if let Ok(Some((offer_num, last_name))) =
+            offer_repo::fetch_offer_filename_parts(&state.db, oid).await
+        {
+            offer_repo::build_offer_filename(&offer_num, &last_name, "pdf")
+        } else {
+            format!("Angebot-{oid}.pdf")
+        };
 
         let email_cfg = &state.config.email;
         let message = build_email_with_attachment(
@@ -204,7 +213,7 @@ pub(super) async fn send_draft_email(
             &subject,
             &body,
             &pdf_bytes,
-            &format!("Angebot-{oid}.pdf"),
+            &attach_filename,
             "application/pdf",
         )
         .map_err(|e| ApiError::Internal(format!("E-Mail-Aufbau fehlgeschlagen: {e}")))?;
