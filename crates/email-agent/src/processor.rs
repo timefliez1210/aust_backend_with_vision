@@ -316,25 +316,37 @@ impl EmailProcessor {
             .await;
         }
 
+        // Parse the email first so we can use the real customer email as the HashMap key.
+        // For form submissions the IMAP sender is always the company inbox
+        // (e.g. angebot@aust-umzuege.de), not the actual customer. Keying by the
+        // IMAP sender caused consecutive form submissions to share a single HashMap
+        // entry: the first customer's data would fill all fields, and merge_inquiry
+        // (which only writes None slots) would silently drop every field from the
+        // next customer — leaving their email grafted onto the wrong person's data.
+        let updated = self.parser.parse_inquiry(&email);
+
+        // Use the parsed email (real customer) when available, else fall back to IMAP sender.
+        let inquiry_key = if !updated.email.is_empty() && updated.email != email.from {
+            updated.email.clone()
+        } else {
+            customer_email.clone()
+        };
+
         // Get or create inquiry for this customer
         let inquiry = self
             .inquiries
-            .entry(customer_email.clone())
+            .entry(inquiry_key.clone())
             .or_insert_with(|| MovingInquiry {
                 id: Uuid::now_v7(),
-                email: customer_email.clone(),
+                email: inquiry_key.clone(),
                 ..Default::default()
             });
-
-        // Parse the email and extract structured data
-        let updated = self.parser.parse_inquiry(&email);
 
         // Merge extracted data into existing inquiry
         merge_inquiry(inquiry, &updated);
 
-        // For form submissions, the parsed email (from JSON/form data) is the real
-        // customer email, not the IMAP sender address
-        if updated.email != email.from && !updated.email.is_empty() {
+        // Ensure the email field is always the real customer email.
+        if !updated.email.is_empty() {
             inquiry.email = updated.email.clone();
         }
 
@@ -425,6 +437,10 @@ impl EmailProcessor {
             if let Some(tx) = &self.offer_tx {
                 let _ = tx.send(ApprovalDecision::InquiryComplete(inquiry_snapshot.clone()));
             }
+            // Remove from HashMap so a future submission from the same customer
+            // (e.g. a new inquiry months later) starts fresh rather than merging
+            // into this completed entry's already-filled fields.
+            self.inquiries.remove(&inquiry_key);
         }
 
         // Generate draft response only for incomplete inquiries.
@@ -1171,7 +1187,9 @@ fn merge_inquiry(target: &mut MovingInquiry, source: &MovingInquiry) {
     if target.departure_floor.is_none() {
         target.departure_floor = source.departure_floor.clone();
     }
-    if target.departure_parking_ban.is_none() {
+    // Parking bans: allow true to override false (customer may clarify later).
+    // Use is_none() guard only when source is None (don't wipe an existing value).
+    if source.departure_parking_ban == Some(true) || target.departure_parking_ban.is_none() {
         target.departure_parking_ban = source.departure_parking_ban;
     }
     if target.arrival_address.is_none() {
@@ -1180,7 +1198,7 @@ fn merge_inquiry(target: &mut MovingInquiry, source: &MovingInquiry) {
     if target.arrival_floor.is_none() {
         target.arrival_floor = source.arrival_floor.clone();
     }
-    if target.arrival_parking_ban.is_none() {
+    if source.arrival_parking_ban == Some(true) || target.arrival_parking_ban.is_none() {
         target.arrival_parking_ban = source.arrival_parking_ban;
     }
     if target.intermediate_address.is_none() {
@@ -1189,7 +1207,7 @@ fn merge_inquiry(target: &mut MovingInquiry, source: &MovingInquiry) {
     if target.intermediate_floor.is_none() {
         target.intermediate_floor = source.intermediate_floor.clone();
     }
-    if target.intermediate_parking_ban.is_none() {
+    if source.intermediate_parking_ban == Some(true) || target.intermediate_parking_ban.is_none() {
         target.intermediate_parking_ban = source.intermediate_parking_ban;
     }
     if target.volume_m3.is_none() {

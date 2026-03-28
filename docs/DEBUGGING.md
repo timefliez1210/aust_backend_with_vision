@@ -115,7 +115,19 @@ DATABASE_URL=postgres://... cargo build
 
 ---
 
-## 9. LibreOffice PDF Conversion Fails Silently
+## 9. Wrong Customer Data on Form-Submission Inquiry (Cross-Customer Contamination)
+
+**Symptom**: An inquiry in the DB has the correct customer email but the wrong name, wrong addresses, and wrong volume — matching a *different* customer who submitted the form around the same time.
+
+**Root cause**: `EmailProcessor` keeps an `inquiries: HashMap<String, MovingInquiry>` to accumulate data across follow-up emails. The key was `email.from` — the IMAP sender. For all form submissions the IMAP sender is always the company inbox (`angebot@aust-umzuege.de`), so every form submission hit the **same HashMap entry**. The first customer's data filled all fields; `merge_inquiry` only writes `None` slots, so subsequent customers' data was silently dropped. The only field that got through was `inquiry.email`, which is overwritten unconditionally — leaving customer B's email on customer A's fully-populated inquiry.
+
+**Fix**: Parse the email **before** touching the HashMap, then key by the parsed customer email (from the JSON form attachment) instead of the IMAP sender. Applied in `processor.rs::process_incoming_email()` at the top of the function.
+
+**Files**: `crates/email-agent/src/processor.rs` — `process_incoming_email()`, HashMap entry creation.
+
+---
+
+## 10. LibreOffice PDF Conversion Fails Silently
 
 **Symptom**: Offer PDF is served as XLSX instead of PDF. No error in logs, but the downloaded file has an XLSX extension.
 
