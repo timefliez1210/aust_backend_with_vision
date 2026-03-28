@@ -13,7 +13,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use aust_core::models::TokenClaims;
-use crate::repositories::{admin_repo, employee_repo};
+use crate::repositories::{admin_repo, employee_repo, feedback_repo};
 use crate::{ApiError, AppState};
 
 use super::admin_customers;
@@ -54,6 +54,9 @@ pub fn router() -> Router<Arc<AppState>> {
         )
         .route("/notes", get(list_notes).post(create_note))
         .route("/notes/{id}", patch(update_note).delete(delete_note))
+        .route("/feedback", get(list_feedback).post(create_feedback))
+        .route("/feedback/{id}", get(get_feedback).patch(patch_feedback))
+        .route("/feedback/{id}/attachments/{idx}", get(download_feedback_attachment))
 }
 
 // --- Dashboard ---
@@ -987,4 +990,248 @@ async fn delete_note(
     }
 
     Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+// ─── Feedback Reports ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct FeedbackListQuery {
+    status: Option<String>,
+    #[serde(rename = "type")]
+    report_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PatchFeedbackBody {
+    status: String,
+}
+
+/// `POST /api/v1/admin/feedback` — Create a new feedback report with optional file attachments.
+///
+/// **Caller**: Admin feedback form (multipart submit).
+/// **Why**: Stores bug reports and feature requests submitted from the admin dashboard.
+///
+/// Accepts `multipart/form-data` with text fields `type`, `priority`, `title`,
+/// `description`, `location` and any number of file fields named `attachments`.
+/// Files are uploaded to S3 under `feedback/{tmp_id}/{index}.{ext}`.
+///
+/// # Returns
+/// `201 Created` with the created `FeedbackReport` JSON.
+async fn create_feedback(
+    State(state): State<Arc<AppState>>,
+    Extension(_claims): Extension<TokenClaims>,
+    mut multipart: Multipart,
+) -> Result<(axum::http::StatusCode, Json<feedback_repo::FeedbackReport>), ApiError> {
+    let mut report_type = String::new();
+    let mut priority = String::from("medium");
+    let mut title = String::new();
+    let mut description: Option<String> = None;
+    let mut location: Option<String> = None;
+    let mut attachment_keys: Vec<String> = Vec::new();
+
+    // Temporary ID for S3 key prefix (re-used as report ID in DB via DEFAULT gen_random_uuid).
+    // We upload first, then insert — keys reference this prefix permanently.
+    let tmp_id = Uuid::now_v7();
+    let mut file_index: usize = 0;
+
+    while let Some(field) = multipart.next_field().await.map_err(|e| {
+        ApiError::BadRequest(format!("Multipart read error: {e}"))
+    })? {
+        match field.name() {
+            Some("type") => {
+                report_type = field.text().await.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+            }
+            Some("priority") => {
+                priority = field.text().await.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+            }
+            Some("title") => {
+                title = field.text().await.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+            }
+            Some("description") => {
+                let v = field.text().await.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+                if !v.is_empty() { description = Some(v); }
+            }
+            Some("location") => {
+                let v = field.text().await.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+                if !v.is_empty() { location = Some(v); }
+            }
+            Some("attachments") => {
+                let ext = field
+                    .file_name()
+                    .and_then(|n| n.rsplit('.').next())
+                    .map(|e| e.to_lowercase())
+                    .unwrap_or_else(|| "bin".into());
+                let ct = field
+                    .content_type()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "application/octet-stream".into());
+                let data = field.bytes().await.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+                if !data.is_empty() {
+                    let key = format!("feedback/{tmp_id}/{file_index}.{ext}");
+                    state.storage.upload(&key, data, &ct).await.map_err(|e| {
+                        tracing::error!("S3 upload for feedback attachment: {e}");
+                        ApiError::Internal("Datei-Upload fehlgeschlagen.".into())
+                    })?;
+                    attachment_keys.push(key);
+                    file_index += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if title.is_empty() {
+        return Err(ApiError::BadRequest("Titel darf nicht leer sein.".into()));
+    }
+    if report_type != "bug" && report_type != "feature" {
+        return Err(ApiError::BadRequest("Ungültiger Typ (bug oder feature).".into()));
+    }
+
+    let report = feedback_repo::create_report(
+        &state.db,
+        &report_type,
+        &priority,
+        &title,
+        description.as_deref(),
+        location.as_deref(),
+        &attachment_keys,
+    )
+    .await?;
+
+    Ok((axum::http::StatusCode::CREATED, Json(report)))
+}
+
+/// `GET /api/v1/admin/feedback` — List all feedback reports (admin only), newest first.
+///
+/// **Caller**: Admin `/admin/reports` page on load.
+/// **Why**: Provides the admin with a complete, filterable list of submitted reports.
+///
+/// # Query Parameters
+/// - `status` — filter by status ("open", "in_progress", "resolved")
+/// - `type`   — filter by type ("bug", "feature")
+///
+/// # Returns
+/// JSON array of `FeedbackReport`.
+async fn list_feedback(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<TokenClaims>,
+    Query(q): Query<FeedbackListQuery>,
+) -> Result<Json<Vec<feedback_repo::FeedbackReport>>, ApiError> {
+    require_admin(&claims)?;
+    let reports = feedback_repo::list_reports(
+        &state.db,
+        q.status.as_deref(),
+        q.report_type.as_deref(),
+    )
+    .await?;
+    Ok(Json(reports))
+}
+
+/// `GET /api/v1/admin/feedback/{id}` — Get a single feedback report by ID (admin only).
+///
+/// **Caller**: Admin `/admin/reports` detail panel.
+/// **Why**: Returns the full report including attachment keys for the download view.
+///
+/// # Returns
+/// `200 OK` with `FeedbackReport` JSON, or `404` if not found.
+async fn get_feedback(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<TokenClaims>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<feedback_repo::FeedbackReport>, ApiError> {
+    require_admin(&claims)?;
+    let report = feedback_repo::get_report(&state.db, id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Report nicht gefunden.".into()))?;
+    Ok(Json(report))
+}
+
+/// `PATCH /api/v1/admin/feedback/{id}` — Update the status of a feedback report (admin only).
+///
+/// **Caller**: Admin `/admin/reports` status dropdown.
+/// **Why**: Lets the admin track progress: open → in_progress → resolved.
+///
+/// # Body
+/// `{ "status": "in_progress" }`
+///
+/// # Returns
+/// `200 OK` with updated `FeedbackReport`.
+async fn patch_feedback(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<TokenClaims>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<PatchFeedbackBody>,
+) -> Result<Json<feedback_repo::FeedbackReport>, ApiError> {
+    require_admin(&claims)?;
+    let valid = ["open", "in_progress", "resolved"];
+    if !valid.contains(&body.status.as_str()) {
+        return Err(ApiError::BadRequest("Ungültiger Status.".into()));
+    }
+    let report = feedback_repo::update_status(&state.db, id, &body.status).await?;
+    Ok(Json(report))
+}
+
+/// `GET /api/v1/admin/feedback/{id}/attachments/{idx}` — Download one attachment by index (admin only).
+///
+/// **Caller**: Admin reports detail view download button.
+/// **Why**: Proxies the attachment from S3 with the correct content-disposition header.
+///
+/// # Path Parameters
+/// - `id`  — report UUID
+/// - `idx` — zero-based attachment index
+///
+/// # Returns
+/// Binary response with `Content-Disposition: attachment` header, or `404`.
+async fn download_feedback_attachment(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<TokenClaims>,
+    Path((id, idx)): Path<(Uuid, usize)>,
+) -> Result<Response, ApiError> {
+    require_admin(&claims)?;
+    let report = feedback_repo::get_report(&state.db, id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Report nicht gefunden.".into()))?;
+
+    let key = report.attachment_keys.get(idx)
+        .ok_or_else(|| ApiError::NotFound("Anhang nicht gefunden.".into()))?;
+
+    let data = state.storage.download(key).await.map_err(|e| {
+        tracing::error!("S3 download for feedback attachment {key}: {e}");
+        ApiError::NotFound("Anhang konnte nicht abgerufen werden.".into())
+    })?;
+
+    let filename = key.rsplit('/').next().unwrap_or("attachment");
+    let ext = filename.rsplit('.').next().unwrap_or("bin");
+    let ct = mime_from_ext(ext);
+
+    Ok(Response::builder()
+        .header(header::CONTENT_TYPE, ct)
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{filename}\""),
+        )
+        .body(axum::body::Body::from(data))
+        .unwrap())
+}
+
+/// Map a file extension to a MIME type string for feedback attachments.
+///
+/// **Caller**: `download_feedback_attachment`
+/// **Why**: Sets the Content-Type header so browsers handle downloads correctly.
+///
+/// # Parameters
+/// - `ext` — lowercase file extension without dot
+///
+/// # Returns
+/// MIME type string; falls back to `"application/octet-stream"` for unknowns.
+fn mime_from_ext(ext: &str) -> &'static str {
+    match ext {
+        "png"  => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif"  => "image/gif",
+        "webp" => "image/webp",
+        "pdf"  => "application/pdf",
+        "mp4"  => "video/mp4",
+        _      => "application/octet-stream",
+    }
 }

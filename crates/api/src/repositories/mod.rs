@@ -13,6 +13,7 @@ pub(crate) mod customer_auth_repo;
 pub(crate) mod customer_repo;
 pub(crate) mod email_repo;
 pub(crate) mod employee_repo;
+pub(crate) mod feedback_repo;
 pub(crate) mod estimation_repo;
 pub(crate) mod inquiry_repo;
 pub(crate) mod invoice_repo;
