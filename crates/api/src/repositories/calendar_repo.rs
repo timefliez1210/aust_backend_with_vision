@@ -1,6 +1,6 @@
 //! Calendar repository — centralised queries for calendar, inquiry_days, and calendar_item_days.
 
-use chrono::NaiveDate;
+use chrono::{NaiveDate, NaiveTime};
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
@@ -24,6 +24,42 @@ pub(crate) struct ScheduleInquiryRow {
     pub day_number: Option<i16>,
     pub total_days: Option<i16>,
     pub day_notes: Option<String>,
+}
+
+/// A single row from `inquiry_days` including optional per-day times.
+#[derive(Debug, FromRow)]
+pub(crate) struct InquiryDayRow {
+    pub id: Uuid,
+    pub day_date: NaiveDate,
+    pub day_number: i16,
+    pub notes: Option<String>,
+    pub start_time: Option<NaiveTime>,
+    pub end_time: Option<NaiveTime>,
+}
+
+/// A single row from `calendar_item_days` including optional per-day times.
+#[derive(Debug, FromRow)]
+pub(crate) struct CalendarItemDayRow {
+    pub id: Uuid,
+    pub day_date: NaiveDate,
+    pub day_number: i16,
+    pub notes: Option<String>,
+    pub start_time: Option<NaiveTime>,
+    pub end_time: Option<NaiveTime>,
+}
+
+/// A per-day employee assignment row (used for both inquiry days and calendar item days).
+///
+/// The `day_id` field holds the UUID of the parent `inquiry_days` or
+/// `calendar_item_days` row so callers can group by day.
+#[derive(Debug, FromRow)]
+pub(crate) struct DayEmployeeRow {
+    pub day_id: Uuid,
+    pub employee_id: Uuid,
+    pub first_name: String,
+    pub last_name: String,
+    pub planned_hours: Option<f64>,
+    pub notes: Option<String>,
 }
 
 // ── Queries ──────────────────────────────────────────────────────────────────
@@ -70,6 +106,13 @@ pub(crate) async fn fetch_capacity_override(
 ///
 /// **Caller**: `calendar::get_schedule`
 /// **Why**: Returns one row per inquiry-day for schedule display.
+///
+/// Single-day branch uses inquiry-level `start_time`/`end_time` and
+/// `inquiry_employees` for the employee count.
+///
+/// Multi-day branch uses per-day `start_time`/`end_time` (falling back to
+/// parent via COALESCE) and `inquiry_day_employees` for the employee count and
+/// names, giving per-day staffing visibility in the calendar view.
 pub(crate) async fn fetch_schedule_inquiries(
     pool: &PgPool,
     from: NaiveDate,
@@ -113,7 +156,9 @@ pub(crate) async fn fetch_schedule_inquiries(
 
         UNION ALL
 
-        -- Multi-day branch: one row per day from inquiry_days
+        -- Multi-day branch: one row per day from inquiry_days.
+        -- Times: per-day if set, else parent inquiry times (COALESCE).
+        -- Employees: per-day inquiry_day_employees (not inquiry_employees).
         SELECT
             id2.day_date AS effective_date,
             i.id AS inquiry_id,
@@ -126,9 +171,9 @@ pub(crate) async fn fetch_schedule_inquiries(
             i.estimated_volume_m3 AS volume_m3,
             i.status,
             i.notes,
-            i.start_time,
-            i.end_time,
-            COUNT(ie.id) AS employees_assigned,
+            COALESCE(id2.start_time, i.start_time) AS start_time,
+            COALESCE(id2.end_time,   i.end_time)   AS end_time,
+            COUNT(ide.id) AS employees_assigned,
             NULLIF(STRING_AGG(
                 e.first_name || ' ' || LEFT(e.last_name, 1) || '.',
                 ', ' ORDER BY e.last_name, e.first_name
@@ -146,11 +191,12 @@ pub(crate) async fn fetch_schedule_inquiries(
             FROM inquiry_days
             GROUP BY inquiry_id
         ) total ON total.inquiry_id = i.id
-        LEFT JOIN inquiry_employees ie ON ie.inquiry_id = i.id
-        LEFT JOIN employees e ON ie.employee_id = e.id
+        LEFT JOIN inquiry_day_employees ide ON ide.inquiry_day_id = id2.id
+        LEFT JOIN employees e ON ide.employee_id = e.id
         WHERE id2.day_date BETWEEN $1 AND $2
           AND i.status NOT IN ('cancelled', 'rejected', 'expired')
-        GROUP BY i.id, c.id, ao.id, ad.id, id2.day_date, id2.day_number, id2.notes, total.total_days
+        GROUP BY i.id, c.id, ao.id, ad.id, id2.id, id2.day_date, id2.day_number,
+                 id2.notes, id2.start_time, id2.end_time, total.total_days
 
         ORDER BY effective_date
         "#,
@@ -218,26 +264,60 @@ pub(crate) async fn upsert_capacity(
     Ok(())
 }
 
-/// Fetch inquiry_days for an inquiry ordered by day_number.
+// ── Inquiry days ─────────────────────────────────────────────────────────────
+
+/// Fetch `inquiry_days` for an inquiry ordered by `day_number`.
 ///
 /// **Caller**: `calendar::get_inquiry_days`
-/// **Why**: Returns the multi-day schedule for an inquiry.
+/// **Why**: Returns the multi-day schedule (with per-day times) for one inquiry.
 pub(crate) async fn fetch_inquiry_days(
     pool: &PgPool,
     inquiry_id: Uuid,
-) -> Result<Vec<(NaiveDate, i16, Option<String>)>, sqlx::Error> {
+) -> Result<Vec<InquiryDayRow>, sqlx::Error> {
     sqlx::query_as(
-        "SELECT day_date, day_number, notes FROM inquiry_days WHERE inquiry_id = $1 ORDER BY day_number",
+        "SELECT id, day_date, day_number, notes, start_time, end_time \
+         FROM inquiry_days WHERE inquiry_id = $1 ORDER BY day_number",
     )
     .bind(inquiry_id)
     .fetch_all(pool)
     .await
 }
 
-/// Delete all inquiry_days for an inquiry (within a transaction).
+/// Fetch all per-day employee assignments for every day of a given inquiry.
+///
+/// **Caller**: `calendar::get_inquiry_days`
+/// **Why**: Lets the handler merge employees into each `InquiryDayRow` without N+1 queries.
+///
+/// Returns rows keyed by `day_id` (the `inquiry_days.id`), joined with employee names.
+pub(crate) async fn fetch_inquiry_day_employees(
+    pool: &PgPool,
+    inquiry_id: Uuid,
+) -> Result<Vec<DayEmployeeRow>, sqlx::Error> {
+    sqlx::query_as(
+        r#"
+        SELECT ide.inquiry_day_id AS day_id,
+               ide.employee_id,
+               e.first_name,
+               e.last_name,
+               ide.planned_hours::float8 AS planned_hours,
+               ide.notes
+        FROM inquiry_day_employees ide
+        JOIN inquiry_days id2 ON ide.inquiry_day_id = id2.id
+        JOIN employees e ON ide.employee_id = e.id
+        WHERE id2.inquiry_id = $1
+        ORDER BY id2.day_number, e.last_name, e.first_name
+        "#,
+    )
+    .bind(inquiry_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// Delete all `inquiry_days` for an inquiry (within a transaction).
 ///
 /// **Caller**: `calendar::put_inquiry_days`
 /// **Why**: Full-replace semantics — delete all before re-inserting.
+///          Cascade on the FK also deletes `inquiry_day_employees`.
 pub(crate) async fn delete_inquiry_days(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     inquiry_id: Uuid,
@@ -249,49 +329,110 @@ pub(crate) async fn delete_inquiry_days(
     Ok(())
 }
 
-/// Insert a single inquiry_day (within a transaction).
+/// Insert a single `inquiry_day` (within a transaction).
 ///
 /// **Caller**: `calendar::put_inquiry_days`
-/// **Why**: Inserts one day in the multi-day schedule.
+/// **Why**: Inserts one day in the multi-day schedule. Returns the new row's UUID
+///          so the caller can insert `inquiry_day_employees` against it.
 pub(crate) async fn insert_inquiry_day(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     inquiry_id: Uuid,
     day_date: NaiveDate,
     day_number: i16,
     notes: Option<&str>,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "INSERT INTO inquiry_days (inquiry_id, day_date, day_number, notes) VALUES ($1, $2, $3, $4)",
+    start_time: Option<NaiveTime>,
+    end_time: Option<NaiveTime>,
+) -> Result<Uuid, sqlx::Error> {
+    let (id,): (Uuid,) = sqlx::query_as(
+        "INSERT INTO inquiry_days (inquiry_id, day_date, day_number, notes, start_time, end_time) \
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
     )
     .bind(inquiry_id)
     .bind(day_date)
     .bind(day_number)
+    .bind(notes)
+    .bind(start_time)
+    .bind(end_time)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(id)
+}
+
+/// Insert one per-day employee assignment for an inquiry day (within a transaction).
+///
+/// **Caller**: `calendar::put_inquiry_days`
+/// **Why**: Assigns an employee with optional planned hours to a specific day.
+pub(crate) async fn insert_inquiry_day_employee(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    inquiry_day_id: Uuid,
+    employee_id: Uuid,
+    planned_hours: Option<f64>,
+    notes: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO inquiry_day_employees (inquiry_day_id, employee_id, planned_hours, notes) \
+         VALUES ($1, $2, $3, $4) ON CONFLICT (inquiry_day_id, employee_id) DO NOTHING",
+    )
+    .bind(inquiry_day_id)
+    .bind(employee_id)
+    .bind(planned_hours)
     .bind(notes)
     .execute(&mut **tx)
     .await?;
     Ok(())
 }
 
-/// Fetch calendar_item_days for a calendar item ordered by day_number.
+// ── Calendar item days ────────────────────────────────────────────────────────
+
+/// Fetch `calendar_item_days` for a calendar item ordered by `day_number`.
 ///
 /// **Caller**: `calendar::get_calendar_item_days`
-/// **Why**: Returns the multi-day schedule for a calendar item (Termin).
+/// **Why**: Returns the multi-day schedule (with per-day times) for one Termin.
 pub(crate) async fn fetch_calendar_item_days(
     pool: &PgPool,
     calendar_item_id: Uuid,
-) -> Result<Vec<(NaiveDate, i16, Option<String>)>, sqlx::Error> {
+) -> Result<Vec<CalendarItemDayRow>, sqlx::Error> {
     sqlx::query_as(
-        "SELECT day_date, day_number, notes FROM calendar_item_days WHERE calendar_item_id = $1 ORDER BY day_number",
+        "SELECT id, day_date, day_number, notes, start_time, end_time \
+         FROM calendar_item_days WHERE calendar_item_id = $1 ORDER BY day_number",
     )
     .bind(calendar_item_id)
     .fetch_all(pool)
     .await
 }
 
-/// Delete all calendar_item_days for a calendar item (within a transaction).
+/// Fetch all per-day employee assignments for every day of a given calendar item.
+///
+/// **Caller**: `calendar::get_calendar_item_days`
+/// **Why**: Lets the handler merge employees into each `CalendarItemDayRow` without N+1 queries.
+pub(crate) async fn fetch_calendar_item_day_employees(
+    pool: &PgPool,
+    calendar_item_id: Uuid,
+) -> Result<Vec<DayEmployeeRow>, sqlx::Error> {
+    sqlx::query_as(
+        r#"
+        SELECT cide.calendar_item_day_id AS day_id,
+               cide.employee_id,
+               e.first_name,
+               e.last_name,
+               cide.planned_hours::float8 AS planned_hours,
+               cide.notes
+        FROM calendar_item_day_employees cide
+        JOIN calendar_item_days cid ON cide.calendar_item_day_id = cid.id
+        JOIN employees e ON cide.employee_id = e.id
+        WHERE cid.calendar_item_id = $1
+        ORDER BY cid.day_number, e.last_name, e.first_name
+        "#,
+    )
+    .bind(calendar_item_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// Delete all `calendar_item_days` for a calendar item (within a transaction).
 ///
 /// **Caller**: `calendar::put_calendar_item_days`
-/// **Why**: Full-replace semantics.
+/// **Why**: Full-replace semantics. Cascade also deletes `calendar_item_day_employees`.
 pub(crate) async fn delete_calendar_item_days(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     calendar_item_id: Uuid,
@@ -303,23 +444,53 @@ pub(crate) async fn delete_calendar_item_days(
     Ok(())
 }
 
-/// Insert a single calendar_item_day (within a transaction).
+/// Insert a single `calendar_item_day` (within a transaction).
 ///
 /// **Caller**: `calendar::put_calendar_item_days`
-/// **Why**: Inserts one day in the multi-day Termin schedule.
+/// **Why**: Inserts one day in the multi-day Termin schedule. Returns the new row's UUID
+///          so the caller can insert `calendar_item_day_employees` against it.
 pub(crate) async fn insert_calendar_item_day(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     calendar_item_id: Uuid,
     day_date: NaiveDate,
     day_number: i16,
     notes: Option<&str>,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "INSERT INTO calendar_item_days (calendar_item_id, day_date, day_number, notes) VALUES ($1, $2, $3, $4)",
+    start_time: Option<NaiveTime>,
+    end_time: Option<NaiveTime>,
+) -> Result<Uuid, sqlx::Error> {
+    let (id,): (Uuid,) = sqlx::query_as(
+        "INSERT INTO calendar_item_days (calendar_item_id, day_date, day_number, notes, start_time, end_time) \
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
     )
     .bind(calendar_item_id)
     .bind(day_date)
     .bind(day_number)
+    .bind(notes)
+    .bind(start_time)
+    .bind(end_time)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(id)
+}
+
+/// Insert one per-day employee assignment for a calendar item day (within a transaction).
+///
+/// **Caller**: `calendar::put_calendar_item_days`
+/// **Why**: Assigns an employee with optional planned hours to a specific Termin day.
+pub(crate) async fn insert_calendar_item_day_employee(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    calendar_item_day_id: Uuid,
+    employee_id: Uuid,
+    planned_hours: Option<f64>,
+    notes: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO calendar_item_day_employees (calendar_item_day_id, employee_id, planned_hours, notes) \
+         VALUES ($1, $2, $3, $4) ON CONFLICT (calendar_item_day_id, employee_id) DO NOTHING",
+    )
+    .bind(calendar_item_day_id)
+    .bind(employee_id)
+    .bind(planned_hours)
     .bind(notes)
     .execute(&mut **tx)
     .await?;

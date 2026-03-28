@@ -325,42 +325,80 @@ async fn set_capacity(
 
 // ── Day management ────────────────────────────────────────────────────────────
 
+/// One employee assignment within a day, as received from the client.
+#[derive(Debug, Deserialize)]
+struct DayEmployeeInput {
+    employee_id: Uuid,
+    #[serde(default)]
+    planned_hours: Option<f64>,
+    #[serde(default)]
+    notes: Option<String>,
+}
+
+/// One employee assignment within a day, as returned to the client.
+#[derive(Debug, Serialize, Clone)]
+struct DayEmployeeResponse {
+    employee_id: Uuid,
+    first_name: String,
+    last_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    planned_hours: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notes: Option<String>,
+}
+
+/// Input body for one day within a PUT /days request.
 #[derive(Debug, Deserialize)]
 struct DayInput {
     day_date: NaiveDate,
     day_number: i16,
     #[serde(default)]
     notes: Option<String>,
+    /// Per-day start time; overrides the parent's start_time when set.
+    #[serde(default)]
+    start_time: Option<NaiveTime>,
+    /// Per-day end time; overrides the parent's end_time when set.
+    #[serde(default)]
+    end_time: Option<NaiveTime>,
+    /// Employee assignments for this specific day.
+    #[serde(default)]
+    employees: Vec<DayEmployeeInput>,
 }
 
-#[derive(Debug, Deserialize)]
-struct PutDaysRequest {
-    days: Vec<DayInput>,
-}
-
+/// Response shape for one day, returned by GET and PUT /days.
 #[derive(Debug, Serialize)]
 struct DayResponse {
     day_date: NaiveDate,
     day_number: i16,
     #[serde(skip_serializing_if = "Option::is_none")]
     notes: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start_time: Option<NaiveTime>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end_time: Option<NaiveTime>,
+    /// Employees assigned to this specific day (empty array = none assigned).
+    employees: Vec<DayEmployeeResponse>,
 }
 
 /// `GET /api/v1/inquiries/{id}/days` — List all scheduled days for a multi-day inquiry.
 ///
 /// **Caller**: Calendar frontend, inquiry detail page.
-/// **Why**: Returns the explicit day list so the UI can render multi-day inquiries
-/// and the admin can inspect or edit the schedule.
+/// **Why**: Returns the explicit day list with per-day times and employees so the UI
+/// can render multi-day inquiries and the admin can inspect or edit the schedule.
 async fn get_inquiry_days(
     State(state): State<Arc<AppState>>,
     Extension(_claims): Extension<TokenClaims>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<DayResponse>>, ApiError> {
-    let rows = calendar_repo::fetch_inquiry_days(&state.db, id)
+    let days = calendar_repo::fetch_inquiry_days(&state.db, id)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    Ok(Json(rows.into_iter().map(|(day_date, day_number, notes)| DayResponse { day_date, day_number, notes }).collect()))
+    let emp_rows = calendar_repo::fetch_inquiry_day_employees(&state.db, id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    Ok(Json(build_day_responses(days.into_iter().map(|r| (r.id, r.day_date, r.day_number, r.notes, r.start_time, r.end_time)).collect(), emp_rows)))
 }
 
 /// `PUT /api/v1/inquiries/{id}/days` — Replace the full day list for an inquiry.
@@ -368,6 +406,7 @@ async fn get_inquiry_days(
 /// **Caller**: Calendar frontend when admin sets or edits multi-day schedule.
 /// **Why**: Full-replace semantics keep the client in control — no partial-update
 /// edge cases. Empty `days` array converts the inquiry back to single-day.
+/// Each day may carry its own `start_time`, `end_time`, and `employees` list.
 ///
 /// # Errors
 /// Returns 400 if any `day_number` values are duplicated or < 1.
@@ -377,16 +416,7 @@ async fn put_inquiry_days(
     Path(id): Path<Uuid>,
     Json(body): Json<PutDaysRequest>,
 ) -> Result<Json<Vec<DayResponse>>, ApiError> {
-    // Validate day_numbers
-    let mut seen = std::collections::HashSet::new();
-    for d in &body.days {
-        if d.day_number < 1 {
-            return Err(ApiError::BadRequest("day_number must be >= 1".into()));
-        }
-        if !seen.insert(d.day_number) {
-            return Err(ApiError::BadRequest(format!("duplicate day_number: {}", d.day_number)));
-        }
-    }
+    validate_day_numbers(&body.days)?;
 
     let mut tx = state.db.begin().await.map_err(|e| ApiError::Internal(e.to_string()))?;
 
@@ -394,15 +424,36 @@ async fn put_inquiry_days(
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
+    let mut inserted: Vec<(Uuid, NaiveDate, i16, Option<String>, Option<NaiveTime>, Option<NaiveTime>)> = Vec::new();
+    let mut emp_map: HashMap<Uuid, Vec<DayEmployeeResponse>> = HashMap::new();
+
     for d in &body.days {
-        calendar_repo::insert_inquiry_day(&mut tx, id, d.day_date, d.day_number, d.notes.as_deref())
+        let day_id = calendar_repo::insert_inquiry_day(
+            &mut tx, id, d.day_date, d.day_number, d.notes.as_deref(), d.start_time, d.end_time,
+        )
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+        for emp in &d.employees {
+            calendar_repo::insert_inquiry_day_employee(
+                &mut tx, day_id, emp.employee_id, emp.planned_hours, emp.notes.as_deref(),
+            )
             .await
             .map_err(|e| ApiError::Internal(e.to_string()))?;
+        }
+
+        inserted.push((day_id, d.day_date, d.day_number, d.notes.clone(), d.start_time, d.end_time));
+        emp_map.insert(day_id, Vec::new()); // placeholder; names fetched below
     }
 
     tx.commit().await.map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    Ok(Json(body.days.into_iter().map(|d| DayResponse { day_date: d.day_date, day_number: d.day_number, notes: d.notes }).collect()))
+    // Re-fetch employee names for the response (we only have IDs from the request)
+    let emp_rows = calendar_repo::fetch_inquiry_day_employees(&state.db, id)
+        .await
+        .unwrap_or_default();
+
+    Ok(Json(build_day_responses(inserted, emp_rows)))
 }
 
 /// `GET /api/v1/calendar-items/{id}/days` — List all scheduled days for a multi-day calendar item.
@@ -414,17 +465,22 @@ async fn get_calendar_item_days(
     Extension(_claims): Extension<TokenClaims>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<DayResponse>>, ApiError> {
-    let rows = calendar_repo::fetch_calendar_item_days(&state.db, id)
+    let days = calendar_repo::fetch_calendar_item_days(&state.db, id)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    Ok(Json(rows.into_iter().map(|(day_date, day_number, notes)| DayResponse { day_date, day_number, notes }).collect()))
+    let emp_rows = calendar_repo::fetch_calendar_item_day_employees(&state.db, id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    Ok(Json(build_day_responses(days.into_iter().map(|r| (r.id, r.day_date, r.day_number, r.notes, r.start_time, r.end_time)).collect(), emp_rows)))
 }
 
 /// `PUT /api/v1/calendar-items/{id}/days` — Replace the full day list for a calendar item.
 ///
 /// **Caller**: Calendar frontend when admin edits multi-day Termin.
 /// **Why**: Full-replace semantics — empty `days` converts back to single-day.
+/// Each day may carry its own `start_time`, `end_time`, and `employees` list.
 ///
 /// # Errors
 /// Returns 400 if any `day_number` values are duplicated or < 1.
@@ -434,15 +490,7 @@ async fn put_calendar_item_days(
     Path(id): Path<Uuid>,
     Json(body): Json<PutDaysRequest>,
 ) -> Result<Json<Vec<DayResponse>>, ApiError> {
-    let mut seen = std::collections::HashSet::new();
-    for d in &body.days {
-        if d.day_number < 1 {
-            return Err(ApiError::BadRequest("day_number must be >= 1".into()));
-        }
-        if !seen.insert(d.day_number) {
-            return Err(ApiError::BadRequest(format!("duplicate day_number: {}", d.day_number)));
-        }
-    }
+    validate_day_numbers(&body.days)?;
 
     let mut tx = state.db.begin().await.map_err(|e| ApiError::Internal(e.to_string()))?;
 
@@ -450,13 +498,91 @@ async fn put_calendar_item_days(
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
+    let mut inserted: Vec<(Uuid, NaiveDate, i16, Option<String>, Option<NaiveTime>, Option<NaiveTime>)> = Vec::new();
+
     for d in &body.days {
-        calendar_repo::insert_calendar_item_day(&mut tx, id, d.day_date, d.day_number, d.notes.as_deref())
+        let day_id = calendar_repo::insert_calendar_item_day(
+            &mut tx, id, d.day_date, d.day_number, d.notes.as_deref(), d.start_time, d.end_time,
+        )
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+        for emp in &d.employees {
+            calendar_repo::insert_calendar_item_day_employee(
+                &mut tx, day_id, emp.employee_id, emp.planned_hours, emp.notes.as_deref(),
+            )
             .await
             .map_err(|e| ApiError::Internal(e.to_string()))?;
+        }
+
+        inserted.push((day_id, d.day_date, d.day_number, d.notes.clone(), d.start_time, d.end_time));
     }
 
     tx.commit().await.map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    Ok(Json(body.days.into_iter().map(|d| DayResponse { day_date: d.day_date, day_number: d.day_number, notes: d.notes }).collect()))
+    let emp_rows = calendar_repo::fetch_calendar_item_day_employees(&state.db, id)
+        .await
+        .unwrap_or_default();
+
+    Ok(Json(build_day_responses(inserted, emp_rows)))
+}
+
+// ── Shared helpers ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct PutDaysRequest {
+    days: Vec<DayInput>,
+}
+
+/// Validate that all `day_number` values are >= 1 and unique.
+///
+/// **Caller**: `put_inquiry_days`, `put_calendar_item_days`
+/// **Why**: Enforces the constraint before touching the database.
+fn validate_day_numbers(days: &[DayInput]) -> Result<(), ApiError> {
+    let mut seen = std::collections::HashSet::new();
+    for d in days {
+        if d.day_number < 1 {
+            return Err(ApiError::BadRequest("day_number must be >= 1".into()));
+        }
+        if !seen.insert(d.day_number) {
+            return Err(ApiError::BadRequest(format!("duplicate day_number: {}", d.day_number)));
+        }
+    }
+    Ok(())
+}
+
+/// Build a `Vec<DayResponse>` by merging day rows with employee rows.
+///
+/// **Caller**: `get_inquiry_days`, `put_inquiry_days`, `get_calendar_item_days`, `put_calendar_item_days`
+/// **Why**: Centralises the merge logic — both GET and PUT return the same shape.
+///
+/// # Parameters
+/// - `days` — `(id, day_date, day_number, notes, start_time, end_time)` tuples ordered by day_number
+/// - `emp_rows` — flat list of employee rows from across all days (keyed by `day_id`)
+fn build_day_responses(
+    days: Vec<(Uuid, NaiveDate, i16, Option<String>, Option<NaiveTime>, Option<NaiveTime>)>,
+    emp_rows: Vec<calendar_repo::DayEmployeeRow>,
+) -> Vec<DayResponse> {
+    // Group employees by day_id
+    let mut emp_by_day: HashMap<Uuid, Vec<DayEmployeeResponse>> = HashMap::new();
+    for e in emp_rows {
+        emp_by_day.entry(e.day_id).or_default().push(DayEmployeeResponse {
+            employee_id: e.employee_id,
+            first_name: e.first_name,
+            last_name: e.last_name,
+            planned_hours: e.planned_hours,
+            notes: e.notes,
+        });
+    }
+
+    days.into_iter().map(|(id, day_date, day_number, notes, start_time, end_time)| {
+        DayResponse {
+            day_date,
+            day_number,
+            notes,
+            start_time,
+            end_time,
+            employees: emp_by_day.remove(&id).unwrap_or_default(),
+        }
+    }).collect()
 }
