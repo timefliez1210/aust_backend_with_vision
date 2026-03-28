@@ -401,13 +401,17 @@ pub(crate) struct EmployeeAssignmentRow {
     pub clock_in: Option<DateTime<Utc>>,
     pub clock_out: Option<DateTime<Utc>>,
     pub actual_hours: Option<f64>,
+    pub employee_clock_in: Option<DateTime<Utc>>,
+    pub employee_clock_out: Option<DateTime<Utc>>,
+    pub employee_actual_hours: Option<f64>,
     pub notes: Option<String>,
 }
 
 /// Fetch employee assignments for an inquiry (with email).
 ///
 /// **Caller**: `list_inquiry_employees` handler
-/// **Why**: Shows assigned employees for a job.
+/// **Why**: Shows assigned employees for a job, including both admin-set and
+///          employee self-reported clock times for discrepancy checking.
 pub(crate) async fn list_employee_assignments(
     pool: &PgPool,
     inquiry_id: Uuid,
@@ -421,6 +425,11 @@ pub(crate) async fn list_employee_assignments(
                CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
                     THEN (EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0)::float8
                     ELSE NULL END AS actual_hours,
+               ie.employee_clock_in,
+               ie.employee_clock_out,
+               CASE WHEN ie.employee_clock_out IS NOT NULL AND ie.employee_clock_in IS NOT NULL
+                    THEN (EXTRACT(EPOCH FROM (ie.employee_clock_out - ie.employee_clock_in)) / 3600.0)::float8
+                    ELSE NULL END AS employee_actual_hours,
                ie.notes
         FROM inquiry_employees ie
         JOIN employees e ON ie.employee_id = e.id
