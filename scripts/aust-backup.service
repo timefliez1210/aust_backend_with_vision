@@ -1,14 +1,15 @@
 [Unit]
-Description=AUST Backend database + storage backup
+Description=AUST Backend database + storage backup (local + offsite)
 Wants=docker.service
 After=docker.service
 
 [Service]
 Type=oneshot
 User=timefliez
-WorkingDirectory=/media/timefliez/FileSystem1/projects/aust_backend
-ExecStart=/media/timefliez/FileSystem1/projects/aust_backend/scripts/backup-db.sh
-ExecStart=/media/timefliez/FileSystem1/projects/aust_backend/scripts/backup-minio.sh
+WorkingDirectory=/media/timefliez/FileSystem/projects/aust_backend
+ExecStart=/media/timefliez/FileSystem/projects/aust_backend/scripts/backup-db.sh
+ExecStart=/media/timefliez/FileSystem/projects/aust_backend/scripts/backup-minio.sh
+ExecStart=/media/timefliez/FileSystem/projects/aust_backend/scripts/backup-offsite.sh
 
 [Install]
 WantedBy=multi-user.target

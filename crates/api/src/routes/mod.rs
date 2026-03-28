@@ -20,13 +20,27 @@ use crate::AppState;
 use axum::{routing::post, Router};
 use std::sync::Arc;
 
-/// Public API routes (no authentication required).
-pub fn public_api_router() -> Router<Arc<AppState>> {
+/// Auth-only public routes — rate-limited in `lib.rs`.
+///
+/// **Why**: These endpoints accept credentials/OTP codes without requiring a token.
+///          They are isolated here so `lib.rs` can wrap them with a rate-limit layer
+///          without touching non-auth public endpoints (media proxy, submissions).
+pub fn auth_public_router() -> Router<Arc<AppState>> {
     Router::new()
         .nest("/auth", auth::router())
-        .nest("/submit", submissions::submit_router())
         .nest("/customer", customer::auth_router())
         .nest("/employee", employee::auth_router())
+}
+
+/// Non-auth public routes (no authentication, no rate limiting).
+///
+/// **Why**: Image/video proxy and form submissions need high throughput and have their
+///          own abuse-resistance (S3 key guessing is impractical; submissions require
+///          valid data). Merging them with auth routes would over-restrict legitimate
+///          traffic if the rate limit is accidentally hit.
+pub fn public_api_router() -> Router<Arc<AppState>> {
+    Router::new()
+        .nest("/submit", submissions::submit_router())
         .nest("/estimates", estimates::public_router())
         .nest("/media", estimates::public_router())
         .route("/distance/calculate", post(distance::calculate))

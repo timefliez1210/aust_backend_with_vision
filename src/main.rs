@@ -134,9 +134,47 @@ async fn main() -> Result<()> {
     tracing::info!("Starting server on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
 
+    tracing::info!("Server shut down cleanly");
     Ok(())
+}
+
+/// Waits for SIGTERM (systemd stop/restart) or Ctrl-C, then returns so axum can
+/// drain in-flight requests before the process exits.
+///
+/// **Caller**: `main()` — passed to `axum::serve().with_graceful_shutdown()`.
+/// **Why**: Without this, `systemctl restart` sends SIGTERM and the kernel kills the
+///          process immediately. Any request in the middle of XLSX→PDF generation or
+///          S3 upload is terminated, leaving orphaned S3 objects or a half-written DB row.
+///          With graceful shutdown, axum stops accepting new connections and waits for
+///          active handlers to finish before the process exits.
+async fn shutdown_signal() {
+    use tokio::signal;
+
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("Failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let sigterm = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("Failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let sigterm = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => { tracing::info!("Received Ctrl-C, shutting down"); },
+        _ = sigterm => { tracing::info!("Received SIGTERM, shutting down"); },
+    }
 }
 
 fn load_config() -> Result<Config> {

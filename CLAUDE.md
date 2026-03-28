@@ -522,32 +522,69 @@ Switch providers via `AUST__LLM__DEFAULT_PROVIDER` (claude/openai/ollama)
 
 # TODOs
 
+## High Priority — Backend Hardening
+
+### Operational Safety
+- [x] Graceful shutdown — `with_graceful_shutdown(shutdown_signal())` in `main.rs`. Handles SIGTERM + Ctrl-C. Drains in-flight requests before exit.
+- [x] Security headers middleware — `crates/api/src/middleware/security_headers.rs`. Sets X-Content-Type-Options, X-Frame-Options, Referrer-Policy, HSTS, CSP on all responses.
+- [x] Rate limiting on auth endpoints — `crates/api/src/middleware/rate_limit.rs`. 10 req/min per IP on `/auth/*`, `/customer/auth/*`, `/employee/auth/*`. In-memory per-IP sliding window, X-Forwarded-For aware.
+
+### Observability
+- [x] Request ID propagation — `crates/api/src/middleware/request_id.rs`. UUID v7 per request, injected into tracing span + `X-Request-ID` response header. Reuses incoming `X-Request-ID` if present.
+
+## High Priority — Frontend Component Refactor
+
+### God Components (break down)
+- [ ] **`inquiries/[id]/+page.svelte`** (6,405 lines) — extract: EstimationItemsTable, PricingEditor, LineItemsManager, EmployeeAssignments, PhotoVideoUpload, AddressEditor
+- [x] **`calendar/+page.svelte`** (3,755 → 2,195 lines) — extracted `CalendarSidePanel.svelte` (all side-panel state/logic/template/CSS). Still to extract: CalendarGrid, TerminPanel, EmployeeAssignmentModal
+- [ ] **`inquiries/+page.svelte`** (1,288 lines) — extract: CreateInquiryForm, VolumeModeTabs
+
+### Shared Component Library (eliminate duplication)
+- [x] **EmployeeAssignmentPanel** — extracted to `$lib/components/admin/EmployeeAssignmentPanel.svelte`. Props: `entityId`, `entityType` ('inquiry' | 'calendar_item'), `onUpdated?`. Deployed in `inquiries/[id]`, `CalendarSidePanel` (×2), `calendar-items/[id]`.
+- [ ] **ConfirmationDialog** — replace 12 inline `confirm()` calls across all pages
+- [ ] **LoadingButton** — `disabled={loading}` + spinner text pattern used 50+ times
+- [ ] **ListPageShell** — pagination + search + loading + empty state (5 list pages: customers, employees, inquiries, calendar-items, emails)
+- [ ] **FormModal** — modal overlay + form grid + cancel/submit (7+ pages)
+- [ ] **SearchToolbar** — search + month picker + status filter (5 pages)
+- [ ] **PaginationControls** — prev/next + page info (5 pages)
+
+### Shared Constants & Utils (calendar ↔ inquiry overlap)
+- [ ] Extract `INQUIRY_STATUS_LABELS` to shared module (currently local in calendar page)
+- [x] Extract `formatTime()` to `$lib/utils/format.ts`
+- [ ] Extract brutto calculation helper — `(cents / 100 * 1.19)` used inline in calendar, calendar-items, inquiry detail
+
+### CSS Centralization
+Design tokens exist in `admin.css` but are barely used. 25 CSS classes duplicated across 3+ files.
+- [ ] Create `admin-components.css` with shared patterns: `.page-header` (11 files), `.search-box` (9 files), `.btn-create`/`.btn-primary` (7 files, merge into one), `.toolbar` (7 files), `.page` container (6 files), `.pagination` (5 files), `.field`/`.form-field` (5 files, unify naming), `.modal`+`.modal-backdrop`+`.modal-actions` (4 files), `.card` (3+ files — also `.create-section`, `.compose-form` are the same pattern)
+- [ ] Replace hardcoded hex colors with existing design tokens — `#022448` → `var(--dt-primary)`, `#1e3a5f` → `var(--dt-primary-container)`, `#a83900` → `var(--dt-secondary)` (4+ occurrences each in page styles)
+- [ ] Add missing tokens to `admin.css` — success green (`#166534`/`#dcfce7`), error red (`#991b1b`/`#fee2e2`), primary-rgb for rgba usage
+- [ ] Move StatusBadge hardcoded color map to CSS variables
+- [ ] Strip duplicate styles from page components after centralization
+
 ## Medium Priority
 
-### Volume Estimation
+### Backend
+- [ ] Expanded `/ready` health check — verify S3/MinIO, LLM provider, vision service (if enabled), not just DB
+- [ ] Make pricing configurable via database (currently hardcoded rates)
+- [ ] Add seasonal/weekend/holiday pricing (Saturday surcharge exists: +€50)
+- [ ] ts-rs type generation — auto-generate TypeScript types from Rust structs, eliminate frontend type drift
+
+### Frontend
+- [ ] Split `api.svelte.ts` formatting into dedicated `format.ts`
+- [ ] Replace `inline-css.py` with Vite plugin (remove Python build dependency)
+- [ ] ConsentManager — GA/GTM IDs still empty placeholders
+
+### Volume Estimation (needs production data)
 - [ ] Fine-tune 3D pipeline with real production photos
 - [ ] Add item catalog volume overrides for high-confidence standard items
 - [ ] Implement ensemble mode (combine LLM + 3D estimates)
 - [ ] Improve cross-image deduplication with better feature extraction
 
-### Pricing Engine
-- [ ] Make pricing configurable via database (currently hardcoded rates)
-- [ ] Add seasonal/weekend/holiday pricing (Saturday surcharge exists: +€50)
-
 ## Low Priority
-
-### API
-- [ ] Add OpenAPI/Swagger documentation
-- [ ] Add rate limiting middleware (login endpoint especially)
-- [ ] Add pagination metadata
-
-### Observability
-- [ ] Structured logging with request IDs
+- [ ] OpenAPI/Swagger documentation
+- [ ] Pagination metadata (total count, next/prev links)
 - [ ] Prometheus metrics endpoint
-
-### DevOps
 - [ ] GitHub Actions CI/CD
 
 ## Technical Debt
-
-No outstanding items.
+- [ ] Stale comment in `crates/core/src/models/user.rs:82` — says Argon2 not implemented, but it is
