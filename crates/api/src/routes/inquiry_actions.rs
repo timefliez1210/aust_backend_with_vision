@@ -652,7 +652,7 @@ pub(crate) async fn trigger_video_upload(
 /// **Why**: Shows which employees are assigned to a job and their hours.
 ///
 /// # Returns
-/// `200 OK` with `{ assignments: [...] }`.
+/// `200 OK` with `{ employees: [...] }`.
 pub(crate) async fn list_inquiry_employees(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
@@ -660,7 +660,7 @@ pub(crate) async fn list_inquiry_employees(
     let rows: Vec<inquiry_repo::EmployeeAssignmentRow> =
         inquiry_repo::list_employee_assignments(&state.db, id).await?;
 
-    Ok(Json(serde_json::json!({ "assignments": rows })))
+    Ok(Json(serde_json::json!({ "employees": rows })))
 }
 
 /// `POST /api/v1/inquiries/{id}/employees` — Assign an employee to this inquiry.
