@@ -66,8 +66,8 @@ if ! command -v cargo >/dev/null 2>&1; then
 fi
 ok "Cargo $(cargo --version 2>/dev/null | awk '{print $2}')"
 
-# Exclude frontend submodule — untracked content inside it is not a backend change
-if [ -n "$(git -C "${PROJECT_DIR}" status --porcelain -- ':!frontend')" ]; then
+# Exclude submodules — frontend and app are managed independently
+if [ -n "$(git -C "${PROJECT_DIR}" status --porcelain -- ':!frontend' ':!app')" ]; then
     fail "Uncommitted changes in backend. Commit or stash first."
 fi
 ok "Working tree clean"
