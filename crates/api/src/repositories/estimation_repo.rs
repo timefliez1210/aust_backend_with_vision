@@ -438,3 +438,30 @@ pub(crate) async fn fetch_completed_for_inquiry(
     .fetch_optional(pool)
     .await
 }
+
+/// Fetch all estimations for an inquiry (processing, failed, completed) ordered newest-first.
+///
+/// **Caller**: `inquiry_builder::build_inquiry_response`
+/// **Why**: The admin dashboard shows all estimation states — processing spinners,
+///          failed error cards, and completed galleries. Only fetching completed
+///          estimations left processing/failed states invisible after a page reload.
+///
+/// # Returns
+/// All estimation rows for the inquiry, regardless of status. Empty vec if none.
+pub(crate) async fn fetch_all_for_inquiry(
+    pool: &PgPool,
+    inquiry_id: Uuid,
+) -> Result<Vec<EstimationDetailRow>, sqlx::Error> {
+    sqlx::query_as(
+        r#"
+        SELECT id, method, status, total_volume_m3, confidence_score,
+               result_data, source_data, created_at
+        FROM volume_estimations
+        WHERE inquiry_id = $1
+        ORDER BY created_at DESC
+        "#,
+    )
+    .bind(inquiry_id)
+    .fetch_all(pool)
+    .await
+}

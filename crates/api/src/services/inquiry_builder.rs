@@ -153,6 +153,41 @@ pub async fn build_inquiry_response(
         (None, Vec::new())
     };
 
+    // 4b. Fetch ALL estimations (processing, failed, completed) for the full gallery + status UI.
+    let all_estimation_rows = estimation_repo::fetch_all_for_inquiry(pool, inquiry_id).await?;
+    let estimations: Vec<EstimationSnapshot> = all_estimation_rows
+        .iter()
+        .map(|e| {
+            let s3_keys = extract_s3_keys(e.source_data.as_ref());
+            let source_images: Vec<String> = s3_keys
+                .iter()
+                .map(|k| format!("/api/v1/estimates/images/{k}"))
+                .collect();
+            let source_video = e
+                .source_data
+                .as_ref()
+                .and_then(|sd| sd.get("video_s3_key")?.as_str())
+                .map(|k| format!("/api/v1/estimates/images/{k}"));
+            let item_count = e
+                .result_data
+                .as_ref()
+                .and_then(|rd| rd.as_array())
+                .map(|arr| arr.len() as i64)
+                .unwrap_or(0);
+            EstimationSnapshot {
+                id: e.id,
+                method: e.method.clone(),
+                status: e.status.clone(),
+                total_volume_m3: e.total_volume_m3,
+                confidence_score: e.confidence_score,
+                item_count,
+                source_images,
+                source_video,
+                created_at: e.created_at,
+            }
+        })
+        .collect();
+
     // 5. Fetch latest active offer
     let offer_row = offer_repo::fetch_active_for_builder(pool, inquiry_id).await?;
     let offer = offer_row.map(|r| build_offer_snapshot(&r, inquiry_id));
@@ -226,6 +261,7 @@ pub async fn build_inquiry_response(
         destination_address,
         stop_address,
         estimation,
+        estimations,
         items,
         offer,
         employees,

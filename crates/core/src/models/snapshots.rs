@@ -68,6 +68,10 @@ pub struct InquiryResponse {
     pub items: Vec<ItemSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub offer: Option<OfferSnapshot>,
+    /// All estimations for this inquiry (processing, failed, completed), newest first.
+    /// Use this to show upload progress and failure states in the admin UI.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub estimations: Vec<EstimationSnapshot>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub employees: Vec<EmployeeAssignmentSnapshot>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
