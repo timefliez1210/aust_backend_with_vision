@@ -817,7 +817,7 @@ pub(crate) fn build_line_items(services: &Services) -> Vec<OfferLineItem> {
         items.push(OfferLineItem {
             description: "Demontage".to_string(),
             quantity: 1.0,
-            unit_price: 50.0,
+            unit_price: 25.0,
             ..Default::default()
         });
     }
@@ -827,7 +827,7 @@ pub(crate) fn build_line_items(services: &Services) -> Vec<OfferLineItem> {
         items.push(OfferLineItem {
             description: "Montage".to_string(),
             quantity: 1.0,
-            unit_price: 50.0,
+            unit_price: 25.0,
             ..Default::default()
         });
     }
