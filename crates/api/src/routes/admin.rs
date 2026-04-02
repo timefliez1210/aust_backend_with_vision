@@ -563,25 +563,40 @@ async fn delete_employee(
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
-/// `GET /api/v1/admin/employees/{id}/hours?month=YYYY-MM` — Monthly hours summary.
+/// `GET /api/v1/admin/employees/{id}/hours` — Hours summary for a date range.
 ///
 /// **Caller**: Admin employee detail page hours card.
-/// **Why**: Aggregates planned/actual hours for a given month with per-assignment breakdown.
+/// **Why**: Aggregates planned/actual hours for either a 7-day rolling window or a calendar
+/// month, with per-assignment breakdown. Employees were confused by the strict monthly view
+/// near month boundaries — the 7-day default solves that.
+///
+/// # Query Parameters
+/// - `from` + `to` (YYYY-MM-DD): explicit date range (used for 7-day view)
+/// - `month` (YYYY-MM): calendar month; used when `from`/`to` are absent
+/// If none are provided, defaults to the current calendar month.
 ///
 /// # Returns
-/// `200 OK` with target, planned, actual totals and assignment breakdown.
+/// `200 OK` with `from`, `to`, `target_hours`, `planned_hours`, `actual_hours`,
+/// `assignment_count`, `assignments`, `calendar_items`.
 async fn employee_hours_summary(
     State(state): State<Arc<AppState>>,
     Extension(_claims): Extension<TokenClaims>,
     Path(id): Path<Uuid>,
     Query(query): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let month_str = query.get("month").cloned().unwrap_or_else(|| {
-        Utc::now().format("%Y-%m").to_string()
-    });
-
-    let (from_date, to_date) = parse_month_range(&month_str)
-        .ok_or_else(|| ApiError::BadRequest("Ungueltiges Monatsformat. Erwartet: YYYY-MM".into()))?;
+    let (from_date, to_date) = if let (Some(f), Some(t)) = (query.get("from"), query.get("to")) {
+        let from = NaiveDate::parse_from_str(f, "%Y-%m-%d")
+            .map_err(|_| ApiError::BadRequest("Ungueltiges Datumsformat fuer 'from'. Erwartet: YYYY-MM-DD".into()))?;
+        let to = NaiveDate::parse_from_str(t, "%Y-%m-%d")
+            .map_err(|_| ApiError::BadRequest("Ungueltiges Datumsformat fuer 'to'. Erwartet: YYYY-MM-DD".into()))?;
+        (from, to)
+    } else {
+        let month_str = query.get("month").cloned().unwrap_or_else(|| {
+            Utc::now().format("%Y-%m").to_string()
+        });
+        parse_month_range(&month_str)
+            .ok_or_else(|| ApiError::BadRequest("Ungueltiges Monatsformat. Erwartet: YYYY-MM".into()))?
+    };
 
     // Fetch employee target
     let target = employee_repo::fetch_hours_target(&state.db, id)
@@ -641,7 +656,8 @@ async fn employee_hours_summary(
         .collect();
 
     Ok(Json(serde_json::json!({
-        "month": month_str,
+        "from": from_date.to_string(),
+        "to": to_date.to_string(),
         "target_hours": target,
         "planned_hours": planned_sum,
         "actual_hours": actual_sum,
