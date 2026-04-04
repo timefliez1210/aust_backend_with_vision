@@ -561,6 +561,24 @@ Design tokens exist in `admin.css` but are barely used. 25 CSS classes duplicate
 - [ ] Move StatusBadge hardcoded color map to CSS variables
 - [ ] Strip duplicate styles from page components after centralization
 
+## AR Per-Item Capture Pipeline (Part 2 + 3 — do after app is tested)
+
+Full plan: `/home/timefliez/.claude/plans/radiant-dancing-flask.md`
+
+### Part 2 — Rust Backend (`crates/api/src/routes/submissions.rs` + `mod.rs`)
+- [ ] Extract shared `create_inquiry_from_form()` helper from `handle_submission()` (customer upsert, address geocoding, inquiry creation, services JSONB, estimation row) so both the existing and new endpoint reuse it
+- [ ] Add `handle_ar_submission()` — parses full `ParsedInquiryForm` (all standard fields via `parse_services_string()`) + new AR fields (`item_manifest`, `poses`, `intrinsics`); calls shared helper for Phase 1, then uploads grouped images/depth to S3 under `estimates/{inquiry_id}/{est_id}/items/{item_idx}/`; stores AR data in `source_data` JSONB; spawns background task
+- [ ] Add `process_ar_submission_background()` — same as existing (ORS distance → vision poll → estimation update → `offer_pipeline::run()` → Telegram) but calls new Modal endpoint `POST /estimate/ar/submit` instead of `/estimate/upload`
+- [ ] Wire `POST /api/v1/submit/mobile/ar` in `routes/mod.rs`
+- [ ] Update `docs/API.md` with new endpoint
+
+### Part 3 — Vision Service (`services/vision/`)
+- [ ] Add `ar_submit` web endpoint + `process_ar_job` async method to `PhotoPipeline` in `modal_app.py` — accepts `{ job_id, items: [{label, s3_keys_rgb[], s3_keys_depth[], poses[], arc_degrees}], intrinsics }`; spawns background job; returns `{ job_id, status: "accepted" }`
+- [ ] Add `GET /estimate/ar/status/{job_id}` poll endpoint (same pattern as existing `/estimate/status/{id}`)
+- [ ] Create `app/vision/ar_pipeline.py` — per-item reconstruction: DINO with exact `item.label` as prompt → SAM2 masks → depth selection (LiDAR or DAv2) → MASt3R MVS reconstruction → DBSCAN → OBB volume → RE catalogue lookup
+- [ ] Create `app/vision/depth_fusion.py` — fuse LiDAR depth (valid 0–5m) with Depth Anything V2 (gap-fill): scale AI depth to match LiDAR mean in valid region
+- [ ] LiDAR path: `hasDepth=true` → fuse device + AI depth; non-LiDAR path: DAv2 only — MASt3R MVS handles geometry from 4-8 frames at 28° arc in both cases
+
 ## Medium Priority
 
 ### Backend
