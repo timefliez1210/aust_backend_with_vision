@@ -787,4 +787,215 @@ impl VisionServiceClient {
             last_err.unwrap_or_else(|| "Vision service request failed".to_string()),
         ))
     }
+
+    // -------------------------------------------------------------------------
+    // AR pipeline — submit/poll (images passed as multipart, same as photo)
+    // -------------------------------------------------------------------------
+
+    /// Submit an AR job to Modal.
+    ///
+    /// **Caller**: `estimate_ar_async`
+    /// **Why**: AR images are sent as raw bytes (same pattern as photo submit) so no
+    ///          S3 credentials are needed in the Modal container for initial processing.
+    ///          `item_manifest`, `intrinsics`, and `poses` are passed as JSON text fields
+    ///          for the full AR pipeline in Part 3; the current stub ignores them.
+    ///
+    /// # Parameters
+    /// - `job_id` — UUID string for the job
+    /// - `images` — raw JPEG bytes paired with MIME types
+    /// - `item_manifest` — JSON string `[{"label":…,"frame_count":N},…]`
+    /// - `intrinsics` — optional JSON string with camera intrinsics
+    /// - `poses` — optional JSON string with flat array of pose matrices
+    ///
+    /// # Returns
+    /// `VisionSubmitResponse` with `status = "accepted"` on success.
+    pub async fn submit_ar(
+        &self,
+        job_id: &str,
+        images: &[(Vec<u8>, String)],
+        item_manifest: &str,
+        intrinsics: Option<&str>,
+        poses: Option<&str>,
+    ) -> Result<VisionSubmitResponse, VolumeError> {
+        let url = format!("{}/estimate/ar/submit", self.base_url);
+
+        let mut form = reqwest::multipart::Form::new()
+            .text("job_id", job_id.to_string())
+            .text("item_manifest", item_manifest.to_string());
+
+        if let Some(intr) = intrinsics {
+            form = form.text("intrinsics", intr.to_string());
+        }
+        if let Some(p) = poses {
+            form = form.text("poses", p.to_string());
+        }
+
+        for (idx, (data, mime_type)) in images.iter().enumerate() {
+            let ext = if mime_type == "image/png" { "png" } else { "jpg" };
+            let part = reqwest::multipart::Part::bytes(data.clone())
+                .file_name(format!("{idx}.{ext}"))
+                .mime_str(mime_type)
+                .unwrap_or_else(|_| {
+                    reqwest::multipart::Part::bytes(data.clone()).file_name(format!("{idx}.{ext}"))
+                });
+            form = form.part("images", part);
+        }
+
+        let resp = self
+            .client
+            .post(&url)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| {
+                VolumeError::ExternalService(format!("AR submit request failed: {e}"))
+            })?;
+
+        if resp.status().is_success() {
+            return resp.json::<VisionSubmitResponse>().await.map_err(|e| {
+                VolumeError::ExternalService(format!("Failed to parse AR submit response: {e}"))
+            });
+        }
+
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        Err(VolumeError::ExternalService(format!(
+            "AR submit returned {status}: {body}"
+        )))
+    }
+
+    /// Poll `/estimate/ar/status/{job_id}`.
+    ///
+    /// **Caller**: `estimate_ar_async` polling loop.
+    /// **Why**: AR jobs share the same `job_store` on Modal as photo/video jobs.
+    ///          The AR status endpoint reads from the same dict — only the URL path differs.
+    pub async fn poll_ar_job_status(&self, job_id: &str) -> Result<VisionJobStatus, VolumeError> {
+        let url = format!("{}/estimate/ar/status/{}", self.base_url, job_id);
+        let resp = self.client.get(&url).send().await.map_err(|e| {
+            VolumeError::ExternalService(format!("AR poll request failed: {e}"))
+        })?;
+
+        let http_status = resp.status();
+        if http_status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(VisionJobStatus {
+                status: "not_found".to_string(),
+                result: None,
+                error: None,
+            });
+        }
+        if http_status.is_success() {
+            return resp.json::<VisionJobStatus>().await.map_err(|e| {
+                VolumeError::ExternalService(format!("Failed to parse AR poll response: {e}"))
+            });
+        }
+        let body = resp.text().await.unwrap_or_default();
+        Err(VolumeError::ExternalService(format!(
+            "AR poll returned {http_status}: {body}"
+        )))
+    }
+
+    /// Submit an AR job and poll until it succeeds, fails, or exhausts retries.
+    ///
+    /// **Caller**: `process_ar_submission_background` in `submissions.rs`
+    /// **Why**: Same submit→poll loop as `estimate_upload_async` and `estimate_video_async`.
+    ///          Encapsulates retry logic so the caller only handles the happy/sad path.
+    ///
+    /// # Parameters
+    /// - `job_id` — UUID string for the job
+    /// - `images` — raw image bytes
+    /// - `item_manifest` — JSON string with item labels and frame counts
+    /// - `intrinsics` — optional JSON string
+    /// - `poses` — optional JSON string
+    /// - `poll_interval` / `max_polls` / `max_retries` — from `vision_service` config
+    pub async fn estimate_ar_async(
+        &self,
+        job_id: &str,
+        images: &[(Vec<u8>, String)],
+        item_manifest: &str,
+        intrinsics: Option<&str>,
+        poses: Option<&str>,
+        poll_interval: Duration,
+        max_polls: u32,
+        max_retries: u32,
+    ) -> Result<VisionServiceResponse, VolumeError> {
+        let mut retries_used = 0u32;
+
+        'retry: loop {
+            match self.submit_ar(job_id, images, item_manifest, intrinsics, poses).await {
+                Ok(resp) => {
+                    tracing::info!(%job_id, "AR job submitted, status={}", resp.status);
+                }
+                Err(e) => {
+                    if retries_used < max_retries {
+                        retries_used += 1;
+                        tracing::warn!(
+                            %job_id,
+                            attempt = retries_used,
+                            "AR submit failed, retrying in 5s: {e}"
+                        );
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        continue 'retry;
+                    }
+                    return Err(e);
+                }
+            }
+
+            for poll_num in 1..=max_polls {
+                tokio::time::sleep(poll_interval).await;
+
+                let status = match self.poll_ar_job_status(job_id).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(%job_id, poll_num, "AR poll error (will continue): {e}");
+                        continue;
+                    }
+                };
+
+                match status.status.as_str() {
+                    "succeeded" => {
+                        tracing::info!(%job_id, poll_num, "AR job completed successfully");
+                        return status.result.ok_or_else(|| {
+                            VolumeError::ExternalService(
+                                "AR status succeeded but result field is missing".into(),
+                            )
+                        });
+                    }
+                    "processing" | "accepted" => {
+                        tracing::debug!(%job_id, poll_num, max_polls, "AR job still processing");
+                    }
+                    "failed" | "not_found" => {
+                        let reason = if status.status == "not_found" {
+                            "Container restarted, job lost".to_string()
+                        } else {
+                            status.error.unwrap_or_else(|| "Unknown AR pipeline error".to_string())
+                        };
+                        if retries_used < max_retries {
+                            retries_used += 1;
+                            tracing::warn!(
+                                %job_id,
+                                attempt = retries_used,
+                                "AR job {}: {reason}, resubmitting in 5s",
+                                status.status
+                            );
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            continue 'retry;
+                        }
+                        return Err(VolumeError::ExternalService(format!(
+                            "AR vision job failed after {retries_used} retries: {reason}"
+                        )));
+                    }
+                    other => {
+                        return Err(VolumeError::ExternalService(format!(
+                            "Unknown AR job status: {other}"
+                        )));
+                    }
+                }
+            }
+
+            return Err(VolumeError::ExternalService(format!(
+                "AR vision service did not complete within {max_polls} polls ({} min)",
+                max_polls as u64 * poll_interval.as_secs() / 60
+            )));
+        }
+    }
 }

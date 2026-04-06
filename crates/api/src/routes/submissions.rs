@@ -33,6 +33,7 @@ pub fn submit_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/photo", post(photo_inquiry))
         .route("/mobile", post(mobile_inquiry))
+        .route("/mobile/ar", post(ar_inquiry))
         .route("/video", post(video_inquiry))
 }
 
@@ -71,6 +72,12 @@ pub(crate) struct ParsedInquiryForm {
     pub images: Vec<(Vec<u8>, String)>,
     pub depth_maps: Vec<(Vec<u8>, String)>,
     pub ar_metadata: Option<String>,
+    /// `[{"label":"Sofa","frame_count":5}, …]` — tells the backend which frames belong to which item.
+    pub item_manifest: Option<String>,
+    /// Flat JSON array of 16-float pose matrices in the same order as `images`.
+    pub poses: Option<String>,
+    /// Camera intrinsics JSON — `{fx,fy,cx,cy,width,height}`.
+    pub intrinsics: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -93,6 +100,370 @@ async fn mobile_inquiry(
 ) -> Result<(StatusCode, Json<SubmitInquiryResponse>), ApiError> {
     let parsed = parse_inquiry_form(multipart, true).await?;
     handle_submission(state, parsed, "mobile_app").await
+}
+
+/// `POST /api/v1/submit/mobile/ar` — AR per-item mobile app inquiry (Source D variant).
+///
+/// **Caller**: Mobile app scan → form screen after AR capture session completes.
+/// **Why**: Structured multi-view input from the native AR scan plugin. Each item
+///          has 4-8 RGB frames (+ optional LiDAR depth maps) taken at 28° arc sweep.
+///          The backend uploads them to S3 grouped by item, then forwards to the
+///          Modal AR pipeline for per-item 3D reconstruction.
+async fn ar_inquiry(
+    State(state): State<Arc<AppState>>,
+    multipart: Multipart,
+) -> Result<(StatusCode, Json<SubmitInquiryResponse>), ApiError> {
+    let parsed = parse_inquiry_form(multipart, true).await?;
+    handle_ar_submission(state, parsed).await
+}
+
+/// Shared handler for AR mobile submissions.
+///
+/// **Caller**: `ar_inquiry`
+/// **Why**: Validates fields, creates customer/addresses/inquiry (same as `handle_submission`),
+///          uploads AR frames to S3 under a grouped layout, stores source_data, then spawns
+///          `process_ar_submission_background`.
+///
+/// # Errors
+/// Returns `ApiError::Validation` for missing required fields, `ApiError::Internal` for DB/S3.
+async fn handle_ar_submission(
+    state: Arc<AppState>,
+    form: ParsedInquiryForm,
+) -> Result<(StatusCode, Json<SubmitInquiryResponse>), ApiError> {
+    let name = form
+        .name
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| ApiError::Validation("Name ist erforderlich".into()))?;
+    let email = form
+        .email
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| ApiError::Validation("E-Mail ist erforderlich".into()))?;
+    let departure_address = form
+        .departure_address
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| ApiError::Validation("Auszugsadresse ist erforderlich".into()))?;
+    let arrival_address = form
+        .arrival_address
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| ApiError::Validation("Einzugsadresse ist erforderlich".into()))?;
+
+    let now = chrono::Utc::now();
+
+    // 1. Upsert customer
+    let customer_id = customer_repo::upsert(
+        &state.db,
+        &email,
+        Some(&name),
+        form.salutation.as_deref(),
+        form.first_name.as_deref(),
+        form.last_name.as_deref(),
+        form.phone.as_deref(),
+        now,
+    )
+    .await
+    .map_err(|e| ApiError::Internal(format!("Kunde konnte nicht erstellt werden: {e}")))?;
+
+    // 2. Create addresses
+    let (dep_street, dep_city, dep_postal) = services::vision::parse_address(&departure_address);
+    let origin_id = address_repo::create(
+        &state.db,
+        &dep_street,
+        &dep_city,
+        Some(dep_postal.as_str()).filter(|s| !s.is_empty()),
+        form.departure_floor.as_deref(),
+        form.departure_elevator,
+    )
+    .await
+    .map_err(|e| ApiError::Internal(format!("Auszugsadresse konnte nicht erstellt werden: {e}")))?;
+
+    let (arr_street, arr_city, arr_postal) = services::vision::parse_address(&arrival_address);
+    let dest_id = address_repo::create(
+        &state.db,
+        &arr_street,
+        &arr_city,
+        Some(arr_postal.as_str()).filter(|s| !s.is_empty()),
+        form.arrival_floor.as_deref(),
+        form.arrival_elevator,
+    )
+    .await
+    .map_err(|e| ApiError::Internal(format!("Einzugsadresse konnte nicht erstellt werden: {e}")))?;
+
+    let preferred_date_ts = form
+        .preferred_date
+        .as_deref()
+        .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+        .and_then(|d| d.and_hms_opt(10, 0, 0))
+        .map(|dt| chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(dt, chrono::Utc));
+
+    let notes = build_notes(
+        form.services.as_deref(),
+        form.departure_parking_ban,
+        form.arrival_parking_ban,
+        form.message.as_deref(),
+    );
+    let services_struct = parse_services_string(
+        form.services.as_deref(),
+        form.departure_parking_ban,
+        form.arrival_parking_ban,
+    );
+    let services_json = serde_json::to_value(&services_struct).unwrap_or(serde_json::json!({}));
+
+    // 3. Create inquiry
+    let inquiry_id = Uuid::now_v7();
+    inquiry_repo::create_minimal(
+        &state.db,
+        inquiry_id,
+        customer_id,
+        Some(origin_id),
+        Some(dest_id),
+        "pending",
+        preferred_date_ts,
+        Some(&notes),
+        Some(&services_json),
+        "mobile_app_ar",
+        now,
+    )
+    .await
+    .map_err(|e| ApiError::Internal(format!("Anfrage konnte nicht erstellt werden: {e}")))?;
+
+    // 4. Pre-create estimation row
+    let estimation_id = Uuid::now_v7();
+    estimation_repo::create_processing(&state.db, estimation_id, inquiry_id, "depth_sensor")
+        .await
+        .map_err(|e| ApiError::Internal(format!("Schätzung konnte nicht erstellt werden: {e}")))?;
+
+    // 5. Upload RGB frames to S3 synchronously so admin UI shows images immediately.
+    //    Layout: estimates/{inquiry_id}/{est_id}/ar/{idx}.jpg
+    let s3_rgb_keys: Vec<String> = {
+        let mut keys = Vec::with_capacity(form.images.len());
+        for (idx, (data, mime_type)) in form.images.iter().enumerate() {
+            let key = format!("estimates/{inquiry_id}/{estimation_id}/ar/{idx}.jpg");
+            if let Err(e) = state.storage.upload(&key, Bytes::from(data.clone()), mime_type).await {
+                tracing::warn!(inquiry_id = %inquiry_id, "AR RGB frame {idx} upload failed: {e}");
+            } else {
+                keys.push(key);
+            }
+        }
+        keys
+    };
+
+    // 6. Upload depth maps to S3.  Layout: …/ar/depth/{idx}.png
+    let s3_depth_keys: Vec<String> = {
+        let mut keys = Vec::with_capacity(form.depth_maps.len());
+        for (idx, (data, mime_type)) in form.depth_maps.iter().enumerate() {
+            let key = format!("estimates/{inquiry_id}/{estimation_id}/ar/depth/{idx}.png");
+            if let Err(e) = state.storage.upload(&key, Bytes::from(data.clone()), mime_type).await {
+                tracing::warn!(inquiry_id = %inquiry_id, "AR depth map {idx} upload failed: {e}");
+            } else {
+                keys.push(key);
+            }
+        }
+        keys
+    };
+
+    // 7. Persist source_data so admin UI shows AR context before Modal finishes.
+    let item_manifest_json: serde_json::Value = form
+        .item_manifest
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or(serde_json::json!([]));
+
+    let source_data = serde_json::json!({
+        "source": "mobile_app_ar",
+        "image_count": form.images.len(),
+        "depth_map_count": form.depth_maps.len(),
+        "s3_rgb_keys": &s3_rgb_keys,
+        "s3_depth_keys": &s3_depth_keys,
+        "item_manifest": &item_manifest_json,
+    });
+    let _ = estimation_repo::update_source_data(&state.db, estimation_id, &source_data).await;
+
+    tracing::info!(
+        inquiry_id = %inquiry_id,
+        image_count = form.images.len(),
+        depth_count = form.depth_maps.len(),
+        "AR inquiry created, spawning background processing"
+    );
+
+    // 8. Spawn background processing
+    let state_bg = Arc::clone(&state);
+    let dep_addr = departure_address.clone();
+    let arr_addr = arrival_address.clone();
+    let images = form.images;
+    let item_manifest_str = form.item_manifest.unwrap_or_default();
+    let intrinsics_str = form.intrinsics;
+    let poses_str = form.poses;
+    tokio::spawn(async move {
+        if let Err(e) = process_ar_submission_background(
+            Arc::clone(&state_bg),
+            inquiry_id,
+            estimation_id,
+            images,
+            item_manifest_str,
+            intrinsics_str,
+            poses_str,
+            s3_rgb_keys,
+            s3_depth_keys,
+            item_manifest_json,
+            dep_addr,
+            arr_addr,
+        )
+        .await
+        {
+            tracing::error!(inquiry_id = %inquiry_id, error = %e, "AR background processing failed");
+            let _ = estimation_repo::mark_failed(&state_bg.db, estimation_id).await;
+        }
+    });
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(SubmitInquiryResponse {
+            inquiry_id,
+            customer_id,
+            status: "processing".to_string(),
+            message: "Anfrage erhalten. AR-Aufnahmen werden analysiert und Angebot wird erstellt."
+                .to_string(),
+        }),
+    ))
+}
+
+/// Background task for AR submissions: distance calc → semaphore → Modal AR pipeline
+/// → store estimation → update inquiry → offer generation.
+///
+/// **Caller**: `handle_ar_submission` via `tokio::spawn`
+/// **Why**: Same async submit/poll pattern as `process_submission_background` and
+///          `process_video_background`. Images are sent as raw bytes to Modal (already
+///          uploaded to S3 for admin UI — Modal receives bytes directly to avoid
+///          needing S3 credentials in the no-GPU `serve()` container).
+///
+/// # Errors
+/// Returns `Err(String)` on any fatal failure; caller marks the estimation 'failed'.
+async fn process_ar_submission_background(
+    state: Arc<AppState>,
+    inquiry_id: Uuid,
+    estimation_id: Uuid,
+    images: Vec<(Vec<u8>, String)>,
+    item_manifest: String,
+    intrinsics: Option<String>,
+    poses: Option<String>,
+    s3_rgb_keys: Vec<String>,
+    s3_depth_keys: Vec<String>,
+    item_manifest_json: serde_json::Value,
+    departure_address: String,
+    arrival_address: String,
+) -> Result<(), String> {
+    // 1. Distance calculation
+    let api_key = &state.config.maps.api_key;
+    if !api_key.is_empty() {
+        let calculator = aust_distance_calculator::RouteCalculator::new(api_key.clone());
+        let request = aust_distance_calculator::RouteRequest {
+            addresses: vec![departure_address, arrival_address],
+        };
+        match calculator.calculate(&request).await {
+            Ok(result) => {
+                let _ = inquiry_repo::update_distance(
+                    &state.db, inquiry_id, result.total_distance_km,
+                )
+                .await;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    inquiry_id = %inquiry_id,
+                    error = %e,
+                    "AR distance calculation failed, continuing"
+                );
+            }
+        }
+    }
+
+    // 2. Acquire vision semaphore
+    let _permit = state
+        .vision_semaphore
+        .acquire()
+        .await
+        .map_err(|e| format!("Vision semaphore closed: {e}"))?;
+    tracing::info!(estimation_id = %estimation_id, "AR vision semaphore acquired, submitting to Modal");
+
+    // 3. Submit to Modal AR endpoint and poll for result
+    let client = state
+        .vision_service
+        .as_ref()
+        .ok_or("Vision service not configured")?;
+
+    let poll_interval =
+        std::time::Duration::from_secs(state.config.vision_service.poll_interval_secs);
+    let max_polls = state.config.vision_service.max_polls;
+    let max_retries = state.config.vision_service.max_retries;
+
+    let response = client
+        .estimate_ar_async(
+            &estimation_id.to_string(),
+            &images,
+            &item_manifest,
+            intrinsics.as_deref(),
+            poses.as_deref(),
+            poll_interval,
+            max_polls,
+            max_retries,
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                inquiry_id = %inquiry_id,
+                estimation_id = %estimation_id,
+                "AR estimation failed after all retries — manual intervention required: {e}"
+            );
+            format!("AR estimation failed: {e}")
+        })?;
+
+    tracing::info!(
+        estimation_id = %estimation_id,
+        volume = response.total_volume_m3,
+        items = response.detected_items.len(),
+        "AR estimation succeeded"
+    );
+
+    // 4. Persist estimation result
+    let source_data = serde_json::json!({
+        "source": "mobile_app_ar",
+        "s3_rgb_keys": &s3_rgb_keys,
+        "s3_depth_keys": &s3_depth_keys,
+        "item_manifest": &item_manifest_json,
+        "has_depth": !s3_depth_keys.is_empty(),
+    });
+    let result_data = serde_json::to_value(&response.detected_items)
+        .map_err(|e| format!("Failed to serialize AR items: {e}"))?;
+
+    let now = chrono::Utc::now();
+    estimation_repo::upsert(
+        &state.db,
+        estimation_id,
+        inquiry_id,
+        EstimationMethod::DepthSensor.as_str(),
+        &source_data,
+        Some(&result_data),
+        response.total_volume_m3,
+        response.confidence_score,
+        now,
+    )
+    .await
+    .map_err(|e| format!("Failed to store AR estimation: {e}"))?;
+
+    // 5. Update inquiry volume and advance status
+    inquiry_repo::update_volume_and_status(
+        &state.db,
+        inquiry_id,
+        response.total_volume_m3,
+        "estimated",
+        now,
+    )
+    .await
+    .map_err(|e| format!("Failed to update AR inquiry: {e}"))?;
+
+    // 6. Auto-generate offer (XLSX → PDF → Telegram)
+    try_auto_generate_offer(Arc::clone(&state), inquiry_id).await;
+
+    Ok(())
 }
 
 /// `POST /api/v1/submit/video` — Public video inquiry (Source E).
@@ -362,6 +733,9 @@ pub(crate) async fn parse_inquiry_form(
         images: Vec::new(),
         depth_maps: Vec::new(),
         ar_metadata: None,
+        item_manifest: None,
+        poses: None,
+        intrinsics: None,
     };
 
     while let Some(field) = multipart
@@ -440,6 +814,15 @@ pub(crate) async fn parse_inquiry_form(
             }
             "ar_metadata" if accept_depth => {
                 form.ar_metadata = Some(read_text_field(field).await?);
+            }
+            "item_manifest" if accept_depth => {
+                form.item_manifest = Some(read_text_field(field).await?);
+            }
+            "poses" if accept_depth => {
+                form.poses = Some(read_text_field(field).await?);
+            }
+            "intrinsics" if accept_depth => {
+                form.intrinsics = Some(read_text_field(field).await?);
             }
             _ => continue,
         }

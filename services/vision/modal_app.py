@@ -539,3 +539,136 @@ def serve_video():
         return {"job_id": job_id, "status": "accepted"}
 
     return web_app
+
+
+# ---------------------------------------------------------------------------
+# AR HTTP layer — no GPU, submit + status for AR per-item capture
+# ---------------------------------------------------------------------------
+
+@app.function(scaledown_window=60, max_containers=2, timeout=60)
+@modal.asgi_app()
+def serve_ar():
+    """Thin HTTP layer for AR per-item estimation — no GPU.
+
+    POST /estimate/ar/submit  — reads images + AR metadata, spawns PhotoPipeline.run_job (stub)
+    GET  /estimate/ar/status  — reads job_store (same dict as photo/video)
+
+    NOTE: This is a Part 2 stub. PhotoPipeline.run_job processes all images together.
+    Part 3 will replace the spawn call with a dedicated ARPipeline that does
+    per-item reconstruction using item_manifest, poses, and intrinsics.
+    """
+    import logging
+    import sys
+    import time
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+    logger = logging.getLogger("serve_ar")
+
+    if "/root" not in sys.path:
+        sys.path.insert(0, "/root")
+
+    from typing import List, Optional
+
+    from fastapi import FastAPI, File, Form, UploadFile
+    from fastapi.responses import JSONResponse
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+
+    web_app = FastAPI(title="AUST Vision Service - AR (Modal)")
+
+    @web_app.get("/health")
+    def health():
+        return {"status": "ok"}
+
+    @web_app.get("/ready")
+    def ready():
+        return {"status": "ready"}
+
+    @web_app.post("/estimate/ar/submit")
+    async def estimate_ar_submit(
+        job_id: str = Form(default="test"),
+        images: List[UploadFile] = File(...),
+        item_manifest: str = Form(default="[]"),
+        intrinsics: Optional[str] = Form(default=None),
+        poses: Optional[str] = Form(default=None),
+        detection_threshold: float = Form(default=0.3),
+    ):
+        """Async submit for AR per-item capture jobs.
+
+        Accepts multipart form with:
+          - job_id: unique job identifier
+          - images: one or more RGB JPEG frames (all items combined)
+          - item_manifest: JSON string — [{label, frame_count}, ...]
+          - intrinsics: JSON string — {fx, fy, cx, cy, width, height} or null
+          - poses: JSON string — [[float×16], ...] column-major 4×4 per frame or null
+
+        Spawns PhotoPipeline.run_job as a stub (Part 3 replaces with ARPipeline).
+        Poll GET /estimate/ar/status/{job_id} for the result.
+        """
+        image_bytes_list = [await img.read() for img in images]
+        logger.info(
+            "Spawning AR job %s (%d images, manifest=%s)",
+            job_id, len(image_bytes_list), item_manifest[:120],
+        )
+
+        # Part 2 stub: run all images through the existing photo pipeline.
+        # Part 3 will pass item_manifest + poses + intrinsics to a dedicated
+        # ARPipeline that does per-item MASt3R reconstruction.
+        call = PhotoPipeline().run_job.spawn(job_id, image_bytes_list, detection_threshold)
+        job_store[job_id] = {
+            "status": "accepted",
+            "call_id": call.object_id,
+            "started_at": time.time(),
+            "item_manifest": item_manifest,
+        }
+
+        return {"job_id": job_id, "status": "accepted"}
+
+    @web_app.get("/estimate/ar/status/{job_id}")
+    async def estimate_ar_status(job_id: str):
+        """Poll endpoint for AR jobs — reads from modal.Dict.
+
+        Same dead-invocation detection as the photo status endpoint.
+        """
+        info = job_store.get(job_id)
+        if info is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": f"Job {job_id!r} not found"},
+            )
+
+        if info["status"] in ("accepted", "processing"):
+            call_id = info.get("call_id")
+            if call_id:
+                try:
+                    fc = modal.FunctionCall.from_id(call_id)
+                    fc.get(timeout=0)
+                    error = "Invocation completed without writing result"
+                    job_store[job_id] = {"status": "failed", "error": error}
+                    return JSONResponse(
+                        status_code=500,
+                        content={"status": "failed", "error": error},
+                    )
+                except TimeoutError:
+                    pass  # still running
+                except modal.exception.InputCancellation as exc:
+                    error = f"Job cancelled: {exc}"
+                    job_store[job_id] = {"status": "failed", "error": error}
+                    return {"status": "failed", "error": error}
+                except Exception as exc:
+                    error = f"Invocation died: {exc}"
+                    logger.error("AR job %s invocation failed: %s", job_id, exc)
+                    job_store[job_id] = {"status": "failed", "error": error}
+                    return {"status": "failed", "error": error}
+
+        response: dict = {"status": info["status"]}
+        if info["status"] == "succeeded":
+            response["result"] = info["result"]
+        elif info["status"] == "failed":
+            response["error"] = info.get("error", "Unknown error")
+        return response
+
+    return web_app
