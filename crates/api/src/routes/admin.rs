@@ -13,6 +13,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use aust_core::models::TokenClaims;
+use aust_offer_generator::{generate_timesheet_xlsx, TimesheetData, TimesheetEntry};
 use crate::repositories::{admin_repo, employee_repo, feedback_repo};
 use crate::{ApiError, AppState};
 
@@ -46,6 +47,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/employees/{id}", get(get_employee).patch(update_employee))
         .route("/employees/{id}/delete", post(delete_employee))
         .route("/employees/{id}/hours", get(employee_hours_summary))
+        .route("/employees/{id}/hours/export", get(employee_hours_export))
         .route(
             "/employees/{id}/documents/{doc_type}",
             post(upload_employee_document)
@@ -665,6 +667,102 @@ async fn employee_hours_summary(
         "assignments": assignments,
         "calendar_items": calendar_items,
     })))
+}
+
+/// `GET /api/v1/admin/employees/{id}/hours/export?month=YYYY-MM` — Download Stundenzettel XLSX.
+///
+/// **Caller**: Admin employee detail page export button.
+/// **Why**: Generates the monthly timesheet document Alex uses for payroll, mirroring the
+/// existing manual Arbeitszeit template (Datum / Arbeitsbeginn / Arbeitsende / Arbeitsstunden).
+///
+/// # Query Parameters
+/// - `month` (YYYY-MM): the month to export. Defaults to current month.
+///
+/// # Returns
+/// `200 OK` with `Content-Disposition: attachment` and XLSX bytes.
+async fn employee_hours_export(
+    State(state): State<Arc<AppState>>,
+    Extension(_claims): Extension<TokenClaims>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> Result<Response, ApiError> {
+    let month_str = query.get("month").cloned().unwrap_or_else(|| {
+        Utc::now().format("%Y-%m").to_string()
+    });
+    let (from_date, to_date) = parse_month_range(&month_str)
+        .ok_or_else(|| ApiError::BadRequest("Ungueltiges Monatsformat. Erwartet: YYYY-MM".into()))?;
+
+    // Load employee name
+    let emp = employee_repo::fetch_by_id(&state.db, id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Mitarbeiter nicht gefunden".into()))?;
+
+    // Load monthly target
+    let target = employee_repo::fetch_hours_target(&state.db, id)
+        .await?
+        .unwrap_or(160.0);
+
+    // Load assignments for the month
+    let inq_rows = employee_repo::fetch_admin_hours(&state.db, id, from_date, to_date).await?;
+    let item_rows = employee_repo::fetch_admin_calendar_item_hours(&state.db, id, from_date, to_date).await?;
+
+    // Merge inquiry assignments and calendar item assignments into a flat entry list
+    let mut entries: Vec<TimesheetEntry> = Vec::new();
+    for r in &inq_rows {
+        if let Some(date) = r.booking_date {
+            entries.push(TimesheetEntry {
+                date,
+                clock_in: r.clock_in,
+                clock_out: r.clock_out,
+                actual_hours: r.actual_hours,
+            });
+        }
+    }
+    for r in &item_rows {
+        if let Some(date) = r.scheduled_date {
+            entries.push(TimesheetEntry {
+                date,
+                clock_in: r.clock_in,
+                clock_out: r.clock_out,
+                actual_hours: r.actual_hours,
+            });
+        }
+    }
+
+    // Format month label: "YYYY-MM" → "MM.YYYY"
+    let month_parts: Vec<&str> = month_str.splitn(2, '-').collect();
+    let month_label = if month_parts.len() == 2 {
+        format!("{}.{}", month_parts[1], month_parts[0])
+    } else {
+        month_str.clone()
+    };
+
+    let xlsx_data = generate_timesheet_xlsx(&TimesheetData {
+        first_name: emp.first_name.clone(),
+        last_name: emp.last_name.clone(),
+        month_label,
+        target_hours: target,
+        entries,
+    })
+    .map_err(|e| ApiError::Internal(format!("Timesheet XLSX generation failed: {e}")))?;
+
+    let filename = format!(
+        "Stundenzettel_{}_{}_{}_{}.xlsx",
+        emp.last_name,
+        emp.first_name,
+        month_parts.get(1).unwrap_or(&""),
+        month_parts.first().unwrap_or(&"")
+    );
+
+    Ok(axum::response::Response::builder()
+        .status(200)
+        .header(header::CONTENT_TYPE, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{filename}\""),
+        )
+        .body(axum::body::Body::from(xlsx_data))
+        .unwrap())
 }
 
 /// Parse "YYYY-MM" into (first_day, last_day) NaiveDate range.
