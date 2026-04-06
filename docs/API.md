@@ -840,6 +840,55 @@ curl -X POST http://localhost:8080/api/v1/submit/mobile \
 
 ---
 
+### POST /api/v1/submit/mobile/ar
+
+Upload AR per-item capture data from the mobile app. Creates an inquiry with `source: "mobile_app"` and triggers the AR reconstruction pipeline on the vision service.
+
+**Auth**: None (public route)
+
+**Request** (`multipart/form-data`)
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `email` | text | Yes | Customer email address |
+| `name` | text | No | Customer name |
+| `phone` | text | No | Customer phone |
+| `departure_address` | text | No | Origin address |
+| `arrival_address` | text | No | Destination address |
+| `services` | text | No | Comma-separated service codes (e.g. `assembly,disassembly`) |
+| `preferred_date` | text | No | ISO 8601 date |
+| `message` | text | No | Additional notes |
+| `item_manifest` | text | Yes | JSON array — `[{label: string, frame_count: number}, ...]` |
+| `intrinsics` | text | No | JSON object — `{fx, fy, cx, cy, width, height}` from ARKit |
+| `poses` | text | No | JSON array — `[[float×16], ...]` column-major 4×4 per frame |
+| `images` | file(s) | Yes | RGB JPEG frames (all items combined, in order) |
+| `depth_maps` | file(s) | No | 16-bit depth PNGs from LiDAR (one per image where available) |
+
+**Response** `200 OK`
+```typescript
+{
+  id: string;          // inquiry ID
+  status: string;      // "estimating"
+  message: string;     // confirmation message
+}
+```
+
+**Business rules**
+- Customer is upserted by email.
+- Estimation method is set to `"depth_sensor"`.
+- Images are stored in S3 under `estimates/{inquiry_id}/{est_id}/ar/{idx}.jpg`; depth maps under `ar/depth/{idx}.png`.
+- AR metadata (`item_manifest`, `poses`, `intrinsics`) is stored in `source_data` JSONB on the estimation row.
+- Background task calls `POST /estimate/ar/submit` on the Modal vision service, then polls until complete.
+- On vision result: updates estimation volume, triggers auto offer generation + Telegram notification.
+
+**Status codes**
+| Code | Meaning |
+|---|---|
+| 200 | Submission accepted, background processing started |
+| 400 | Missing email or no images |
+| 422 | Invalid input |
+
+---
+
 ## Volume Estimation
 
 ### GET /api/v1/estimates/images/{key}
