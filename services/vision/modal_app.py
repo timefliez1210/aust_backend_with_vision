@@ -542,6 +542,98 @@ def serve_video():
 
 
 # ---------------------------------------------------------------------------
+# AR pipeline — GPU worker class
+# ---------------------------------------------------------------------------
+
+@app.cls(gpu="L4", scaledown_window=120, max_containers=1, timeout=1800)
+class ARPipeline:
+    """GPU worker for AR per-item volume estimation.
+
+    Each item in the manifest is processed independently:
+    - DINO with the exact user-assigned label as prompt
+    - SAM2 segmentation per frame
+    - Depth Anything V2 for depth (LiDAR depth stays on S3, not passed here)
+    - MASt3R MVS reconstruction for items with ≥2 frames (single GPU swap)
+    - RE catalog lookup for final volume
+    """
+
+    @modal.enter()
+    def setup(self) -> None:
+        import logging
+        import sys
+
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        )
+        self._logger = logging.getLogger("ar_pipeline")
+
+        if "/root" not in sys.path:
+            sys.path.insert(0, "/root")
+
+        from pillow_heif import register_heif_opener
+        register_heif_opener()
+
+        from app.vision.model_loader import registry
+        registry.load_all()
+        self._registry = registry
+        self._logger.info("ARPipeline ready")
+
+    @modal.method()
+    def run_job(
+        self,
+        job_id: str,
+        image_bytes_list: list,
+        item_manifest_json: str,
+        intrinsics_json: str | None,
+        poses_json: str | None,
+    ) -> None:
+        """Run the AR pipeline for one job.
+
+        Called by: serve_ar() ASGI app via .spawn().
+        Why: Same decoupled pattern as PhotoPipeline.run_job — Modal tracks this
+             invocation, keeps the container alive, writes result to job_store.
+
+        Args:
+            job_id: unique identifier for this job
+            image_bytes_list: flat list of JPEG bytes — all frames from all items in order
+            item_manifest_json: JSON string [{label, frame_count}, ...]
+            intrinsics_json: JSON string {fx, fy, cx, cy, width, height} or None
+            poses_json: JSON string [[float×16], ...] flat per-frame or None
+        """
+        import time
+        from app.vision.ar_pipeline import ARVisionPipeline
+
+        job_store[job_id] = {"status": "processing", "started_at": time.time()}
+        try:
+            pipeline = ARVisionPipeline(self._registry)
+            result = pipeline.run(
+                job_id=job_id,
+                image_bytes_list=image_bytes_list,
+                item_manifest_json=item_manifest_json,
+                intrinsics_json=intrinsics_json,
+                poses_json=poses_json,
+            )
+            payload = {
+                "status": "succeeded",
+                "result": result.model_dump(),
+                "finished_at": time.time(),
+            }
+            self._logger.info(
+                "AR job %s succeeded: %d items, %.3f m³",
+                job_id, len(result.detected_items), result.total_volume_m3,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._logger.exception("AR job %s failed", job_id)
+            payload = {
+                "status": "failed",
+                "error": str(exc),
+                "finished_at": time.time(),
+            }
+        job_store[job_id] = payload
+
+
+# ---------------------------------------------------------------------------
 # AR HTTP layer — no GPU, submit + status for AR per-item capture
 # ---------------------------------------------------------------------------
 
@@ -550,12 +642,8 @@ def serve_video():
 def serve_ar():
     """Thin HTTP layer for AR per-item estimation — no GPU.
 
-    POST /estimate/ar/submit  — reads images + AR metadata, spawns PhotoPipeline.run_job (stub)
+    POST /estimate/ar/submit  — reads images + AR metadata, spawns ARPipeline.run_job
     GET  /estimate/ar/status  — reads job_store (same dict as photo/video)
-
-    NOTE: This is a Part 2 stub. PhotoPipeline.run_job processes all images together.
-    Part 3 will replace the spawn call with a dedicated ARPipeline that does
-    per-item reconstruction using item_manifest, poses, and intrinsics.
     """
     import logging
     import sys
@@ -594,19 +682,17 @@ def serve_ar():
         item_manifest: str = Form(default="[]"),
         intrinsics: Optional[str] = Form(default=None),
         poses: Optional[str] = Form(default=None),
-        detection_threshold: float = Form(default=0.3),
     ):
         """Async submit for AR per-item capture jobs.
 
         Accepts multipart form with:
           - job_id: unique job identifier
-          - images: one or more RGB JPEG frames (all items combined)
-          - item_manifest: JSON string — [{label, frame_count}, ...]
-          - intrinsics: JSON string — {fx, fy, cx, cy, width, height} or null
-          - poses: JSON string — [[float×16], ...] column-major 4×4 per frame or null
+          - images: RGB JPEG frames — flat list, all items in manifest order
+          - item_manifest: JSON [{label, frame_count}, ...]
+          - intrinsics: JSON {fx, fy, cx, cy, width, height} or null
+          - poses: JSON [[float×16], ...] column-major 4×4 per frame or null
 
-        Spawns PhotoPipeline.run_job as a stub (Part 3 replaces with ARPipeline).
-        Poll GET /estimate/ar/status/{job_id} for the result.
+        Spawns ARPipeline.run_job. Poll GET /estimate/ar/status/{job_id} for result.
         """
         image_bytes_list = [await img.read() for img in images]
         logger.info(
@@ -614,10 +700,9 @@ def serve_ar():
             job_id, len(image_bytes_list), item_manifest[:120],
         )
 
-        # Part 2 stub: run all images through the existing photo pipeline.
-        # Part 3 will pass item_manifest + poses + intrinsics to a dedicated
-        # ARPipeline that does per-item MASt3R reconstruction.
-        call = PhotoPipeline().run_job.spawn(job_id, image_bytes_list, detection_threshold)
+        call = ARPipeline().run_job.spawn(
+            job_id, image_bytes_list, item_manifest, intrinsics, poses,
+        )
         job_store[job_id] = {
             "status": "accepted",
             "call_id": call.object_id,
@@ -631,7 +716,7 @@ def serve_ar():
     async def estimate_ar_status(job_id: str):
         """Poll endpoint for AR jobs — reads from modal.Dict.
 
-        Same dead-invocation detection as the photo status endpoint.
+        Same dead-invocation detection as the photo/video status endpoints.
         """
         info = job_store.get(job_id)
         if info is None:
@@ -653,7 +738,7 @@ def serve_ar():
                         content={"status": "failed", "error": error},
                     )
                 except TimeoutError:
-                    pass  # still running
+                    pass  # still running — normal case
                 except modal.exception.InputCancellation as exc:
                     error = f"Job cancelled: {exc}"
                     job_store[job_id] = {"status": "failed", "error": error}
