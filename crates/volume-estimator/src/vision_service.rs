@@ -12,6 +12,7 @@ pub struct VisionServiceClient {
     client: reqwest::Client,
     base_url: String,
     video_base_url: String,
+    ar_base_url: String,
     max_retries: u32,
 }
 
@@ -87,7 +88,7 @@ pub struct VisionItemDimensions {
 }
 
 impl VisionServiceClient {
-    pub fn new(base_url: &str, video_base_url: Option<&str>, timeout_secs: u64, max_retries: u32) -> Result<Self, VolumeError> {
+    pub fn new(base_url: &str, video_base_url: Option<&str>, ar_base_url: Option<&str>, timeout_secs: u64, max_retries: u32) -> Result<Self, VolumeError> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
             .build()
@@ -97,11 +98,15 @@ impl VisionServiceClient {
         let video = video_base_url
             .map(|u| u.trim_end_matches('/').to_string())
             .unwrap_or_else(|| base.clone());
+        let ar = ar_base_url
+            .map(|u| u.trim_end_matches('/').to_string())
+            .unwrap_or_else(|| base.clone());
 
         Ok(Self {
             client,
             base_url: base,
             video_base_url: video,
+            ar_base_url: ar,
             max_retries,
         })
     }
@@ -817,7 +822,7 @@ impl VisionServiceClient {
         intrinsics: Option<&str>,
         poses: Option<&str>,
     ) -> Result<VisionSubmitResponse, VolumeError> {
-        let url = format!("{}/estimate/ar/submit", self.base_url);
+        let url = format!("{}/estimate/ar/submit", self.ar_base_url);
 
         let mut form = reqwest::multipart::Form::new()
             .text("job_id", job_id.to_string())
@@ -870,7 +875,7 @@ impl VisionServiceClient {
     /// **Why**: AR jobs share the same `job_store` on Modal as photo/video jobs.
     ///          The AR status endpoint reads from the same dict — only the URL path differs.
     pub async fn poll_ar_job_status(&self, job_id: &str) -> Result<VisionJobStatus, VolumeError> {
-        let url = format!("{}/estimate/ar/status/{}", self.base_url, job_id);
+        let url = format!("{}/estimate/ar/status/{}", self.ar_base_url, job_id);
         let resp = self.client.get(&url).send().await.map_err(|e| {
             VolumeError::ExternalService(format!("AR poll request failed: {e}"))
         })?;

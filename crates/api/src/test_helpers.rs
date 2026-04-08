@@ -100,7 +100,7 @@ pub async fn test_app_state_with_vision(pool: PgPool, vision_url: &str) -> AppSt
         Arc::new(MockLlmProvider::new("{}"));
     let storage: Arc<dyn aust_storage::StorageProvider> =
         Arc::new(LocalStorage::new("/tmp/aust-test-uploads").expect("create test storage"));
-    let vision = VisionServiceClient::new(vision_url, Some(vision_url), 30, 0)
+    let vision = VisionServiceClient::new(vision_url, Some(vision_url), Some(vision_url), 30, 0)
         .expect("create test vision client");
 
     AppState::new(config, pool, llm, storage, Some(vision))

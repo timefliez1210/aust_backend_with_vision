@@ -48,6 +48,7 @@ async fn main() -> Result<()> {
         match aust_volume_estimator::VisionServiceClient::new(
             &config.vision_service.base_url,
             config.vision_service.video_base_url.as_deref(),
+            config.vision_service.ar_base_url.as_deref(),
             config.vision_service.timeout_secs,
             config.vision_service.max_retries,
         ) {

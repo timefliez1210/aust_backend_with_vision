@@ -50,6 +50,7 @@ search_window_days = 14
 enabled = true
 base_url = "https://crfabig--aust-vision-serve.modal.run"
 video_base_url = "https://crfabig--aust-vision-serve-video.modal.run"
+ar_base_url = "https://crfabig--aust-vision-serve-ar.modal.run"
 timeout_secs = 120
 max_retries = 2
 poll_interval_secs = 60

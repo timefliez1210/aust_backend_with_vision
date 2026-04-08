@@ -216,6 +216,10 @@ pub struct VisionServiceConfig {
     /// Falls back to `base_url` when `None`.
     #[serde(default)]
     pub video_base_url: Option<String>,
+    /// Optional separate base URL for the AR per-item capture endpoint.
+    /// Falls back to `base_url` when `None`.
+    #[serde(default)]
+    pub ar_base_url: Option<String>,
     /// HTTP request timeout in seconds for individual submit/poll requests.
     /// Submit should complete in <60s; poll responses are tiny (~1ms).
     pub timeout_secs: u64,
@@ -235,6 +239,7 @@ impl Default for VisionServiceConfig {
             enabled: false,
             base_url: "http://localhost:8090".to_string(),
             video_base_url: None,
+            ar_base_url: None,
             timeout_secs: 120,
             max_retries: 1,
             poll_interval_secs: 60,
