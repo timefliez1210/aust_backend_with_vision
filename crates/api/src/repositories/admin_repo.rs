@@ -436,7 +436,7 @@ pub(crate) async fn list_orders_single_status(
                (SELECT ROUND(o.price_cents * 1.19)::bigint FROM offers o WHERE o.inquiry_id = q.id ORDER BY o.created_at DESC LIMIT 1) AS offer_price_brutto,
                q.scheduled_date AS booking_date,
                q.created_at,
-               (SELECT COUNT(*)::bigint FROM inquiry_employees WHERE inquiry_id = q.id) AS employees_assigned,
+               (SELECT COUNT(DISTINCT ide.employee_id)::bigint FROM inquiry_day_employees ide JOIN inquiry_days iday ON ide.inquiry_day_id = iday.id WHERE iday.inquiry_id = q.id) AS employees_assigned,
                (SELECT o.persons FROM offers o WHERE o.inquiry_id = q.id ORDER BY o.created_at DESC LIMIT 1) AS employees_quoted
         FROM inquiries q
         JOIN customers c ON q.customer_id = c.id
@@ -476,7 +476,7 @@ pub(crate) async fn list_orders_all_statuses(
                (SELECT ROUND(o.price_cents * 1.19)::bigint FROM offers o WHERE o.inquiry_id = q.id ORDER BY o.created_at DESC LIMIT 1) AS offer_price_brutto,
                q.scheduled_date AS booking_date,
                q.created_at,
-               (SELECT COUNT(*)::bigint FROM inquiry_employees WHERE inquiry_id = q.id) AS employees_assigned,
+               (SELECT COUNT(DISTINCT ide.employee_id)::bigint FROM inquiry_day_employees ide JOIN inquiry_days iday ON ide.inquiry_day_id = iday.id WHERE iday.inquiry_id = q.id) AS employees_assigned,
                (SELECT o.persons FROM offers o WHERE o.inquiry_id = q.id ORDER BY o.created_at DESC LIMIT 1) AS employees_quoted
         FROM inquiries q
         JOIN customers c ON q.customer_id = c.id

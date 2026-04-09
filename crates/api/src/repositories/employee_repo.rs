@@ -195,8 +195,8 @@ pub(crate) async fn fetch_schedule_jobs(
     sqlx::query_as(
         r#"
         SELECT
-            ie.inquiry_id,
-            i.scheduled_date AS job_date,
+            iday.inquiry_id,
+            iday.day_date AS job_date,
             i.status,
             oa.street      AS origin_street,
             oa.city        AS origin_city,
@@ -207,19 +207,20 @@ pub(crate) async fn fetch_schedule_jobs(
             i.estimated_volume_m3,
             COALESCE(c.first_name || ' ' || c.last_name, c.name) AS customer_name,
             c.phone AS customer_phone,
-            ie.planned_hours::float8 AS planned_hours,
-            CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
-                 THEN (EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0)::float8
+            ide.planned_hours::float8 AS planned_hours,
+            CASE WHEN ide.clock_out IS NOT NULL AND ide.clock_in IS NOT NULL
+                 THEN (EXTRACT(EPOCH FROM (ide.clock_out - ide.clock_in)) / 3600.0)::float8
                  ELSE NULL END AS actual_hours
-        FROM inquiry_employees ie
-        JOIN inquiries  i  ON ie.inquiry_id = i.id
+        FROM inquiry_day_employees ide
+        JOIN inquiry_days iday ON ide.inquiry_day_id = iday.id
+        JOIN inquiries  i  ON iday.inquiry_id = i.id
         JOIN customers  c  ON i.customer_id = c.id
         LEFT JOIN addresses oa ON i.origin_address_id      = oa.id
         LEFT JOIN addresses da ON i.destination_address_id = da.id
-        WHERE ie.employee_id = $1
-          AND COALESCE(i.scheduled_date, ie.created_at::date)
-              BETWEEN $2 AND $3
-        ORDER BY i.scheduled_date ASC NULLS LAST
+        WHERE ide.employee_id = $1
+          AND iday.day_date BETWEEN $2 AND $3
+          AND i.status NOT IN ('cancelled', 'rejected', 'expired')
+        ORDER BY iday.day_date ASC
         "#,
     )
     .bind(employee_id)
@@ -255,21 +256,23 @@ pub(crate) async fn fetch_schedule_items(
     sqlx::query_as(
         r#"
         SELECT
-            cie.calendar_item_id,
+            cdde.calendar_item_id,
             ci.title,
             ci.location,
             ci.category,
-            ci.scheduled_date,
+            cday.day_date AS scheduled_date,
             ci.status,
-            cie.planned_hours::float8 AS planned_hours,
-            CASE WHEN cie.clock_out IS NOT NULL AND cie.clock_in IS NOT NULL
-                 THEN (EXTRACT(EPOCH FROM (cie.clock_out - cie.clock_in)) / 3600.0)::float8
+            cdde.planned_hours::float8 AS planned_hours,
+            CASE WHEN cdde.clock_out IS NOT NULL AND cdde.clock_in IS NOT NULL
+                 THEN (EXTRACT(EPOCH FROM (cdde.clock_out - cdde.clock_in)) / 3600.0)::float8
                  ELSE NULL END AS actual_hours
-        FROM calendar_item_employees cie
-        JOIN calendar_items ci ON ci.id = cie.calendar_item_id
-        WHERE cie.employee_id = $1
-          AND ci.scheduled_date BETWEEN $2 AND $3
-        ORDER BY ci.scheduled_date ASC NULLS LAST
+        FROM calendar_item_day_employees cdde
+        JOIN calendar_item_days cday ON cdde.calendar_item_day_id = cday.id
+        JOIN calendar_items ci ON ci.id = cday.calendar_item_id
+        WHERE cdde.employee_id = $1
+          AND cday.day_date BETWEEN $2 AND $3
+          AND ci.status NOT IN ('cancelled')
+        ORDER BY cday.day_date ASC
         "#,
     )
     .bind(employee_id)
@@ -301,10 +304,12 @@ pub(crate) async fn fetch_colleague_names(
 
     let rows: Vec<ColleagueRow> = sqlx::query_as(
         r#"
-        SELECT ie.inquiry_id, e.first_name, e.last_name
-        FROM inquiry_employees ie
-        JOIN employees e ON ie.employee_id = e.id
-        WHERE ie.inquiry_id = ANY($1) AND ie.employee_id != $2
+        SELECT iday.inquiry_id, e.first_name, e.last_name
+        FROM inquiry_day_employees ide
+        JOIN inquiry_days iday ON ide.inquiry_day_id = iday.id
+        JOIN employees e ON ide.employee_id = e.id
+        WHERE iday.inquiry_id = ANY($1) AND ide.employee_id != $2
+        GROUP BY iday.inquiry_id, e.first_name, e.last_name
         ORDER BY e.last_name, e.first_name
         "#,
     )
@@ -344,10 +349,12 @@ pub(crate) async fn fetch_item_colleague_names(
 
     let rows: Vec<ColleagueRow> = sqlx::query_as(
         r#"
-        SELECT cie.calendar_item_id, e.first_name, e.last_name
-        FROM calendar_item_employees cie
-        JOIN employees e ON cie.employee_id = e.id
-        WHERE cie.calendar_item_id = ANY($1) AND cie.employee_id != $2
+        SELECT cday.calendar_item_id, e.first_name, e.last_name
+        FROM calendar_item_day_employees cdde
+        JOIN calendar_item_days cday ON cdde.calendar_item_day_id = cday.id
+        JOIN employees e ON cdde.employee_id = e.id
+        WHERE cday.calendar_item_id = ANY($1) AND cdde.employee_id != $2
+        GROUP BY cday.calendar_item_id, e.first_name, e.last_name
         ORDER BY e.last_name, e.first_name
         "#,
     )
@@ -385,12 +392,13 @@ pub(crate) async fn fetch_assignment(
 ) -> Result<Option<AssignmentRow>, sqlx::Error> {
     sqlx::query_as(
         r#"
-        SELECT planned_hours::float8,
-               notes,
-               employee_clock_in,
-               employee_clock_out
-        FROM inquiry_employees
-        WHERE inquiry_id = $1 AND employee_id = $2
+        SELECT ide.planned_hours::float8,
+               ide.notes,
+               NULL::timestamptz AS employee_clock_in,
+               NULL::timestamptz AS employee_clock_out
+        FROM inquiry_day_employees ide
+        JOIN inquiry_days iday ON ide.inquiry_day_id = iday.id
+        WHERE iday.inquiry_id = $1 AND ide.employee_id = $2 AND iday.day_number = 1
         "#,
     )
     .bind(inquiry_id)
@@ -533,48 +541,51 @@ pub(crate) async fn fetch_hours_entries(
         r#"
         SELECT
             'job'                                              AS entry_type,
-            ie.inquiry_id                                     AS inquiry_id,
+            iday.inquiry_id                                   AS inquiry_id,
             NULL::uuid                                        AS calendar_item_id,
             NULL::text                                        AS title,
-            NULL::text                                        AS location,
-            i.scheduled_date AS job_date,
+            NULL::text                                         AS location,
+            iday.day_date                                     AS job_date,
             oa.city                                           AS origin_city,
             da.city                                           AS destination_city,
-            ie.planned_hours::float8                          AS planned_hours,
-            CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
-                 THEN (EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0)::float8
-                 ELSE NULL END                                AS actual_hours,
-            i.status                                          AS status
-        FROM inquiry_employees ie
-        JOIN inquiries i ON ie.inquiry_id = i.id
+            ide.planned_hours::float8                          AS planned_hours,
+            CASE WHEN ide.clock_out IS NOT NULL AND ide.clock_in IS NOT NULL
+                 THEN (EXTRACT(EPOCH FROM (ide.clock_out - ide.clock_in)) / 3600.0)::float8
+                 ELSE NULL END                                 AS actual_hours,
+            i.status                                           AS status
+        FROM inquiry_day_employees ide
+        JOIN inquiry_days iday ON ide.inquiry_day_id = iday.id
+        JOIN inquiries i ON iday.inquiry_id = i.id
         LEFT JOIN addresses oa ON i.origin_address_id      = oa.id
         LEFT JOIN addresses da ON i.destination_address_id = da.id
-        WHERE ie.employee_id = $1
-          AND COALESCE(i.scheduled_date, ie.created_at::date)
-              BETWEEN $2 AND $3
+        WHERE ide.employee_id = $1
+          AND iday.day_date BETWEEN $2 AND $3
+          AND i.status NOT IN ('cancelled', 'rejected', 'expired')
 
         UNION ALL
 
         SELECT
-            'item'                   AS entry_type,
-            NULL::uuid               AS inquiry_id,
-            cie.calendar_item_id     AS calendar_item_id,
-            ci.title                 AS title,
-            ci.location              AS location,
-            ci.scheduled_date        AS job_date,
-            NULL::text               AS origin_city,
-            NULL::text               AS destination_city,
-            cie.planned_hours::float8 AS planned_hours,
-            CASE WHEN cie.clock_out IS NOT NULL AND cie.clock_in IS NOT NULL
-                 THEN (EXTRACT(EPOCH FROM (cie.clock_out - cie.clock_in)) / 3600.0)::float8
-                 ELSE NULL END        AS actual_hours,
-            ci.status                AS status
-        FROM calendar_item_employees cie
-        JOIN calendar_items ci ON ci.id = cie.calendar_item_id
-        WHERE cie.employee_id = $1
-          AND ci.scheduled_date BETWEEN $2 AND $3
+            'item'                    AS entry_type,
+            NULL::uuid                AS inquiry_id,
+            cday.calendar_item_id     AS calendar_item_id,
+            ci.title                  AS title,
+            ci.location               AS location,
+            cday.day_date             AS job_date,
+            NULL::text                AS origin_city,
+            NULL::text                AS destination_city,
+            cdde.planned_hours::float8 AS planned_hours,
+            CASE WHEN cdde.clock_out IS NOT NULL AND cdde.clock_in IS NOT NULL
+                 THEN (EXTRACT(EPOCH FROM (cdde.clock_out - cdde.clock_in)) / 3600.0)::float8
+                 ELSE NULL END         AS actual_hours,
+            ci.status                 AS status
+        FROM calendar_item_day_employees cdde
+        JOIN calendar_item_days cday ON cdde.calendar_item_day_id = cday.id
+        JOIN calendar_items ci ON ci.id = cday.calendar_item_id
+        WHERE cdde.employee_id = $1
+          AND cday.day_date BETWEEN $2 AND $3
+          AND ci.status NOT IN ('cancelled')
 
-        ORDER BY job_date ASC NULLS LAST
+        ORDER BY job_date ASC
         "#,
     )
     .bind(employee_id)
@@ -705,24 +716,27 @@ pub(crate) async fn fetch_month_hours(
             COALESCE(SUM(planned_hours), 0.0)::float8 AS planned,
             COALESCE(SUM(COALESCE(actual_hours, planned_hours)), 0.0)::float8 AS actual
         FROM (
-            SELECT ie.planned_hours::float8,
-                   CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
-                        THEN (EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0)::float8
+            SELECT ide.planned_hours::float8,
+                   CASE WHEN ide.clock_out IS NOT NULL AND ide.clock_in IS NOT NULL
+                        THEN (EXTRACT(EPOCH FROM (ide.clock_out - ide.clock_in)) / 3600.0)::float8
                         ELSE NULL END AS actual_hours
-            FROM inquiry_employees ie
-            JOIN inquiries i ON i.id = ie.inquiry_id
-            WHERE ie.employee_id = $1
-              AND COALESCE(i.scheduled_date, ie.created_at::date)
-                  BETWEEN $2 AND $3
+            FROM inquiry_day_employees ide
+            JOIN inquiry_days iday ON ide.inquiry_day_id = iday.id
+            JOIN inquiries i ON iday.inquiry_id = i.id
+            WHERE ide.employee_id = $1
+              AND iday.day_date BETWEEN $2 AND $3
+              AND i.status NOT IN ('cancelled', 'rejected', 'expired')
             UNION ALL
-            SELECT cie.planned_hours::float8,
-                   CASE WHEN cie.clock_out IS NOT NULL AND cie.clock_in IS NOT NULL
-                        THEN (EXTRACT(EPOCH FROM (cie.clock_out - cie.clock_in)) / 3600.0)::float8
+            SELECT cdde.planned_hours::float8,
+                   CASE WHEN cdde.clock_out IS NOT NULL AND cdde.clock_in IS NOT NULL
+                        THEN (EXTRACT(EPOCH FROM (cdde.clock_out - cdde.clock_in)) / 3600.0)::float8
                         ELSE NULL END AS actual_hours
-            FROM calendar_item_employees cie
-            JOIN calendar_items ci ON ci.id = cie.calendar_item_id
-            WHERE cie.employee_id = $1
-              AND ci.scheduled_date BETWEEN $2 AND $3
+            FROM calendar_item_day_employees cdde
+            JOIN calendar_item_days cday ON cdde.calendar_item_day_id = cday.id
+            JOIN calendar_items ci ON ci.id = cday.calendar_item_id
+            WHERE cdde.employee_id = $1
+              AND cday.day_date BETWEEN $2 AND $3
+              AND ci.status NOT IN ('cancelled')
         ) combined
         "#,
     )
@@ -893,24 +907,26 @@ pub(crate) async fn fetch_admin_assignments(
 ) -> Result<Vec<AdminAssignmentRow>, sqlx::Error> {
     sqlx::query_as(
         r#"
-        SELECT ie.inquiry_id,
+        SELECT iday.inquiry_id,
                COALESCE(c.first_name || ' ' || c.last_name, c.name) AS customer_name,
                oa.city AS origin_city,
                da.city AS destination_city,
-               i.scheduled_date AS booking_date,
-               ie.planned_hours::float8 AS planned_hours,
-               CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
-                    THEN (EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0)::float8
+               iday.day_date AS booking_date,
+               ide.planned_hours::float8 AS planned_hours,
+               CASE WHEN ide.clock_out IS NOT NULL AND ide.clock_in IS NOT NULL
+                    THEN (EXTRACT(EPOCH FROM (ide.clock_out - ide.clock_in)) / 3600.0)::float8
                     ELSE NULL END AS actual_hours,
-               ie.notes,
+               ide.notes,
                i.status AS inquiry_status
-        FROM inquiry_employees ie
-        JOIN inquiries i ON ie.inquiry_id = i.id
+        FROM inquiry_day_employees ide
+        JOIN inquiry_days iday ON ide.inquiry_day_id = iday.id
+        JOIN inquiries i ON iday.inquiry_id = i.id
         JOIN customers c ON i.customer_id = c.id
         LEFT JOIN addresses oa ON i.origin_address_id = oa.id
         LEFT JOIN addresses da ON i.destination_address_id = da.id
-        WHERE ie.employee_id = $1
-        ORDER BY i.scheduled_date DESC NULLS LAST
+        WHERE ide.employee_id = $1
+          AND i.status NOT IN ('cancelled', 'rejected', 'expired')
+        ORDER BY iday.day_date DESC NULLS LAST
         LIMIT 50
         "#,
     )
@@ -946,26 +962,28 @@ pub(crate) async fn fetch_admin_hours(
 ) -> Result<Vec<AdminHoursRow>, sqlx::Error> {
     sqlx::query_as(
         r#"
-        SELECT ie.inquiry_id,
+        SELECT iday.inquiry_id,
                COALESCE(c.first_name || ' ' || c.last_name, c.name) AS customer_name,
                oa.city AS origin_city,
                da.city AS destination_city,
-               i.scheduled_date AS booking_date,
-               ie.planned_hours::float8 AS planned_hours,
-               ie.clock_in,
-               ie.clock_out,
-               CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
-                    THEN (EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0)::float8
+               iday.day_date AS booking_date,
+               ide.planned_hours::float8 AS planned_hours,
+               ide.clock_in,
+               ide.clock_out,
+               CASE WHEN ide.clock_out IS NOT NULL AND ide.clock_in IS NOT NULL
+                    THEN (EXTRACT(EPOCH FROM (ide.clock_out - ide.clock_in)) / 3600.0)::float8
                     ELSE NULL END AS actual_hours,
                i.status AS inquiry_status
-        FROM inquiry_employees ie
-        JOIN inquiries i ON ie.inquiry_id = i.id
+        FROM inquiry_day_employees ide
+        JOIN inquiry_days iday ON ide.inquiry_day_id = iday.id
+        JOIN inquiries i ON iday.inquiry_id = i.id
         JOIN customers c ON i.customer_id = c.id
         LEFT JOIN addresses oa ON i.origin_address_id = oa.id
         LEFT JOIN addresses da ON i.destination_address_id = da.id
-        WHERE ie.employee_id = $1
-          AND COALESCE(i.scheduled_date, ie.created_at::date) BETWEEN $2 AND $3
-        ORDER BY COALESCE(i.scheduled_date, ie.created_at::date)
+        WHERE ide.employee_id = $1
+          AND iday.day_date BETWEEN $2 AND $3
+          AND i.status NOT IN ('cancelled', 'rejected', 'expired')
+        ORDER BY iday.day_date
         "#,
     )
     .bind(employee_id)
@@ -1002,23 +1020,25 @@ pub(crate) async fn fetch_admin_calendar_item_hours(
 ) -> Result<Vec<AdminCalendarItemHoursRow>, sqlx::Error> {
     sqlx::query_as(
         r#"
-        SELECT cie.calendar_item_id,
+        SELECT cday.calendar_item_id,
                ci.title,
                ci.category,
                ci.location,
-               ci.scheduled_date,
-               cie.planned_hours::float8 AS planned_hours,
-               cie.clock_in,
-               cie.clock_out,
-               CASE WHEN cie.clock_out IS NOT NULL AND cie.clock_in IS NOT NULL
-                    THEN (EXTRACT(EPOCH FROM (cie.clock_out - cie.clock_in)) / 3600.0)::float8
+               cday.day_date AS scheduled_date,
+               cdde.planned_hours::float8 AS planned_hours,
+               cdde.clock_in,
+               cdde.clock_out,
+               CASE WHEN cdde.clock_out IS NOT NULL AND cdde.clock_in IS NOT NULL
+                    THEN (EXTRACT(EPOCH FROM (cdde.clock_out - cdde.clock_in)) / 3600.0)::float8
                     ELSE NULL END AS actual_hours,
                ci.status
-        FROM calendar_item_employees cie
-        JOIN calendar_items ci ON ci.id = cie.calendar_item_id
-        WHERE cie.employee_id = $1
-          AND ci.scheduled_date BETWEEN $2 AND $3
-        ORDER BY ci.scheduled_date
+        FROM calendar_item_day_employees cdde
+        JOIN calendar_item_days cday ON cdde.calendar_item_day_id = cday.id
+        JOIN calendar_items ci ON ci.id = cday.calendar_item_id
+        WHERE cdde.employee_id = $1
+          AND cday.day_date BETWEEN $2 AND $3
+          AND ci.status NOT IN ('cancelled')
+        ORDER BY cday.day_date
         "#,
     )
     .bind(employee_id)

@@ -452,7 +452,8 @@ pub(crate) async fn check_employee_active(
 /// Insert an employee assignment for an inquiry.
 ///
 /// **Caller**: `assign_employee` handler
-/// **Why**: Links an employee to a moving job.
+/// **Why**: Links an employee to a moving job. Auto-creates a day-1 inquiry_days row
+///          if one doesn't exist, then inserts into inquiry_day_employees.
 pub(crate) async fn insert_employee_assignment(
     pool: &PgPool,
     id: Uuid,
@@ -461,10 +462,53 @@ pub(crate) async fn insert_employee_assignment(
     planned_hours: f64,
     notes: Option<&str>,
 ) -> Result<(), sqlx::Error> {
+    // Ensure a day-1 inquiry_days row exists for this inquiry
+    let day_id: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM inquiry_days WHERE inquiry_id = $1 AND day_number = 1",
+    )
+    .bind(inquiry_id)
+    .fetch_optional(pool)
+    .await?;
+
+    let inquiry_day_id = if let Some((existing_id,)) = day_id {
+        existing_id
+    } else {
+        // No inquiry_days row yet — create day 1 from the inquiry's scheduled_date
+        let row: (Uuid,) = sqlx::query_as(
+            r#"
+            INSERT INTO inquiry_days (inquiry_id, day_date, day_number, start_time, end_time)
+            SELECT $1, COALESCE(scheduled_date, created_at::date), 1, start_time, end_time
+            FROM inquiries WHERE id = $1
+            RETURNING id
+            "#,
+        )
+        .bind(inquiry_id)
+        .fetch_one(pool)
+        .await?;
+        row.0
+    };
+
+    // Insert into inquiry_day_employees
     sqlx::query(
+        r#"
+        INSERT INTO inquiry_day_employees (id, inquiry_day_id, employee_id, planned_hours, notes)
+        VALUES ($1, $2, $3, $4, $5)
+        "#,
+    )
+    .bind(id)
+    .bind(inquiry_day_id)
+    .bind(employee_id)
+    .bind(planned_hours)
+    .bind(notes)
+    .execute(pool)
+    .await?;
+
+    // Also insert into inquiry_employees for backwards compat during transition
+    let _ = sqlx::query(
         r#"
         INSERT INTO inquiry_employees (id, inquiry_id, employee_id, planned_hours, notes)
         VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (inquiry_id, employee_id) DO NOTHING
         "#,
     )
     .bind(id)
@@ -473,17 +517,19 @@ pub(crate) async fn insert_employee_assignment(
     .bind(planned_hours)
     .bind(notes)
     .execute(pool)
-    .await?;
+    .await;
+
     Ok(())
 }
 
 /// Update an employee assignment (hours, clock times, notes).
 ///
 /// **Caller**: `update_assignment` handler
-/// **Why**: Operators adjust hours after the job.
+/// **Why**: Operators adjust hours after the job. Updates both the day-level
+///          and flat tables for transition compatibility.
 ///
 /// # Returns
-/// Number of rows affected (0 if not found).
+/// Number of rows affected in the day-level table (0 if not found).
 pub(crate) async fn update_employee_assignment(
     pool: &PgPool,
     inquiry_id: Uuid,
@@ -493,14 +539,43 @@ pub(crate) async fn update_employee_assignment(
     clock_out: Option<DateTime<Utc>>,
     notes: Option<&str>,
 ) -> Result<u64, sqlx::Error> {
+    // Update day-level table
     let result = sqlx::query(
+        r#"
+        UPDATE inquiry_day_employees SET
+            clock_in  = COALESCE($4, clock_in),
+            clock_out = COALESCE($5, clock_out),
+            planned_hours = CASE
+                WHEN COALESCE($4, clock_in) IS NOT NULL AND COALESCE($5, clock_out) IS NOT NULL
+                THEN (EXTRACT(EPOCH FROM (COALESCE($5, clock_out) - COALESCE($4, clock_in))) / 3600.0)
+                ELSE COALESCE($3, planned_hours)
+            END,
+            notes = COALESCE($6, notes)
+        FROM inquiry_days iday
+        WHERE inquiry_day_id = iday.id
+          AND iday.inquiry_id = $1
+          AND employee_id = $2
+          AND iday.day_number = 1
+        "#,
+    )
+    .bind(inquiry_id)
+    .bind(employee_id)
+    .bind(planned_hours)
+    .bind(clock_in)
+    .bind(clock_out)
+    .bind(notes)
+    .execute(pool)
+    .await?;
+
+    // Also update flat table for backwards compat
+    let _ = sqlx::query(
         r#"
         UPDATE inquiry_employees SET
             clock_in  = COALESCE($4, clock_in),
             clock_out = COALESCE($5, clock_out),
             planned_hours = CASE
                 WHEN COALESCE($4, clock_in) IS NOT NULL AND COALESCE($5, clock_out) IS NOT NULL
-                THEN (EXTRACT(EPOCH FROM (COALESCE($5, clock_out) - COALESCE($4, clock_in))) / 3600.0)::float8
+                THEN (EXTRACT(EPOCH FROM (COALESCE($5, clock_out) - COALESCE($4, clock_in))) / 3600.0)
                 ELSE COALESCE($3, planned_hours)
             END,
             notes = COALESCE($6, notes)
@@ -514,7 +589,8 @@ pub(crate) async fn update_employee_assignment(
     .bind(clock_out)
     .bind(notes)
     .execute(pool)
-    .await?;
+    .await;
+
     Ok(result.rows_affected())
 }
 
@@ -559,22 +635,40 @@ pub(crate) async fn fetch_updated_assignment(
 /// Delete an employee assignment from an inquiry.
 ///
 /// **Caller**: `remove_assignment` handler
-/// **Why**: Unlinks an employee from a moving job.
+/// **Why**: Unlinks an employee from a moving job. Deletes from both day-level
+///          and flat tables for transition compatibility.
 ///
 /// # Returns
-/// Number of rows deleted (0 or 1).
+/// Number of rows deleted from the day-level table (0 or more).
 pub(crate) async fn delete_employee_assignment(
     pool: &PgPool,
     inquiry_id: Uuid,
     employee_id: Uuid,
 ) -> Result<u64, sqlx::Error> {
+    // Delete from day-level table (may affect multiple days)
     let result = sqlx::query(
-        "DELETE FROM inquiry_employees WHERE inquiry_id = $1 AND employee_id = $2",
+        r#"
+        DELETE FROM inquiry_day_employees
+        WHERE employee_id = $2
+          AND inquiry_day_id IN (
+              SELECT id FROM inquiry_days WHERE inquiry_id = $1
+          )
+        "#,
     )
     .bind(inquiry_id)
     .bind(employee_id)
     .execute(pool)
     .await?;
+
+    // Also delete from flat table
+    let _ = sqlx::query(
+        "DELETE FROM inquiry_employees WHERE inquiry_id = $1 AND employee_id = $2",
+    )
+    .bind(inquiry_id)
+    .bind(employee_id)
+    .execute(pool)
+    .await;
+
     Ok(result.rows_affected())
 }
 
