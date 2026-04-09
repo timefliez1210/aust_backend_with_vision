@@ -90,6 +90,27 @@ struct ScheduleInquiry {
 }
 
 #[derive(Debug, Serialize)]
+struct ScheduleCalendarItem {
+    calendar_item_id: Uuid,
+    title: String,
+    category: String,
+    location: Option<String>,
+    start_time: NaiveTime,
+    end_time: Option<NaiveTime>,
+    employees_assigned: i64,
+    employee_names: Option<String>,
+    /// Which day number this entry represents (None for single-day items).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    day_number: Option<i16>,
+    /// Total number of days for this item (None for single-day).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_days: Option<i16>,
+    /// Per-day notes from `calendar_item_days` (None for single-day).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    day_notes: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 struct ScheduleEntry {
     date: NaiveDate,
     available: bool,
@@ -97,6 +118,7 @@ struct ScheduleEntry {
     booked: i32,
     remaining: i32,
     inquiries: Vec<ScheduleInquiry>,
+    calendar_items: Vec<ScheduleCalendarItem>,
 }
 
 #[derive(Debug, Serialize, Deserialize, FromRow)]
@@ -276,12 +298,36 @@ async fn get_schedule(
         });
     }
 
+    // Fetch calendar item schedule rows (per-day, same model as inquiries)
+    let cal_item_rows = calendar_repo::fetch_schedule_calendar_items(&state.db, query.from, query.to)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    // Group calendar items by date
+    let mut cal_item_map: HashMap<NaiveDate, Vec<ScheduleCalendarItem>> = HashMap::new();
+    for r in cal_item_rows {
+        cal_item_map.entry(r.effective_date).or_default().push(ScheduleCalendarItem {
+            calendar_item_id: r.calendar_item_id,
+            title: r.title,
+            category: r.category,
+            location: r.location,
+            start_time: r.start_time,
+            end_time: r.end_time,
+            employees_assigned: r.employees_assigned,
+            employee_names: r.employee_names,
+            day_number: r.day_number,
+            total_days: r.total_days,
+            day_notes: r.day_notes,
+        });
+    }
+
     // Build one entry per day in the range
     let mut entries = Vec::new();
     let mut current = query.from;
     while current <= query.to {
         let capacity = override_map.get(&current).copied().unwrap_or(default_capacity);
         let day_inquiries = inquiry_map.remove(&current).unwrap_or_default();
+        let day_cal_items = cal_item_map.remove(&current).unwrap_or_default();
         let booked = day_inquiries.len() as i32;
         let remaining = (capacity - booked).max(0);
 
@@ -292,6 +338,7 @@ async fn get_schedule(
             booked,
             remaining,
             inquiries: day_inquiries,
+            calendar_items: day_cal_items,
         });
         current = current.succ_opt().unwrap();
     }

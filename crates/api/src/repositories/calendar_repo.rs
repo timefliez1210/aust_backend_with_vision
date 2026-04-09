@@ -496,3 +496,107 @@ pub(crate) async fn insert_calendar_item_day_employee(
     .await?;
     Ok(())
 }
+
+// ── Calendar item schedule queries ────────────────────────────────────────────
+
+/// Schedule calendar item row — per-day projection used by `get_schedule`.
+///
+/// Mirrors `ScheduleInquiryRow` for calendar items (Termine).
+#[derive(Debug, FromRow)]
+pub(crate) struct ScheduleCalendarItemRow {
+    pub effective_date: NaiveDate,
+    pub calendar_item_id: Uuid,
+    pub title: String,
+    pub category: String,
+    pub location: Option<String>,
+    pub start_time: chrono::NaiveTime,
+    pub end_time: Option<chrono::NaiveTime>,
+    pub employees_assigned: i64,
+    pub employee_names: Option<String>,
+    pub day_number: Option<i16>,
+    pub total_days: Option<i16>,
+    pub day_notes: Option<String>,
+}
+
+/// Fetch calendar items as per-day schedule rows within a date range.
+///
+/// **Caller**: `calendar::get_schedule`
+/// **Why**: Returns one row per calendar-item-day for multi-day items, or one row
+///          per single-day item. Mirrors `fetch_schedule_inquiries` for Termine.
+///
+/// Single-day branch uses `calendar_item_employees` for the employee count
+/// (only fires for items with no `calendar_item_days` rows — i.e. unassigned).
+/// Multi-day branch uses `calendar_item_day_employees` for per-day staffing.
+pub(crate) async fn fetch_schedule_calendar_items(
+    pool: &PgPool,
+    from: NaiveDate,
+    to: NaiveDate,
+) -> Result<Vec<ScheduleCalendarItemRow>, sqlx::Error> {
+    sqlx::query_as(
+        r#"
+        -- Single-day branch: calendar item has no rows in calendar_item_days
+        SELECT
+            ci.scheduled_date AS effective_date,
+            ci.id AS calendar_item_id,
+            ci.title,
+            ci.category,
+            ci.location,
+            ci.start_time,
+            ci.end_time,
+            COUNT(cie.id) AS employees_assigned,
+            NULLIF(STRING_AGG(
+                e.first_name || ' ' || LEFT(e.last_name, 1) || '.',
+                ', ' ORDER BY e.last_name, e.first_name
+            ), '') AS employee_names,
+            NULL::smallint AS day_number,
+            NULL::smallint AS total_days,
+            NULL::text AS day_notes
+        FROM calendar_items ci
+        LEFT JOIN calendar_item_employees cie ON cie.calendar_item_id = ci.id
+        LEFT JOIN employees e ON cie.employee_id = e.id
+        WHERE NOT EXISTS (SELECT 1 FROM calendar_item_days WHERE calendar_item_id = ci.id)
+          AND ci.scheduled_date BETWEEN $1 AND $2
+          AND ci.status NOT IN ('cancelled')
+        GROUP BY ci.id
+
+        UNION ALL
+
+        -- Multi-day branch: one row per day from calendar_item_days.
+        SELECT
+            cday.day_date AS effective_date,
+            ci.id AS calendar_item_id,
+            ci.title,
+            ci.category,
+            ci.location,
+            COALESCE(cday.start_time, ci.start_time) AS start_time,
+            COALESCE(cday.end_time,   ci.end_time)     AS end_time,
+            COUNT(cdde.id) AS employees_assigned,
+            NULLIF(STRING_AGG(
+                e.first_name || ' ' || LEFT(e.last_name, 1) || '.',
+                ', ' ORDER BY e.last_name, e.first_name
+            ), '') AS employee_names,
+            cday.day_number,
+            total.total_days,
+            cday.notes AS day_notes
+        FROM calendar_items ci
+        JOIN calendar_item_days cday ON cday.calendar_item_id = ci.id
+        JOIN (
+            SELECT calendar_item_id, COUNT(*)::smallint AS total_days
+            FROM calendar_item_days
+            GROUP BY calendar_item_id
+        ) total ON total.calendar_item_id = ci.id
+        LEFT JOIN calendar_item_day_employees cdde ON cdde.calendar_item_day_id = cday.id
+        LEFT JOIN employees e ON cdde.employee_id = e.id
+        WHERE cday.day_date BETWEEN $1 AND $2
+          AND ci.status NOT IN ('cancelled')
+        GROUP BY ci.id, cday.id, cday.day_date, cday.day_number,
+                 cday.start_time, cday.end_time, cday.notes, total.total_days
+
+        ORDER BY effective_date
+        "#,
+    )
+    .bind(from)
+    .bind(to)
+    .fetch_all(pool)
+    .await
+}
