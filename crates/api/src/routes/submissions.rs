@@ -66,6 +66,8 @@ pub(crate) struct ParsedInquiryForm {
     pub arrival_floor: Option<String>,
     pub arrival_parking_ban: Option<bool>,
     pub arrival_elevator: Option<bool>,
+    /// The date the customer wants to move. Also accepts `preferred_date`
+    /// (legacy alias) in JSON submissions via manual parsing; `wunschtermin` in multipart forms.
     pub scheduled_date: Option<String>,
     pub services: Option<String>,
     pub message: Option<String>,
@@ -775,7 +777,7 @@ pub(crate) async fn parse_inquiry_form(
                 let text = read_text_field(field).await?;
                 form.arrival_elevator = Some(parse_bool_field(&text));
             }
-            "wunschtermin" | "scheduled_date" => {
+            "wunschtermin" | "preferred_date" | "scheduled_date" => {
                 form.scheduled_date = Some(read_text_field(field).await?);
             }
             "services" | "zusatzleistungen" => {
