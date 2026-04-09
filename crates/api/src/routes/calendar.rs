@@ -11,7 +11,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use aust_core::models::TokenClaims;
-use crate::repositories::calendar_repo;
+use crate::repositories::{calendar_item_repo, calendar_repo, inquiry_repo};
 use crate::{ApiError, AppState};
 
 /// Register the calendar routes.
@@ -448,6 +448,10 @@ async fn put_inquiry_days(
 
     tx.commit().await.map_err(|e| ApiError::Internal(e.to_string()))?;
 
+    // Sync flat inquiry_employees table from day-level data
+    // (keeps the flat table in sync for the offer builder and other flat-table reads)
+    let _ = inquiry_repo::sync_flat_inquiry_employees(&state.db, id).await;
+
     // Re-fetch employee names for the response (we only have IDs from the request)
     let emp_rows = calendar_repo::fetch_inquiry_day_employees(&state.db, id)
         .await
@@ -519,6 +523,9 @@ async fn put_calendar_item_days(
     }
 
     tx.commit().await.map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    // Sync flat calendar_item_employees table from day-level data
+    let _ = calendar_item_repo::sync_flat_calendar_item_employees(&state.db, id).await;
 
     let emp_rows = calendar_repo::fetch_calendar_item_day_employees(&state.db, id)
         .await

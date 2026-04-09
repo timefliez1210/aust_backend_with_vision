@@ -404,24 +404,27 @@ pub(crate) struct EmployeeAssignmentRow {
 /// Fetch employee assignments for an inquiry (with email).
 ///
 /// **Caller**: `list_inquiry_employees` handler
-/// **Why**: Shows assigned employees for a job.
+/// **Why**: Shows assigned employees for a job. Reads from day-level table,
+///          aggregating per-employee across all days.
 pub(crate) async fn list_employee_assignments(
     pool: &PgPool,
     inquiry_id: Uuid,
 ) -> Result<Vec<EmployeeAssignmentRow>, sqlx::Error> {
     sqlx::query_as(
         r#"
-        SELECT ie.employee_id, e.first_name, e.last_name, e.email,
-               ie.planned_hours::float8 AS planned_hours,
-               ie.clock_in,
-               ie.clock_out,
-               CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
-                    THEN (EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0)::float8
-                    ELSE NULL END AS actual_hours,
-               ie.notes
-        FROM inquiry_employees ie
-        JOIN employees e ON ie.employee_id = e.id
-        WHERE ie.inquiry_id = $1
+        SELECT ide.employee_id, e.first_name, e.last_name, e.email,
+               SUM(ide.planned_hours)::float8 AS planned_hours,
+               MIN(CASE WHEN iday.day_number = 1 THEN ide.clock_in END) AS clock_in,
+               MAX(CASE WHEN iday.day_number = 1 THEN ide.clock_out END) AS clock_out,
+               SUM(CASE WHEN ide.clock_out IS NOT NULL AND ide.clock_in IS NOT NULL
+                         THEN (EXTRACT(EPOCH FROM (ide.clock_out - ide.clock_in)) / 3600.0)
+                         ELSE NULL END)::float8 AS actual_hours,
+               STRING_AGG(ide.notes, '; ' ORDER BY iday.day_number) AS notes
+        FROM inquiry_day_employees ide
+        JOIN inquiry_days iday ON ide.inquiry_day_id = iday.id
+        JOIN employees e ON ide.employee_id = e.id
+        WHERE iday.inquiry_id = $1
+        GROUP BY ide.employee_id, e.first_name, e.last_name, e.email
         ORDER BY e.last_name, e.first_name
         "#,
     )
@@ -615,15 +618,17 @@ pub(crate) async fn fetch_updated_assignment(
 ) -> Result<UpdatedAssignmentRow, sqlx::Error> {
     sqlx::query_as(
         r#"
-        SELECT planned_hours::float8 AS planned_hours,
-               clock_in,
-               clock_out,
-               CASE WHEN clock_out IS NOT NULL AND clock_in IS NOT NULL
-                    THEN (EXTRACT(EPOCH FROM (clock_out - clock_in)) / 3600.0)::float8
-                    ELSE NULL END AS actual_hours,
-               notes
-        FROM inquiry_employees
-        WHERE inquiry_id = $1 AND employee_id = $2
+        SELECT SUM(ide.planned_hours)::float8 AS planned_hours,
+               MIN(CASE WHEN iday.day_number = 1 THEN ide.clock_in END) AS clock_in,
+               MAX(CASE WHEN iday.day_number = 1 THEN ide.clock_out END) AS clock_out,
+               SUM(CASE WHEN ide.clock_out IS NOT NULL AND ide.clock_in IS NOT NULL
+                         THEN (EXTRACT(EPOCH FROM (ide.clock_out - ide.clock_in)) / 3600.0)
+                         ELSE NULL END)::float8 AS actual_hours,
+               STRING_AGG(ide.notes, '; ' ORDER BY iday.day_number) AS notes
+        FROM inquiry_day_employees ide
+        JOIN inquiry_days iday ON ide.inquiry_day_id = iday.id
+        WHERE iday.inquiry_id = $1 AND ide.employee_id = $2
+        GROUP BY ide.employee_id
         "#,
     )
     .bind(inquiry_id)
@@ -896,5 +901,49 @@ pub(crate) async fn create_minimal(
     .bind(now)
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+// ── Flat-table sync (transition compatibility) ───────────────────────────────
+
+/// After day-level writes, sync the flat `inquiry_employees` table so that
+/// `fetch_employee_assignments_snapshot` (offer builder) and any other flat-table
+/// reads still return correct data.
+///
+/// **Caller**: `put_inquiry_days` handler, after committing day-level data.
+/// **Why**: The multi-day editor writes only to `inquiry_day_employees`. This function
+///          rebuilds the flat table from the day-level data to keep both in sync.
+pub(crate) async fn sync_flat_inquiry_employees(
+    pool: &PgPool,
+    inquiry_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    // Delete all existing flat-table rows for this inquiry
+    sqlx::query("DELETE FROM inquiry_employees WHERE inquiry_id = $1")
+        .bind(inquiry_id)
+        .execute(pool)
+        .await?;
+
+    // Re-insert from day-level data, aggregating per employee
+    sqlx::query(
+        r#"
+        INSERT INTO inquiry_employees (id, inquiry_id, employee_id, planned_hours, clock_in, clock_out, notes, created_at)
+        SELECT gen_random_uuid(),
+               iday.inquiry_id,
+               ide.employee_id,
+               SUM(ide.planned_hours),
+               MIN(CASE WHEN iday.day_number = 1 THEN ide.clock_in END),
+               MAX(CASE WHEN iday.day_number = 1 THEN ide.clock_out END),
+               STRING_AGG(ide.notes, '; ' ORDER BY iday.day_number),
+               NOW()
+        FROM inquiry_day_employees ide
+        JOIN inquiry_days iday ON ide.inquiry_day_id = iday.id
+        WHERE iday.inquiry_id = $1
+        GROUP BY iday.inquiry_id, ide.employee_id
+        "#,
+    )
+    .bind(inquiry_id)
+    .execute(pool)
+    .await?;
+
     Ok(())
 }

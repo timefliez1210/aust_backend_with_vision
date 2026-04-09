@@ -648,7 +648,7 @@ fn parse_month_range(month: &str) -> Option<(NaiveDate, NaiveDate)> {
 ///
 /// **Caller**: `get_schedule`.
 /// **Why**: Employees need to know who else is attending the same training / maintenance
-/// session. Mirrors `fetch_colleague_names` but queries `calendar_item_employees`.
+/// session. Mirrors `fetch_colleague_names` but queries `calendar_item_day_employees`.
 ///
 /// # Returns
 /// Map of `calendar_item_id` → list of `"FirstName LastName"` strings.

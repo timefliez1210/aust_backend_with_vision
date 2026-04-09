@@ -343,19 +343,21 @@ pub(crate) async fn fetch_item_employee(
 ) -> Result<Option<CalendarItemEmployee>, sqlx::Error> {
     sqlx::query_as(
         r#"
-        SELECT cie.employee_id,
+        SELECT cdde.employee_id,
                e.first_name,
                e.last_name,
-               cie.planned_hours::float8 AS planned_hours,
-               cie.clock_in,
-               cie.clock_out,
-               CASE WHEN cie.clock_out IS NOT NULL AND cie.clock_in IS NOT NULL
-                    THEN (EXTRACT(EPOCH FROM (cie.clock_out - cie.clock_in)) / 3600.0)::float8
-                    ELSE NULL END AS actual_hours,
-               cie.notes
-        FROM calendar_item_employees cie
-        JOIN employees e ON e.id = cie.employee_id
-        WHERE cie.calendar_item_id = $1 AND cie.employee_id = $2
+               SUM(cdde.planned_hours)::float8 AS planned_hours,
+               MIN(CASE WHEN cday.day_number = 1 THEN cdde.clock_in END) AS clock_in,
+               MAX(CASE WHEN cday.day_number = 1 THEN cdde.clock_out END) AS clock_out,
+               SUM(CASE WHEN cdde.clock_out IS NOT NULL AND cdde.clock_in IS NOT NULL
+                         THEN (EXTRACT(EPOCH FROM (cdde.clock_out - cdde.clock_in)) / 3600.0)
+                         ELSE NULL END)::float8 AS actual_hours,
+               STRING_AGG(cdde.notes, '; ' ORDER BY cday.day_number) AS notes
+        FROM calendar_item_day_employees cdde
+        JOIN calendar_item_days cday ON cdde.calendar_item_day_id = cday.id
+        JOIN employees e ON e.id = cdde.employee_id
+        WHERE cday.calendar_item_id = $1 AND cdde.employee_id = $2
+        GROUP BY cdde.employee_id, e.first_name, e.last_name
         "#,
     )
     .bind(calendar_item_id)
@@ -418,23 +420,67 @@ pub(crate) async fn fetch_item_employees(
 ) -> Result<Vec<CalendarItemEmployee>, sqlx::Error> {
     sqlx::query_as(
         r#"
-        SELECT cie.employee_id,
+        SELECT cdde.employee_id,
                e.first_name,
                e.last_name,
-               cie.planned_hours::float8 AS planned_hours,
-               cie.clock_in,
-               cie.clock_out,
-               CASE WHEN cie.clock_out IS NOT NULL AND cie.clock_in IS NOT NULL
-                    THEN (EXTRACT(EPOCH FROM (cie.clock_out - cie.clock_in)) / 3600.0)::float8
-                    ELSE NULL END AS actual_hours,
-               cie.notes
-        FROM calendar_item_employees cie
-        JOIN employees e ON e.id = cie.employee_id
-        WHERE cie.calendar_item_id = $1
+               SUM(cdde.planned_hours)::float8 AS planned_hours,
+               MIN(CASE WHEN cday.day_number = 1 THEN cdde.clock_in END) AS clock_in,
+               MAX(CASE WHEN cday.day_number = 1 THEN cdde.clock_out END) AS clock_out,
+               SUM(CASE WHEN cdde.clock_out IS NOT NULL AND cdde.clock_in IS NOT NULL
+                         THEN (EXTRACT(EPOCH FROM (cdde.clock_out - cdde.clock_in)) / 3600.0)
+                         ELSE NULL END)::float8 AS actual_hours,
+               STRING_AGG(cdde.notes, '; ' ORDER BY cday.day_number) AS notes
+        FROM calendar_item_day_employees cdde
+        JOIN calendar_item_days cday ON cdde.calendar_item_day_id = cday.id
+        JOIN employees e ON e.id = cdde.employee_id
+        WHERE cday.calendar_item_id = $1
+        GROUP BY cdde.employee_id, e.first_name, e.last_name
         ORDER BY e.last_name, e.first_name
         "#,
     )
     .bind(item_id)
     .fetch_all(pool)
     .await
+}
+
+// ── Flat-table sync (transition compatibility) ───────────────────────────────
+
+/// After day-level writes, sync the flat `calendar_item_employees` table so
+/// that any remaining flat-table reads return correct data.
+///
+/// **Caller**: `put_calendar_item_days` handler, after committing day-level data.
+/// **Why**: The multi-day editor writes only to `calendar_item_day_employees`. This
+///          function rebuilds the flat table from day-level data.
+pub(crate) async fn sync_flat_calendar_item_employees(
+    pool: &PgPool,
+    calendar_item_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    // Delete all existing flat-table rows for this calendar item
+    sqlx::query("DELETE FROM calendar_item_employees WHERE calendar_item_id = $1")
+        .bind(calendar_item_id)
+        .execute(pool)
+        .await?;
+
+    // Re-insert from day-level data, aggregating per employee
+    sqlx::query(
+        r#"
+        INSERT INTO calendar_item_employees (calendar_item_id, employee_id, planned_hours, clock_in, clock_out, notes, created_at)
+        SELECT cday.calendar_item_id,
+               cdde.employee_id,
+               SUM(cdde.planned_hours),
+               MIN(CASE WHEN cday.day_number = 1 THEN cdde.clock_in END),
+               MAX(CASE WHEN cday.day_number = 1 THEN cdde.clock_out END),
+               STRING_AGG(cdde.notes, '; ' ORDER BY cday.day_number),
+               NOW()
+        FROM calendar_item_day_employees cdde
+        JOIN calendar_item_days cday ON cdde.calendar_item_day_id = cday.id
+        WHERE cday.calendar_item_id = $1
+        GROUP BY cday.calendar_item_id, cdde.employee_id
+        "#,
+    )
+    .bind(calendar_item_id)
+    .execute(pool)
+    .await?;
+
+    Ok(())
 }
