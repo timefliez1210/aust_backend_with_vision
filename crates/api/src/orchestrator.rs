@@ -363,10 +363,7 @@ async fn handle_complete_inquiry(
 
     // 5. Create quote
     let inquiry_id = Uuid::now_v7();
-    let preferred_date_ts = inquiry
-        .preferred_date
-        .map(|d| d.and_hms_opt(10, 0, 0).unwrap())
-        .map(|dt| chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(dt, chrono::Utc));
+    let scheduled_date = inquiry.scheduled_date;
 
     let inquiry_services = build_services(&inquiry);
     let services_json = serde_json::to_value(&inquiry_services).unwrap_or_default();
@@ -387,7 +384,7 @@ async fn handle_complete_inquiry(
         "estimated",
         Some(volume_m3),
         distance_km,
-        preferred_date_ts,
+        scheduled_date,
         notes.as_deref(),
         &services_json,
         &source,

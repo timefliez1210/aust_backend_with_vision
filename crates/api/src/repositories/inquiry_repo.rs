@@ -18,7 +18,7 @@ pub(crate) struct InquiryDbRow {
     pub status: String,
     pub estimated_volume_m3: Option<f64>,
     pub distance_km: Option<f64>,
-    pub preferred_date: Option<DateTime<Utc>>,
+    pub preferred_date: Option<DateTime<Utc>>, // retired — kept for DB compat
     pub scheduled_date: Option<chrono::NaiveDate>,
     pub start_time: NaiveTime,
     pub end_time: NaiveTime,
@@ -245,7 +245,7 @@ pub(crate) async fn create(
     status: &str,
     estimated_volume_m3: Option<f64>,
     distance_km: Option<f64>,
-    preferred_date: Option<DateTime<Utc>>,
+    scheduled_date: Option<NaiveDate>,
     notes: Option<&str>,
     services: &serde_json::Value,
     source: &str,
@@ -254,7 +254,7 @@ pub(crate) async fn create(
     sqlx::query(
         r#"
         INSERT INTO inquiries (id, customer_id, origin_address_id, destination_address_id, stop_address_id,
-                           status, estimated_volume_m3, distance_km, preferred_date, notes, services, source, created_at, updated_at)
+                           status, estimated_volume_m3, distance_km, scheduled_date, notes, services, source, created_at, updated_at)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $13)
         "#,
     )
@@ -266,7 +266,7 @@ pub(crate) async fn create(
     .bind(status)
     .bind(estimated_volume_m3)
     .bind(distance_km)
-    .bind(preferred_date)
+    .bind(scheduled_date)
     .bind(notes)
     .bind(services)
     .bind(source)
@@ -289,7 +289,6 @@ pub(crate) async fn update_fields(
     services_json: Option<&serde_json::Value>,
     estimated_volume_m3: Option<f64>,
     distance_km: Option<f64>,
-    preferred_date: Option<DateTime<Utc>>,
     start_time: Option<NaiveTime>,
     end_time: Option<NaiveTime>,
     origin_address_id: Option<Uuid>,
@@ -305,13 +304,12 @@ pub(crate) async fn update_fields(
             services = COALESCE($4, services),
             estimated_volume_m3 = COALESCE($5, estimated_volume_m3),
             distance_km = COALESCE($6, distance_km),
-            preferred_date = COALESCE($7, preferred_date),
-            scheduled_date = CASE WHEN $7 IS NOT NULL THEN NULL WHEN $11 IS NOT NULL THEN $11 ELSE scheduled_date END,
+            scheduled_date = COALESCE($7, scheduled_date),
             start_time = COALESCE($8, start_time),
             end_time = COALESCE($9, end_time),
             origin_address_id = COALESCE($10, origin_address_id),
-            destination_address_id = COALESCE($12, destination_address_id),
-            updated_at = $13
+            destination_address_id = COALESCE($11, destination_address_id),
+            updated_at = $12
         WHERE id = $1
         "#,
     )
@@ -321,11 +319,10 @@ pub(crate) async fn update_fields(
     .bind(services_json)
     .bind(estimated_volume_m3)
     .bind(distance_km)
-    .bind(preferred_date)
+    .bind(scheduled_date)
     .bind(start_time)
     .bind(end_time)
     .bind(origin_address_id)
-    .bind(scheduled_date)
     .bind(destination_address_id)
     .bind(now)
     .execute(pool)
@@ -780,7 +777,7 @@ pub(crate) async fn create_minimal(
     origin_id: Option<Uuid>,
     dest_id: Option<Uuid>,
     status: &str,
-    preferred_date: Option<DateTime<Utc>>,
+    scheduled_date: Option<NaiveDate>,
     notes: Option<&str>,
     services: Option<&serde_json::Value>,
     source: &str,
@@ -789,7 +786,7 @@ pub(crate) async fn create_minimal(
     sqlx::query(
         r#"
         INSERT INTO inquiries (id, customer_id, origin_address_id, destination_address_id,
-                           status, preferred_date, notes, services, source, created_at, updated_at)
+                           status, scheduled_date, notes, services, source, created_at, updated_at)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)
         "#,
     )
@@ -798,7 +795,7 @@ pub(crate) async fn create_minimal(
     .bind(origin_id)
     .bind(dest_id)
     .bind(status)
-    .bind(preferred_date)
+    .bind(scheduled_date)
     .bind(notes)
     .bind(services)
     .bind(source)

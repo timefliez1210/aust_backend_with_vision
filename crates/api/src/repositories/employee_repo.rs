@@ -196,7 +196,7 @@ pub(crate) async fn fetch_schedule_jobs(
         r#"
         SELECT
             ie.inquiry_id,
-            COALESCE(i.scheduled_date, i.preferred_date::date) AS job_date,
+            i.scheduled_date AS job_date,
             i.status,
             oa.street      AS origin_street,
             oa.city        AS origin_city,
@@ -217,9 +217,9 @@ pub(crate) async fn fetch_schedule_jobs(
         LEFT JOIN addresses oa ON i.origin_address_id      = oa.id
         LEFT JOIN addresses da ON i.destination_address_id = da.id
         WHERE ie.employee_id = $1
-          AND COALESCE(i.scheduled_date, i.preferred_date::date, ie.created_at::date)
+          AND COALESCE(i.scheduled_date, ie.created_at::date)
               BETWEEN $2 AND $3
-        ORDER BY COALESCE(i.scheduled_date, i.preferred_date::date) ASC NULLS LAST
+        ORDER BY i.scheduled_date ASC NULLS LAST
         "#,
     )
     .bind(employee_id)
@@ -430,7 +430,7 @@ pub(crate) async fn fetch_job_inquiry(
     sqlx::query_as(
         r#"
         SELECT
-            COALESCE(i.scheduled_date, i.preferred_date::date) AS job_date,
+            i.scheduled_date AS job_date,
             i.status,
             i.estimated_volume_m3,
             oa.street      AS origin_street,
@@ -537,7 +537,7 @@ pub(crate) async fn fetch_hours_entries(
             NULL::uuid                                        AS calendar_item_id,
             NULL::text                                        AS title,
             NULL::text                                        AS location,
-            COALESCE(i.scheduled_date, i.preferred_date::date) AS job_date,
+            i.scheduled_date AS job_date,
             oa.city                                           AS origin_city,
             da.city                                           AS destination_city,
             ie.planned_hours::float8                          AS planned_hours,
@@ -550,7 +550,7 @@ pub(crate) async fn fetch_hours_entries(
         LEFT JOIN addresses oa ON i.origin_address_id      = oa.id
         LEFT JOIN addresses da ON i.destination_address_id = da.id
         WHERE ie.employee_id = $1
-          AND COALESCE(i.scheduled_date, i.preferred_date::date, ie.created_at::date)
+          AND COALESCE(i.scheduled_date, ie.created_at::date)
               BETWEEN $2 AND $3
 
         UNION ALL
@@ -712,7 +712,7 @@ pub(crate) async fn fetch_month_hours(
             FROM inquiry_employees ie
             JOIN inquiries i ON i.id = ie.inquiry_id
             WHERE ie.employee_id = $1
-              AND COALESCE(i.scheduled_date, i.preferred_date::date, ie.created_at::date)
+              AND COALESCE(i.scheduled_date, ie.created_at::date)
                   BETWEEN $2 AND $3
             UNION ALL
             SELECT cie.planned_hours::float8,
@@ -897,7 +897,7 @@ pub(crate) async fn fetch_admin_assignments(
                COALESCE(c.first_name || ' ' || c.last_name, c.name) AS customer_name,
                oa.city AS origin_city,
                da.city AS destination_city,
-               COALESCE(i.scheduled_date, i.preferred_date::date) AS booking_date,
+               i.scheduled_date AS booking_date,
                ie.planned_hours::float8 AS planned_hours,
                CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
                     THEN (EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0)::float8
@@ -910,7 +910,7 @@ pub(crate) async fn fetch_admin_assignments(
         LEFT JOIN addresses oa ON i.origin_address_id = oa.id
         LEFT JOIN addresses da ON i.destination_address_id = da.id
         WHERE ie.employee_id = $1
-        ORDER BY COALESCE(i.scheduled_date, i.preferred_date::date) DESC NULLS LAST
+        ORDER BY i.scheduled_date DESC NULLS LAST
         LIMIT 50
         "#,
     )
@@ -950,7 +950,7 @@ pub(crate) async fn fetch_admin_hours(
                COALESCE(c.first_name || ' ' || c.last_name, c.name) AS customer_name,
                oa.city AS origin_city,
                da.city AS destination_city,
-               COALESCE(i.scheduled_date, i.preferred_date::date) AS booking_date,
+               i.scheduled_date AS booking_date,
                ie.planned_hours::float8 AS planned_hours,
                ie.clock_in,
                ie.clock_out,
@@ -964,8 +964,8 @@ pub(crate) async fn fetch_admin_hours(
         LEFT JOIN addresses oa ON i.origin_address_id = oa.id
         LEFT JOIN addresses da ON i.destination_address_id = da.id
         WHERE ie.employee_id = $1
-          AND COALESCE(i.scheduled_date, i.preferred_date::date, ie.created_at::date) BETWEEN $2 AND $3
-        ORDER BY COALESCE(i.scheduled_date, i.preferred_date::date, ie.created_at::date)
+          AND COALESCE(i.scheduled_date, ie.created_at::date) BETWEEN $2 AND $3
+        ORDER BY COALESCE(i.scheduled_date, ie.created_at::date)
         "#,
     )
     .bind(employee_id)

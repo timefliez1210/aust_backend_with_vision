@@ -189,7 +189,7 @@ pub async fn insert_test_quote_with_status(pool: &PgPool, status: &str) -> uuid:
 
     sqlx::query(
         "INSERT INTO inquiries (id, customer_id, origin_address_id, destination_address_id,
-         status, preferred_date, estimated_volume_m3, notes, services, source, created_at, updated_at)
+         status, scheduled_date, estimated_volume_m3, notes, services, source, created_at, updated_at)
          VALUES ($1, $2, $3, $4, $5, '2026-04-01', 20.0, 'Halteverbot Auszug', '{}', 'direct_email', NOW(), NOW())",
     )
     .bind(id)

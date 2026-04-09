@@ -75,7 +75,7 @@ pub(crate) async fn count_active_on_date(
     let (count,): (i64,) = sqlx::query_as(
         r#"
         SELECT COUNT(*) FROM inquiries
-        WHERE COALESCE(scheduled_date, preferred_date::date) = $1
+        WHERE scheduled_date = $1
           AND status NOT IN ('cancelled', 'rejected', 'expired')
         "#,
     )
@@ -122,7 +122,7 @@ pub(crate) async fn fetch_schedule_inquiries(
         r#"
         -- Single-day branch: inquiry has no rows in inquiry_days
         SELECT
-            COALESCE(i.scheduled_date, i.preferred_date::date) AS effective_date,
+            i.scheduled_date AS effective_date,
             i.id AS inquiry_id,
             COALESCE(
                 NULLIF(TRIM(COALESCE(c.first_name,'') || ' ' || COALESCE(c.last_name,'')), ''),
@@ -150,7 +150,7 @@ pub(crate) async fn fetch_schedule_inquiries(
         LEFT JOIN inquiry_employees ie ON ie.inquiry_id = i.id
         LEFT JOIN employees e ON ie.employee_id = e.id
         WHERE NOT EXISTS (SELECT 1 FROM inquiry_days WHERE inquiry_id = i.id)
-          AND COALESCE(i.scheduled_date, i.preferred_date::date) BETWEEN $1 AND $2
+          AND i.scheduled_date BETWEEN $1 AND $2
           AND i.status NOT IN ('cancelled', 'rejected', 'expired')
         GROUP BY i.id, c.id, ao.id, ad.id
 

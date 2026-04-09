@@ -25,7 +25,7 @@ pub(crate) struct InquiryRow {
     pub status: String,
     pub estimated_volume_m3: Option<f64>,
     pub distance_km: Option<f64>,
-    pub preferred_date: Option<chrono::DateTime<chrono::Utc>>,
+    pub scheduled_date: Option<chrono::NaiveDate>,
     pub notes: Option<String>,
     #[sqlx(default)]
     pub services: serde_json::Value,
@@ -54,7 +54,8 @@ impl From<InquiryRow> for Inquiry {
             status,
             estimated_volume_m3: row.estimated_volume_m3,
             distance_km: row.distance_km,
-            preferred_date: row.preferred_date,
+            preferred_date: None,
+            scheduled_date: row.scheduled_date,
             notes: row.notes,
             source: Some(row.source),
             services,

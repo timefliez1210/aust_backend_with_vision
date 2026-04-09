@@ -102,7 +102,7 @@ pub(crate) async fn send_offer_to_telegram(config: &TelegramConfig, generated: &
     if !s.dest_address.is_empty() {
         caption.push_str(&format!("\n*Einzug:* {dest_line}"));
     }
-    caption.push_str(&format!("\n*Wunschtermin:* {}", s.preferred_date));
+    caption.push_str(&format!("\n*Wunschtermin:* {}", s.scheduled_date));
 
     caption.push_str(&format!("\n\n*Volumen:* {:.1} m³", s.volume_m3));
     if s.items_count > 0 {

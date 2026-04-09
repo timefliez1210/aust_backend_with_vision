@@ -238,7 +238,7 @@ pub async fn build_inquiry_response(
         services,
         volume_m3: row.estimated_volume_m3,
         distance_km: row.distance_km,
-        preferred_date: row.preferred_date.map(|d| d.format("%Y-%m-%d").to_string()),
+        // preferred_date retired — scheduled_date is now the single date field
         scheduled_date: row.scheduled_date,
         start_time: row.start_time,
         end_time: row.end_time,

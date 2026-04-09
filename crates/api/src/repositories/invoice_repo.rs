@@ -449,20 +449,20 @@ pub(crate) async fn transition_inquiry_to_invoiced(
     Ok(())
 }
 
-/// Fetch the preferred_date from an inquiry for invoice date display.
+/// Fetch the scheduled_date from an inquiry for invoice date display.
 ///
 /// **Caller**: `invoices::load_invoice_context`
-/// **Why**: Service date on the invoice comes from the inquiry's preferred_date.
+/// **Why**: Service date on the invoice comes from the inquiry's scheduled_date.
 pub(crate) async fn fetch_moving_date(
     pool: &PgPool,
     inquiry_id: Uuid,
 ) -> Result<Option<chrono::NaiveDate>, sqlx::Error> {
-    let row: Option<(Option<DateTime<Utc>>,)> =
-        sqlx::query_as("SELECT preferred_date FROM inquiries WHERE id = $1")
+    let row: Option<(Option<chrono::NaiveDate>,)> =
+        sqlx::query_as("SELECT scheduled_date FROM inquiries WHERE id = $1")
             .bind(inquiry_id)
             .fetch_optional(pool)
             .await?;
-    Ok(row.and_then(|(dt,)| dt).map(|dt| dt.date_naive()))
+    Ok(row.and_then(|(dt,)| dt))
 }
 
 /// Fetch origin address for invoice display.

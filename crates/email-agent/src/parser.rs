@@ -186,7 +186,7 @@ impl EmailParser {
             })
             .count() as u32;
 
-        let preferred_date = form
+        let scheduled_date = form
             .wunschtermin
             .as_deref()
             .and_then(|d| parse_date(d));
@@ -227,7 +227,7 @@ impl EmailParser {
             salutation: form.anrede,
             email: form.email.unwrap_or_else(|| email.from.clone()),
             phone: form.phone,
-            preferred_date,
+            scheduled_date,
             departure_address: form.auszugsadresse,
             departure_floor: form.etage_auszug,
             departure_parking_ban: Some(is_truthy(form.halteverbot_auszug.as_deref())),
@@ -330,7 +330,7 @@ impl EmailParser {
         debug!("Extracted form_email={:?} (from={})", form_email, email.from);
 
         let phone = extract_field(body, "Telefon");
-        let preferred_date = extract_field(body, "Wunschtermin").and_then(|d| parse_date(&d));
+        let scheduled_date = extract_field(body, "Wunschtermin").and_then(|d| parse_date(&d));
 
         // Try flat format first, fall back to section-based format
         let departure_address = extract_field(body, "Auszugsadresse")
@@ -390,7 +390,7 @@ impl EmailParser {
             salutation,
             email: form_email.unwrap_or_else(|| email.from.clone()),
             phone,
-            preferred_date,
+            scheduled_date,
             departure_address,
             departure_floor,
             departure_parking_ban,
@@ -874,7 +874,7 @@ mod tests {
         assert_eq!(inquiry.email, "crfabig@googlemail.com");
         assert_eq!(inquiry.phone, Some("015203080947".to_string()));
         assert_eq!(
-            inquiry.preferred_date,
+            inquiry.scheduled_date,
             Some(NaiveDate::from_ymd_opt(2026, 2, 24).unwrap())
         );
         assert_eq!(
@@ -950,7 +950,7 @@ mod tests {
             email: "test@test.de".to_string(),
             name: Some("Max".to_string()),
             phone: Some("0176".to_string()),
-            preferred_date: Some(NaiveDate::from_ymd_opt(2025, 6, 1).unwrap()),
+            scheduled_date: Some(NaiveDate::from_ymd_opt(2025, 6, 1).unwrap()),
             departure_address: Some("Musterstr 1, 31134 Hildesheim".to_string()),
             departure_floor: Some("2. Stock".to_string()),
             arrival_address: Some("Zielstr 5, 30159 Hannover".to_string()),
@@ -1105,7 +1105,7 @@ mod tests {
         let email = make_json_email(json);
         let inquiry = EmailParser::new().parse_inquiry(&email);
         assert_eq!(
-            inquiry.preferred_date,
+            inquiry.scheduled_date,
             Some(NaiveDate::from_ymd_opt(2026, 3, 15).unwrap())
         );
     }
@@ -1121,7 +1121,7 @@ mod tests {
         let email = make_json_email(json);
         let inquiry = EmailParser::new().parse_inquiry(&email);
         assert_eq!(
-            inquiry.preferred_date,
+            inquiry.scheduled_date,
             Some(NaiveDate::from_ymd_opt(2026, 3, 15).unwrap())
         );
     }
@@ -1136,6 +1136,6 @@ mod tests {
         }"#;
         let email = make_json_email(json);
         let inquiry = EmailParser::new().parse_inquiry(&email);
-        assert_eq!(inquiry.preferred_date, None, "Invalid date should be None, not panic");
+        assert_eq!(inquiry.scheduled_date, None, "Invalid date should be None, not panic");
     }
 }

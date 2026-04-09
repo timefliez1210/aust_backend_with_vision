@@ -43,7 +43,7 @@ pub(crate) struct TelegramSummary {
     pub dest_address: String,
     pub dest_floor: String,
     pub dest_elevator: Option<bool>,
-    pub preferred_date: String,
+    pub scheduled_date: String,
     pub volume_m3: f64,
     pub items_count: usize,
     pub distance_km: f64,
@@ -219,7 +219,7 @@ pub(crate) async fn build_offer_with_overrides(
     let pricing_input = PricingInput {
         volume_m3: volume,
         distance_km: distance,
-        preferred_date: inquiry.preferred_date,
+        scheduled_date: inquiry.scheduled_date,
         floor_origin: origin_floor,
         floor_destination: dest_floor,
         has_elevator_origin: origin.as_ref().and_then(|a| a.elevator),
@@ -328,7 +328,7 @@ pub(crate) async fn build_offer_with_overrides(
     let greeting = customer.formal_greeting();
 
     let moving_date = inquiry
-        .preferred_date
+        .scheduled_date
         .map(|d| d.format("%d.%m.%Y").to_string())
         .unwrap_or_else(|| "nach Vereinbarung".to_string());
 
@@ -560,7 +560,7 @@ pub(crate) async fn build_offer_with_overrides(
         dest_address: dest_full,
         dest_floor: dest_floor_info,
         dest_elevator: destination.as_ref().and_then(|a| a.elevator),
-        preferred_date: moving_date,
+        scheduled_date: moving_date,
         volume_m3: volume,
         items_count: detected_items.len(),
         distance_km: distance,

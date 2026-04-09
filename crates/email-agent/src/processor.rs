@@ -374,7 +374,7 @@ impl EmailProcessor {
         }
 
         // Check calendar availability if a preferred date is set
-        let availability = if let Some(date) = inquiry.preferred_date {
+        let availability = if let Some(date) = inquiry.scheduled_date {
             match crate::calendar::check_availability(
                 &self.db,
                 date,
@@ -822,7 +822,7 @@ impl EmailProcessor {
                 JOIN customers c ON i.customer_id = c.id
                 LEFT JOIN addresses ao ON i.origin_address_id = ao.id
                 LEFT JOIN addresses ad ON i.destination_address_id = ad.id
-                WHERE COALESCE(i.scheduled_date, i.preferred_date::date) = $1
+                WHERE i.scheduled_date = $1
                   AND i.status NOT IN ('cancelled', 'rejected', 'expired')
                 "#,
             )
@@ -1178,8 +1178,8 @@ fn merge_inquiry(target: &mut MovingInquiry, source: &MovingInquiry) {
     if target.phone.is_none() {
         target.phone = source.phone.clone();
     }
-    if target.preferred_date.is_none() {
-        target.preferred_date = source.preferred_date;
+    if target.scheduled_date.is_none() {
+        target.scheduled_date = source.scheduled_date;
     }
     if target.departure_address.is_none() {
         target.departure_address = source.departure_address.clone();

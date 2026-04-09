@@ -155,11 +155,11 @@ pub(crate) async fn fetch_customer_profile(
 pub(crate) async fn list_customer_inquiries(
     pool: &PgPool,
     customer_id: Uuid,
-) -> Result<Vec<(Uuid, String, Option<chrono::DateTime<Utc>>, chrono::DateTime<Utc>, Option<String>, Option<String>, Option<f64>, Option<i64>)>, sqlx::Error> {
+) -> Result<Vec<(Uuid, String, Option<chrono::NaiveDate>, chrono::DateTime<Utc>, Option<String>, Option<String>, Option<f64>, Option<i64>)>, sqlx::Error> {
     sqlx::query_as(
         r#"
         SELECT
-            q.id, q.status, q.preferred_date, q.created_at,
+            q.id, q.status, q.scheduled_date, q.created_at,
             oa.city AS origin_city,
             da.city AS destination_city,
             q.estimated_volume_m3,
@@ -184,10 +184,10 @@ pub(crate) async fn fetch_inquiry_owned(
     pool: &PgPool,
     inquiry_id: Uuid,
     customer_id: Uuid,
-) -> Result<Option<(Uuid, String, Option<f64>, Option<f64>, Option<chrono::DateTime<Utc>>, Option<Uuid>, Option<Uuid>)>, sqlx::Error> {
+) -> Result<Option<(Uuid, String, Option<f64>, Option<f64>, Option<chrono::NaiveDate>, Option<Uuid>, Option<Uuid>)>, sqlx::Error> {
     sqlx::query_as(
         r#"
-        SELECT id, status, estimated_volume_m3, distance_km, preferred_date,
+        SELECT id, status, estimated_volume_m3, distance_km, scheduled_date,
                origin_address_id, destination_address_id
         FROM inquiries
         WHERE id = $1 AND customer_id = $2

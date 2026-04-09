@@ -37,8 +37,6 @@ pub struct InquiryResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub distance_km: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub preferred_date: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub scheduled_date: Option<NaiveDate>,
     pub start_time: NaiveTime,
     pub end_time: NaiveTime,

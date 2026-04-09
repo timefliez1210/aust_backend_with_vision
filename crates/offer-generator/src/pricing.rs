@@ -118,14 +118,13 @@ impl PricingEngine {
     /// on Sundays are not typically offered).
     ///
     /// # Parameters
-    /// - `input` — pricing input; only `preferred_date` is examined here
+    /// - `input` — pricing input; only `scheduled_date` is examined here
     ///
     /// # Returns
-    /// `5000` (= €50.00) if the preferred date falls on a Saturday, `0` otherwise.
+    /// `5000` (= €50.00) if the scheduled date falls on a Saturday, `0` otherwise.
     fn calculate_date_adjustment(&self, input: &PricingInput) -> i64 {
-        if let Some(date) = input.preferred_date {
-            let weekday = date.weekday();
-            if weekday == chrono::Weekday::Sat {
+        if let Some(date) = input.scheduled_date {
+            if date.weekday() == chrono::Weekday::Sat {
                 return 5000;
             }
         }
@@ -191,7 +190,7 @@ mod tests {
         PricingInput {
             volume_m3: 10.0,
             distance_km: 0.0,
-            preferred_date: None,
+            scheduled_date: None,
             floor_origin: None,
             floor_destination: None,
             has_elevator_origin: None,
@@ -352,7 +351,7 @@ mod tests {
         let engine = PricingEngine::new();
         let mut input = base_input();
         // Feb 28, 2026 is a Saturday
-        input.preferred_date = Some(chrono::Utc.with_ymd_and_hms(2026, 2, 28, 10, 0, 0).unwrap());
+        input.scheduled_date = Some(chrono::NaiveDate::from_ymd_opt(2026, 2, 28).unwrap());
         let result = engine.calculate(&input);
         assert_eq!(result.breakdown.date_adjustment_cents, 5_000);
     }
@@ -362,7 +361,7 @@ mod tests {
     fn sunday_no_surcharge() {
         let engine = PricingEngine::new();
         let mut input = base_input();
-        input.preferred_date = Some(chrono::Utc.with_ymd_and_hms(2026, 3, 1, 10, 0, 0).unwrap());
+        input.scheduled_date = Some(chrono::NaiveDate::from_ymd_opt(2026, 3, 1).unwrap());
         let result = engine.calculate(&input);
         assert_eq!(result.breakdown.date_adjustment_cents, 0);
     }
@@ -438,7 +437,7 @@ mod tests {
             let input = PricingInput {
                 volume_m3: volume,
                 distance_km: 0.0,
-                preferred_date: None,
+                scheduled_date: None,
                 floor_origin: floor_o,
                 floor_destination: floor_d,
                 floor_stop: floor_s,

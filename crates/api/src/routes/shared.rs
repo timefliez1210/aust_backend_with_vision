@@ -22,7 +22,7 @@ mod tests {
             status: status.to_string(),
             estimated_volume_m3: None,
             distance_km: None,
-            preferred_date: None,
+            scheduled_date: None,
             notes: None,
             services: serde_json::json!({}),
             source: "direct_email".to_string(),

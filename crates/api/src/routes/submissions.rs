@@ -66,7 +66,7 @@ pub(crate) struct ParsedInquiryForm {
     pub arrival_floor: Option<String>,
     pub arrival_parking_ban: Option<bool>,
     pub arrival_elevator: Option<bool>,
-    pub preferred_date: Option<String>,
+    pub scheduled_date: Option<String>,
     pub services: Option<String>,
     pub message: Option<String>,
     pub images: Vec<(Vec<u8>, String)>,
@@ -188,12 +188,10 @@ async fn handle_ar_submission(
     .await
     .map_err(|e| ApiError::Internal(format!("Einzugsadresse konnte nicht erstellt werden: {e}")))?;
 
-    let preferred_date_ts = form
-        .preferred_date
+    let scheduled_date_naive = form
+        .scheduled_date
         .as_deref()
-        .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
-        .and_then(|d| d.and_hms_opt(10, 0, 0))
-        .map(|dt| chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(dt, chrono::Utc));
+        .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok());
 
     let notes = build_notes(
         form.services.as_deref(),
@@ -217,7 +215,7 @@ async fn handle_ar_submission(
         Some(origin_id),
         Some(dest_id),
         "pending",
-        preferred_date_ts,
+        scheduled_date_naive,
         Some(&notes),
         Some(&services_json),
         "mobile_app_ar",
@@ -491,7 +489,7 @@ async fn video_inquiry(
     let mut arrival_floor: Option<String> = None;
     let mut arrival_elevator: Option<bool> = None;
     let mut arrival_parking_ban: Option<bool> = None;
-    let mut preferred_date: Option<String> = None;
+    let mut scheduled_date: Option<String> = None;
     let mut services_text: Option<String> = None;
     let mut message: Option<String> = None;
     let mut video_files: Vec<(Vec<u8>, String)> = Vec::new();
@@ -529,7 +527,7 @@ async fn video_inquiry(
                 let t = read_text_field(field).await?;
                 arrival_parking_ban = Some(parse_bool_field(&t));
             }
-            "wunschtermin" | "preferred_date" => preferred_date = Some(read_text_field(field).await?),
+            "wunschtermin" | "preferred_date" | "scheduled_date" => scheduled_date = Some(read_text_field(field).await?),
             "zusatzleistungen" | "services" => services_text = Some(read_text_field(field).await?),
             "nachricht" | "message" => message = Some(read_text_field(field).await?),
             "video" => {
@@ -605,10 +603,8 @@ async fn video_inquiry(
     .await
     .map_err(|e| ApiError::Internal(format!("Einzugsadresse konnte nicht erstellt werden: {e}")))?;
 
-    let preferred_date_ts = preferred_date.as_deref()
-        .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
-        .and_then(|d| d.and_hms_opt(10, 0, 0))
-        .map(|dt| chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(dt, chrono::Utc));
+    let scheduled_date_naive = scheduled_date.as_deref()
+        .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok());
 
     let notes = build_notes(
         services_text.as_deref(),
@@ -626,7 +622,7 @@ async fn video_inquiry(
         Some(origin_id),
         Some(dest_id),
         "pending",
-        preferred_date_ts,
+        scheduled_date_naive,
         Some(&notes),
         None,
         "video_webapp",
@@ -727,7 +723,7 @@ pub(crate) async fn parse_inquiry_form(
         arrival_floor: None,
         arrival_parking_ban: None,
         arrival_elevator: None,
-        preferred_date: None,
+        scheduled_date: None,
         services: None,
         message: None,
         images: Vec::new(),
@@ -779,8 +775,8 @@ pub(crate) async fn parse_inquiry_form(
                 let text = read_text_field(field).await?;
                 form.arrival_elevator = Some(parse_bool_field(&text));
             }
-            "preferred_date" | "wunschtermin" => {
-                form.preferred_date = Some(read_text_field(field).await?);
+            "wunschtermin" | "scheduled_date" => {
+                form.scheduled_date = Some(read_text_field(field).await?);
             }
             "services" | "zusatzleistungen" => {
                 form.services = Some(read_text_field(field).await?);
@@ -917,12 +913,10 @@ pub(crate) async fn handle_submission(
     .map_err(|e| ApiError::Internal(format!("Einzugsadresse konnte nicht erstellt werden: {e}")))?;
 
     // 4. Parse preferred date
-    let preferred_date_ts = form
-        .preferred_date
+    let scheduled_date_naive = form
+        .scheduled_date
         .as_deref()
-        .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
-        .and_then(|d| d.and_hms_opt(10, 0, 0))
-        .map(|dt| chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(dt, chrono::Utc));
+        .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok());
 
     // 5. Build notes from services, parking bans, and message
     let notes = build_notes(
@@ -949,7 +943,7 @@ pub(crate) async fn handle_submission(
         Some(origin_id),
         Some(dest_id),
         "pending",
-        preferred_date_ts,
+        scheduled_date_naive,
         Some(&notes),
         Some(&services_json),
         source,

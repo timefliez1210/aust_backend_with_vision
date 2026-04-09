@@ -375,7 +375,7 @@ pub(crate) async fn fetch_inquiry_for_offer(
     sqlx::query_as(
         r#"
         SELECT id, customer_id, origin_address_id, destination_address_id, stop_address_id,
-               status, estimated_volume_m3, distance_km, preferred_date, notes, services,
+               status, estimated_volume_m3, distance_km, scheduled_date, notes, services,
                source, offer_sent_at, accepted_at, created_at, updated_at
         FROM inquiries WHERE id = $1
         "#,

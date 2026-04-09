@@ -98,7 +98,7 @@ pub(super) struct CustomerQuote {
     id: Uuid,
     status: String,
     estimated_volume_m3: Option<f64>,
-    preferred_date: Option<DateTime<Utc>>,
+    scheduled_date: Option<NaiveDate>,
     created_at: DateTime<Utc>,
 }
 
@@ -150,7 +150,7 @@ pub(super) async fn get_customer(
         .into_iter()
         .map(|q| CustomerQuote {
             id: q.id, status: q.status, estimated_volume_m3: q.estimated_volume_m3,
-            preferred_date: q.preferred_date, created_at: q.created_at,
+            scheduled_date: q.scheduled_date, created_at: q.created_at,
         })
         .collect();
 

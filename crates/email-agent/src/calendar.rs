@@ -49,12 +49,12 @@ pub struct ScheduleEntry {
 /// Count active inquiries scheduled on `date`.
 ///
 /// "Active" = status not in (cancelled, rejected, expired).
-/// Uses `COALESCE(scheduled_date, preferred_date::date)` as the effective date.
+/// Uses `scheduled_date` as the effective date.
 async fn count_active(pool: &PgPool, date: NaiveDate) -> Result<i32, sqlx::Error> {
     let (count,): (i64,) = sqlx::query_as(
         r#"
         SELECT COUNT(*) FROM inquiries
-        WHERE COALESCE(scheduled_date, preferred_date::date) = $1
+        WHERE scheduled_date = $1
           AND status NOT IN ('cancelled', 'rejected', 'expired')
         "#,
     )
@@ -181,7 +181,7 @@ pub async fn get_schedule(
         sqlx::query_as(
             r#"
             SELECT
-                COALESCE(i.scheduled_date, i.preferred_date::date) AS effective_date,
+                i.scheduled_date AS effective_date,
                 i.id,
                 COALESCE(
                     NULLIF(TRIM(COALESCE(c.first_name,'') || ' ' || COALESCE(c.last_name,'')), ''),
@@ -195,7 +195,7 @@ pub async fn get_schedule(
             JOIN customers c ON i.customer_id = c.id
             LEFT JOIN addresses ao ON i.origin_address_id = ao.id
             LEFT JOIN addresses ad ON i.destination_address_id = ad.id
-            WHERE COALESCE(i.scheduled_date, i.preferred_date::date) BETWEEN $1 AND $2
+            WHERE i.scheduled_date BETWEEN $1 AND $2
               AND i.status NOT IN ('cancelled', 'rejected', 'expired')
             ORDER BY effective_date
             "#,

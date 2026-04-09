@@ -180,7 +180,7 @@ struct OrderListItem {
     #[serde(rename = "volume_m3")]
     estimated_volume_m3: Option<f64>,
     status: String,
-    preferred_date: Option<DateTime<Utc>>,
+    scheduled_date: Option<NaiveDate>,
     offer_price_brutto: Option<i64>,
     booking_date: Option<NaiveDate>,
     created_at: DateTime<Utc>,
@@ -199,7 +199,7 @@ struct OrdersListResponse {
 /// **Caller**: Axum router / admin dashboard "Auftraege" tab.
 /// **Why**: Orders are inquiries that have been accepted. This endpoint filters by the three
 /// order-phase statuses and joins booking dates and the latest offer's brutto price for
-/// the order management table. Results are sorted by `preferred_date` (moving date) ascending.
+/// the order management table. Results are sorted by `scheduled_date` (moving date) ascending.
 ///
 /// # Parameters
 /// - `state` — shared AppState (DB pool)
@@ -242,7 +242,7 @@ async fn list_orders(
             id: r.id, customer_name: r.customer_name, customer_email: r.customer_email,
             origin_city: r.origin_city, destination_city: r.destination_city,
             estimated_volume_m3: r.estimated_volume_m3, status: r.status,
-            preferred_date: r.preferred_date, offer_price_brutto: r.offer_price_brutto,
+            scheduled_date: r.scheduled_date, offer_price_brutto: r.offer_price_brutto,
             booking_date: r.booking_date, created_at: r.created_at,
             employees_assigned: r.employees_assigned, employees_quoted: r.employees_quoted,
         })

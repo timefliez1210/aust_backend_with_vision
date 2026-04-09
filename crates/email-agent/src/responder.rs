@@ -170,7 +170,7 @@ Regeln:
             departure = inquiry.departure_address.as_deref().unwrap_or("-"),
             arrival = inquiry.arrival_address.as_deref().unwrap_or("-"),
             date = inquiry
-                .preferred_date
+                .scheduled_date
                 .map(|d| d.format("%d.%m.%Y").to_string())
                 .unwrap_or_else(|| "-".to_string()),
             volume = inquiry
@@ -258,7 +258,7 @@ Extrahiere diese Felder (wenn vorhanden):
 {
   "name": "vollständiger Name",
   "phone": "Telefonnummer",
-  "preferred_date": "YYYY-MM-DD",
+  "scheduled_date": "YYYY-MM-DD",
   "departure_address": "vollständige Auszugsadresse",
   "departure_floor": "Stockwerk (z.B. Erdgeschoss, 2. Stock)",
   "arrival_address": "vollständige Einzugsadresse",
@@ -301,10 +301,10 @@ Antworte NUR mit dem JSON-Objekt, ohne Erklärungen. Setze fehlende Felder auf n
                     updated.phone = Some(phone.to_string());
                 }
             }
-            if let Some(date_str) = extracted.get("preferred_date").and_then(|v| v.as_str()) {
-                if updated.preferred_date.is_none() {
+            if let Some(date_str) = extracted.get("scheduled_date").and_then(|v| v.as_str()) {
+                if updated.scheduled_date.is_none() {
                     if let Ok(date) = NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
-                        updated.preferred_date = Some(date);
+                        updated.scheduled_date = Some(date);
                     }
                 }
             }
@@ -367,7 +367,7 @@ fn format_known_data(inquiry: &MovingInquiry) -> String {
     if let Some(phone) = &inquiry.phone {
         lines.push(format!("- Telefon: {phone}"));
     }
-    if let Some(date) = inquiry.preferred_date {
+    if let Some(date) = inquiry.scheduled_date {
         lines.push(format!("- Wunschtermin: {}", date.format("%d.%m.%Y")));
     }
     if let Some(addr) = &inquiry.departure_address {

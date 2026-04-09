@@ -83,7 +83,7 @@ struct CreateInquiryRequest {
     destination: Option<AddressInput>,
     services: Option<Services>,
     notes: Option<String>,
-    preferred_date: Option<String>,
+    scheduled_date: Option<String>,
     distance_km: Option<f64>,
     estimated_volume_m3: Option<f64>,
     items_list: Option<String>,
@@ -113,7 +113,6 @@ struct UpdateInquiryRequest {
     services: Option<Services>,
     estimated_volume_m3: Option<f64>,
     distance_km: Option<f64>,
-    preferred_date: Option<String>,
     scheduled_date: Option<String>,
     start_time: Option<NaiveTime>,
     end_time: Option<NaiveTime>,
@@ -185,12 +184,9 @@ async fn create_inquiry(
         None
     };
 
-    let preferred_date = request
-        .preferred_date
-        .as_deref()
-        .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
-        .and_then(|d| d.and_hms_opt(10, 0, 0))
-        .map(|dt| chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(dt, chrono::Utc));
+    let scheduled_date = request.scheduled_date.as_deref().and_then(|s| {
+        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
+    });
 
     let services_json = serde_json::to_value(request.services.unwrap_or_default())
         .unwrap_or(serde_json::json!({}));
@@ -213,7 +209,7 @@ async fn create_inquiry(
         initial_status.as_str(),
         request.estimated_volume_m3,
         request.distance_km,
-        preferred_date,
+        scheduled_date,
         request.notes.as_deref(),
         &services_json,
         "admin_dashboard",
@@ -298,15 +294,6 @@ async fn update_inquiry(
 ) -> Result<Json<InquiryResponseModel>, ApiError> {
     let now = chrono::Utc::now();
 
-
-    // Parse preferred date if provided
-    let preferred_date = request.preferred_date.as_deref().and_then(|s| {
-        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
-            .ok()
-            .and_then(|d| d.and_hms_opt(10, 0, 0))
-            .map(|dt| chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(dt, chrono::Utc))
-    });
-
     // Serialize services if provided
     let services_json = request
         .services
@@ -325,7 +312,6 @@ async fn update_inquiry(
         services_json.as_ref(),
         request.estimated_volume_m3,
         request.distance_km,
-        preferred_date,
         request.start_time,
         request.end_time,
         request.origin_address_id,

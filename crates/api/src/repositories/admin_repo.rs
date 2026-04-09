@@ -31,7 +31,7 @@ pub(crate) async fn count_pending_offers(pool: &PgPool) -> Result<i64, sqlx::Err
 /// Count today's bookings (non-cancelled inquiries scheduled for today).
 pub(crate) async fn count_todays_bookings(pool: &PgPool, today: NaiveDate) -> Result<i64, sqlx::Error> {
     let row: Option<(i64,)> = sqlx::query_as(
-        "SELECT COUNT(*) FROM inquiries WHERE COALESCE(scheduled_date, preferred_date::date) = $1 AND status NOT IN ('cancelled', 'rejected', 'expired')",
+        "SELECT COUNT(*) FROM inquiries WHERE scheduled_date = $1 AND status NOT IN ('cancelled', 'rejected', 'expired')",
     )
     .bind(today)
     .fetch_optional(pool)
@@ -137,13 +137,13 @@ pub(crate) async fn fetch_conflict_dates(
 ) -> Result<Vec<ConflictRow>, sqlx::Error> {
     sqlx::query_as(
         r#"
-        SELECT COALESCE(scheduled_date, preferred_date::date) AS booking_date, COUNT(*) AS booking_count
+        SELECT scheduled_date AS booking_date, COUNT(*) AS booking_count
         FROM inquiries
-        WHERE COALESCE(scheduled_date, preferred_date::date) BETWEEN $1 AND $2
+        WHERE scheduled_date BETWEEN $1 AND $2
           AND status NOT IN ('cancelled', 'rejected', 'expired')
-        GROUP BY COALESCE(scheduled_date, preferred_date::date)
+        GROUP BY scheduled_date
         HAVING COUNT(*) > COALESCE(
-            (SELECT capacity FROM calendar_capacity_overrides WHERE override_date = COALESCE(scheduled_date, preferred_date::date)),
+            (SELECT capacity FROM calendar_capacity_overrides WHERE override_date = scheduled_date),
             $3
         )
         ORDER BY booking_date
@@ -240,7 +240,7 @@ pub(crate) struct CustomerQuote {
     pub id: Uuid,
     pub status: String,
     pub estimated_volume_m3: Option<f64>,
-    pub preferred_date: Option<DateTime<Utc>>,
+    pub scheduled_date: Option<NaiveDate>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -251,7 +251,7 @@ pub(crate) async fn fetch_customer_quotes(
 ) -> Result<Vec<CustomerQuote>, sqlx::Error> {
     sqlx::query_as(
         r#"
-        SELECT id, status, estimated_volume_m3, preferred_date, created_at
+        SELECT id, status, estimated_volume_m3, scheduled_date, created_at
         FROM inquiries WHERE customer_id = $1
         ORDER BY created_at DESC
         "#,
@@ -407,7 +407,7 @@ pub(crate) struct OrderListItem {
     pub destination_city: Option<String>,
     pub estimated_volume_m3: Option<f64>,
     pub status: String,
-    pub preferred_date: Option<DateTime<Utc>>,
+    pub scheduled_date: Option<NaiveDate>,
     pub offer_price_brutto: Option<i64>,
     pub booking_date: Option<NaiveDate>,
     pub created_at: DateTime<Utc>,
@@ -432,7 +432,7 @@ pub(crate) async fn list_orders_single_status(
                da.city AS destination_city,
                q.estimated_volume_m3,
                q.status,
-               q.preferred_date,
+               q.scheduled_date,
                (SELECT ROUND(o.price_cents * 1.19)::bigint FROM offers o WHERE o.inquiry_id = q.id ORDER BY o.created_at DESC LIMIT 1) AS offer_price_brutto,
                q.scheduled_date AS booking_date,
                q.created_at,
@@ -444,7 +444,7 @@ pub(crate) async fn list_orders_single_status(
         LEFT JOIN addresses da ON q.destination_address_id = da.id
         WHERE q.status = $1
           AND (c.name ILIKE $2 OR c.email ILIKE $2)
-        ORDER BY COALESCE(q.preferred_date, q.created_at) ASC
+        ORDER BY COALESCE(q.scheduled_date, q.created_at) ASC
         LIMIT $3 OFFSET $4
         "#,
     )
@@ -472,7 +472,7 @@ pub(crate) async fn list_orders_all_statuses(
                da.city AS destination_city,
                q.estimated_volume_m3,
                q.status,
-               q.preferred_date,
+               q.scheduled_date,
                (SELECT ROUND(o.price_cents * 1.19)::bigint FROM offers o WHERE o.inquiry_id = q.id ORDER BY o.created_at DESC LIMIT 1) AS offer_price_brutto,
                q.scheduled_date AS booking_date,
                q.created_at,
@@ -484,7 +484,7 @@ pub(crate) async fn list_orders_all_statuses(
         LEFT JOIN addresses da ON q.destination_address_id = da.id
         WHERE q.status IN ('accepted', 'scheduled', 'completed', 'invoiced', 'paid')
           AND (c.name ILIKE $1 OR c.email ILIKE $1)
-        ORDER BY COALESCE(q.preferred_date, q.created_at) ASC
+        ORDER BY COALESCE(q.scheduled_date, q.created_at) ASC
         LIMIT $2 OFFSET $3
         "#,
     )

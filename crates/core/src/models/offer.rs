@@ -140,7 +140,7 @@ pub struct PricingInput {
     /// Route distance in kilometres (depot → origin → [stop] → destination).
     pub distance_km: f64,
     /// Requested moving date; used to apply date-based surcharges (e.g., Saturday +€50).
-    pub preferred_date: Option<DateTime<Utc>>,
+    pub scheduled_date: Option<NaiveDate>,
     /// Floor number at the departure address (0 = ground floor).
     /// Used to calculate stair-carrying time and floor surcharge.
     pub floor_origin: Option<u32>,

@@ -185,7 +185,9 @@ pub struct Inquiry {
     /// Total driving distance in kilometres for the full route (depot->origin->
     /// [stop]->destination); `None` until the distance calculator runs.
     pub distance_km: Option<f64>,
-    pub preferred_date: Option<DateTime<Utc>>,
+    pub preferred_date: Option<DateTime<Utc>>, // retired — kept for DB compat
+    /// The locked-in moving date (replaces preferred_date as the single date field).
+    pub scheduled_date: Option<NaiveDate>,
     /// Free-text customer message (e.g., `"Bitte vorsichtig mit dem Klavier"`).
     pub notes: Option<String>,
     /// How this inquiry entered the system (email_form, contact_form, direct_email, photo_api, etc.).
@@ -230,8 +232,8 @@ pub struct MovingInquiry {
     pub phone: Option<String>,
 
     // Move details
-    /// Customer's preferred moving date.
-    pub preferred_date: Option<NaiveDate>,
+    /// Customer's scheduled moving date.
+    pub scheduled_date: Option<NaiveDate>,
 
     // Departure (Auszug)
     /// Full departure street address.
@@ -319,8 +321,8 @@ impl MovingInquiry {
         if self.phone.is_none() {
             missing.push(MissingField::Phone);
         }
-        if self.preferred_date.is_none() {
-            missing.push(MissingField::PreferredDate);
+        if self.scheduled_date.is_none() {
+            missing.push(MissingField::ScheduledDate);
         }
         if self.departure_address.is_none() {
             missing.push(MissingField::DepartureAddress);
@@ -370,7 +372,7 @@ impl MovingInquiry {
 pub enum MissingField {
     Name,
     Phone,
-    PreferredDate,
+    ScheduledDate,
     DepartureAddress,
     DepartureFloor,
     ArrivalAddress,
@@ -389,7 +391,7 @@ impl MissingField {
         match self {
             Self::Name => "Ihren vollständigen Namen",
             Self::Phone => "Ihre Telefonnummer für Rückfragen",
-            Self::PreferredDate => "Ihren Wunschtermin für den Umzug",
+            Self::ScheduledDate => "Ihren Wunschtermin für den Umzug",
             Self::DepartureAddress => "die vollständige Auszugsadresse (Straße, Hausnummer, PLZ, Ort)",
             Self::DepartureFloor => "in welchem Stockwerk sich die Auszugswohnung befindet",
             Self::ArrivalAddress => "die vollständige Einzugsadresse (Straße, Hausnummer, PLZ, Ort)",
