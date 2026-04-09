@@ -444,7 +444,7 @@ pub(crate) async fn list_orders_single_status(
         LEFT JOIN addresses da ON q.destination_address_id = da.id
         WHERE q.status = $1
           AND (c.name ILIKE $2 OR c.email ILIKE $2)
-        ORDER BY COALESCE(q.scheduled_date, q.created_at) ASC
+        ORDER BY COALESCE(q.scheduled_date::timestamptz, q.created_at) ASC
         LIMIT $3 OFFSET $4
         "#,
     )
@@ -484,7 +484,7 @@ pub(crate) async fn list_orders_all_statuses(
         LEFT JOIN addresses da ON q.destination_address_id = da.id
         WHERE q.status IN ('accepted', 'scheduled', 'completed', 'invoiced', 'paid')
           AND (c.name ILIKE $1 OR c.email ILIKE $1)
-        ORDER BY COALESCE(q.scheduled_date, q.created_at) ASC
+        ORDER BY COALESCE(q.scheduled_date::timestamptz, q.created_at) ASC
         LIMIT $2 OFFSET $3
         "#,
     )
