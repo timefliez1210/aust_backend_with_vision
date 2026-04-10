@@ -114,6 +114,10 @@ pub struct InquiryListItem {
     pub status: InquiryStatus,
     pub has_offer: bool,
     pub offer_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub customer_type: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 

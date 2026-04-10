@@ -58,6 +58,29 @@ pub async fn build_inquiry_response(
     let destination_address = fetch_address(pool, row.destination_address_id).await?;
     let stop_address = fetch_address(pool, row.stop_address_id).await?;
 
+    // 3b. Fetch recipient (if different from customer) and billing address
+    let recipient = if let Some(rid) = row.recipient_id {
+        if rid == row.customer_id {
+            // recipient = same as customer, just include the customer snapshot later
+            None // will be filled from customer below
+        } else {
+            customer_repo::fetch_by_id(pool, rid).await.ok().map(|c| CustomerSnapshot {
+                id: c.id,
+                name: c.name,
+                salutation: c.salutation,
+                first_name: c.first_name,
+                last_name: c.last_name,
+                email: c.email,
+                phone: c.phone,
+                customer_type: c.customer_type,
+                company_name: c.company_name,
+            })
+        }
+    } else {
+        None
+    };
+    let billing_address = fetch_address(pool, row.inquiry_billing_address_id).await?;
+
     // 4. Fetch latest completed estimation + items
     let est = estimation_repo::fetch_completed_for_inquiry(pool, inquiry_id).await?;
 
@@ -250,8 +273,8 @@ pub async fn build_inquiry_response(
         accepted_at: row.accepted_at,
         service_type: row.service_type,
         submission_mode: row.submission_mode,
-        recipient: None,  // loaded separately if needed
-        billing_address: None,  // loaded separately if needed
+        recipient,
+        billing_address,
         customer: Some(CustomerSnapshot {
             id: customer.id,
             name: customer.name,
@@ -330,6 +353,8 @@ pub async fn build_inquiry_list(
             customer_name: r.customer_name,
             customer_email: r.customer_email,
             salutation: r.customer_salutation,
+            service_type: r.service_type,
+            customer_type: r.customer_type,
             origin_city: r.origin_city,
             destination_city: r.destination_city,
             volume_m3: r.volume_m3,

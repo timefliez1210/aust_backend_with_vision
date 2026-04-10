@@ -35,6 +35,7 @@ pub fn submit_router() -> Router<Arc<AppState>> {
         .route("/mobile", post(mobile_inquiry))
         .route("/mobile/ar", post(ar_inquiry))
         .route("/video", post(video_inquiry))
+        .route("/manual", post(manual_inquiry))
 }
 
 // ---------------------------------------------------------------------------
@@ -58,6 +59,22 @@ pub(crate) struct ParsedInquiryForm {
     pub last_name: Option<String>,
     pub email: Option<String>,
     pub phone: Option<String>,
+    // New unified-model fields
+    pub customer_type: Option<String>,
+    pub company_name: Option<String>,
+    pub service_type: Option<String>,
+    pub submission_mode: Option<String>,
+    // Recipient (Leistungsempfänger) — when booking for someone else
+    pub recipient_first_name: Option<String>,
+    pub recipient_last_name: Option<String>,
+    pub recipient_phone: Option<String>,
+    pub recipient_email: Option<String>,
+    // Billing address (when different from origin/destination)
+    pub billing_street: Option<String>,
+    pub billing_number: Option<String>,
+    pub billing_postal: Option<String>,
+    pub billing_city: Option<String>,
+    // Address fields
     pub departure_address: Option<String>,
     pub departure_floor: Option<String>,
     pub departure_parking_ban: Option<bool>,
@@ -160,8 +177,8 @@ async fn handle_ar_submission(
         form.first_name.as_deref(),
         form.last_name.as_deref(),
         form.phone.as_deref(),
-        None,
-        None,
+        form.customer_type.as_deref(),
+        form.company_name.as_deref(),
         now,
     )
     .await
@@ -176,8 +193,8 @@ async fn handle_ar_submission(
         Some(dep_postal.as_str()).filter(|s| !s.is_empty()),
         form.departure_floor.as_deref(),
         form.departure_elevator,
-        None,
-        None,
+        None,  // house_number not available from parsed address string
+        form.departure_parking_ban,
     )
     .await
     .map_err(|e| ApiError::Internal(format!("Auszugsadresse konnte nicht erstellt werden: {e}")))?;
@@ -190,8 +207,8 @@ async fn handle_ar_submission(
         Some(arr_postal.as_str()).filter(|s| !s.is_empty()),
         form.arrival_floor.as_deref(),
         form.arrival_elevator,
-        None,
-        None,
+        None,  // house_number not available from parsed address string
+        form.arrival_parking_ban,
     )
     .await
     .map_err(|e| ApiError::Internal(format!("Einzugsadresse konnte nicht erstellt werden: {e}")))?;
@@ -505,6 +522,19 @@ async fn video_inquiry(
     let mut scheduled_date: Option<String> = None;
     let mut services_text: Option<String> = None;
     let mut message: Option<String> = None;
+    // Unified model fields
+    let mut customer_type: Option<String> = None;
+    let mut company_name: Option<String> = None;
+    let mut service_type: Option<String> = None;
+    let mut submission_mode: Option<String> = None;
+    let mut recipient_first_name: Option<String> = None;
+    let mut recipient_last_name: Option<String> = None;
+    let mut recipient_phone: Option<String> = None;
+    let mut recipient_email: Option<String> = None;
+    let mut billing_street: Option<String> = None;
+    let mut billing_number: Option<String> = None;
+    let mut billing_postal: Option<String> = None;
+    let mut billing_city: Option<String> = None;
     let mut video_files: Vec<(Vec<u8>, String)> = Vec::new();
 
     while let Some(field) = multipart
@@ -541,7 +571,7 @@ async fn video_inquiry(
                 arrival_parking_ban = Some(parse_bool_field(&t));
             }
             "wunschtermin" | "preferred_date" | "scheduled_date" => scheduled_date = Some(read_text_field(field).await?),
-            "zusatzleistungen" | "services" => services_text = Some(read_text_field(field).await?),
+            "zusatzleistungen" | "services" | "services[]" => services_text = Some(read_text_field(field).await?),
             "nachricht" | "message" => message = Some(read_text_field(field).await?),
             "video" => {
                 // Accept any video/* MIME type; fall back to video/mp4 for generic types
@@ -559,6 +589,19 @@ async fn video_inquiry(
                     video_files.push((data.to_vec(), content_type));
                 }
             }
+            // Unified model fields (video form)
+            "customer_type" => customer_type = Some(read_text_field(field).await?),
+            "company_name" | "firmenname" => company_name = Some(read_text_field(field).await?),
+            "service_type" => service_type = Some(read_text_field(field).await?),
+            "submission_mode" => submission_mode = Some(read_text_field(field).await?),
+            "recipient_first_name" => recipient_first_name = Some(read_text_field(field).await?),
+            "recipient_last_name" => recipient_last_name = Some(read_text_field(field).await?),
+            "recipient_phone" => recipient_phone = Some(read_text_field(field).await?),
+            "recipient_email" => recipient_email = Some(read_text_field(field).await?),
+            "billing_street" => billing_street = Some(read_text_field(field).await?),
+            "billing_number" | "billing_house_number" => billing_number = Some(read_text_field(field).await?),
+            "billing_postal" | "billing_zip" | "billing_plz" => billing_postal = Some(read_text_field(field).await?),
+            "billing_city" | "billing_ort" => billing_city = Some(read_text_field(field).await?),
             _ => continue,
         }
     }
@@ -586,8 +629,8 @@ async fn video_inquiry(
         first_name.as_deref(),
         last_name.as_deref(),
         phone.as_deref(),
-        None,
-        None,
+        customer_type.as_deref(),
+        company_name.as_deref(),
         now,
     )
     .await
@@ -603,7 +646,7 @@ async fn video_inquiry(
         departure_floor.as_deref(),
         departure_elevator,
         None,
-        None,
+        departure_parking_ban,
     )
     .await
     .map_err(|e| ApiError::Internal(format!("Auszugsadresse konnte nicht erstellt werden: {e}")))?;
@@ -617,7 +660,7 @@ async fn video_inquiry(
         arrival_floor.as_deref(),
         arrival_elevator,
         None,
-        None,
+        arrival_parking_ban,
     )
     .await
     .map_err(|e| ApiError::Internal(format!("Einzugsadresse konnte nicht erstellt werden: {e}")))?;
@@ -645,8 +688,8 @@ async fn video_inquiry(
         Some(&notes),
         None,
         "video_webapp",
-        None,  // service_type
-        None,  // submission_mode
+        service_type.as_deref(),
+        Some("video"),  // submission_mode
         None,  // recipient_id
         None,  // billing_address_id
         None,  // custom_fields
@@ -727,6 +770,175 @@ async fn video_inquiry(
     ))
 }
 
+/// `POST /api/v1/submit/manual` — Public manual inquiry (no images/video required).
+///
+/// **Caller**: foto-angebot "manuell" mode, other public forms that don't upload media.
+/// **Why**: Public customers need a way to submit inquiries without going through the admin API.
+async fn manual_inquiry(
+    State(state): State<Arc<AppState>>,
+    multipart: Multipart,
+) -> Result<(StatusCode, Json<SubmitInquiryResponse>), ApiError> {
+    let form = parse_inquiry_form(multipart, false).await?;
+
+    // Validate required fields
+    let name = form
+        .name
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| ApiError::Validation("Name ist erforderlich".into()))?;
+    let email = form
+        .email
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| ApiError::Validation("E-Mail ist erforderlich".into()))?;
+    let departure_address = form
+        .departure_address
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| ApiError::Validation("Auszugsadresse ist erforderlich".into()))?;
+    let arrival_address = form
+        .arrival_address
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| ApiError::Validation("Einzugsadresse ist erforderlich".into()))?;
+
+    let now = chrono::Utc::now();
+
+    // 1. Upsert customer
+    let customer_id = customer_repo::upsert(
+        &state.db,
+        email,
+        Some(name),
+        form.salutation.as_deref(),
+        form.first_name.as_deref(),
+        form.last_name.as_deref(),
+        form.phone.as_deref(),
+        form.customer_type.as_deref(),
+        form.company_name.as_deref(),
+        now,
+    )
+    .await
+    .map_err(|e| ApiError::Internal(format!("Kunde konnte nicht erstellt werden: {e}")))?;
+
+    // 2. Create origin address
+    let (dep_street, dep_city, dep_postal) = services::vision::parse_address(departure_address);
+    let origin_id = address_repo::create(
+        &state.db,
+        &dep_street,
+        &dep_city,
+        Some(dep_postal.as_str()).filter(|s| !s.is_empty()),
+        form.departure_floor.as_deref(),
+        form.departure_elevator,
+        None,
+        form.departure_parking_ban,
+    )
+    .await
+    .map_err(|e| ApiError::Internal(format!("Auszugsadresse konnte nicht erstellt werden: {e}")))?;
+
+    // 3. Create destination address
+    let (arr_street, arr_city, arr_postal) = services::vision::parse_address(arrival_address);
+    let dest_id = address_repo::create(
+        &state.db,
+        &arr_street,
+        &arr_city,
+        Some(arr_postal.as_str()).filter(|s| !s.is_empty()),
+        form.arrival_floor.as_deref(),
+        form.arrival_elevator,
+        None,
+        form.arrival_parking_ban,
+    )
+    .await
+    .map_err(|e| ApiError::Internal(format!("Einzugsadresse konnte nicht erstellt werden: {e}")))?;
+
+    // 3b. Create billing address if provided
+    let billing_address_id = if form.billing_street.is_some() || form.billing_city.is_some() {
+        let b_street = form.billing_street.as_deref().unwrap_or("");
+        let b_city = form.billing_city.as_deref().unwrap_or("");
+        if !b_street.is_empty() && !b_city.is_empty() {
+            let (parsed_street, parsed_city, parsed_postal) = services::vision::parse_address(
+                &format!("{b_street} {b_city}"),
+            );
+            Some(address_repo::create(
+                &state.db,
+                &parsed_street,
+                &parsed_city,
+                Some(parsed_postal.as_str()).filter(|s| !s.is_empty()),
+                None,
+                None,
+                form.billing_number.as_deref(),
+                Some(false),
+            ).await.map_err(|e| ApiError::Internal(format!("Rechnungsadresse konnte nicht erstellt werden: {e}")))?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // 4. Parse scheduled date
+    let scheduled_date_naive = form
+        .scheduled_date
+        .as_deref()
+        .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok());
+
+    // 5. Build notes from services, parking bans, and message
+    let notes = build_notes(
+        form.services.as_deref(),
+        form.departure_parking_ban,
+        form.arrival_parking_ban,
+        form.message.as_deref(),
+    );
+
+    let services_struct = parse_services_string(
+        form.services.as_deref(),
+        form.departure_parking_ban,
+        form.arrival_parking_ban,
+    );
+    let services_json = serde_json::to_value(&services_struct).unwrap_or(serde_json::json!({}));
+
+    // 6. Create inquiry
+    let inquiry_id = Uuid::now_v7();
+    inquiry_repo::create_minimal(
+        &state.db,
+        inquiry_id,
+        customer_id,
+        Some(origin_id),
+        Some(dest_id),
+        "pending",
+        scheduled_date_naive,
+        Some(&notes),
+        Some(&services_json),
+        "manuell",
+        form.service_type.as_deref(),
+        Some("manuell"),  // submission_mode
+        None,              // recipient_id
+        billing_address_id,
+        None,              // custom_fields
+        now,
+    )
+    .await
+    .map_err(|e| ApiError::Internal(format!("Anfrage konnte nicht erstellt werden: {e}")))?;
+
+    tracing::info!(inquiry_id = %inquiry_id, "Manual inquiry created for submission");
+
+    // 7. Trigger auto-offer and distance calculation in background
+    let state_bg = Arc::clone(&state);
+    tokio::spawn(async move {
+        try_auto_generate_offer(Arc::clone(&state_bg), inquiry_id).await;
+    });
+
+    Ok((
+        StatusCode::CREATED,
+        Json(SubmitInquiryResponse {
+            inquiry_id,
+            customer_id,
+            status: "pending".to_string(),
+            message: "Anfrage erstellt. Wir melden uns mit einem Angebot.".to_string(),
+        }),
+    ))
+}
+
+
 /// Parse the multipart form data into a structured form.
 pub(crate) async fn parse_inquiry_form(
     mut multipart: Multipart,
@@ -739,6 +951,18 @@ pub(crate) async fn parse_inquiry_form(
         last_name: None,
         email: None,
         phone: None,
+        customer_type: None,
+        company_name: None,
+        service_type: None,
+        submission_mode: None,
+        recipient_first_name: None,
+        recipient_last_name: None,
+        recipient_phone: None,
+        recipient_email: None,
+        billing_street: None,
+        billing_number: None,
+        billing_postal: None,
+        billing_city: None,
         departure_address: None,
         departure_floor: None,
         departure_parking_ban: None,
@@ -844,6 +1068,19 @@ pub(crate) async fn parse_inquiry_form(
             "intrinsics" if accept_depth => {
                 form.intrinsics = Some(read_text_field(field).await?);
             }
+            // Unified model fields
+            "customer_type" => form.customer_type = Some(read_text_field(field).await?),
+            "company_name" | "firmenname" => form.company_name = Some(read_text_field(field).await?),
+            "service_type" => form.service_type = Some(read_text_field(field).await?),
+            "submission_mode" => form.submission_mode = Some(read_text_field(field).await?),
+            "recipient_first_name" => form.recipient_first_name = Some(read_text_field(field).await?),
+            "recipient_last_name" => form.recipient_last_name = Some(read_text_field(field).await?),
+            "recipient_phone" => form.recipient_phone = Some(read_text_field(field).await?),
+            "recipient_email" => form.recipient_email = Some(read_text_field(field).await?),
+            "billing_street" => form.billing_street = Some(read_text_field(field).await?),
+            "billing_number" | "billing_house_number" => form.billing_number = Some(read_text_field(field).await?),
+            "billing_postal" | "billing_zip" | "billing_plz" => form.billing_postal = Some(read_text_field(field).await?),
+            "billing_city" | "billing_ort" => form.billing_city = Some(read_text_field(field).await?),
             _ => continue,
         }
     }
@@ -966,6 +1203,34 @@ pub(crate) async fn handle_submission(
 
     // 6. Create inquiry
     let inquiry_id = Uuid::now_v7();
+    // Create billing address if provided
+    let billing_address_id = if form.billing_street.is_some() || form.billing_city.is_some() {
+        let b_street = form.billing_street.as_deref().unwrap_or("");
+        let b_city = form.billing_city.as_deref().unwrap_or("");
+        if !b_street.is_empty() && !b_city.is_empty() {
+            let (parsed_street, parsed_city, parsed_postal) = services::vision::parse_address(
+                &format!("{b_street} {b_city}")
+            );
+            Some(address_repo::create(
+                &state.db,
+                &parsed_street,
+                &parsed_city,
+                Some(parsed_postal.as_str()).filter(|s| !s.is_empty()),
+                None,
+                None,
+                form.billing_number.as_deref(),
+                Some(false),
+            ).await.map_err(|e| ApiError::Internal(format!("Rechnungsadresse konnte nicht erstellt werden: {e}")))?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Build custom_fields from form extras
+    let custom_fields_json: Option<serde_json::Value> = None;
+
     inquiry_repo::create_minimal(
         &state.db,
         inquiry_id,
@@ -977,11 +1242,11 @@ pub(crate) async fn handle_submission(
         Some(&notes),
         Some(&services_json),
         source,
-        None,  // service_type
-        None,  // submission_mode
-        None,  // recipient_id
-        None,  // billing_address_id
-        None,  // custom_fields
+        form.service_type.as_deref(),      // service_type
+        form.submission_mode.as_deref(),   // submission_mode (set by handler: "foto"/"video")
+        None,                              // recipient_id (created separately if needed)
+        billing_address_id,               // billing_address_id
+        custom_fields_json.as_ref(),      // custom_fields
         now,
     )
     .await
