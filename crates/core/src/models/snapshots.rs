@@ -50,6 +50,14 @@ pub struct InquiryResponse {
     pub offer_sent_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub accepted_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub submission_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recipient: Option<CustomerSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub billing_address: Option<AddressSnapshot>,
 
     // Related entities
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -118,12 +126,18 @@ pub struct CustomerSnapshot {
     pub last_name: Option<String>,
     pub email: String,
     pub phone: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub customer_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub company_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddressSnapshot {
     pub id: Uuid,
     pub street: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub house_number: Option<String>,
     pub city: String,
     pub postal_code: String,
     pub country: String,
@@ -133,6 +147,8 @@ pub struct AddressSnapshot {
     pub elevator: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub needs_parking_ban: Option<bool>,
+    #[serde(default)]
+    pub parking_ban: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latitude: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]

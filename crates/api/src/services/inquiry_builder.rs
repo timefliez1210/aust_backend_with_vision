@@ -248,6 +248,10 @@ pub async fn build_inquiry_response(
         updated_at: row.updated_at,
         offer_sent_at: row.offer_sent_at,
         accepted_at: row.accepted_at,
+        service_type: row.service_type,
+        submission_mode: row.submission_mode,
+        recipient: None,  // loaded separately if needed
+        billing_address: None,  // loaded separately if needed
         customer: Some(CustomerSnapshot {
             id: customer.id,
             name: customer.name,
@@ -256,6 +260,8 @@ pub async fn build_inquiry_response(
             last_name: customer.last_name,
             email: customer.email,
             phone: customer.phone,
+            customer_type: customer.customer_type,
+            company_name: customer.company_name,
         }),
         origin_address,
         destination_address,
@@ -355,6 +361,7 @@ async fn fetch_address(
     Ok(row.map(|a| AddressSnapshot {
         id: a.id,
         street: a.street,
+        house_number: a.house_number,
         city: a.city,
         postal_code: a.postal_code.unwrap_or_default(),
         country: if a.country.is_empty() {
@@ -365,6 +372,7 @@ async fn fetch_address(
         floor: a.floor,
         elevator: a.elevator,
         needs_parking_ban: None,
+        parking_ban: a.parking_ban,
         latitude: a.latitude,
         longitude: a.longitude,
     }))

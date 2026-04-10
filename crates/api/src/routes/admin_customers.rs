@@ -330,20 +330,24 @@ pub(super) async fn delete_customer(
 #[derive(Debug, Deserialize)]
 pub(super) struct UpdateAddressRequest {
     street: Option<String>,
+    house_number: Option<String>,
     city: Option<String>,
     postal_code: Option<String>,
     floor: Option<String>,
     elevator: Option<bool>,
+    parking_ban: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
 pub(super) struct AddressResponse {
     id: Uuid,
     street: String,
+    house_number: Option<String>,
     city: String,
     postal_code: Option<String>,
     floor: Option<String>,
     elevator: Option<bool>,
+    parking_ban: bool,
 }
 
 /// `PATCH /api/v1/admin/addresses/{id}` — Partially update an address record.
@@ -371,16 +375,16 @@ pub(super) async fn update_address(
 ) -> Result<Json<AddressResponse>, ApiError> {
     let repo_row = admin_repo::update_address(
         &state.db, id,
-        request.street.as_deref(), request.city.as_deref(),
+        request.street.as_deref(), request.house_number.as_deref(), request.city.as_deref(),
         request.postal_code.as_deref(), request.floor.as_deref(),
-        request.elevator,
+        request.elevator, request.parking_ban,
     )
     .await?;
 
     repo_row
         .map(|a| Json(AddressResponse {
-            id: a.id, street: a.street, city: a.city,
-            postal_code: a.postal_code, floor: a.floor, elevator: a.elevator,
+            id: a.id, street: a.street, house_number: a.house_number, city: a.city,
+            postal_code: a.postal_code, floor: a.floor, elevator: a.elevator, parking_ban: a.parking_ban,
         }))
         .ok_or_else(|| ApiError::NotFound(format!("Adresse {id} nicht gefunden")))
 }

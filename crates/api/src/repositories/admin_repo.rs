@@ -546,10 +546,12 @@ pub(crate) async fn count_orders_all_statuses(
 pub(crate) struct AddressResponse {
     pub id: Uuid,
     pub street: String,
+    pub house_number: Option<String>,
     pub city: String,
     pub postal_code: Option<String>,
     pub floor: Option<String>,
     pub elevator: Option<bool>,
+    pub parking_ban: bool,
 }
 
 /// Update an address (partial update).
@@ -557,29 +559,35 @@ pub(crate) async fn update_address(
     pool: &PgPool,
     id: Uuid,
     street: Option<&str>,
+    house_number: Option<&str>,
     city: Option<&str>,
     postal_code: Option<&str>,
     floor: Option<&str>,
     elevator: Option<bool>,
+    parking_ban: Option<bool>,
 ) -> Result<Option<AddressResponse>, sqlx::Error> {
     sqlx::query_as(
         r#"
         UPDATE addresses SET
             street = COALESCE($2, street),
-            city = COALESCE($3, city),
-            postal_code = COALESCE($4, postal_code),
-            floor = COALESCE($5, floor),
-            elevator = COALESCE($6, elevator)
+            house_number = COALESCE($3, house_number),
+            city = COALESCE($4, city),
+            postal_code = COALESCE($5, postal_code),
+            floor = COALESCE($6, floor),
+            elevator = COALESCE($7, elevator),
+            parking_ban = COALESCE($8, parking_ban)
         WHERE id = $1
-        RETURNING id, street, city, postal_code, floor, elevator
+        RETURNING id, street, house_number, city, postal_code, floor, elevator, parking_ban
         "#,
     )
     .bind(id)
     .bind(street)
+    .bind(house_number)
     .bind(city)
     .bind(postal_code)
     .bind(floor)
     .bind(elevator)
+    .bind(parking_ban)
     .fetch_optional(pool)
     .await
 }

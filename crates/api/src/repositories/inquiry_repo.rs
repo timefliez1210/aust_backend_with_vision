@@ -828,6 +828,10 @@ pub(crate) struct ListItemDbRow {
     pub customer_name: Option<String>,
     pub customer_email: String,
     pub customer_salutation: Option<String>,
+    #[sqlx(default)]
+    pub customer_type: Option<String>,
+    #[sqlx(default)]
+    pub service_type: Option<String>,
     pub origin_city: Option<String>,
     pub destination_city: Option<String>,
     pub volume_m3: Option<f64>,
@@ -857,6 +861,8 @@ pub(crate) async fn list_items(
             c.name AS customer_name,
             c.email AS customer_email,
             c.salutation AS customer_salutation,
+            c.customer_type,
+            i.service_type,
             oa.city AS origin_city,
             da.city AS destination_city,
             i.estimated_volume_m3 AS volume_m3,
