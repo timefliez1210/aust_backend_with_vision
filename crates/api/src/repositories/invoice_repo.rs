@@ -30,14 +30,6 @@ pub(crate) struct ActiveOfferRow {
     pub offer_number: Option<String>,
 }
 
-/// Address projection for invoice display.
-#[derive(Debug, FromRow)]
-pub(crate) struct InvoiceAddressRow {
-    pub street: Option<String>,
-    pub city: Option<String>,
-    pub postal_code: Option<String>,
-}
-
 // ── Queries ──────────────────────────────────────────────────────────────────
 
 /// List all invoices for an inquiry, ordered by creation date.
@@ -463,25 +455,6 @@ pub(crate) async fn fetch_moving_date(
             .fetch_optional(pool)
             .await?;
     Ok(row.and_then(|(dt,)| dt))
-}
-
-/// Fetch origin address for invoice display.
-///
-/// **Caller**: `invoices::load_invoice_context`
-/// **Why**: Invoice PDF includes the origin address.
-pub(crate) async fn fetch_origin_address(
-    pool: &PgPool,
-    inquiry_id: Uuid,
-) -> Result<Option<InvoiceAddressRow>, sqlx::Error> {
-    sqlx::query_as(
-        "SELECT a.street, a.city, a.postal_code
-         FROM addresses a
-         JOIN inquiries i ON i.origin_address_id = a.id
-         WHERE i.id = $1",
-    )
-    .bind(inquiry_id)
-    .fetch_optional(pool)
-    .await
 }
 
 /// Fetch the latest offer netto price for an inquiry.

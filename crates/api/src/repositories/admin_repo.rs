@@ -184,6 +184,10 @@ pub(crate) struct CustomerListItem {
     pub first_name: Option<String>,
     pub last_name: Option<String>,
     pub phone: Option<String>,
+    #[sqlx(default)]
+    pub customer_type: Option<String>,
+    #[sqlx(default)]
+    pub company_name: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -196,7 +200,7 @@ pub(crate) async fn list_customers(
 ) -> Result<Vec<CustomerListItem>, sqlx::Error> {
     sqlx::query_as(
         r#"
-        SELECT id, email, name, salutation, first_name, last_name, phone, created_at
+        SELECT id, email, name, salutation, first_name, last_name, phone, customer_type, company_name, created_at
         FROM customers
         WHERE name ILIKE $1 OR email ILIKE $1
         ORDER BY created_at DESC
@@ -227,7 +231,7 @@ pub(crate) async fn fetch_customer(
     id: Uuid,
 ) -> Result<Option<CustomerListItem>, sqlx::Error> {
     sqlx::query_as(
-        "SELECT id, email, name, salutation, first_name, last_name, phone, created_at FROM customers WHERE id = $1",
+        "SELECT id, email, name, salutation, first_name, last_name, phone, customer_type, company_name, created_at FROM customers WHERE id = $1",
     )
     .bind(id)
     .fetch_optional(pool)
@@ -239,6 +243,8 @@ pub(crate) async fn fetch_customer(
 pub(crate) struct CustomerQuote {
     pub id: Uuid,
     pub status: String,
+    #[sqlx(default)]
+    pub service_type: Option<String>,
     pub estimated_volume_m3: Option<f64>,
     pub scheduled_date: Option<NaiveDate>,
     pub created_at: DateTime<Utc>,
@@ -251,7 +257,7 @@ pub(crate) async fn fetch_customer_quotes(
 ) -> Result<Vec<CustomerQuote>, sqlx::Error> {
     sqlx::query_as(
         r#"
-        SELECT id, status, estimated_volume_m3, scheduled_date, created_at
+        SELECT id, status, service_type, estimated_volume_m3, scheduled_date, created_at
         FROM inquiries WHERE customer_id = $1
         ORDER BY created_at DESC
         "#,
@@ -328,6 +334,8 @@ pub(crate) async fn update_customer(
     last_name: Option<&str>,
     phone: Option<&str>,
     email: Option<&str>,
+    customer_type: Option<&str>,
+    company_name: Option<&str>,
 ) -> Result<Option<CustomerListItem>, sqlx::Error> {
     sqlx::query_as(
         r#"
@@ -337,9 +345,11 @@ pub(crate) async fn update_customer(
             first_name = COALESCE($4, first_name),
             last_name = COALESCE($5, last_name),
             phone = COALESCE($6, phone),
-            email = COALESCE($7, email)
+            email = COALESCE($7, email),
+            customer_type = COALESCE($8, customer_type),
+            company_name = COALESCE($9, company_name)
         WHERE id = $1
-        RETURNING id, email, name, salutation, first_name, last_name, phone, created_at
+        RETURNING id, email, name, salutation, first_name, last_name, phone, customer_type, company_name, created_at
         "#,
     )
     .bind(id)
@@ -349,6 +359,8 @@ pub(crate) async fn update_customer(
     .bind(last_name)
     .bind(phone)
     .bind(email)
+    .bind(customer_type)
+    .bind(company_name)
     .fetch_optional(pool)
     .await
 }

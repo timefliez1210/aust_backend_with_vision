@@ -12,6 +12,10 @@ pub(crate) struct ScheduleInquiryRow {
     pub effective_date: NaiveDate,
     pub inquiry_id: Uuid,
     pub customer_name: Option<String>,
+    #[sqlx(default)]
+    pub customer_type: Option<String>,
+    #[sqlx(default)]
+    pub company_name: Option<String>,
     pub departure_address: Option<String>,
     pub arrival_address: Option<String>,
     pub volume_m3: Option<f64>,
@@ -24,6 +28,8 @@ pub(crate) struct ScheduleInquiryRow {
     pub day_number: Option<i16>,
     pub total_days: Option<i16>,
     pub day_notes: Option<String>,
+    #[sqlx(default)]
+    pub service_type: Option<String>,
 }
 
 /// A single row from `inquiry_days` including optional per-day times.
@@ -128,10 +134,13 @@ pub(crate) async fn fetch_schedule_inquiries(
                 NULLIF(TRIM(COALESCE(c.first_name,'') || ' ' || COALESCE(c.last_name,'')), ''),
                 c.name, c.email
             ) AS customer_name,
+            c.customer_type,
+            c.company_name,
             CASE WHEN ao.id IS NOT NULL THEN ao.street || ', ' || ao.city END AS departure_address,
             CASE WHEN ad.id IS NOT NULL THEN ad.street || ', ' || ad.city END AS arrival_address,
             i.estimated_volume_m3 AS volume_m3,
             i.status,
+            i.service_type,
             i.notes,
             i.start_time,
             i.end_time,

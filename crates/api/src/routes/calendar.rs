@@ -68,6 +68,10 @@ struct AvailabilityResult {
 struct ScheduleInquiry {
     inquiry_id: Uuid,
     customer_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    customer_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    company_name: Option<String>,
     departure_address: Option<String>,
     arrival_address: Option<String>,
     volume_m3: Option<f64>,
@@ -87,6 +91,8 @@ struct ScheduleInquiry {
     /// Per-day notes from `inquiry_days` (None for single-day).
     #[serde(skip_serializing_if = "Option::is_none")]
     day_notes: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_type: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -281,7 +287,7 @@ async fn get_schedule(
         let price = price_map.get(&r.inquiry_id).copied();
         inquiry_map.entry(r.effective_date).or_default().push(ScheduleInquiry {
             inquiry_id: r.inquiry_id,
-            customer_name: r.customer_name,
+            customer_name: r.customer_name, customer_type: r.customer_type, company_name: r.company_name,
             departure_address: r.departure_address,
             arrival_address: r.arrival_address,
             volume_m3: r.volume_m3,
@@ -295,6 +301,7 @@ async fn get_schedule(
             day_number: r.day_number,
             total_days: r.total_days,
             day_notes: r.day_notes,
+            service_type: r.service_type,
         });
     }
 

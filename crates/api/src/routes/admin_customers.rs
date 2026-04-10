@@ -32,6 +32,8 @@ pub(super) struct CustomerListItem {
     first_name: Option<String>,
     last_name: Option<String>,
     phone: Option<String>,
+    customer_type: Option<String>,
+    company_name: Option<String>,
     created_at: DateTime<Utc>,
 }
 
@@ -69,7 +71,8 @@ pub(super) async fn list_customers(
         .into_iter()
         .map(|c| CustomerListItem {
             id: c.id, email: c.email, name: c.name, salutation: c.salutation,
-            first_name: c.first_name, last_name: c.last_name, phone: c.phone, created_at: c.created_at,
+            first_name: c.first_name, last_name: c.last_name, phone: c.phone,
+            customer_type: c.customer_type, company_name: c.company_name, created_at: c.created_at,
         })
         .collect();
 
@@ -87,6 +90,8 @@ pub(super) struct CustomerDetailResponse {
     first_name: Option<String>,
     last_name: Option<String>,
     phone: Option<String>,
+    customer_type: Option<String>,
+    company_name: Option<String>,
     created_at: DateTime<Utc>,
     quotes: Vec<CustomerQuote>,
     offers: Vec<CustomerOffer>,
@@ -97,6 +102,7 @@ pub(super) struct CustomerDetailResponse {
 pub(super) struct CustomerQuote {
     id: Uuid,
     status: String,
+    service_type: Option<String>,
     estimated_volume_m3: Option<f64>,
     scheduled_date: Option<NaiveDate>,
     created_at: DateTime<Utc>,
@@ -149,7 +155,8 @@ pub(super) async fn get_customer(
     let quotes: Vec<CustomerQuote> = repo_quotes
         .into_iter()
         .map(|q| CustomerQuote {
-            id: q.id, status: q.status, estimated_volume_m3: q.estimated_volume_m3,
+            id: q.id, status: q.status, service_type: q.service_type,
+            estimated_volume_m3: q.estimated_volume_m3,
             scheduled_date: q.scheduled_date, created_at: q.created_at,
         })
         .collect();
@@ -180,6 +187,8 @@ pub(super) async fn get_customer(
         first_name: repo_customer.first_name,
         last_name: repo_customer.last_name,
         phone: repo_customer.phone,
+        customer_type: repo_customer.customer_type,
+        company_name: repo_customer.company_name,
         created_at: repo_customer.created_at,
         quotes,
         offers,
@@ -195,6 +204,8 @@ pub(super) struct UpdateCustomerRequest {
     last_name: Option<String>,
     phone: Option<String>,
     email: Option<String>,
+    customer_type: Option<String>,
+    company_name: Option<String>,
 }
 
 /// `PATCH /api/v1/admin/customers/{id}` — Partially update a customer's contact fields.
@@ -224,13 +235,15 @@ pub(super) async fn update_customer(
         request.name.as_deref(), request.salutation.as_deref(),
         request.first_name.as_deref(), request.last_name.as_deref(),
         request.phone.as_deref(), request.email.as_deref(),
+        request.customer_type.as_deref(), request.company_name.as_deref(),
     )
     .await?;
 
     repo_row
         .map(|c| Json(CustomerListItem {
             id: c.id, email: c.email, name: c.name, salutation: c.salutation,
-            first_name: c.first_name, last_name: c.last_name, phone: c.phone, created_at: c.created_at,
+            first_name: c.first_name, last_name: c.last_name, phone: c.phone,
+            customer_type: c.customer_type, company_name: c.company_name, created_at: c.created_at,
         }))
         .ok_or_else(|| ApiError::NotFound(format!("Kunde {id} nicht gefunden")))
 }
@@ -245,6 +258,8 @@ pub(super) struct CreateCustomerRequest {
     first_name: Option<String>,
     last_name: Option<String>,
     phone: Option<String>,
+    customer_type: Option<String>,
+    company_name: Option<String>,
 }
 
 /// `POST /api/v1/admin/customers` — Create a new customer record.
@@ -290,7 +305,8 @@ pub(super) async fn create_customer(
     repo_row
         .map(|c| (axum::http::StatusCode::CREATED, Json(CustomerListItem {
             id: c.id, email: c.email, name: c.name, salutation: c.salutation,
-            first_name: c.first_name, last_name: c.last_name, phone: c.phone, created_at: c.created_at,
+            first_name: c.first_name, last_name: c.last_name, phone: c.phone,
+            customer_type: c.customer_type, company_name: c.company_name, created_at: c.created_at,
         })))
         .ok_or_else(|| ApiError::Internal("Kunde konnte nicht erstellt werden".into()))
 }
