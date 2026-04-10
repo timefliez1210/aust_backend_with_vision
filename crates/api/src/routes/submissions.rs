@@ -160,6 +160,8 @@ async fn handle_ar_submission(
         form.first_name.as_deref(),
         form.last_name.as_deref(),
         form.phone.as_deref(),
+        None,
+        None,
         now,
     )
     .await
@@ -174,6 +176,8 @@ async fn handle_ar_submission(
         Some(dep_postal.as_str()).filter(|s| !s.is_empty()),
         form.departure_floor.as_deref(),
         form.departure_elevator,
+        None,
+        None,
     )
     .await
     .map_err(|e| ApiError::Internal(format!("Auszugsadresse konnte nicht erstellt werden: {e}")))?;
@@ -186,6 +190,8 @@ async fn handle_ar_submission(
         Some(arr_postal.as_str()).filter(|s| !s.is_empty()),
         form.arrival_floor.as_deref(),
         form.arrival_elevator,
+        None,
+        None,
     )
     .await
     .map_err(|e| ApiError::Internal(format!("Einzugsadresse konnte nicht erstellt werden: {e}")))?;
@@ -221,6 +227,11 @@ async fn handle_ar_submission(
         Some(&notes),
         Some(&services_json),
         "mobile_app_ar",
+        None,  // service_type
+        None,  // submission_mode
+        None,  // recipient_id
+        None,  // billing_address_id
+        None,  // custom_fields
         now,
     )
     .await
@@ -575,6 +586,8 @@ async fn video_inquiry(
         first_name.as_deref(),
         last_name.as_deref(),
         phone.as_deref(),
+        None,
+        None,
         now,
     )
     .await
@@ -589,6 +602,8 @@ async fn video_inquiry(
         Some(dep_postal.as_str()).filter(|s| !s.is_empty()),
         departure_floor.as_deref(),
         departure_elevator,
+        None,
+        None,
     )
     .await
     .map_err(|e| ApiError::Internal(format!("Auszugsadresse konnte nicht erstellt werden: {e}")))?;
@@ -601,6 +616,8 @@ async fn video_inquiry(
         Some(arr_postal.as_str()).filter(|s| !s.is_empty()),
         arrival_floor.as_deref(),
         arrival_elevator,
+        None,
+        None,
     )
     .await
     .map_err(|e| ApiError::Internal(format!("Einzugsadresse konnte nicht erstellt werden: {e}")))?;
@@ -628,6 +645,11 @@ async fn video_inquiry(
         Some(&notes),
         None,
         "video_webapp",
+        None,  // service_type
+        None,  // submission_mode
+        None,  // recipient_id
+        None,  // billing_address_id
+        None,  // custom_fields
         now,
     )
     .await
@@ -879,6 +901,8 @@ pub(crate) async fn handle_submission(
         form.first_name.as_deref(),
         form.last_name.as_deref(),
         form.phone.as_deref(),
+        None,
+        None,
         now,
     )
     .await
@@ -896,6 +920,8 @@ pub(crate) async fn handle_submission(
         Some(dep_postal.as_str()).filter(|s| !s.is_empty()),
         form.departure_floor.as_deref(),
         form.departure_elevator,
+        None,
+        None,
     )
     .await
     .map_err(|e| ApiError::Internal(format!("Auszugsadresse konnte nicht erstellt werden: {e}")))?;
@@ -910,6 +936,8 @@ pub(crate) async fn handle_submission(
         Some(arr_postal.as_str()).filter(|s| !s.is_empty()),
         form.arrival_floor.as_deref(),
         form.arrival_elevator,
+        None,
+        None,
     )
     .await
     .map_err(|e| ApiError::Internal(format!("Einzugsadresse konnte nicht erstellt werden: {e}")))?;
@@ -949,6 +977,11 @@ pub(crate) async fn handle_submission(
         Some(&notes),
         Some(&services_json),
         source,
+        None,  // service_type
+        None,  // submission_mode
+        None,  // recipient_id
+        None,  // billing_address_id
+        None,  // custom_fields
         now,
     )
     .await

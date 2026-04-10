@@ -22,6 +22,16 @@ pub(crate) struct InquiryDbRow {
     pub scheduled_date: Option<chrono::NaiveDate>,
     pub start_time: NaiveTime,
     pub end_time: NaiveTime,
+    #[sqlx(default)]
+    pub service_type: Option<String>,
+    #[sqlx(default)]
+    pub submission_mode: Option<String>,
+    #[sqlx(default)]
+    pub recipient_id: Option<Uuid>,
+    #[sqlx(default)]
+    pub inquiry_billing_address_id: Option<Uuid>,
+    #[sqlx(default)]
+    pub custom_fields: serde_json::Value,
     pub notes: Option<String>,
     #[sqlx(default)]
     pub services: serde_json::Value,
@@ -68,7 +78,8 @@ pub(crate) async fn fetch_by_id(
         r#"
         SELECT id, customer_id, origin_address_id, destination_address_id, stop_address_id,
                status, estimated_volume_m3, distance_km, preferred_date, scheduled_date,
-               start_time, end_time, notes,
+               start_time, end_time, service_type, submission_mode, recipient_id,
+               billing_address_id AS inquiry_billing_address_id, custom_fields, notes,
                services, source, offer_sent_at, accepted_at, created_at, updated_at
         FROM inquiries WHERE id = $1
         "#,
@@ -249,13 +260,21 @@ pub(crate) async fn create(
     notes: Option<&str>,
     services: &serde_json::Value,
     source: &str,
+    service_type: Option<&str>,
+    submission_mode: Option<&str>,
+    recipient_id: Option<Uuid>,
+    billing_address_id: Option<Uuid>,
+    custom_fields: &serde_json::Value,
     now: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
         INSERT INTO inquiries (id, customer_id, origin_address_id, destination_address_id, stop_address_id,
-                           status, estimated_volume_m3, distance_km, scheduled_date, notes, services, source, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $13)
+                           status, estimated_volume_m3, distance_km, scheduled_date, notes, services, source,
+                           service_type, submission_mode, recipient_id, billing_address_id, custom_fields,
+                           created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                $14, $15, $16, $17, $18, $18)
         "#,
     )
     .bind(id)
@@ -270,6 +289,11 @@ pub(crate) async fn create(
     .bind(notes)
     .bind(services)
     .bind(source)
+    .bind(service_type)
+    .bind(submission_mode)
+    .bind(recipient_id)
+    .bind(billing_address_id)
+    .bind(custom_fields)
     .bind(now)
     .execute(pool)
     .await?;
@@ -294,6 +318,11 @@ pub(crate) async fn update_fields(
     origin_address_id: Option<Uuid>,
     scheduled_date: Option<NaiveDate>,
     destination_address_id: Option<Uuid>,
+    service_type: Option<&str>,
+    submission_mode: Option<&str>,
+    recipient_id: Option<Uuid>,
+    billing_address_id: Option<Uuid>,
+    custom_fields: Option<&serde_json::Value>,
     now: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
@@ -309,7 +338,12 @@ pub(crate) async fn update_fields(
             end_time = COALESCE($9, end_time),
             origin_address_id = COALESCE($10, origin_address_id),
             destination_address_id = COALESCE($11, destination_address_id),
-            updated_at = $12
+            service_type = COALESCE($12, service_type),
+            submission_mode = COALESCE($13, submission_mode),
+            recipient_id = COALESCE($14, recipient_id),
+            billing_address_id = COALESCE($15, billing_address_id),
+            custom_fields = COALESCE($16, custom_fields),
+            updated_at = $17
         WHERE id = $1
         "#,
     )
@@ -324,7 +358,38 @@ pub(crate) async fn update_fields(
     .bind(end_time)
     .bind(origin_address_id)
     .bind(destination_address_id)
+    .bind(service_type)
+    .bind(submission_mode)
+    .bind(recipient_id)
+    .bind(billing_address_id)
+    .bind(custom_fields)
     .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Auto-update billing_address_id from origin to destination when an inquiry
+/// transitions to "completed". Only applies when billing_address_id is currently
+/// the same as origin_address_id (booking-for-self) or NULL.
+///
+/// **Caller**: `update_inquiry` handler, after status change to "completed".
+/// **Why**: Once the customer has moved, invoices should go to the new address.
+pub(crate) async fn auto_update_billing_on_completed(
+    pool: &PgPool,
+    inquiry_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        UPDATE inquiries SET
+            billing_address_id = destination_address_id,
+            updated_at = NOW()
+        WHERE id = $1
+          AND (billing_address_id IS NULL OR billing_address_id = origin_address_id)
+          AND destination_address_id IS NOT NULL
+        "#,
+    )
+    .bind(inquiry_id)
     .execute(pool)
     .await?;
     Ok(())
@@ -880,13 +945,20 @@ pub(crate) async fn create_minimal(
     notes: Option<&str>,
     services: Option<&serde_json::Value>,
     source: &str,
+    service_type: Option<&str>,
+    submission_mode: Option<&str>,
+    recipient_id: Option<Uuid>,
+    billing_address_id: Option<Uuid>,
+    custom_fields: Option<&serde_json::Value>,
     now: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
         INSERT INTO inquiries (id, customer_id, origin_address_id, destination_address_id,
-                           status, scheduled_date, notes, services, source, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)
+                           status, scheduled_date, notes, services, source,
+                           service_type, submission_mode, recipient_id, billing_address_id, custom_fields,
+                           created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $15, $15)
         "#,
     )
     .bind(id)
@@ -898,6 +970,11 @@ pub(crate) async fn create_minimal(
     .bind(notes)
     .bind(services)
     .bind(source)
+    .bind(service_type)
+    .bind(submission_mode)
+    .bind(recipient_id)
+    .bind(billing_address_id)
+    .bind(custom_fields)
     .bind(now)
     .execute(pool)
     .await?;

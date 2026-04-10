@@ -32,6 +32,16 @@ pub(crate) struct InquiryRow {
     #[sqlx(default)]
     pub source: String,
     #[sqlx(default)]
+    pub service_type: Option<String>,
+    #[sqlx(default)]
+    pub submission_mode: Option<String>,
+    #[sqlx(default)]
+    pub recipient_id: Option<Uuid>,
+    #[sqlx(default)]
+    pub inquiry_billing_address_id: Option<Uuid>,
+    #[sqlx(default)]
+    pub custom_fields: serde_json::Value,
+    #[sqlx(default)]
     pub offer_sent_at: Option<chrono::DateTime<chrono::Utc>>,
     #[sqlx(default)]
     pub accepted_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -51,6 +61,11 @@ impl From<InquiryRow> for Inquiry {
             origin_address_id: row.origin_address_id,
             destination_address_id: row.destination_address_id,
             stop_address_id: row.stop_address_id,
+            service_type: row.service_type,
+            submission_mode: row.submission_mode,
+            recipient_id: row.recipient_id,
+            billing_address_id: row.inquiry_billing_address_id,
+            custom_fields: row.custom_fields,
             status,
             estimated_volume_m3: row.estimated_volume_m3,
             distance_km: row.distance_km,
@@ -65,4 +80,31 @@ impl From<InquiryRow> for Inquiry {
             updated_at: row.updated_at,
         }
     }
+}
+
+/// Resolve the billing address for an inquiry.
+///
+/// Logic:
+/// - If `inquiry_billing_address_id` is set → use it (explicit override).
+/// - If inquiry status >= "completed" → use destination (they've moved).
+/// - Otherwise → use origin (they still live there).
+///
+/// This function does NOT auto-mutate the billing address — that happens
+/// in the status-update handler when transitioning to "completed".
+pub(crate) fn resolve_billing_address_id(
+    inquiry_billing_address_id: Option<Uuid>,
+    origin_address_id: Option<Uuid>,
+    destination_address_id: Option<Uuid>,
+    status: &str,
+) -> Option<Uuid> {
+    // Explicit billing address always wins
+    if inquiry_billing_address_id.is_some() {
+        return inquiry_billing_address_id;
+    }
+    // After move completion, billing goes to destination
+    if matches!(status, "completed" | "invoiced" | "paid") {
+        return destination_address_id;
+    }
+    // Default: they still live at origin
+    origin_address_id
 }

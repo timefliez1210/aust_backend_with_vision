@@ -20,13 +20,29 @@ pub(crate) struct CustomerRow {
     pub first_name: Option<String>,
     pub last_name: Option<String>,
     pub phone: Option<String>,
+    #[sqlx(default)]
+    pub customer_type: Option<String>,
+    #[sqlx(default)]
+    pub company_name: Option<String>,
+    #[sqlx(default)]
+    pub billing_address_id: Option<Uuid>,
 }
 
 impl CustomerRow {
     /// Formal greeting line using stored salutation + last name.
     /// Falls back to the `detect_salutation_and_greeting` heuristic for legacy
     /// customers who pre-date the structured name fields.
+    ///
+    /// For business customers without a known Ansprechpartner, returns
+    /// "Sehr geehrte Damen und Herren,".
     pub fn formal_greeting(&self) -> String {
+        // Business without personal salutation → generic
+        if self.customer_type.as_deref() == Some("business")
+            && self.last_name.is_none()
+            && self.salutation.is_none()
+        {
+            return "Sehr geehrte Damen und Herren,".to_string();
+        }
         match (self.salutation.as_deref(), self.last_name.as_deref()) {
             (Some("Herr"), Some(ln)) => format!("Sehr geehrter Herr {ln},"),
             (Some("Frau"), Some(ln)) => format!("Sehr geehrte Frau {ln},"),
@@ -39,7 +55,16 @@ impl CustomerRow {
     }
 
     /// Address-block salutation for XLSX cell A8 ("Herrn", "Frau", "Divers", or "").
+    /// For business customers, returns the company name instead of a personal salutation.
     pub fn address_salutation(&self) -> String {
+        // Business → company name goes in the salutation slot
+        if self.customer_type.as_deref() == Some("business") {
+            if let Some(ref cn) = self.company_name {
+                if !cn.is_empty() {
+                    return cn.clone();
+                }
+            }
+        }
         match self.salutation.as_deref() {
             Some("Herr") => "Herrn".to_string(),
             Some("Frau") => "Frau".to_string(),
@@ -49,6 +74,25 @@ impl CustomerRow {
                 crate::services::offer_builder::detect_salutation_and_greeting(name).0
             }
         }
+    }
+
+    /// Attention line for XLSX cell A9 — "z.Hd. Herrn Müller" for business
+    /// customers with a known Ansprechpartner. Empty string for private.
+    pub fn attention_line(&self) -> String {
+        if self.customer_type.as_deref() != Some("business") {
+            return String::new();
+        }
+        // Business with known Ansprechpartner
+        let name = match (self.salutation.as_deref(), self.first_name.as_deref(), self.last_name.as_deref()) {
+            (Some("Herr"), Some(f), Some(l)) => format!("z.Hd. Herrn {f} {l}"),
+            (Some("Frau"), Some(f), Some(l)) => format!("z.Hd. Frau {f} {l}"),
+            (Some("D"), Some(f), Some(l)) => format!("z.Hd. {f} {l}"),
+            (Some("Herr"), None, Some(l)) => format!("z.Hd. Herrn {l}"),
+            (Some("Frau"), None, Some(l)) => format!("z.Hd. Frau {l}"),
+            (_, Some(f), Some(l)) => format!("z.Hd. {f} {l}"),
+            _ => String::new(),
+        };
+        name
     }
 
     /// Full display name: first + last, or the legacy `name` field, or email.
@@ -68,7 +112,7 @@ impl CustomerRow {
 /// **Why**: Multiple modules need the full customer row for greeting, snapshot, etc.
 pub(crate) async fn fetch_by_id(pool: &PgPool, customer_id: Uuid) -> Result<CustomerRow, ApiError> {
     sqlx::query_as(
-        "SELECT id, email, name, salutation, first_name, last_name, phone FROM customers WHERE id = $1",
+        "SELECT id, email, name, salutation, first_name, last_name, phone, customer_type, company_name, billing_address_id FROM customers WHERE id = $1",
     )
     .bind(customer_id)
     .fetch_optional(pool)
@@ -85,7 +129,7 @@ pub(crate) async fn fetch_by_email(
     email: &str,
 ) -> Result<Option<CustomerRow>, ApiError> {
     let row = sqlx::query_as(
-        "SELECT id, email, name, salutation, first_name, last_name, phone FROM customers WHERE email = $1",
+        "SELECT id, email, name, salutation, first_name, last_name, phone, customer_type, company_name, billing_address_id FROM customers WHERE email = $1",
     )
     .bind(email)
     .fetch_optional(pool)
@@ -109,19 +153,23 @@ pub(crate) async fn upsert(
     first_name: Option<&str>,
     last_name: Option<&str>,
     phone: Option<&str>,
+    customer_type: Option<&str>,
+    company_name: Option<&str>,
     now: DateTime<Utc>,
 ) -> Result<Uuid, sqlx::Error> {
     let (id,): (Uuid,) = sqlx::query_as(
         r#"
-        INSERT INTO customers (id, email, name, salutation, first_name, last_name, phone, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
+        INSERT INTO customers (id, email, name, salutation, first_name, last_name, phone, customer_type, company_name, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)
         ON CONFLICT (email) DO UPDATE SET
-            name       = COALESCE(EXCLUDED.name,       customers.name),
-            salutation = COALESCE(EXCLUDED.salutation, customers.salutation),
-            first_name = COALESCE(EXCLUDED.first_name, customers.first_name),
-            last_name  = COALESCE(EXCLUDED.last_name,  customers.last_name),
-            phone      = COALESCE(EXCLUDED.phone,      customers.phone),
-            updated_at = $8
+            name         = COALESCE(EXCLUDED.name,         customers.name),
+            salutation   = COALESCE(EXCLUDED.salutation,   customers.salutation),
+            first_name   = COALESCE(EXCLUDED.first_name,   customers.first_name),
+            last_name    = COALESCE(EXCLUDED.last_name,     customers.last_name),
+            phone        = COALESCE(EXCLUDED.phone,        customers.phone),
+            customer_type = COALESCE(EXCLUDED.customer_type, customers.customer_type),
+            company_name  = COALESCE(EXCLUDED.company_name,  customers.company_name),
+            updated_at   = $10
         RETURNING id
         "#,
     )
@@ -132,6 +180,8 @@ pub(crate) async fn upsert(
     .bind(first_name)
     .bind(last_name)
     .bind(phone)
+    .bind(customer_type)
+    .bind(company_name)
     .bind(now)
     .fetch_one(pool)
     .await?;
@@ -147,7 +197,7 @@ pub(crate) async fn fetch_by_inquiry_id(
     inquiry_id: Uuid,
 ) -> Result<CustomerRow, ApiError> {
     sqlx::query_as(
-        "SELECT c.id, c.email, c.name, c.salutation, c.first_name, c.last_name, c.phone
+        "SELECT c.id, c.email, c.name, c.salutation, c.first_name, c.last_name, c.phone, c.customer_type, c.company_name, c.billing_address_id
          FROM customers c
          JOIN inquiries i ON i.customer_id = c.id
          WHERE i.id = $1",

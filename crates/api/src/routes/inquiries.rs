@@ -87,6 +87,11 @@ struct CreateInquiryRequest {
     distance_km: Option<f64>,
     estimated_volume_m3: Option<f64>,
     items_list: Option<String>,
+    service_type: Option<String>,
+    submission_mode: Option<String>,
+    recipient_id: Option<Uuid>,
+    billing_address_id: Option<Uuid>,
+    custom_fields: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -118,6 +123,11 @@ struct UpdateInquiryRequest {
     end_time: Option<NaiveTime>,
     origin_address_id: Option<Uuid>,
     destination_address_id: Option<Uuid>,
+    service_type: Option<String>,
+    submission_mode: Option<String>,
+    recipient_id: Option<Uuid>,
+    billing_address_id: Option<Uuid>,
+    custom_fields: Option<serde_json::Value>,
 }
 
 // ---------------------------------------------------------------------------
@@ -152,6 +162,8 @@ async fn create_inquiry(
                 addr.postal_code.as_deref(),
                 addr.floor.as_deref(),
                 addr.elevator,
+        None,
+        None,
             )
             .await?;
             Some(id)
@@ -174,6 +186,8 @@ async fn create_inquiry(
                 addr.postal_code.as_deref(),
                 addr.floor.as_deref(),
                 addr.elevator,
+        None,
+        None,
             )
             .await?;
             Some(id)
@@ -213,6 +227,11 @@ async fn create_inquiry(
         request.notes.as_deref(),
         &services_json,
         "admin_dashboard",
+        request.service_type.as_deref(),
+        request.submission_mode.as_deref(),
+        request.recipient_id,
+        request.billing_address_id,
+        request.custom_fields.as_ref().unwrap_or(&serde_json::json!({})),
         now,
     )
     .await?;
@@ -317,9 +336,19 @@ async fn update_inquiry(
         request.origin_address_id,
         scheduled_date,
         request.destination_address_id,
+        request.service_type.as_deref(),
+        request.submission_mode.as_deref(),
+        request.recipient_id,
+        request.billing_address_id,
+        request.custom_fields.as_ref(),
         now,
     )
     .await?;
+
+    // Auto-update billing address from origin → destination on completion
+    if request.status.as_deref() == Some("completed") {
+        let _ = inquiry_repo::auto_update_billing_on_completed(&state.db, id).await;
+    }
 
     let response = inquiry_builder::build_inquiry_response(&state.db, id).await?;
     Ok(Json(response))

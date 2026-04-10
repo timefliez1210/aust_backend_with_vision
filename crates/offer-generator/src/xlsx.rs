@@ -48,6 +48,13 @@ pub struct OfferData {
     pub customer_phone: String,
     /// Customer e-mail address (cell F18, same row as phone — rendered as plain text).
     pub customer_email: String,
+    /// Company name for business customers — rendered above customer name in the address block.
+    /// When set, A8 = company name, A9 = "z.Hd. …" attention line.
+    #[serde(default)]
+    pub company_name: Option<String>,
+    /// Attention line for business customers, e.g. `"z.Hd. Herrn Schmidt"`.
+    #[serde(default)]
+    pub attention_line: Option<String>,
     /// Opening salutation line, e.g. `"Sehr geehrter Herr Müller,"` (cell A20).
     pub greeting: String,
     /// Moving date as a pre-formatted German string, e.g. `"15.04.2026"` (cell B17).
@@ -325,8 +332,14 @@ fn build_cell_modifications(
     let mut mods = Vec::new();
 
     // Customer address block
-    mods.push(("A8".into(), CellValue::Text(data.customer_salutation.clone())));
-    mods.push(("A9".into(), CellValue::Text(data.customer_name.clone())));
+    // Address block: for business, A8=company A9=attention; for private, A8=salutation A9=name
+    if let Some(ref company) = data.company_name {
+        mods.push(("A8".into(), CellValue::Text(company.clone())));
+        mods.push(("A9".into(), CellValue::Text(data.attention_line.clone().unwrap_or_default())));
+    } else {
+        mods.push(("A8".into(), CellValue::Text(data.customer_salutation.clone())));
+        mods.push(("A9".into(), CellValue::Text(data.customer_name.clone())));
+    }
     mods.push(("A10".into(), CellValue::Text(data.customer_street.clone())));
     mods.push(("A11".into(), CellValue::Text(data.customer_city.clone())));
 
@@ -1622,6 +1635,8 @@ mod tests {
             customer_city: "31135 Hildesheim".to_string(),
             customer_phone: "+491234567890".to_string(),
             customer_email: "max@example.com".to_string(),
+            company_name: None,
+            attention_line: None,
             greeting: "Sehr geehrter Herr Mustermann,".to_string(),
             moving_date: "01.04.2026".to_string(),
             origin_street: "Auszugstr. 1".to_string(),

@@ -11,10 +11,14 @@ pub(crate) struct AddressRow {
     #[allow(dead_code)]
     pub id: Uuid,
     pub street: String,
+    #[sqlx(default)]
+    pub house_number: Option<String>,
     pub city: String,
     pub postal_code: Option<String>,
     pub floor: Option<String>,
     pub elevator: Option<bool>,
+    #[sqlx(default)]
+    pub parking_ban: bool,
 }
 
 /// Fetch a single address by primary key (offer-generation projection).
@@ -26,7 +30,7 @@ pub(crate) async fn fetch_by_id(
     address_id: Uuid,
 ) -> Result<Option<AddressRow>, ApiError> {
     let row = sqlx::query_as(
-        "SELECT id, street, city, postal_code, floor, elevator FROM addresses WHERE id = $1",
+        "SELECT id, street, house_number, city, postal_code, floor, elevator, parking_ban FROM addresses WHERE id = $1",
     )
     .bind(address_id)
     .fetch_optional(pool)
@@ -75,12 +79,16 @@ pub(crate) async fn fetch_street_city(
 pub(crate) struct AddressFullRow {
     pub id: Uuid,
     pub street: String,
+    #[sqlx(default)]
+    pub house_number: Option<String>,
     pub city: String,
     pub postal_code: Option<String>,
     #[sqlx(default)]
     pub country: String,
     pub floor: Option<String>,
     pub elevator: Option<bool>,
+    #[sqlx(default)]
+    pub parking_ban: bool,
     #[sqlx(default)]
     pub latitude: Option<f64>,
     #[sqlx(default)]
@@ -97,7 +105,7 @@ pub(crate) async fn fetch_full(
 ) -> Result<Option<AddressFullRow>, sqlx::Error> {
     sqlx::query_as(
         r#"
-        SELECT id, street, city, postal_code, country, floor, elevator, latitude, longitude
+        SELECT id, street, house_number, city, postal_code, country, floor, elevator, parking_ban, latitude, longitude
         FROM addresses WHERE id = $1
         "#,
     )
@@ -118,9 +126,11 @@ pub(crate) async fn create(
     postal_code: Option<&str>,
     floor: Option<&str>,
     elevator: Option<bool>,
+    house_number: Option<&str>,
+    parking_ban: Option<bool>,
 ) -> Result<Uuid, sqlx::Error> {
     let (id,): (Uuid,) = sqlx::query_as(
-        "INSERT INTO addresses (id, street, city, postal_code, floor, elevator) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+        "INSERT INTO addresses (id, street, city, postal_code, floor, elevator, house_number, parking_ban) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
     )
     .bind(Uuid::now_v7())
     .bind(street)
@@ -128,6 +138,8 @@ pub(crate) async fn create(
     .bind(postal_code)
     .bind(floor)
     .bind(elevator)
+    .bind(house_number)
+    .bind(parking_ban.unwrap_or(false))
     .fetch_one(pool)
     .await?;
     Ok(id)

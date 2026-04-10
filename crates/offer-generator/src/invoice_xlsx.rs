@@ -40,6 +40,10 @@ pub struct InvoiceData {
     pub customer_name: String,
     /// Customer email address (A9).
     pub customer_email: String,
+    /// Company name for business customers — rendered above customer name in the address block.
+    pub company_name: Option<String>,
+    /// Attention line for business customers, e.g. `"z.Hd. Herrn Schmidt"`.
+    pub attention_line: Option<String>,
     /// Origin street + house number (A10, A27).
     pub origin_street: String,
     /// Origin postal code + city, e.g. `"31135 Hildesheim"` (A11).
@@ -157,8 +161,15 @@ fn build_cell_modifications(data: &InvoiceData) -> Vec<(String, CellValue)> {
     let mut mods = Vec::new();
 
     // Customer address block
-    mods.push(("A8".into(), CellValue::Text(data.customer_name.clone())));
-    mods.push(("A9".into(), CellValue::Text(data.customer_email.clone())));
+    // Address block: for business, A8=company A9=attention; for private, A8=name A9=email
+    if let Some(ref company) = data.company_name {
+        mods.push(("A8".into(), CellValue::Text(company.clone())));
+        let attn = data.attention_line.clone().unwrap_or_default();
+        mods.push(("A9".into(), CellValue::Text(if attn.is_empty() { data.customer_email.clone() } else { attn })));
+    } else {
+        mods.push(("A8".into(), CellValue::Text(data.customer_name.clone())));
+        mods.push(("A9".into(), CellValue::Text(data.customer_email.clone())));
+    }
     mods.push(("A10".into(), CellValue::Text(data.origin_street.clone())));
     mods.push(("A11".into(), CellValue::Text(data.origin_city.clone())));
 

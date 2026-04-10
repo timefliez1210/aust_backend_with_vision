@@ -15,6 +15,8 @@ async fn main() {
         customer_city: "31135 Hildesheim".into(),
         customer_phone: "0176 12345678".into(),
         customer_email: "max.krause@example.com".into(),
+        company_name: None,
+        attention_line: None,
         greeting: "Sehr geehrter Herr Krause,".into(),
         moving_date: "15.04.2026".into(),
         origin_street: "Alte Allee 7".into(),

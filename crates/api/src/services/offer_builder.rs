@@ -4,6 +4,7 @@ use uuid::Uuid;
 use crate::ApiError;
 use crate::repositories::{AddressRow, CustomerRow};
 use crate::repositories::{address_repo, customer_repo, offer_repo};
+use crate::types::resolve_billing_address_id;
 use crate::types::InquiryRow;
 use aust_core::config::Config;
 use aust_core::models::{
@@ -355,6 +356,28 @@ pub(crate) async fn build_offer_with_overrides(
         .and_then(|a| a.floor.clone())
         .unwrap_or_default();
 
+    // Resolve billing address: explicit > destination (post-move) > origin (pre-move)
+    let billing_addr_id = resolve_billing_address_id(
+        inquiry.billing_address_id,
+        inquiry.origin_address_id,
+        inquiry.destination_address_id,
+        inquiry.status.as_str(),
+    );
+    let billing_addr = address_repo::fetch_optional(db, billing_addr_id).await?;
+    let billing_street = billing_addr
+        .as_ref()
+        .map(|a| {
+            match a.house_number.as_deref() {
+                Some(hn) if !hn.is_empty() => format!("{} {}", a.street, hn),
+                _ => a.street.clone(),
+            }
+        })
+        .unwrap_or_else(|| origin_street.clone());
+    let billing_city = billing_addr
+        .as_ref()
+        .map(|a| format_city(a))
+        .unwrap_or_else(|| origin_city.clone());
+
     // Get or generate offer ID and number (UPDATE-in-place when existing_offer_id is set)
     let (offer_id, offer_number) = if let Some(existing_id) = overrides.existing_offer_id {
         let offer_number = offer_repo::fetch_offer_number(db, existing_id)
@@ -390,10 +413,12 @@ pub(crate) async fn build_offer_with_overrides(
         valid_until: valid_until_date,
         customer_salutation,
         customer_name: customer_name.clone(),
-        customer_street: origin_street.clone(),
-        customer_city: origin_city.clone(),
+        customer_street: billing_street.clone(),
+        customer_city: billing_city.clone(),
         customer_phone: customer.phone.clone().unwrap_or_default(),
         customer_email: customer.email.clone(),
+        company_name: customer.company_name.clone(),
+        attention_line: Some(customer.attention_line()).filter(|s| !s.is_empty()),
         greeting,
         moving_date: moving_date.clone(),
         origin_street: origin_street.clone(),
@@ -1498,6 +1523,8 @@ mod tests {
             postal_code: Some("31134".to_string()),
             floor: None,
             elevator: None,
+            house_number: None,
+            parking_ban: false,
         };
         assert_eq!(format_city(&addr), "31134 Hildesheim");
     }
@@ -1511,6 +1538,8 @@ mod tests {
             postal_code: None,
             floor: None,
             elevator: None,
+            house_number: None,
+            parking_ban: false,
         };
         assert_eq!(format_city(&addr), "Hildesheim");
     }
@@ -1524,6 +1553,8 @@ mod tests {
             postal_code: Some("".to_string()),
             floor: None,
             elevator: None,
+            house_number: None,
+            parking_ban: false,
         };
         assert_eq!(format_city(&addr), " Hildesheim");
     }

@@ -217,6 +217,8 @@ async fn handle_complete_inquiry(
         inq_first_name.as_deref(),
         inq_last_name.as_deref(),
         inquiry.phone.as_deref(),
+        None,
+        None,
         now,
     )
     .await
@@ -239,6 +241,8 @@ async fn handle_complete_inquiry(
             postal_opt,
             inquiry.departure_floor.as_deref(),
             inquiry.departure_elevator,
+        None,
+        None,
         )
         .await
         {
@@ -263,6 +267,8 @@ async fn handle_complete_inquiry(
             postal_opt,
             inquiry.arrival_floor.as_deref(),
             inquiry.arrival_elevator,
+        None,
+        None,
         )
         .await
         {
@@ -288,6 +294,8 @@ async fn handle_complete_inquiry(
                 postal_opt,
                 inquiry.intermediate_floor.as_deref(),
                 inquiry.intermediate_elevator,
+        None,
+        None,
             )
             .await
             {
@@ -388,6 +396,11 @@ async fn handle_complete_inquiry(
         notes.as_deref(),
         &services_json,
         &source,
+        None,  // service_type — legacy orchestrator path
+        None,  // submission_mode
+        None,  // recipient_id
+        None,  // billing_address_id
+        &serde_json::json!({}),  // custom_fields
         now,
     )
     .await

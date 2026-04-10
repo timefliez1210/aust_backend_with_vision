@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::repositories::{invoice_repo, CustomerRow};
+use crate::repositories::{address_repo, inquiry_repo, invoice_repo, CustomerRow};
 use crate::ApiError;
 use crate::AppState;
 use aust_offer_generator::{
@@ -592,8 +592,8 @@ async fn send_invoice(
 struct InvoiceContext {
     offer: ActiveOfferRow,
     customer: CustomerRow,
-    origin_street: String,
-    origin_city: String,
+    billing_street: String,
+    billing_city: String,
     moving_date: Option<chrono::NaiveDate>,
 }
 
@@ -618,27 +618,45 @@ async fn load_invoice_context(
 
     let moving_date = invoice_repo::fetch_moving_date(db, inquiry_id).await?;
 
-    // Origin address
-    let origin = invoice_repo::fetch_origin_address(db, inquiry_id).await?;
+    // Resolve billing address: explicit > destination (post-move) > origin (pre-move)
+    let billing_addr_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT COALESCE(billing_address_id,
+            CASE WHEN status IN ('completed','invoiced','paid') AND destination_address_id IS NOT NULL
+                 THEN destination_address_id
+                 ELSE origin_address_id
+            END)
+         FROM inquiries WHERE id = $1"
+    )
+    .bind(inquiry_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))?
+    .flatten();
+    let billing = address_repo::fetch_optional(db, billing_addr_id).await?;
 
-    let origin_street = origin
+    let billing_street = billing
         .as_ref()
-        .and_then(|a| a.street.clone())
+        .map(|a| {
+            match a.house_number.as_deref() {
+                Some(hn) if !hn.is_empty() => format!("{} {}", a.street, hn),
+                _ => a.street.clone(),
+            }
+        })
         .unwrap_or_default();
-    let origin_city = origin
+    let billing_city = billing
         .as_ref()
         .map(|a| {
             let postal = a.postal_code.as_deref().unwrap_or("");
-            let city = a.city.as_deref().unwrap_or("");
-            format!("{postal} {city}").trim().to_string()
+            let city = a.city.as_str();
+            if postal.is_empty() { city.to_string() } else { format!("{postal} {city}") }
         })
         .unwrap_or_default();
 
     Ok(InvoiceContext {
         offer,
         customer,
-        origin_street,
-        origin_city,
+        billing_street,
+        billing_city,
         moving_date,
     })
 }
@@ -664,8 +682,10 @@ fn build_invoice_data(
         service_date: ctx.moving_date,
         customer_name,
         customer_email: ctx.customer.email.clone(),
-        origin_street: ctx.origin_street.clone(),
-        origin_city: ctx.origin_city.clone(),
+        company_name: ctx.customer.company_name.clone(),
+        attention_line: Some(ctx.customer.attention_line()).filter(|s| !s.is_empty()),
+        origin_street: ctx.billing_street.clone(),
+        origin_city: ctx.billing_city.clone(),
         offer_number: ctx.offer.offer_number.clone().unwrap_or_default(),
         base_netto_cents,
         extra_services,

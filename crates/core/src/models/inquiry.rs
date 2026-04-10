@@ -178,6 +178,11 @@ pub struct Inquiry {
     pub destination_address_id: Option<Uuid>,
     /// Optional intermediate stop (Zwischenstopp) address.
     pub stop_address_id: Option<Uuid>,
+    pub service_type: Option<String>,
+    pub submission_mode: Option<String>,
+    pub recipient_id: Option<Uuid>,
+    pub billing_address_id: Option<Uuid>,
+    pub custom_fields: serde_json::Value,
     pub status: InquiryStatus,
     /// Agreed total moving volume in cubic metres; set after volume estimation
     /// completes or when the inventory form is used.
