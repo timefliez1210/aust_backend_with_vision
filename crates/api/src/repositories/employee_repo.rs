@@ -478,11 +478,13 @@ pub(crate) async fn update_clock_times(
 ) -> Result<u64, sqlx::Error> {
     let result = sqlx::query(
         r#"
-        UPDATE inquiry_employees
-        SET employee_clock_in  = $1,
-            employee_clock_out = $2,
-            updated_at         = NOW()
-        WHERE inquiry_id = $3 AND employee_id = $4
+        UPDATE inquiry_day_employees ide
+        SET clock_in  = $1,
+            clock_out = $2
+        FROM inquiry_days iday
+        WHERE ide.inquiry_day_id = iday.id
+          AND iday.inquiry_id = $3
+          AND ide.employee_id = $4
         "#,
     )
     .bind(clock_in)

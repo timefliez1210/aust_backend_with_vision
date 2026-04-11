@@ -396,7 +396,7 @@ async fn fetch_address(
         },
         floor: a.floor,
         elevator: a.elevator,
-        needs_parking_ban: None,
+        needs_parking_ban: Some(a.parking_ban),
         parking_ban: a.parking_ban,
         latitude: a.latitude,
         longitude: a.longitude,

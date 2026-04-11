@@ -77,13 +77,25 @@ pub(crate) struct ParsedInquiryForm {
     pub billing_city: Option<String>,
     // Address fields
     pub departure_address: Option<String>,
+    pub departure_city: Option<String>,
+    pub departure_postal: Option<String>,
     pub departure_floor: Option<String>,
     pub departure_parking_ban: Option<bool>,
     pub departure_elevator: Option<bool>,
     pub arrival_address: Option<String>,
+    pub arrival_city: Option<String>,
+    pub arrival_postal: Option<String>,
     pub arrival_floor: Option<String>,
     pub arrival_parking_ban: Option<bool>,
     pub arrival_elevator: Option<bool>,
+    /// Volume in m³ provided by customer (manuell mode)
+    pub volumen: Option<String>,
+    /// Item list text provided by customer (manuell mode)
+    pub umzugsgut: Option<String>,
+    /// Volume in m³ (from photo/video mode)
+    pub volume_m3: Option<String>,
+    /// Item list text (from photo/video mode)
+    pub items_list: Option<String>,
     /// The date the customer wants to move. Also accepts `preferred_date`
     /// (legacy alias) in JSON submissions via manual parsing; `wunschtermin` in multipart forms.
     pub scheduled_date: Option<String>,
@@ -186,7 +198,11 @@ async fn handle_ar_submission(
     .map_err(|e| ApiError::Internal(format!("Kunde konnte nicht erstellt werden: {e}")))?;
 
     // 2. Create addresses
-    let (dep_street, dep_city, dep_postal) = services::vision::parse_address(&departure_address);
+    let (dep_street, dep_city, dep_postal) = merge_address_parts(
+        services::vision::parse_address(&departure_address),
+        form.departure_city.as_deref(),
+        form.departure_postal.as_deref(),
+    );
     let origin_id = address_repo::create(
         &state.db,
         &dep_street,
@@ -200,7 +216,11 @@ async fn handle_ar_submission(
     .await
     .map_err(|e| ApiError::Internal(format!("Auszugsadresse konnte nicht erstellt werden: {e}")))?;
 
-    let (arr_street, arr_city, arr_postal) = services::vision::parse_address(&arrival_address);
+    let (arr_street, arr_city, arr_postal) = merge_address_parts(
+        services::vision::parse_address(&arrival_address),
+        form.arrival_city.as_deref(),
+        form.arrival_postal.as_deref(),
+    );
     let dest_id = address_repo::create(
         &state.db,
         &arr_street,
@@ -294,7 +314,7 @@ async fn handle_ar_submission(
 
     // 4. Pre-create estimation row
     let estimation_id = Uuid::now_v7();
-    estimation_repo::create_processing(&state.db, estimation_id, inquiry_id, "depth_sensor")
+    estimation_repo::create_processing(&state.db, estimation_id, inquiry_id, "ar")
         .await
         .map_err(|e| ApiError::Internal(format!("Schätzung konnte nicht erstellt werden: {e}")))?;
 
@@ -550,10 +570,14 @@ async fn video_inquiry(
     let mut email: Option<String> = None;
     let mut phone: Option<String> = None;
     let mut departure_address: Option<String> = None;
+    let mut departure_city: Option<String> = None;
+    let mut departure_postal: Option<String> = None;
     let mut departure_floor: Option<String> = None;
     let mut departure_elevator: Option<bool> = None;
     let mut departure_parking_ban: Option<bool> = None;
     let mut arrival_address: Option<String> = None;
+    let mut arrival_city: Option<String> = None;
+    let mut arrival_postal: Option<String> = None;
     let mut arrival_floor: Option<String> = None;
     let mut arrival_elevator: Option<bool> = None;
     let mut arrival_parking_ban: Option<bool> = None;
@@ -590,6 +614,8 @@ async fn video_inquiry(
             "email" => email = Some(read_text_field(field).await?),
             "phone" => phone = Some(read_text_field(field).await?),
             "auszugsadresse" | "departure_address" => departure_address = Some(read_text_field(field).await?),
+            "startOrt" => departure_city = Some(read_text_field(field).await?),
+            "startPlz" => departure_postal = Some(read_text_field(field).await?),
             "etage_auszug" | "departure_floor" => departure_floor = Some(read_text_field(field).await?),
             "aufzug_auszug" | "departure_elevator" => {
                 let t = read_text_field(field).await?;
@@ -600,6 +626,8 @@ async fn video_inquiry(
                 departure_parking_ban = Some(parse_bool_field(&t));
             }
             "einzugsadresse" | "arrival_address" => arrival_address = Some(read_text_field(field).await?),
+            "endOrt" => arrival_city = Some(read_text_field(field).await?),
+            "endPlz" => arrival_postal = Some(read_text_field(field).await?),
             "etage_einzug" | "arrival_floor" => arrival_floor = Some(read_text_field(field).await?),
             "aufzug_einzug" | "arrival_elevator" => {
                 let t = read_text_field(field).await?;
@@ -677,7 +705,11 @@ async fn video_inquiry(
     .map_err(|e| ApiError::Internal(format!("Kunde konnte nicht erstellt werden: {e}")))?;
 
     // Create addresses
-    let (dep_street, dep_city, dep_postal) = services::vision::parse_address(&departure_address);
+    let (dep_street, dep_city, dep_postal) = merge_address_parts(
+        services::vision::parse_address(&departure_address),
+        departure_city.as_deref(),
+        departure_postal.as_deref(),
+    );
     let origin_id = address_repo::create(
         &state.db,
         &dep_street,
@@ -691,7 +723,11 @@ async fn video_inquiry(
     .await
     .map_err(|e| ApiError::Internal(format!("Auszugsadresse konnte nicht erstellt werden: {e}")))?;
 
-    let (arr_street, arr_city, arr_postal) = services::vision::parse_address(&arrival_address);
+    let (arr_street, arr_city, arr_postal) = merge_address_parts(
+        services::vision::parse_address(&arrival_address),
+        arrival_city.as_deref(),
+        arrival_postal.as_deref(),
+    );
     let dest_id = address_repo::create(
         &state.db,
         &arr_street,
@@ -906,7 +942,11 @@ async fn manual_inquiry(
     .map_err(|e| ApiError::Internal(format!("Kunde konnte nicht erstellt werden: {e}")))?;
 
     // 2. Create origin address
-    let (dep_street, dep_city, dep_postal) = services::vision::parse_address(departure_address);
+    let (dep_street, dep_city, dep_postal) = merge_address_parts(
+        services::vision::parse_address(departure_address),
+        form.departure_city.as_deref(),
+        form.departure_postal.as_deref(),
+    );
     let origin_id = address_repo::create(
         &state.db,
         &dep_street,
@@ -921,7 +961,11 @@ async fn manual_inquiry(
     .map_err(|e| ApiError::Internal(format!("Auszugsadresse konnte nicht erstellt werden: {e}")))?;
 
     // 3. Create destination address
-    let (arr_street, arr_city, arr_postal) = services::vision::parse_address(arrival_address);
+    let (arr_street, arr_city, arr_postal) = merge_address_parts(
+        services::vision::parse_address(arrival_address),
+        form.arrival_city.as_deref(),
+        form.arrival_postal.as_deref(),
+    );
     let dest_id = address_repo::create(
         &state.db,
         &arr_street,
@@ -1062,14 +1106,22 @@ pub(crate) async fn parse_inquiry_form(
         billing_postal: None,
         billing_city: None,
         departure_address: None,
+        departure_city: None,
+        departure_postal: None,
         departure_floor: None,
         departure_parking_ban: None,
         departure_elevator: None,
         arrival_address: None,
+        arrival_city: None,
+        arrival_postal: None,
         arrival_floor: None,
         arrival_parking_ban: None,
         arrival_elevator: None,
         scheduled_date: None,
+        volumen: None,
+        umzugsgut: None,
+        volume_m3: None,
+        items_list: None,
         services: None,
         message: None,
         images: Vec::new(),
@@ -1180,6 +1232,16 @@ pub(crate) async fn parse_inquiry_form(
             "billing_number" | "billing_house_number" => form.billing_number = Some(read_text_field(field).await?),
             "billing_postal" | "billing_zip" | "billing_plz" => form.billing_postal = Some(read_text_field(field).await?),
             "billing_city" | "billing_ort" => form.billing_city = Some(read_text_field(field).await?),
+            // Separate city/postal fields from manuell mode
+            "startOrt" => form.departure_city = Some(read_text_field(field).await?),
+            "startPlz" => form.departure_postal = Some(read_text_field(field).await?),
+            "endOrt" => form.arrival_city = Some(read_text_field(field).await?),
+            "endPlz" => form.arrival_postal = Some(read_text_field(field).await?),
+            // Volume and items from different submission modes
+            "volumen" | "volume" => form.volumen = Some(read_text_field(field).await?),
+            "umzugsgut" | "items" => form.umzugsgut = Some(read_text_field(field).await?),
+            "volume_m3" => form.volume_m3 = Some(read_text_field(field).await?),
+            "items_list" => form.items_list = Some(read_text_field(field).await?),
             _ => continue,
         }
     }
@@ -1192,6 +1254,23 @@ pub(crate) async fn read_text_field(field: axum::extract::multipart::Field<'_>) 
         .text()
         .await
         .map_err(|e| ApiError::BadRequest(format!("Feld konnte nicht gelesen werden: {e}")))
+}
+
+/// Merge parsed address with separate city/postal fields.
+/// Explicit fields (from manuell mode) override parsed values.
+pub(crate) fn merge_address_parts(
+    parsed: (String, String, String),
+    city: Option<&str>,
+    postal: Option<&str>,
+) -> (String, String, String) {
+    let (street, mut parsed_city, mut parsed_postal) = parsed;
+    if let Some(c) = city.filter(|s| !s.trim().is_empty()) {
+        parsed_city = c.trim().to_string();
+    }
+    if let Some(p) = postal.filter(|s| !s.trim().is_empty()) {
+        parsed_postal = p.trim().to_string();
+    }
+    (street, parsed_city, parsed_postal)
 }
 
 pub(crate) fn parse_bool_field(value: &str) -> bool {
@@ -1248,8 +1327,11 @@ pub(crate) async fn handle_submission(
     tracing::info!(customer_id = %customer_id, email = %email, "Customer created/updated");
 
     // 2. Create origin address
-    let (dep_street, dep_city, dep_postal) =
-        services::vision::parse_address(&departure_address);
+    let (dep_street, dep_city, dep_postal) = merge_address_parts(
+        services::vision::parse_address(&departure_address),
+        form.departure_city.as_deref(),
+        form.departure_postal.as_deref(),
+    );
     let origin_id = address_repo::create(
         &state.db,
         &dep_street,
@@ -1264,8 +1346,11 @@ pub(crate) async fn handle_submission(
     .map_err(|e| ApiError::Internal(format!("Auszugsadresse konnte nicht erstellt werden: {e}")))?;
 
     // 3. Create destination address
-    let (arr_street, arr_city, arr_postal) =
-        services::vision::parse_address(&arrival_address);
+    let (arr_street, arr_city, arr_postal) = merge_address_parts(
+        services::vision::parse_address(&arrival_address),
+        form.arrival_city.as_deref(),
+        form.arrival_postal.as_deref(),
+    );
     let dest_id = address_repo::create(
         &state.db,
         &arr_street,
@@ -1364,8 +1449,70 @@ pub(crate) async fn handle_submission(
 
     tracing::info!(inquiry_id = %inquiry_id, "Inquiry created for submission");
 
-    // 7. Pre-create estimation row and upload images to S3 *before* spawning the
-    //    background task so the frontend sees images immediately after receiving 202.
+    // 7. Check for manual volume (manuell mode) — skip vision pipeline if provided.
+    let manual_volume: Option<f64> = form.volumen.as_deref()
+        .or(form.volume_m3.as_deref())
+        .and_then(|s| s.trim().parse::<f64>().ok());
+
+    if manual_volume.is_some() && form.images.is_empty() {
+        // Fast path: customer provided volume directly, no vision pipeline needed.
+        let volume = manual_volume.unwrap();
+        let now_update = chrono::Utc::now();
+        inquiry_repo::update_volume_and_status(&state.db, inquiry_id, volume, "estimated", now_update).await
+            .map_err(|e| ApiError::Internal(format!("Volumen konnte nicht gespeichert werden: {e}")))?;
+
+        // Create completed estimation row with manual method
+        let estimation_id = Uuid::now_v7();
+        let items_text = form.umzugsgut.as_deref().or(form.items_list.as_deref()).unwrap_or("");
+        let source_data = serde_json::json!({
+            "source": "manual",
+            "submission_mode": submission_mode
+        });
+        let result_data = serde_json::json!({
+            "items_text": items_text,
+            "total_volume_m3": volume
+        });
+        estimation_repo::insert_no_return(
+            &state.db,
+            estimation_id,
+            inquiry_id,
+            "manual",
+            &source_data,
+            Some(&result_data),
+            volume,
+            0.5,  // moderate confidence — customer-provided
+            now,
+        ).await
+            .map_err(|e| ApiError::Internal(format!("Schätzung konnte nicht erstellt werden: {e}")))?;
+
+        // Spawn distance calculation (same as AR handler)
+        let state_bg = Arc::clone(&state);
+        let dep_addr = departure_address.clone();
+        let arr_addr = arrival_address.clone();
+        tokio::spawn(async move {
+            try_auto_generate_offer(Arc::clone(&state_bg), inquiry_id).await;
+            let api_key = &state_bg.config.maps.api_key;
+            if !api_key.is_empty() {
+                let calculator = aust_distance_calculator::RouteCalculator::new(api_key.clone());
+                let req = aust_distance_calculator::RouteRequest { addresses: vec![dep_addr, arr_addr] };
+                if let Ok(r) = calculator.calculate(&req).await {
+                    let _ = inquiry_repo::update_distance(&state_bg.db, inquiry_id, r.total_distance_km).await;
+                }
+            }
+        });
+
+        return Ok((
+            StatusCode::OK,
+            Json(SubmitInquiryResponse {
+                inquiry_id,
+                customer_id,
+                status: "estimated".to_string(),
+                message: "Anfrage erhalten. Angebot wird erstellt.".to_string(),
+            }),
+        ));
+    }
+
+    // 8. Vision pipeline path: pre-create estimation row and upload images to S3.
     let estimation_id = Uuid::now_v7();
 
     // Pre-create estimation record with status='processing' so polling works immediately.

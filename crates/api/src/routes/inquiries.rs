@@ -415,6 +415,28 @@ async fn delete_inquiry(
         ));
     }
 
+    // 0. Check for active bookings — prevent hard-delete if employees are assigned
+    let day_count: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM inquiry_days WHERE inquiry_id = $1",
+    )
+    .bind(id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| ApiError::Internal(format!("Tag-Abfrage fehlgeschlagen: {e}")))?;
+    let emp_count: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM inquiry_day_employees ide JOIN inquiry_days iday ON ide.inquiry_day_id = iday.id WHERE iday.inquiry_id = $1",
+    )
+    .bind(id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| ApiError::Internal(format!("Mitarbeiter-Abfrage fehlgeschlagen: {e}")))?;
+
+    if day_count.0 > 0 || emp_count.0 > 0 {
+        return Err(ApiError::Validation(
+            format!("Inquiry {id} hat aktive Buchungen ({} Tage, {} Mitarbeiterzuweisungen). Bitte zuerst alle Buchungen entfernen.", day_count.0, emp_count.0),
+        ));
+    }
+
     // 1. Collect S3 keys before deleting DB rows (CASCADE would remove them)
     //    Offer PDFs
     let offer_keys = offer_repo::fetch_all_pdf_keys(&state.db, id).await.unwrap_or_default();

@@ -26,6 +26,10 @@ pub(crate) struct CalendarItemRow {
     pub customer_id: Option<Uuid>,
     #[sqlx(default)]
     pub customer_name: Option<String>,
+    #[sqlx(default)]
+    pub customer_type: Option<String>,
+    #[sqlx(default)]
+    pub company_name: Option<String>,
 }
 
 /// Employee assignment record for a calendar item.
@@ -56,7 +60,7 @@ pub(crate) async fn fetch_item_row(pool: &PgPool, id: Uuid) -> Result<CalendarIt
                ci.scheduled_date, ci.start_time, ci.end_time,
                ci.duration_hours::float8 AS duration_hours,
                ci.status, ci.created_at, ci.updated_at,
-               ci.customer_id, c.name AS customer_name
+               ci.customer_id, c.name AS customer_name, c.customer_type, c.company_name
         FROM calendar_items ci
         LEFT JOIN customers c ON c.id = ci.customer_id
         WHERE ci.id = $1
@@ -83,7 +87,7 @@ pub(crate) async fn list_items_by_month(
                ci.scheduled_date, ci.start_time, ci.end_time,
                ci.duration_hours::float8 AS duration_hours,
                ci.status, ci.created_at, ci.updated_at,
-               ci.customer_id, c.name AS customer_name
+               ci.customer_id, c.name AS customer_name, c.customer_type, c.company_name
         FROM calendar_items ci
         LEFT JOIN customers c ON c.id = ci.customer_id
         WHERE ci.scheduled_date >= $1 AND ci.scheduled_date < $2
@@ -107,7 +111,7 @@ pub(crate) async fn list_items_all(pool: &PgPool) -> Result<Vec<CalendarItemRow>
                ci.scheduled_date, ci.start_time, ci.end_time,
                ci.duration_hours::float8 AS duration_hours,
                ci.status, ci.created_at, ci.updated_at,
-               ci.customer_id, c.name AS customer_name
+               ci.customer_id, c.name AS customer_name, c.customer_type, c.company_name
         FROM calendar_items ci
         LEFT JOIN customers c ON c.id = ci.customer_id
         ORDER BY ci.scheduled_date ASC NULLS LAST
