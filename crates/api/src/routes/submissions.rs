@@ -1736,7 +1736,11 @@ pub(crate) async fn process_submission_background(
         format!("Vision estimation failed: {e}")
     })?;
 
-    let method = EstimationMethod::DepthSensor;
+    let method = if !depth_maps.is_empty() {
+        EstimationMethod::DepthSensor
+    } else {
+        EstimationMethod::Vision
+    };
 
     tracing::info!(
         estimation_id = %estimation_id,

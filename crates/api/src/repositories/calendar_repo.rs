@@ -121,7 +121,7 @@ pub(crate) async fn fetch_capacity_override(
 /// **Why**: Returns one row per inquiry-day for schedule display.
 ///
 /// Single-day branch uses inquiry-level `start_time`/`end_time` and
-/// `inquiry_employees` for the employee count.
+/// `inquiry_day_employees` (via inquiry_days) for the employee count.
 ///
 /// Multi-day branch uses per-day `start_time`/`end_time` (falling back to
 /// parent via COALESCE) and `inquiry_day_employees` for the employee count and
@@ -151,7 +151,7 @@ pub(crate) async fn fetch_schedule_inquiries(
             i.notes,
             i.start_time,
             i.end_time,
-            COUNT(ie.id) AS employees_assigned,
+            COUNT(ide.id) AS employees_assigned,
             NULLIF(STRING_AGG(
                 e.first_name || ' ' || LEFT(e.last_name, 1) || '.',
                 ', ' ORDER BY e.last_name, e.first_name
@@ -163,8 +163,9 @@ pub(crate) async fn fetch_schedule_inquiries(
         JOIN customers c ON i.customer_id = c.id
         LEFT JOIN addresses ao ON i.origin_address_id = ao.id
         LEFT JOIN addresses ad ON i.destination_address_id = ad.id
-        LEFT JOIN inquiry_employees ie ON ie.inquiry_id = i.id
-        LEFT JOIN employees e ON ie.employee_id = e.id
+        LEFT JOIN inquiry_days iday ON iday.inquiry_id = i.id
+        LEFT JOIN inquiry_day_employees ide ON ide.inquiry_day_id = iday.id
+        LEFT JOIN employees e ON ide.employee_id = e.id
         WHERE NOT EXISTS (SELECT 1 FROM inquiry_days WHERE inquiry_id = i.id)
           AND i.scheduled_date BETWEEN $1 AND $2
           AND i.status NOT IN ('cancelled', 'rejected', 'expired')

@@ -773,22 +773,23 @@ pub(crate) async fn fetch_employee_assignments_snapshot(
 ) -> Result<Vec<EmployeeAssignmentSnapshotRow>, sqlx::Error> {
     sqlx::query_as(
         r#"
-        SELECT ie.employee_id, e.first_name, e.last_name,
-               ie.planned_hours::float8 AS planned_hours,
-               ie.clock_in,
-               ie.clock_out,
-               CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
-                    THEN (EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0)::float8
+        SELECT ide.employee_id, e.first_name, e.last_name,
+               ide.planned_hours::float8 AS planned_hours,
+               ide.clock_in,
+               ide.clock_out,
+               CASE WHEN ide.clock_out IS NOT NULL AND ide.clock_in IS NOT NULL
+                    THEN (EXTRACT(EPOCH FROM (ide.clock_out - ide.clock_in)) / 3600.0)::float8
                     ELSE NULL END AS actual_hours,
-               ie.employee_clock_in,
-               ie.employee_clock_out,
-               CASE WHEN ie.employee_clock_out IS NOT NULL AND ie.employee_clock_in IS NOT NULL
-                    THEN (EXTRACT(EPOCH FROM (ie.employee_clock_out - ie.employee_clock_in)) / 3600.0)::float8
+               ide.clock_in AS employee_clock_in,
+               ide.clock_out AS employee_clock_out,
+               CASE WHEN ide.clock_out IS NOT NULL AND ide.clock_in IS NOT NULL
+                    THEN (EXTRACT(EPOCH FROM (ide.clock_out - ide.clock_in)) / 3600.0)::float8
                     ELSE NULL END AS employee_actual_hours,
-               ie.notes
-        FROM inquiry_employees ie
-        JOIN employees e ON ie.employee_id = e.id
-        WHERE ie.inquiry_id = $1
+               ide.notes
+        FROM inquiry_day_employees ide
+        JOIN inquiry_days iday ON ide.inquiry_day_id = iday.id
+        JOIN employees e ON ide.employee_id = e.id
+        WHERE iday.inquiry_id = $1 AND iday.day_number = 1
         ORDER BY e.last_name, e.first_name
         "#,
     )
