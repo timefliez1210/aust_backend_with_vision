@@ -932,11 +932,10 @@ async fn download_employee_document(
     Extension(_claims): Extension<TokenClaims>,
     Path((id, doc_type)): Path<(Uuid, String)>,
 ) -> Result<Response, ApiError> {
-    resolve_doc_column(&doc_type)
+    let col = resolve_doc_column(&doc_type)
         .ok_or_else(|| ApiError::BadRequest("Unbekannter Dokumenttyp".into()))?;
 
-    // Fetch the stored S3 key
-    let col = &format!("{}_key", doc_type.replace('-', "_"));
+    // Fetch the stored S3 key using the pre-validated column name
     let key = employee_repo::fetch_document_key(&state.db, id, col)
         .await?
         .ok_or_else(|| ApiError::NotFound("Dokument nicht vorhanden".into()))?;

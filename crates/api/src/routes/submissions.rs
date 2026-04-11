@@ -65,6 +65,7 @@ pub(crate) struct ParsedInquiryForm {
     pub service_type: Option<String>,
     pub submission_mode: Option<String>,
     // Recipient (Leistungsempfänger) — when booking for someone else
+    pub recipient_salutation: Option<String>,
     pub recipient_first_name: Option<String>,
     pub recipient_last_name: Option<String>,
     pub recipient_phone: Option<String>,
@@ -109,7 +110,7 @@ async fn photo_inquiry(
     multipart: Multipart,
 ) -> Result<(StatusCode, Json<SubmitInquiryResponse>), ApiError> {
     let parsed = parse_inquiry_form(multipart, false).await?;
-    handle_submission(state, parsed, "photo_webapp").await
+    handle_submission(state, parsed, "photo_webapp", "foto").await
 }
 
 /// POST /submit/mobile -- Mobile app inquiry (Source D).
@@ -118,7 +119,7 @@ async fn mobile_inquiry(
     multipart: Multipart,
 ) -> Result<(StatusCode, Json<SubmitInquiryResponse>), ApiError> {
     let parsed = parse_inquiry_form(multipart, true).await?;
-    handle_submission(state, parsed, "mobile_app").await
+    handle_submission(state, parsed, "mobile_app", "mobile").await
 }
 
 /// `POST /api/v1/submit/mobile/ar` — AR per-item mobile app inquiry (Source D variant).
@@ -231,6 +232,22 @@ async fn handle_ar_submission(
     );
     let services_json = serde_json::to_value(&services_struct).unwrap_or(serde_json::json!({}));
 
+    // Create recipient customer if provided (booking for someone else)
+    let recipient_id = if form.recipient_last_name.as_deref().map_or(false, |s| !s.trim().is_empty()) {
+        Some(customer_repo::create_recipient(
+            &state.db,
+            &email,
+            form.recipient_salutation.as_deref(),
+            form.recipient_first_name.as_deref(),
+            form.recipient_last_name.as_deref(),
+            form.recipient_phone.as_deref(),
+            form.recipient_email.as_deref(),
+            now,
+        ).await?)
+    } else {
+        None
+    };
+
     // 3. Create inquiry
     let inquiry_id = Uuid::now_v7();
     inquiry_repo::create_minimal(
@@ -246,7 +263,7 @@ async fn handle_ar_submission(
         "mobile_app_ar",
         form.service_type.as_deref(),      // service_type
         Some("ar"),                       // submission_mode
-        None,                              // recipient_id
+        recipient_id,                      // recipient_id
         None,                              // billing_address_id
         None,                              // custom_fields
         now,
@@ -527,6 +544,7 @@ async fn video_inquiry(
     let mut company_name: Option<String> = None;
     let mut service_type: Option<String> = None;
     let mut submission_mode: Option<String> = None;
+    let mut recipient_salutation: Option<String> = None;
     let mut recipient_first_name: Option<String> = None;
     let mut recipient_last_name: Option<String> = None;
     let mut recipient_phone: Option<String> = None;
@@ -594,6 +612,7 @@ async fn video_inquiry(
             "company_name" | "firmenname" => company_name = Some(read_text_field(field).await?),
             "service_type" => service_type = Some(read_text_field(field).await?),
             "submission_mode" => submission_mode = Some(read_text_field(field).await?),
+            "recipient_salutation" => recipient_salutation = Some(read_text_field(field).await?),
             "recipient_first_name" => recipient_first_name = Some(read_text_field(field).await?),
             "recipient_last_name" => recipient_last_name = Some(read_text_field(field).await?),
             "recipient_phone" => recipient_phone = Some(read_text_field(field).await?),
@@ -675,6 +694,30 @@ async fn video_inquiry(
         message.as_deref(),
     );
 
+    // Parse services into structured JSON
+    let services_struct = parse_services_string(
+        services_text.as_deref(),
+        departure_parking_ban,
+        arrival_parking_ban,
+    );
+    let services_json = serde_json::to_value(&services_struct).unwrap_or(serde_json::json!({}));
+
+    // Create recipient customer if provided (booking for someone else)
+    let recipient_id = if recipient_last_name.as_deref().map_or(false, |s| !s.trim().is_empty()) {
+        Some(customer_repo::create_recipient(
+            &state.db,
+            &email,
+            recipient_salutation.as_deref(),
+            recipient_first_name.as_deref(),
+            recipient_last_name.as_deref(),
+            recipient_phone.as_deref(),
+            recipient_email.as_deref(),
+            now,
+        ).await?)
+    } else {
+        None
+    };
+
     // Create inquiry
     let inquiry_id = Uuid::now_v7();
     inquiry_repo::create_minimal(
@@ -686,11 +729,11 @@ async fn video_inquiry(
         "pending",
         scheduled_date_naive,
         Some(&notes),
-        None,
+        Some(&services_json),
         "video_webapp",
         service_type.as_deref(),
         Some("video"),  // submission_mode
-        None,  // recipient_id
+        recipient_id,
         None,  // billing_address_id
         None,  // custom_fields
         now,
@@ -893,6 +936,22 @@ async fn manual_inquiry(
     );
     let services_json = serde_json::to_value(&services_struct).unwrap_or(serde_json::json!({}));
 
+    // Create recipient customer if provided (booking for someone else)
+    let recipient_id = if form.recipient_last_name.as_deref().map_or(false, |s| !s.trim().is_empty()) {
+        Some(customer_repo::create_recipient(
+            &state.db,
+            &email,
+            form.recipient_salutation.as_deref(),
+            form.recipient_first_name.as_deref(),
+            form.recipient_last_name.as_deref(),
+            form.recipient_phone.as_deref(),
+            form.recipient_email.as_deref(),
+            now,
+        ).await?)
+    } else {
+        None
+    };
+
     // 6. Create inquiry
     let inquiry_id = Uuid::now_v7();
     inquiry_repo::create_minimal(
@@ -908,7 +967,7 @@ async fn manual_inquiry(
         "manuell",
         form.service_type.as_deref(),
         Some("manuell"),  // submission_mode
-        None,              // recipient_id
+        recipient_id,                    // recipient_id
         billing_address_id,
         None,              // custom_fields
         now,
@@ -952,6 +1011,7 @@ pub(crate) async fn parse_inquiry_form(
         company_name: None,
         service_type: None,
         submission_mode: None,
+        recipient_salutation: None,
         recipient_first_name: None,
         recipient_last_name: None,
         recipient_phone: None,
@@ -1070,6 +1130,7 @@ pub(crate) async fn parse_inquiry_form(
             "company_name" | "firmenname" => form.company_name = Some(read_text_field(field).await?),
             "service_type" => form.service_type = Some(read_text_field(field).await?),
             "submission_mode" => form.submission_mode = Some(read_text_field(field).await?),
+            "recipient_salutation" => form.recipient_salutation = Some(read_text_field(field).await?),
             "recipient_first_name" => form.recipient_first_name = Some(read_text_field(field).await?),
             "recipient_last_name" => form.recipient_last_name = Some(read_text_field(field).await?),
             "recipient_phone" => form.recipient_phone = Some(read_text_field(field).await?),
@@ -1104,6 +1165,7 @@ pub(crate) async fn handle_submission(
     state: Arc<AppState>,
     form: ParsedInquiryForm,
     source: &str,
+    submission_mode: &str,
 ) -> Result<(StatusCode, Json<SubmitInquiryResponse>), ApiError> {
     // Validate required fields
     let name = form
@@ -1135,8 +1197,8 @@ pub(crate) async fn handle_submission(
         form.first_name.as_deref(),
         form.last_name.as_deref(),
         form.phone.as_deref(),
-        None,
-        None,
+        form.customer_type.as_deref(),
+        form.company_name.as_deref(),
         now,
     )
     .await
@@ -1155,7 +1217,7 @@ pub(crate) async fn handle_submission(
         form.departure_floor.as_deref(),
         form.departure_elevator,
         None,
-        None,
+        form.departure_parking_ban,
     )
     .await
     .map_err(|e| ApiError::Internal(format!("Auszugsadresse konnte nicht erstellt werden: {e}")))?;
@@ -1171,7 +1233,7 @@ pub(crate) async fn handle_submission(
         form.arrival_floor.as_deref(),
         form.arrival_elevator,
         None,
-        None,
+        form.arrival_parking_ban,
     )
     .await
     .map_err(|e| ApiError::Internal(format!("Einzugsadresse konnte nicht erstellt werden: {e}")))?;
@@ -1198,8 +1260,6 @@ pub(crate) async fn handle_submission(
     );
     let services_json = serde_json::to_value(&services_struct).unwrap_or(serde_json::json!({}));
 
-    // 6. Create inquiry
-    let inquiry_id = Uuid::now_v7();
     // Create billing address if provided
     let billing_address_id = if form.billing_street.is_some() || form.billing_city.is_some() {
         let b_street = form.billing_street.as_deref().unwrap_or("");
@@ -1223,6 +1283,24 @@ pub(crate) async fn handle_submission(
     };
 
 
+    // 6b. Create recipient customer if provided (booking for someone else)
+    let recipient_id = if form.recipient_last_name.as_deref().map_or(false, |s| !s.trim().is_empty()) {
+        Some(customer_repo::create_recipient(
+            &state.db,
+            &email,
+            form.recipient_salutation.as_deref(),
+            form.recipient_first_name.as_deref(),
+            form.recipient_last_name.as_deref(),
+            form.recipient_phone.as_deref(),
+            form.recipient_email.as_deref(),
+            now,
+        ).await?)
+    } else {
+        None
+    };
+
+    // 6c. Create inquiry
+    let inquiry_id = Uuid::now_v7();
     inquiry_repo::create_minimal(
         &state.db,
         inquiry_id,
@@ -1235,9 +1313,9 @@ pub(crate) async fn handle_submission(
         Some(&services_json),
         source,
         form.service_type.as_deref(),      // service_type
-        Some("foto"),                     // submission_mode
-        None,                              // recipient_id (created separately if needed)
-        billing_address_id,               // billing_address_id
+        Some(submission_mode),              // submission_mode
+        recipient_id,                       // recipient_id
+        billing_address_id,                 // billing_address_id
         None,                              // custom_fields
         now,
     )

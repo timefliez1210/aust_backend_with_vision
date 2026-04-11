@@ -182,10 +182,13 @@ pub(crate) async fn fetch_schedule_inquiries(
                 NULLIF(TRIM(COALESCE(c.first_name,'') || ' ' || COALESCE(c.last_name,'')), ''),
                 c.name, c.email
             ) AS customer_name,
+            c.customer_type,
+            c.company_name,
             CASE WHEN ao.id IS NOT NULL THEN ao.street || ', ' || ao.city END AS departure_address,
             CASE WHEN ad.id IS NOT NULL THEN ad.street || ', ' || ad.city END AS arrival_address,
             i.estimated_volume_m3 AS volume_m3,
             i.status,
+            i.service_type,
             i.notes,
             COALESCE(id2.start_time, i.start_time) AS start_time,
             COALESCE(id2.end_time,   i.end_time)   AS end_time,

@@ -218,3 +218,71 @@ pub(crate) async fn exists(pool: &PgPool, customer_id: Uuid) -> Result<bool, sql
         .fetch_one(pool)
         .await
 }
+
+/// Create a recipient customer from form fields.
+///
+/// **Caller**: All four submission handlers (photo, video, mobile, AR) and manual_inquiry.
+/// **Why**: When a customer books a service for someone else, the recipient
+///          is a separate person. We create a minimal customer record so that
+///          `recipient_id` can be set on the inquiry.
+///
+/// If the recipient has no email, we generate a placeholder to satisfy the
+/// UNIQUE constraint on customers.email. The placeholder includes the payer's
+/// email as a disambiguator so that recipients without email don't collide.
+pub(crate) async fn create_recipient(
+    pool: &PgPool,
+    payer_email: &str,
+    salutation: Option<&str>,
+    first_name: Option<&str>,
+    last_name: Option<&str>,
+    phone: Option<&str>,
+    email: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<Uuid, ApiError> {
+    // Recipient must have at least a last name to be meaningful
+    let last = last_name.filter(|s| !s.trim().is_empty());
+    if last.is_none() {
+        // No recipient data — return early with Ok(None) equivalent
+        // Callers should check whether recipient_last_name was provided before calling
+        return Err(ApiError::Validation("Empfaenger-Nachname ist erforderlich".into()));
+    }
+
+    // Use provided email, or generate a placeholder
+    let recipient_email = match email.filter(|s| !s.trim().is_empty()) {
+        Some(e) => e.to_string(),
+        None => format!("recipient-{}@aufraeumhelden.com", uuid::Uuid::now_v7()),
+    };
+
+    let id = uuid::Uuid::now_v7();
+    let name = format!("{} {}",
+        first_name.as_deref().unwrap_or(""),
+        last.as_deref().unwrap_or(""
+    )).trim().to_string();
+
+    sqlx::query_as(
+        r#"
+        INSERT INTO customers (id, email, name, salutation, first_name, last_name, phone, customer_type, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, 'private', $8, $8)
+        ON CONFLICT (email) DO UPDATE SET
+            name = COALESCE(NULLIF(EXCLUDED.name, ''), customers.name),
+            salutation = COALESCE(NULLIF(EXCLUDED.salutation, ''), customers.salutation),
+            first_name = COALESCE(NULLIF(EXCLUDED.first_name, ''), customers.first_name),
+            last_name = COALESCE(NULLIF(EXCLUDED.last_name, ''), customers.last_name),
+            phone = COALESCE(NULLIF(EXCLUDED.phone, ''), customers.phone),
+            updated_at = EXCLUDED.updated_at
+        RETURNING id
+        "#,
+    )
+    .bind(id)
+    .bind(&recipient_email)
+    .bind(&name)
+    .bind(salutation)
+    .bind(first_name)
+    .bind(last)
+    .bind(phone)
+    .bind(now)
+    .fetch_one(pool)
+    .await
+    .map(|(id,): (Uuid,)| id)
+    .map_err(|e| ApiError::Internal(format!("Empfaenger konnte nicht erstellt werden: {e}")))
+}
