@@ -261,7 +261,8 @@ impl Default for ServerConfig {
 ///
 /// **Caller**: `offer-generator` pricing engine uses `depot_address` as the
 /// route start/end point and `fahrt_rate_per_km` to calculate the Anfahrt
-/// (travel surcharge) line item.
+/// (travel surcharge) line item. `rate_per_person_hour_cents` controls the
+/// base labor rate. Service line-item prices are also configurable here.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CompanyConfig {
     /// Full street address of the company depot, used as the origin when
@@ -270,13 +271,40 @@ pub struct CompanyConfig {
     /// Euro amount charged per kilometre for the Anfahrt/Abfahrt line item.
     /// For example, `1.5` means €1.50/km.
     pub fahrt_rate_per_km: f64,
+    /// Labor rate in cents per person-hour. Default: 3000 (= €30.00/hr).
+    /// This is the base hourly rate used by the pricing engine.
+    #[serde(default = "default_rate_per_person_hour_cents")]
+    pub rate_per_person_hour_cents: i64,
+    /// Price per Demontage/Montage unit in EUR. Default: 25.0 (= €25.00).
+    #[serde(default = "default_assembly_price")]
+    pub assembly_price: f64,
+    /// Price per Halteverbotszone unit in EUR. Default: 100.0 (= €100.00).
+    #[serde(default = "default_parking_ban_price")]
+    pub parking_ban_price: f64,
+    /// Price for Umzugsmaterial (packing materials) in EUR. Default: 30.0 (= €30.00).
+    #[serde(default = "default_packing_price")]
+    pub packing_price: f64,
+    /// Saturday surcharge in cents. Default: 5000 (= €50.00).
+    #[serde(default = "default_saturday_surcharge_cents")]
+    pub saturday_surcharge_cents: i64,
 }
+
+fn default_rate_per_person_hour_cents() -> i64 { 3000 }
+fn default_assembly_price() -> f64 { 25.0 }
+fn default_parking_ban_price() -> f64 { 100.0 }
+fn default_packing_price() -> f64 { 30.0 }
+fn default_saturday_surcharge_cents() -> i64 { 5000 }
 
 impl Default for CompanyConfig {
     fn default() -> Self {
         Self {
             depot_address: "Borsigstr 6 31135 Hildesheim".to_string(),
             fahrt_rate_per_km: 1.0,
+            rate_per_person_hour_cents: 3000,
+            assembly_price: 25.0,
+            parking_ban_price: 100.0,
+            packing_price: 30.0,
+            saturday_surcharge_cents: 5000,
         }
     }
 }

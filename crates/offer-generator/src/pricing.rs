@@ -13,20 +13,31 @@ use chrono::Datelike;
 /// a flat `Fahrkostenpauschale` line item built separately in the route handler.
 pub struct PricingEngine {
     /// Labor rate stored as integer cents to avoid floating-point drift.
+    /// Loaded from `CompanyConfig::rate_per_person_hour_cents`.
     /// Default: 3000 cents = €30.00 per person-hour.
     rate_per_person_hour: i64,
+    /// Saturday surcharge in cents. Default: 5000 = €50.00.
+    saturday_surcharge_cents: i64,
 }
 
 impl PricingEngine {
+    /// Create a `PricingEngine` with a specific per-person-hour rate and Saturday surcharge.
+    ///
+    /// **Caller**: `crates/api/src/routes/offers.rs`, passing config values.
+    pub fn with_rate(rate_cents: i64, saturday_surcharge_cents: i64) -> Self {
+        Self {
+            rate_per_person_hour: rate_cents,
+            saturday_surcharge_cents,
+        }
+    }
+
     /// Create a `PricingEngine` with the default rate of €30.00 per person-hour.
     ///
-    /// **Caller**: `crates/api/src/routes/offers.rs`
-    /// **Why**: Provides a single construction point; when the rate becomes
-    /// configurable from the database (see TODO in CLAUDE.md), this is the
-    /// function to update.
+    /// **Caller**: Tests and legacy call sites that don't have config available.
     pub fn new() -> Self {
         Self {
-            rate_per_person_hour: 3000, // €30/hr
+            rate_per_person_hour: 3000,
+            saturday_surcharge_cents: 5000,
         }
     }
 
@@ -115,17 +126,18 @@ impl PricingEngine {
     ///
     /// **Why**: Saturday moves require extra crew coordination and are priced at
     /// a premium. No surcharge applies on any other day, including Sunday (moves
-    /// on Sundays are not typically offered).
+    /// on Sundays are not typically offered). The surcharge amount is configurable
+    /// via `CompanyConfig::saturday_surcharge_cents`.
     ///
     /// # Parameters
     /// - `input` — pricing input; only `scheduled_date` is examined here
     ///
     /// # Returns
-    /// `5000` (= €50.00) if the scheduled date falls on a Saturday, `0` otherwise.
+    /// `saturday_surcharge_cents` if the scheduled date falls on a Saturday, `0` otherwise.
     fn calculate_date_adjustment(&self, input: &PricingInput) -> i64 {
         if let Some(date) = input.scheduled_date {
             if date.weekday() == chrono::Weekday::Sat {
-                return 5000;
+                return self.saturday_surcharge_cents;
             }
         }
         0

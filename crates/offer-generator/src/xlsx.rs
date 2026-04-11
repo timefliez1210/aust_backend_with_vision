@@ -412,6 +412,16 @@ fn build_cell_modifications(
     }
 
     // 2. Write items sequentially starting at row 31
+    // L1: warn when line items exceed template capacity
+    if data.line_items.len() > 12 {
+        tracing::warn!(
+            offer_number = %data.offer_number,
+            total_items = data.line_items.len(),
+            max_items = 12,
+            "Offer has {} line items but template only has 12 slots (rows 31-42). Excess items will be truncated in PDF.",
+            data.line_items.len()
+        );
+    }
     let max_items = 12.min(data.line_items.len()); // template has 12 slots (31-42)
     for (i, item) in data.line_items.iter().take(max_items).enumerate() {
         let row = 31 + i as u32;

@@ -31,7 +31,11 @@ use uuid::Uuid;
 /// # Returns
 /// Nothing. Errors are logged and, if critical, forwarded to the admin via Telegram.
 pub async fn try_auto_generate_offer(state: Arc<AppState>, inquiry_id: Uuid) {
-    // Check if an offer already exists for this quote
+    // Check if an offer already exists for this quote.
+    // NOTE: A UNIQUE partial index (`offers_inquiry_active_unique`) on offers(inquiry_id)
+    //       WHERE status NOT IN ('rejected','cancelled') prevents duplicate active offers
+    //       even under concurrent access. The check below is an optimization to avoid
+    //       unnecessary work; the DB constraint is the true guard.
     let already_exists = offer_repo::any_exists_for_inquiry(&state.db, inquiry_id)
         .await
         .unwrap_or(false);

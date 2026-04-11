@@ -226,7 +226,7 @@ pub(super) struct UpdateCustomerRequest {
 /// - `404` if customer not found
 pub(super) async fn update_customer(
     State(state): State<Arc<AppState>>,
-    Extension(_claims): Extension<TokenClaims>,
+    Extension(claims): Extension<TokenClaims>,
     Path(id): Path<Uuid>,
     Json(request): Json<UpdateCustomerRequest>,
 ) -> Result<Json<CustomerListItem>, ApiError> {
@@ -238,6 +238,8 @@ pub(super) async fn update_customer(
         request.customer_type.as_deref(), request.company_name.as_deref(),
     )
     .await?;
+
+    tracing::info!(admin = %claims.sub, admin_email = %claims.email, customer_id = %id, "Admin updated customer");
 
     repo_row
         .map(|c| Json(CustomerListItem {
@@ -339,6 +341,7 @@ pub(super) async fn delete_customer(
     if rows == 0 {
         return Err(ApiError::NotFound(format!("Kunde {id} nicht gefunden")));
     }
+    tracing::info!(admin = %claims.sub, admin_email = %claims.email, customer_id = %id, "Admin deleted customer");
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 

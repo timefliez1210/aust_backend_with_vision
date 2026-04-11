@@ -229,7 +229,7 @@ pub(crate) async fn build_offer_with_overrides(
         has_elevator_stop: stop_address.as_ref().and_then(|a| a.elevator),
     };
 
-    let pricing_engine = PricingEngine::new();
+    let pricing_engine = PricingEngine::with_rate(config.company.rate_per_person_hour_cents, config.company.saturday_surcharge_cents);
     let mut pricing_result = pricing_engine.calculate(&pricing_input);
 
     // Apply overrides
@@ -308,7 +308,8 @@ pub(crate) async fn build_offer_with_overrides(
         result
     } else {
         let mut items = vec![fahrt_item];
-        items.extend(build_line_items(&inquiry_services));
+        let service_prices = ServicePrices::from_config(config);
+        items.extend(build_line_items(&inquiry_services, &service_prices));
         items
     };
 
@@ -501,14 +502,33 @@ pub(crate) async fn build_offer_with_overrides(
         .await
         .map_err(ApiError::Database)?
     } else {
-        offer_repo::insert_returning(
+        match offer_repo::insert_returning(
             db, offer_id, inquiry_id, actual_netto_cents, "EUR", valid_until_date,
             Some(&s3_key), OfferStatus::Draft.as_str(), now, &offer_number,
             pricing_result.estimated_helpers as i32, pricing_result.estimated_hours,
             rate_cents, &line_items_json, fahrt_override_cents,
         )
         .await
-        .map_err(ApiError::Database)?
+        {
+            Ok(row) => row,
+            Err(sqlx::Error::Database(ref e)) if e.constraint() == Some("offers_inquiry_active_unique") => {
+                // M1 guard: concurrent offer generation beat us — the unique partial index
+                // prevented a duplicate. Treat as idempotent success by fetching the existing offer.
+                tracing::info!(inquiry_id = %inquiry_id, "Concurrent offer generation detected (unique constraint) — returning existing offer");
+                let existing_id = offer_repo::fetch_active_id_for_inquiry(db, inquiry_id)
+                    .await
+                    .map_err(ApiError::Database)?
+                    .ok_or_else(|| ApiError::Internal("Offer exists but could not be fetched".into()))?;
+                offer_repo::update_returning(
+                    db, existing_id, actual_netto_cents, Some(&s3_key), OfferStatus::Draft.as_str(),
+                    pricing_result.estimated_helpers as i32, pricing_result.estimated_hours,
+                    rate_cents, &line_items_json, fahrt_override_cents,
+                )
+                .await
+                .map_err(ApiError::Database)?
+            }
+            Err(e) => return Err(ApiError::Database(e)),
+        }
     };
 
     // Map repo row to Offer domain model
@@ -813,6 +833,37 @@ async fn build_fahrt_item(
     }
 }
 
+/// Configurable service line-item prices, loaded from `CompanyConfig`.
+///
+/// **Caller**: `build_line_items` — determines unit prices for assembly, parking ban, and packing.
+/// **Why**: Avoids hardcoded pricing constants that require a redeploy to change.
+pub(crate) struct ServicePrices {
+    pub assembly_unit_price: f64,
+    pub parking_ban_unit_price: f64,
+    pub packing_unit_price: f64,
+}
+
+impl ServicePrices {
+    /// Build from the application config.
+    pub fn from_config(config: &Config) -> Self {
+        Self {
+            assembly_unit_price: config.company.assembly_price,
+            parking_ban_unit_price: config.company.parking_ban_price,
+            packing_unit_price: config.company.packing_price,
+        }
+    }
+
+    /// Default prices for tests (matches CompanyConfig defaults).
+    #[allow(dead_code)]
+    pub fn defaults() -> Self {
+        Self {
+            assembly_unit_price: 25.0,
+            parking_ban_unit_price: 100.0,
+            packing_unit_price: 30.0,
+        }
+    }
+}
+
 /// Derive the non-labor XLSX line items from structured `Services` flags.
 ///
 /// **Caller**: `build_offer_with_overrides` — called only when `overrides.line_items` is
@@ -834,7 +885,7 @@ async fn build_fahrt_item(
 ///
 /// Does NOT include Fahrkostenpauschale (computed separately in `build_offer_with_overrides`)
 /// or the labor item (prepended separately before this list is appended).
-pub(crate) fn build_line_items(services: &Services) -> Vec<OfferLineItem> {
+pub(crate) fn build_line_items(services: &Services, prices: &ServicePrices) -> Vec<OfferLineItem> {
     let mut items = Vec::new();
 
     // Demontage — if disassembly service requested
@@ -842,7 +893,7 @@ pub(crate) fn build_line_items(services: &Services) -> Vec<OfferLineItem> {
         items.push(OfferLineItem {
             description: "Demontage".to_string(),
             quantity: 1.0,
-            unit_price: 25.0,
+            unit_price: prices.assembly_unit_price,
             ..Default::default()
         });
     }
@@ -852,7 +903,7 @@ pub(crate) fn build_line_items(services: &Services) -> Vec<OfferLineItem> {
         items.push(OfferLineItem {
             description: "Montage".to_string(),
             quantity: 1.0,
-            unit_price: 25.0,
+            unit_price: prices.assembly_unit_price,
             ..Default::default()
         });
     }
@@ -873,7 +924,7 @@ pub(crate) fn build_line_items(services: &Services) -> Vec<OfferLineItem> {
         items.push(OfferLineItem {
             description: "Halteverbotszone".to_string(),
             quantity: halteverbot_count as f64,
-            unit_price: 100.0,
+            unit_price: prices.parking_ban_unit_price,
             remark,
             ..Default::default()
         });
@@ -884,8 +935,8 @@ pub(crate) fn build_line_items(services: &Services) -> Vec<OfferLineItem> {
         items.push(OfferLineItem {
             description: "Umzugsmaterial".to_string(),
             quantity: 1.0,
-            unit_price: 30.0,
-            remark: Some("Stretchfolie, Decken, Gurte Einzelpreis 30,00 €".to_string()),
+            unit_price: prices.packing_unit_price,
+            remark: Some(format!("Stretchfolie, Decken, Gurte Einzelpreis {} €", format!("{:.2}", prices.packing_unit_price).replace('.', ","))),
             ..Default::default()
         });
     }
@@ -1296,7 +1347,7 @@ mod tests {
 
     #[test]
     fn always_has_versicherung_last() {
-        let items = build_line_items(&Services::default());
+        let items = build_line_items(&Services::default(), &ServicePrices::defaults());
         assert!(!items.is_empty(), "should have at least Versicherung");
         let last = items.last().unwrap();
         assert_eq!(last.description, "Nürnbergerversicherung");
@@ -1306,40 +1357,40 @@ mod tests {
 
     #[test]
     fn no_transporter_item() {
-        let items = build_line_items(&Services::default());
+        let items = build_line_items(&Services::default(), &ServicePrices::defaults());
         assert!(!items.iter().any(|i| i.description.contains("Transporter")), "Transporter must not appear");
     }
 
     #[test]
     fn no_anfahrt_item() {
-        let items = build_line_items(&Services::default());
+        let items = build_line_items(&Services::default(), &ServicePrices::defaults());
         assert!(!items.iter().any(|i| i.description.contains("Anfahrt")), "Anfahrt must not appear");
     }
 
     #[test]
     fn demontage_separate_from_montage() {
-        let items = build_line_items(&Services { disassembly: true, ..Default::default() });
+        let items = build_line_items(&Services { disassembly: true, ..Default::default() }, &ServicePrices::defaults());
         assert!(items.iter().any(|i| i.description == "Demontage"), "should have Demontage");
         assert!(!items.iter().any(|i| i.description == "Montage"), "should NOT have Montage");
     }
 
     #[test]
     fn montage_separate_from_demontage() {
-        let items = build_line_items(&Services { assembly: true, ..Default::default() });
+        let items = build_line_items(&Services { assembly: true, ..Default::default() }, &ServicePrices::defaults());
         assert!(items.iter().any(|i| i.description == "Montage"), "should have Montage");
         assert!(!items.iter().any(|i| i.description == "Demontage"), "should NOT have Demontage");
     }
 
     #[test]
     fn both_services_both_items() {
-        let items = build_line_items(&Services { assembly: true, disassembly: true, ..Default::default() });
+        let items = build_line_items(&Services { assembly: true, disassembly: true, ..Default::default() }, &ServicePrices::defaults());
         assert!(items.iter().any(|i| i.description == "Demontage"), "should have Demontage");
         assert!(items.iter().any(|i| i.description == "Montage"), "should have Montage");
     }
 
     #[test]
     fn halteverbot_origin_only() {
-        let items = build_line_items(&Services { parking_ban_origin: true, ..Default::default() });
+        let items = build_line_items(&Services { parking_ban_origin: true, ..Default::default() }, &ServicePrices::defaults());
         let hv = items.iter().find(|i| i.description == "Halteverbotszone").expect("should have halteverbot");
         assert_eq!(hv.quantity, 1.0);
         assert_eq!(hv.remark.as_deref(), Some("Beladestelle"));
@@ -1347,7 +1398,7 @@ mod tests {
 
     #[test]
     fn halteverbot_destination_only() {
-        let items = build_line_items(&Services { parking_ban_destination: true, ..Default::default() });
+        let items = build_line_items(&Services { parking_ban_destination: true, ..Default::default() }, &ServicePrices::defaults());
         let hv = items.iter().find(|i| i.description == "Halteverbotszone").expect("should have halteverbot");
         assert_eq!(hv.quantity, 1.0);
         assert_eq!(hv.remark.as_deref(), Some("Entladestelle"));
@@ -1355,7 +1406,7 @@ mod tests {
 
     #[test]
     fn halteverbot_both() {
-        let items = build_line_items(&Services { parking_ban_origin: true, parking_ban_destination: true, ..Default::default() });
+        let items = build_line_items(&Services { parking_ban_origin: true, parking_ban_destination: true, ..Default::default() }, &ServicePrices::defaults());
         let hv = items.iter().find(|i| i.description == "Halteverbotszone").expect("should have halteverbot");
         assert_eq!(hv.quantity, 2.0);
         assert_eq!(hv.remark.as_deref(), Some("Beladestelle + Entladestelle"));
@@ -1363,7 +1414,7 @@ mod tests {
 
     #[test]
     fn umzugsmaterial_remark() {
-        let items = build_line_items(&Services { packing: true, ..Default::default() });
+        let items = build_line_items(&Services { packing: true, ..Default::default() }, &ServicePrices::defaults());
         let um = items.iter().find(|i| i.description == "Umzugsmaterial").expect("should have umzugsmaterial");
         assert_eq!(um.unit_price, 30.0);
         assert_eq!(um.remark.as_deref(), Some("Stretchfolie, Decken, Gurte Einzelpreis 30,00 €"));
@@ -1371,13 +1422,13 @@ mod tests {
 
     #[test]
     fn packing_triggers_umzugsmaterial() {
-        let items = build_line_items(&Services { packing: true, ..Default::default() });
+        let items = build_line_items(&Services { packing: true, ..Default::default() }, &ServicePrices::defaults());
         assert!(items.iter().any(|i| i.description == "Umzugsmaterial"));
     }
 
     #[test]
     fn versicherung_zero_price() {
-        let items = build_line_items(&Services::default());
+        let items = build_line_items(&Services::default(), &ServicePrices::defaults());
         let v = items.iter().find(|i| i.description == "Nürnbergerversicherung").unwrap();
         assert_eq!(v.quantity, 1.0);
         assert_eq!(v.unit_price, 0.0);
@@ -1579,7 +1630,7 @@ mod tests {
                 parking_ban_origin: ban_origin,
                 parking_ban_destination: ban_dest,
             };
-            let items = build_line_items(&services);
+            let items = build_line_items(&services, &ServicePrices::defaults());
             // Must always end with Nürnbergerversicherung
             assert!(!items.is_empty());
             let last = items.last().unwrap();

@@ -327,6 +327,7 @@ async fn delete_user(
         return Err(ApiError::NotFound(format!("Benutzer {id} nicht gefunden")));
     }
 
+    tracing::info!(admin = %claims.sub, admin_email = %claims.email, deleted_user = %id, "Admin deleted user");
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -517,7 +518,7 @@ async fn get_employee(
 /// `200 OK` with updated employee JSON.
 async fn update_employee(
     State(state): State<Arc<AppState>>,
-    Extension(_claims): Extension<TokenClaims>,
+    Extension(claims): Extension<TokenClaims>,
     Path(id): Path<Uuid>,
     Json(body): Json<aust_core::models::UpdateEmployee>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -540,6 +541,7 @@ async fn update_employee(
     )
     .await?;
 
+    tracing::info!(admin = %claims.sub, admin_email = %claims.email, employee_id = %id, "Admin updated employee");
     let employee = fetch_employee_json(&state.db, id).await?;
     Ok(Json(employee))
 }
@@ -562,6 +564,7 @@ async fn delete_employee(
         return Err(ApiError::NotFound("Mitarbeiter nicht gefunden".into()));
     }
 
+    tracing::info!(admin = %claims.sub, admin_email = %claims.email, employee_id = %id, "Admin soft-deleted employee");
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 

@@ -343,11 +343,37 @@ async fn update_inquiry(
 ) -> Result<Json<InquiryResponseModel>, ApiError> {
     let now = chrono::Utc::now();
 
+    // Fetch current inquiry for status checks
+    let current_inquiry = inquiry_repo::fetch_by_id(&state.db, id).await?;
+    let current_status: InquiryStatus = current_inquiry.status.parse()
+        .map_err(|_| ApiError::Internal(format!("Invalid status in DB: {}", current_inquiry.status)))?;
+
+    // M3: Gate mutable fields on current status
+    // Once an inquiry has an offer (offer_ready or beyond), volume, services,
+    // distance, and addresses are locked — changing them would break the accepted offer.
+    let is_locked_status = matches!(
+        current_status,
+        InquiryStatus::OfferReady
+        | InquiryStatus::OfferSent
+        | InquiryStatus::Accepted
+        | InquiryStatus::Scheduled
+        | InquiryStatus::Completed
+        | InquiryStatus::Invoiced
+        | InquiryStatus::Paid
+    );
+    let locked_fields_modified = request.estimated_volume_m3.is_some()
+        || request.services.is_some()
+        || request.distance_km.is_some()
+        || request.origin_address_id.is_some()
+        || request.destination_address_id.is_some();
+    if is_locked_status && locked_fields_modified {
+        return Err(ApiError::Validation(
+            "Inquiry mit vorhandenem Angebot kann nicht mehr inhaltlich geändert werden (Volumen, Services, Entfernung, Adressen). Bitte Angebot neu erstellen.".into(),
+        ));
+    }
+
     // Validate status transition if status is being changed
     if let Some(ref new_status) = request.status {
-        let current_inquiry = inquiry_repo::fetch_by_id(&state.db, id).await?;
-        let current_status: InquiryStatus = current_inquiry.status.parse()
-            .map_err(|_| ApiError::Internal(format!("Invalid status in DB: {}", current_inquiry.status)))?;
         let target_status: InquiryStatus = new_status.parse()
             .map_err(|e| ApiError::Validation(format!("Ungueltiger Status: {e}")))?;
         if !current_status.can_transition_to(&target_status) {
@@ -438,22 +464,35 @@ async fn delete_inquiry(
     }
 
     // 1. Collect S3 keys before deleting DB rows (CASCADE would remove them)
+    //    Track S3 deletion results for retry/logging (L2)
+    let mut s3_delete_failures: Vec<String> = Vec::new();
+
     //    Offer PDFs
     let offer_keys = offer_repo::fetch_all_pdf_keys(&state.db, id).await.unwrap_or_default();
     for key in &offer_keys {
         if let Err(e) = state.storage.delete(key).await {
             tracing::warn!(inquiry_id = %id, key = %key, error = %e, "Failed to delete offer PDF from S3");
+            s3_delete_failures.push(key.clone());
         }
     }
     //    Estimation images and depth maps
     let estimations = estimation_repo::fetch_all_estimations_for_inquiry(&state.db, id).await.unwrap_or_default();
     for (source_data, result_data) in &estimations {
-        let keys = crate::routes::estimates::collect_estimation_s3_keys(source_data, result_data.as_ref());
+        let keys = collect_estimation_s3_keys(source_data, result_data.as_ref());
         for key in keys {
             if let Err(e) = state.storage.delete(&key).await {
                 tracing::warn!(inquiry_id = %id, key = %key, error = %e, "Failed to delete estimation file from S3");
+                s3_delete_failures.push(key);
             }
         }
+    }
+    if !s3_delete_failures.is_empty() {
+        tracing::error!(
+            inquiry_id = %id,
+            failed_count = s3_delete_failures.len(),
+            failed_keys = ?s3_delete_failures,
+            "S3 orphan keys remaining after inquiry deletion — manual cleanup may be needed"
+        );
     }
 
     // 2. Delete DB rows (CASCADE handles offers, estimations, etc.)
@@ -463,6 +502,7 @@ async fn delete_inquiry(
         return Err(ApiError::NotFound(format!("Inquiry {id} not found")));
     }
 
+    tracing::info!(admin = %claims.sub, admin_email = %claims.email, inquiry_id = %id, "Admin hard-deleted inquiry");
     Ok(StatusCode::NO_CONTENT)
 }
 
