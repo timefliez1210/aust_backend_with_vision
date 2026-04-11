@@ -465,3 +465,22 @@ pub(crate) async fn fetch_all_for_inquiry(
     .fetch_all(pool)
     .await
 }
+
+/// Fetch all estimations for an inquiry (source_data + result_data).
+/// Used for S3 cleanup when hard-deleting an inquiry.
+pub(crate) async fn fetch_all_estimations_for_inquiry(
+    pool: &PgPool,
+    inquiry_id: Uuid,
+) -> Result<Vec<(serde_json::Value, Option<serde_json::Value>)>, sqlx::Error> {
+    let rows: Vec<(serde_json::Value, Option<serde_json::Value>)> = sqlx::query_as(
+        r#"
+        SELECT source_data, result_data
+        FROM volume_estimations
+        WHERE inquiry_id = $1
+        "#,
+    )
+    .bind(inquiry_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}

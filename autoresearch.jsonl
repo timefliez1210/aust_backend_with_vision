@@ -1,3 +1,4 @@
 {"type":"config","name":"Unified inquiry/customer model with billing, recipient, service_type","metricName":"files_changed","metricUnit":"files","bestDirection":"lower"}
 {"run":1,"commit":"607e1e1","metric":0,"metrics":{},"status":"keep","description":"Baseline - everything compiles before changes","timestamp":1775781772843,"segment":0,"confidence":null,"iterationTokens":108}
 {"run":2,"commit":"c581fac","metric":18,"metrics":{},"status":"keep","description":"Backend complete — migration + repos + routes + offer/invoice billing address resolution + business customer greeting","timestamp":1775784957106,"segment":0,"confidence":null,"iterationTokens":52482}
+{"type":"config","name":"Review fixes — status machine, S3 cleanup, sync tx, capacity count, defaults","metricName":"bugs_fixed","metricUnit":"count","bestDirection":"higher"}

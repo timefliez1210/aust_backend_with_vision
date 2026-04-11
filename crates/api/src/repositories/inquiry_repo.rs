@@ -541,11 +541,16 @@ pub(crate) async fn insert_employee_assignment(
     let inquiry_day_id = if let Some((existing_id,)) = day_id {
         existing_id
     } else {
-        // No inquiry_days row yet — create day 1 from the inquiry's scheduled_date
+        // No inquiry_days row yet — create day 1 from the inquiry's scheduled_date.
+        // Fall back to 08:00–17:00 if the inquiry has no times set.
         let row: (Uuid,) = sqlx::query_as(
             r#"
             INSERT INTO inquiry_days (inquiry_id, day_date, day_number, start_time, end_time)
-            SELECT $1, COALESCE(scheduled_date, created_at::date), 1, start_time, end_time
+            SELECT $1,
+                   COALESCE(scheduled_date, created_at::date),
+                   1,
+                   COALESCE(start_time, '08:00'::time),
+                   COALESCE(end_time, '17:00'::time)
             FROM inquiries WHERE id = $1
             RETURNING id
             "#,

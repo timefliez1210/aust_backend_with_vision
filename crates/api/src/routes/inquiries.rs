@@ -16,6 +16,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::repositories::{address_repo, customer_repo, estimation_repo, inquiry_repo, offer_repo};
+use crate::routes::estimates::collect_estimation_s3_keys;
 use crate::routes::inquiry_actions::{
     assign_employee, generate_inquiry_offer, list_inquiry_employees, remove_assignment,
     trigger_estimate, trigger_estimate_upload, trigger_video_upload, update_assignment,
@@ -313,6 +314,21 @@ async fn update_inquiry(
 ) -> Result<Json<InquiryResponseModel>, ApiError> {
     let now = chrono::Utc::now();
 
+    // Validate status transition if status is being changed
+    if let Some(ref new_status) = request.status {
+        let current_inquiry = inquiry_repo::fetch_by_id(&state.db, id).await?;
+        let current_status: InquiryStatus = current_inquiry.status.parse()
+            .map_err(|_| ApiError::Internal(format!("Invalid status in DB: {}", current_inquiry.status)))?;
+        let target_status: InquiryStatus = new_status.parse()
+            .map_err(|e| ApiError::Validation(format!("Ungueltiger Status: {e}")))?;
+        if !current_status.can_transition_to(&target_status) {
+            return Err(ApiError::Validation(format!(
+                "Statuswechsel von '{}' nach '{}' ist nicht erlaubt",
+                current_status, target_status
+            )));
+        }
+    }
+
     // Serialize services if provided
     let services_json = request
         .services
@@ -369,6 +385,27 @@ async fn delete_inquiry(
             "Diese Aktion erfordert Administrator-Berechtigungen".into(),
         ));
     }
+
+    // 1. Collect S3 keys before deleting DB rows (CASCADE would remove them)
+    //    Offer PDFs
+    let offer_keys = offer_repo::fetch_all_pdf_keys(&state.db, id).await.unwrap_or_default();
+    for key in &offer_keys {
+        if let Err(e) = state.storage.delete(key).await {
+            tracing::warn!(inquiry_id = %id, key = %key, error = %e, "Failed to delete offer PDF from S3");
+        }
+    }
+    //    Estimation images and depth maps
+    let estimations = estimation_repo::fetch_all_estimations_for_inquiry(&state.db, id).await.unwrap_or_default();
+    for (source_data, result_data) in &estimations {
+        let keys = crate::routes::estimates::collect_estimation_s3_keys(source_data, result_data.as_ref());
+        for key in keys {
+            if let Err(e) = state.storage.delete(&key).await {
+                tracing::warn!(inquiry_id = %id, key = %key, error = %e, "Failed to delete estimation file from S3");
+            }
+        }
+    }
+
+    // 2. Delete DB rows (CASCADE handles offers, estimations, etc.)
     let rows_affected = inquiry_repo::hard_delete(&state.db, id).await?;
 
     if rows_affected == 0 {

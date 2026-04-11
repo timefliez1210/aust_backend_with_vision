@@ -425,3 +425,18 @@ pub(crate) async fn fetch_active_for_builder(
     .fetch_optional(pool)
     .await
 }
+
+/// Fetch all PDF storage keys for an inquiry's offers.
+/// Used for S3 cleanup when deleting an inquiry.
+pub(crate) async fn fetch_all_pdf_keys(
+    pool: &PgPool,
+    inquiry_id: Uuid,
+) -> Result<Vec<String>, sqlx::Error> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT pdf_storage_key FROM offers WHERE inquiry_id = $1 AND pdf_storage_key IS NOT NULL",
+    )
+    .bind(inquiry_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(k,)| k).collect())
+}

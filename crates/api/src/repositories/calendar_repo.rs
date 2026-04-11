@@ -80,9 +80,16 @@ pub(crate) async fn count_active_on_date(
 ) -> Result<i64, sqlx::Error> {
     let (count,): (i64,) = sqlx::query_as(
         r#"
-        SELECT COUNT(*) FROM inquiries
-        WHERE scheduled_date = $1
-          AND status NOT IN ('cancelled', 'rejected', 'expired')
+        SELECT (
+            (SELECT COUNT(*) FROM inquiries
+             WHERE scheduled_date = $1
+               AND status NOT IN ('cancelled', 'rejected', 'expired'))
+            +
+            (SELECT COUNT(*) FROM calendar_items ci
+             JOIN calendar_item_days cid ON ci.id = cid.calendar_item_id
+             WHERE cid.day_date = $1
+               AND ci.status NOT IN ('cancelled'))
+        )
         "#,
     )
     .bind(date)
@@ -284,8 +291,15 @@ pub(crate) async fn fetch_inquiry_days(
     inquiry_id: Uuid,
 ) -> Result<Vec<InquiryDayRow>, sqlx::Error> {
     sqlx::query_as(
-        "SELECT id, day_date, day_number, notes, start_time, end_time \
-         FROM inquiry_days WHERE inquiry_id = $1 ORDER BY day_number",
+        r#"
+        SELECT iday.id, iday.day_date, iday.day_number, iday.notes,
+               COALESCE(iday.start_time, i.start_time),
+               COALESCE(iday.end_time, i.end_time)
+        FROM inquiry_days iday
+        JOIN inquiries i ON iday.inquiry_id = i.id
+        WHERE iday.inquiry_id = $1
+        ORDER BY iday.day_number
+        "#,
     )
     .bind(inquiry_id)
     .fetch_all(pool)
@@ -402,8 +416,15 @@ pub(crate) async fn fetch_calendar_item_days(
     calendar_item_id: Uuid,
 ) -> Result<Vec<CalendarItemDayRow>, sqlx::Error> {
     sqlx::query_as(
-        "SELECT id, day_date, day_number, notes, start_time, end_time \
-         FROM calendar_item_days WHERE calendar_item_id = $1 ORDER BY day_number",
+        r#"
+        SELECT cd.id, cd.day_date, cd.day_number, cd.notes,
+               COALESCE(cd.start_time, ci.start_time),
+               COALESCE(cd.end_time, ci.end_time)
+        FROM calendar_item_days cd
+        JOIN calendar_items ci ON cd.calendar_item_id = ci.id
+        WHERE cd.calendar_item_id = $1
+        ORDER BY cd.day_number
+        "#,
     )
     .bind(calendar_item_id)
     .fetch_all(pool)

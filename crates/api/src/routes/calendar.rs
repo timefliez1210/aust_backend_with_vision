@@ -504,7 +504,10 @@ async fn put_inquiry_days(
 
     // Sync flat inquiry_employees table from day-level data
     // (keeps the flat table in sync for the offer builder and other flat-table reads)
-    let _ = inquiry_repo::sync_flat_inquiry_employees(&state.db, id).await;
+    if let Err(e) = inquiry_repo::sync_flat_inquiry_employees(&state.db, id).await {
+        tracing::error!(inquiry_id = %id, error = %e, "Failed to sync flat inquiry_employees after put_inquiry_days");
+        // Day-level data is correct; flat table may be stale until next sync
+    }
 
     // Re-fetch employee names for the response (we only have IDs from the request)
     let emp_rows = calendar_repo::fetch_inquiry_day_employees(&state.db, id)
@@ -579,7 +582,9 @@ async fn put_calendar_item_days(
     tx.commit().await.map_err(|e| ApiError::Internal(e.to_string()))?;
 
     // Sync flat calendar_item_employees table from day-level data
-    let _ = calendar_item_repo::sync_flat_calendar_item_employees(&state.db, id).await;
+    if let Err(e) = calendar_item_repo::sync_flat_calendar_item_employees(&state.db, id).await {
+        tracing::error!(calendar_item_id = %id, error = %e, "Failed to sync flat calendar_item_employees after put_calendar_item_days");
+    }
 
     let emp_rows = calendar_repo::fetch_calendar_item_day_employees(&state.db, id)
         .await
