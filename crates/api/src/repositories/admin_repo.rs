@@ -375,13 +375,15 @@ pub(crate) async fn create_customer(
     first_name: Option<&str>,
     last_name: Option<&str>,
     phone: Option<&str>,
+    customer_type: Option<&str>,
+    company_name: Option<&str>,
     now: DateTime<Utc>,
 ) -> Result<Option<CustomerListItem>, sqlx::Error> {
     sqlx::query_as(
         r#"
-        INSERT INTO customers (id, email, name, salutation, first_name, last_name, phone, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
-        RETURNING id, email, name, salutation, first_name, last_name, phone, created_at
+        INSERT INTO customers (id, email, name, salutation, first_name, last_name, phone, customer_type, company_name, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)
+        RETURNING id, email, name, salutation, first_name, last_name, phone, customer_type, company_name, created_at
         "#,
     )
     .bind(id)
@@ -391,6 +393,8 @@ pub(crate) async fn create_customer(
     .bind(first_name)
     .bind(last_name)
     .bind(phone)
+    .bind(customer_type)
+    .bind(company_name)
     .bind(now)
     .fetch_optional(pool)
     .await

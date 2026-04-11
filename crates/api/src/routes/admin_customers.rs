@@ -290,7 +290,8 @@ pub(super) async fn create_customer(
         &state.db, id, &request.email,
         request.name.as_deref(), request.salutation.as_deref(),
         request.first_name.as_deref(), request.last_name.as_deref(),
-        request.phone.as_deref(), now,
+        request.phone.as_deref(), request.customer_type.as_deref(),
+        request.company_name.as_deref(), now,
     )
     .await
     .map_err(|e| {

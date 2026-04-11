@@ -244,11 +244,11 @@ async fn handle_ar_submission(
         Some(&notes),
         Some(&services_json),
         "mobile_app_ar",
-        None,  // service_type
-        None,  // submission_mode
-        None,  // recipient_id
-        None,  // billing_address_id
-        None,  // custom_fields
+        form.service_type.as_deref(),      // service_type
+        Some("ar"),                       // submission_mode
+        None,                              // recipient_id
+        None,                              // billing_address_id
+        None,                              // custom_fields
         now,
     )
     .await
@@ -855,14 +855,11 @@ async fn manual_inquiry(
         let b_street = form.billing_street.as_deref().unwrap_or("");
         let b_city = form.billing_city.as_deref().unwrap_or("");
         if !b_street.is_empty() && !b_city.is_empty() {
-            let (parsed_street, parsed_city, parsed_postal) = services::vision::parse_address(
-                &format!("{b_street} {b_city}"),
-            );
             Some(address_repo::create(
                 &state.db,
-                &parsed_street,
-                &parsed_city,
-                Some(parsed_postal.as_str()).filter(|s| !s.is_empty()),
+                b_street,
+                b_city,
+                form.billing_postal.as_deref().filter(|s| !s.is_empty()),
                 None,
                 None,
                 form.billing_number.as_deref(),
@@ -1026,7 +1023,7 @@ pub(crate) async fn parse_inquiry_form(
             "wunschtermin" | "preferred_date" | "scheduled_date" => {
                 form.scheduled_date = Some(read_text_field(field).await?);
             }
-            "services" | "zusatzleistungen" => {
+            "services" | "zusatzleistungen" | "services[]" => {
                 form.services = Some(read_text_field(field).await?);
             }
             "message" | "nachricht" => form.message = Some(read_text_field(field).await?),
@@ -1208,14 +1205,11 @@ pub(crate) async fn handle_submission(
         let b_street = form.billing_street.as_deref().unwrap_or("");
         let b_city = form.billing_city.as_deref().unwrap_or("");
         if !b_street.is_empty() && !b_city.is_empty() {
-            let (parsed_street, parsed_city, parsed_postal) = services::vision::parse_address(
-                &format!("{b_street} {b_city}")
-            );
             Some(address_repo::create(
                 &state.db,
-                &parsed_street,
-                &parsed_city,
-                Some(parsed_postal.as_str()).filter(|s| !s.is_empty()),
+                b_street,
+                b_city,
+                form.billing_postal.as_deref().filter(|s| !s.is_empty()),
                 None,
                 None,
                 form.billing_number.as_deref(),
@@ -1228,8 +1222,6 @@ pub(crate) async fn handle_submission(
         None
     };
 
-    // Build custom_fields from form extras
-    let custom_fields_json: Option<serde_json::Value> = None;
 
     inquiry_repo::create_minimal(
         &state.db,
@@ -1243,10 +1235,10 @@ pub(crate) async fn handle_submission(
         Some(&services_json),
         source,
         form.service_type.as_deref(),      // service_type
-        form.submission_mode.as_deref(),   // submission_mode (set by handler: "foto"/"video")
+        Some("foto"),                     // submission_mode
         None,                              // recipient_id (created separately if needed)
         billing_address_id,               // billing_address_id
-        custom_fields_json.as_ref(),      // custom_fields
+        None,                              // custom_fields
         now,
     )
     .await
