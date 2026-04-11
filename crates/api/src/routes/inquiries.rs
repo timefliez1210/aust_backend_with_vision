@@ -75,6 +75,8 @@ struct AddressInput {
     postal_code: Option<String>,
     floor: Option<String>,
     elevator: Option<bool>,
+    house_number: Option<String>,
+    parking_ban: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -91,6 +93,9 @@ struct CreateInquiryRequest {
     service_type: Option<String>,
     submission_mode: Option<String>,
     recipient_id: Option<Uuid>,
+    /// Inline billing address — if provided, creates an address record and sets billing_address_id.
+    /// If both billing_address and billing_address_id are provided, billing_address_id takes priority.
+    billing_address: Option<AddressInput>,
     billing_address_id: Option<Uuid>,
     custom_fields: Option<serde_json::Value>,
 }
@@ -163,8 +168,8 @@ async fn create_inquiry(
                 addr.postal_code.as_deref(),
                 addr.floor.as_deref(),
                 addr.elevator,
-        None,
-        None,
+                addr.house_number.as_deref(),
+                addr.parking_ban,
             )
             .await?;
             Some(id)
@@ -187,8 +192,8 @@ async fn create_inquiry(
                 addr.postal_code.as_deref(),
                 addr.floor.as_deref(),
                 addr.elevator,
-        None,
-        None,
+                addr.house_number.as_deref(),
+                addr.parking_ban,
             )
             .await?;
             Some(id)
@@ -197,6 +202,30 @@ async fn create_inquiry(
         }
     } else {
         None
+    };
+
+    // Create billing address if provided inline
+    let billing_address_id = if let Some(ref addr) = request.billing_address {
+        let street = addr.street.as_deref().unwrap_or("").trim().to_string();
+        let city = addr.city.as_deref().unwrap_or("").trim().to_string();
+        if !street.is_empty() || !city.is_empty() {
+            let id = address_repo::create(
+                &state.db,
+                &street,
+                &city,
+                addr.postal_code.as_deref(),
+                addr.floor.as_deref(),
+                addr.elevator,
+                addr.house_number.as_deref(),
+                addr.parking_ban,
+            )
+            .await?;
+            Some(id)
+        } else {
+            request.billing_address_id
+        }
+    } else {
+        request.billing_address_id
     };
 
     let scheduled_date = request.scheduled_date.as_deref().and_then(|s| {
@@ -231,7 +260,7 @@ async fn create_inquiry(
         request.service_type.as_deref(),
         request.submission_mode.as_deref(),
         request.recipient_id,
-        request.billing_address_id,
+        billing_address_id,
         request.custom_fields.as_ref().unwrap_or(&serde_json::json!({})),
         now,
     )
