@@ -226,3 +226,47 @@ pub struct ItemDimensions {
     pub width_m: f64,
     pub height_m: f64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn estimation_method_as_str_values() {
+        assert_eq!(EstimationMethod::Vision.as_str(), "vision");
+        assert_eq!(EstimationMethod::Inventory.as_str(), "inventory");
+        assert_eq!(EstimationMethod::DepthSensor.as_str(), "depth_sensor");
+        assert_eq!(EstimationMethod::Ar.as_str(), "ar");
+        assert_eq!(EstimationMethod::Video.as_str(), "video");
+        assert_eq!(EstimationMethod::Manual.as_str(), "manual");
+    }
+
+    #[test]
+    fn estimation_method_from_str_roundtrip() {
+        for (s, expected) in [
+            ("vision", EstimationMethod::Vision),
+            ("inventory", EstimationMethod::Inventory),
+            ("depth_sensor", EstimationMethod::DepthSensor),
+            ("ar", EstimationMethod::Ar),
+            ("video", EstimationMethod::Video),
+            ("manual", EstimationMethod::Manual),
+        ] {
+            let parsed: EstimationMethod = s.parse().unwrap();
+            assert_eq!(parsed, expected);
+            // Round-trip: as_str -> parse -> same enum
+            assert_eq!(parsed.as_str(), s);
+        }
+    }
+
+    #[test]
+    fn estimation_method_rejects_unknown() {
+        let result = "unknown_method".parse::<EstimationMethod>();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn estimation_method_ar_is_distinct_from_depth_sensor() {
+        assert_ne!(EstimationMethod::Ar, EstimationMethod::DepthSensor);
+        assert_ne!(EstimationMethod::Ar.as_str(), EstimationMethod::DepthSensor.as_str());
+    }
+}

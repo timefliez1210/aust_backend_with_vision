@@ -1987,3 +1987,168 @@ pub(crate) fn build_notes(
 
     parts.join(", ")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── merge_address_parts ──────────────────────────────────────────────
+
+    #[test]
+    fn merge_prefers_explicit_city() {
+        let parsed = ("Musterstr. 1".into(), "".into(), "".into());
+        let result = merge_address_parts(parsed, Some("Sarstedt"), None);
+        assert_eq!(result.1, "Sarstedt");
+    }
+
+    #[test]
+    fn merge_prefers_explicit_postal() {
+        let parsed = ("Musterstr. 1".into(), "Hannover".into(), "".into());
+        let result = merge_address_parts(parsed, None, Some("31157"));
+        assert_eq!(result.2, "31157");
+        assert_eq!(result.1, "Hannover");
+    }
+
+    #[test]
+    fn merge_explicit_overrides_parsed() {
+        let parsed = ("Musterstr. 1".into(), "Hannover".into(), "30159".into());
+        let result = merge_address_parts(parsed, Some("Sarstedt"), Some("31157"));
+        assert_eq!(result.0, "Musterstr. 1");
+        assert_eq!(result.1, "Sarstedt");
+        assert_eq!(result.2, "31157");
+    }
+
+    #[test]
+    fn merge_empty_explicit_ignored() {
+        let parsed = ("Musterstr. 1".into(), "Hannover".into(), "30159".into());
+        let result = merge_address_parts(parsed, Some(""), Some("  "));
+        assert_eq!(result.1, "Hannover");
+        assert_eq!(result.2, "30159");
+    }
+
+    #[test]
+    fn merge_none_keeps_parsed() {
+        let parsed = ("Berlinstr. 5".into(), "Berlin".into(), "10115".into());
+        let result = merge_address_parts(parsed, None, None);
+        assert_eq!(result.0, "Berlinstr. 5");
+        assert_eq!(result.1, "Berlin");
+        assert_eq!(result.2, "10115");
+    }
+
+    // ── parse_bool_field ────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_bool_true_variants() {
+        for v in &["true", "1", "yes", "ja", "True", "TRUE", "Ja", "  true  "] {
+            assert!(parse_bool_field(v), "expected true for {:?}", v);
+        }
+    }
+
+    #[test]
+    fn parse_bool_false_variants() {
+        for v in &["false", "0", "no", "nein", "", "maybe"] {
+            assert!(!parse_bool_field(v), "expected false for {:?}", v);
+        }
+    }
+
+    // ── parse_services_string ────────────────────────────────────────────
+
+    #[test]
+    fn services_english_all() {
+        let s = parse_services_string(
+            Some("packing,assembly,disassembly,storage,disposal"), None, None,
+        );
+        assert!(s.packing);
+        assert!(s.assembly);
+        assert!(s.disassembly);
+        assert!(s.storage);
+        assert!(s.disposal);
+        assert!(!s.parking_ban_origin);
+        assert!(!s.parking_ban_destination);
+    }
+
+    #[test]
+    fn services_german_all() {
+        let s = parse_services_string(
+            Some("Verpackung,Montage,Demontage,Einlagerung,Entsorgung"), None, None,
+        );
+        assert!(s.packing);
+        assert!(s.assembly);
+        assert!(s.disassembly);
+        assert!(s.storage);
+        assert!(s.disposal);
+    }
+
+    #[test]
+    fn services_parking_bans_only() {
+        let s = parse_services_string(None, Some(true), Some(true));
+        assert!(s.parking_ban_origin);
+        assert!(s.parking_ban_destination);
+    }
+
+    #[test]
+    fn services_empty() {
+        let s = parse_services_string(None, None, None);
+        assert!(!s.packing && !s.assembly && !s.disassembly && !s.storage && !s.disposal);
+    }
+
+    // ── EstimationMethod ─────────────────────────────────────────────────
+
+    #[test]
+    fn estimation_method_roundtrip() {
+        use aust_core::models::EstimationMethod;
+        for m in [
+            EstimationMethod::Vision,
+            EstimationMethod::Inventory,
+            EstimationMethod::DepthSensor,
+            EstimationMethod::Ar,
+            EstimationMethod::Video,
+            EstimationMethod::Manual,
+        ] {
+            let s = m.as_str();
+            let parsed: EstimationMethod = s.parse().unwrap();
+            assert_eq!(m, parsed, "roundtrip failed for {:?}", m);
+        }
+    }
+
+    #[test]
+    fn estimation_method_ar_recognized() {
+        use aust_core::models::EstimationMethod;
+        assert_eq!("ar".parse::<EstimationMethod>().unwrap(), EstimationMethod::Ar);
+    }
+
+    #[test]
+    fn estimation_method_manual_recognized() {
+        use aust_core::models::EstimationMethod;
+        assert_eq!("manual".parse::<EstimationMethod>().unwrap(), EstimationMethod::Manual);
+    }
+
+    // ── build_notes ────────────────────────────────────────────────────
+
+    #[test]
+    fn notes_with_parking_bans() {
+        let notes = build_notes(None, Some(true), Some(true), None);
+        assert!(notes.contains("Halteverbot Auszug"));
+        assert!(notes.contains("Halteverbot Einzug"));
+    }
+
+    #[test]
+    fn notes_with_services_and_message() {
+        let notes = build_notes(
+            Some("packing,assembly"),
+            Some(true),
+            None,
+            Some("Bitte vorsichtig sein"),
+        );
+        assert!(notes.contains("Verpackungsservice"));
+        assert!(notes.contains("Montage"));
+        assert!(notes.contains("Halteverbot Auszug"));
+        assert!(notes.contains("Bitte vorsichtig sein"));
+    }
+
+    #[test]
+    fn notes_empty() {
+        let notes = build_notes(None, None, None, None);
+        assert!(notes.is_empty());
+    }
+}

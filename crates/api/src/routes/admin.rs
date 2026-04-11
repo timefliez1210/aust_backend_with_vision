@@ -1348,3 +1348,23 @@ fn mime_from_ext(ext: &str) -> &'static str {
         _      => "application/octet-stream",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_doc_column_valid_types() {
+        assert_eq!(resolve_doc_column("arbeitsvertrag"), Some("arbeitsvertrag_key"));
+        assert_eq!(resolve_doc_column("mitarbeiterfragebogen"), Some("mitarbeiterfragebogen_key"));
+    }
+
+    #[test]
+    fn resolve_doc_column_rejects_invalid() {
+        // SQL injection attempt: must not return a column name
+        assert!(resolve_doc_column("arbeitsvertrag; DROP TABLE employees").is_none());
+        assert!(resolve_doc_column("1=1").is_none());
+        assert!(resolve_doc_column("invalid_type").is_none());
+        assert!(resolve_doc_column("").is_none());
+    }
+}

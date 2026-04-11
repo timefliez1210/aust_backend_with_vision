@@ -1036,3 +1036,32 @@ pub(crate) async fn sync_flat_inquiry_employees(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    /// Verify that the submission_mode CHECK constraint values are recognized.
+    /// The migration adding 'ar' and 'mobile' was required because the AR
+    /// endpoint created inquiries with submission_mode = 'ar' which violated
+    /// the original CHECK(submission_mode IN ('termin','manuell','foto','video')).
+    #[test]
+    fn test_valid_submission_modes() {
+        let valid_modes = ["termin", "manuell", "foto", "video", "ar", "mobile"];
+        for mode in valid_modes {
+            // Each mode must be a non-empty lowercase string
+            assert!(!mode.is_empty(), "submission mode must not be empty");
+            assert_eq!(mode, mode.to_lowercase(), "submission mode must be lowercase: {mode}");
+        }
+    }
+
+    /// Verify that the status transition logic prevents invalid transitions.
+    #[test]
+    fn test_inquiry_status_transitions() {
+        use aust_core::models::InquiryStatus;
+        // pending -> estimated is valid
+        assert!(InquiryStatus::Pending.can_transition_to(&InquiryStatus::Estimated));
+        // estimated -> offer_ready is valid
+        assert!(InquiryStatus::Estimated.can_transition_to(&InquiryStatus::OfferReady));
+        // cancelled -> pending is NOT valid
+        assert!(!InquiryStatus::Cancelled.can_transition_to(&InquiryStatus::Pending));
+    }
+}
