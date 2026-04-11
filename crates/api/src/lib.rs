@@ -7,8 +7,7 @@ pub mod services;
 pub mod state;
 pub(crate) mod types;
 
-#[cfg(test)]
-pub(crate) mod test_helpers;
+pub mod test_helpers;
 
 pub use error::ApiError;
 pub use orchestrator::run_offer_event_handler;

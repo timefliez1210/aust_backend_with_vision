@@ -1,4 +1,4 @@
-#![cfg(test)]
+#![allow(dead_code)]
 
 use aust_core::config::*;
 use aust_core::Config;
@@ -330,13 +330,152 @@ pub async fn clean_test_data(pool: &PgPool) {
     for table in &[
         "volume_estimations",
         "offers",
+        "inquiry_day_employees",
+        "inquiry_days",
+        "inquiry_employees",
         "inquiries",
         "addresses",
         "customers",
+        "employees",
     ] {
         sqlx::query(&format!("DELETE FROM {table}"))
             .execute(pool)
             .await
             .ok();
     }
+}
+
+/// Insert a test employee and return its ID.
+pub async fn insert_test_employee(pool: &PgPool, first_name: &str, last_name: &str) -> uuid::Uuid {
+    let id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO employees (id, first_name, last_name, email, monthly_hours_target, active, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, 160.0, true, NOW(), NOW())",
+    )
+    .bind(id)
+    .bind(first_name)
+    .bind(last_name)
+    .bind(format!("{}.{}@test.de", first_name.to_lowercase(), last_name.to_lowercase()))
+    .execute(pool)
+    .await
+    .expect("insert test employee");
+    id
+}
+
+/// Insert an inquiry day and return the day ID.
+pub async fn insert_test_inquiry_day(
+    pool: &PgPool,
+    inquiry_id: uuid::Uuid,
+    day_number: i16,
+    day_date: chrono::NaiveDate,
+) -> uuid::Uuid {
+    let id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO inquiry_days (id, inquiry_id, day_date, day_number, start_time, end_time)
+         VALUES ($1, $2, $3, $4, '08:00'::time, '17:00'::time)",
+    )
+    .bind(id)
+    .bind(inquiry_id)
+    .bind(day_date)
+    .bind(day_number)
+    .execute(pool)
+    .await
+    .expect("insert test inquiry_day");
+    id
+}
+
+/// Insert a day-employee assignment and return the assignment ID.
+pub async fn insert_test_day_employee(
+    pool: &PgPool,
+    inquiry_day_id: uuid::Uuid,
+    employee_id: uuid::Uuid,
+    planned_hours: f64,
+) {
+    sqlx::query(
+        "INSERT INTO inquiry_day_employees (inquiry_day_id, employee_id, planned_hours)
+         VALUES ($1, $2, $3)",
+    )
+    .bind(inquiry_day_id)
+    .bind(employee_id)
+    .bind(planned_hours)
+    .execute(pool)
+    .await
+    .expect("insert test day_employee");
+}
+
+/// Insert a test customer with a specific customer_type and return its ID.
+pub async fn insert_test_customer_with_type(pool: &PgPool, customer_type: &str, company_name: Option<&str>) -> uuid::Uuid {
+    let id = uuid::Uuid::now_v7();
+    let email = format!("test-{}@example.com", id);
+    sqlx::query(
+        "INSERT INTO customers (id, name, email, phone, customer_type, company_name, created_at, updated_at)
+         VALUES ($1, 'Test Kunde', $2, '+4915112345678', $3, $4, NOW(), NOW())",
+    )
+    .bind(id)
+    .bind(&email)
+    .bind(customer_type)
+    .bind(company_name)
+    .execute(pool)
+    .await
+    .expect("insert test customer");
+    id
+}
+
+/// Insert a test address with parking_ban and return its ID.
+pub async fn insert_test_address_full(
+    pool: &PgPool,
+    street: &str,
+    house_number: Option<&str>,
+    city: &str,
+    postal_code: &str,
+    floor: Option<i32>,
+    elevator: Option<bool>,
+    parking_ban: Option<bool>,
+) -> uuid::Uuid {
+    let id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO addresses (id, street, house_number, city, postal_code, country, floor, elevator, parking_ban, created_at)
+         VALUES ($1, $2, $3, $4, $5, 'Deutschland', $6, $7, $8, NOW())",
+    )
+    .bind(id)
+    .bind(street)
+    .bind(house_number)
+    .bind(city)
+    .bind(postal_code)
+    .bind(floor)
+    .bind(elevator)
+    .bind(parking_ban)
+    .execute(pool)
+    .await
+    .expect("insert test address");
+    id
+}
+
+/// Insert a test inquiry with full fields and return its ID.
+pub async fn insert_test_inquiry_full(
+    pool: &PgPool,
+    customer_id: uuid::Uuid,
+    origin_id: uuid::Uuid,
+    dest_id: uuid::Uuid,
+    status: &str,
+    submission_mode: &str,
+    service_type: Option<&str>,
+) -> uuid::Uuid {
+    let id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO inquiries (id, customer_id, origin_address_id, destination_address_id,
+         status, submission_mode, service_type, notes, services, source, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'test notes', '{}', 'test', NOW(), NOW())",
+    )
+    .bind(id)
+    .bind(customer_id)
+    .bind(origin_id)
+    .bind(dest_id)
+    .bind(status)
+    .bind(submission_mode)
+    .bind(service_type)
+    .execute(pool)
+    .await
+    .expect("insert test inquiry");
+    id
 }
