@@ -1079,11 +1079,11 @@ pub(crate) async fn set_document_key(
 pub(crate) async fn fetch_document_key(
     pool: &PgPool,
     id: Uuid,
-    doc_type: &str,
+    col: &str,
 ) -> Result<Option<String>, sqlx::Error> {
     sqlx::query_scalar(&format!(
-        "SELECT {}_key FROM employees WHERE id = $1",
-        doc_type.replace('-', "_")
+        "SELECT {} FROM employees WHERE id = $1",
+        col
     ))
     .bind(id)
     .fetch_optional(pool)

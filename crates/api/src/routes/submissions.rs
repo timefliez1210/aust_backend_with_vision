@@ -236,7 +236,6 @@ async fn handle_ar_submission(
     let recipient_id = if form.recipient_last_name.as_deref().map_or(false, |s| !s.trim().is_empty()) {
         Some(customer_repo::create_recipient(
             &state.db,
-            &email,
             form.recipient_salutation.as_deref(),
             form.recipient_first_name.as_deref(),
             form.recipient_last_name.as_deref(),
@@ -244,6 +243,28 @@ async fn handle_ar_submission(
             form.recipient_email.as_deref(),
             now,
         ).await?)
+    } else {
+        None
+    };
+
+    // Create billing address if provided
+    let billing_address_id = if form.billing_street.is_some() || form.billing_city.is_some() {
+        let b_street = form.billing_street.as_deref().unwrap_or("");
+        let b_city = form.billing_city.as_deref().unwrap_or("");
+        if !b_street.is_empty() && !b_city.is_empty() {
+            Some(address_repo::create(
+                &state.db,
+                b_street,
+                b_city,
+                form.billing_postal.as_deref().filter(|s| !s.is_empty()),
+                None,
+                None,
+                form.billing_number.as_deref(),
+                Some(false),
+            ).await.map_err(|e| ApiError::Internal(format!("Rechnungsadresse konnte nicht erstellt werden: {e}")))?)
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -264,7 +285,7 @@ async fn handle_ar_submission(
         form.service_type.as_deref(),      // service_type
         Some("ar"),                       // submission_mode
         recipient_id,                      // recipient_id
-        None,                              // billing_address_id
+        billing_address_id,                 // billing_address_id
         None,                              // custom_fields
         now,
     )
@@ -706,7 +727,6 @@ async fn video_inquiry(
     let recipient_id = if recipient_last_name.as_deref().map_or(false, |s| !s.trim().is_empty()) {
         Some(customer_repo::create_recipient(
             &state.db,
-            &email,
             recipient_salutation.as_deref(),
             recipient_first_name.as_deref(),
             recipient_last_name.as_deref(),
@@ -714,6 +734,28 @@ async fn video_inquiry(
             recipient_email.as_deref(),
             now,
         ).await?)
+    } else {
+        None
+    };
+
+    // Create billing address if provided
+    let billing_address_id = if billing_street.is_some() || billing_city.is_some() {
+        let b_street = billing_street.as_deref().unwrap_or("");
+        let b_city = billing_city.as_deref().unwrap_or("");
+        if !b_street.is_empty() && !b_city.is_empty() {
+            Some(address_repo::create(
+                &state.db,
+                b_street,
+                b_city,
+                billing_postal.as_deref().filter(|s| !s.is_empty()),
+                None,
+                None,
+                billing_number.as_deref(),
+                Some(false),
+            ).await.map_err(|e| ApiError::Internal(format!("Rechnungsadresse konnte nicht erstellt werden: {e}")))?)
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -734,7 +776,7 @@ async fn video_inquiry(
         service_type.as_deref(),
         Some("video"),  // submission_mode
         recipient_id,
-        None,  // billing_address_id
+        billing_address_id,
         None,  // custom_fields
         now,
     )
@@ -940,7 +982,6 @@ async fn manual_inquiry(
     let recipient_id = if form.recipient_last_name.as_deref().map_or(false, |s| !s.trim().is_empty()) {
         Some(customer_repo::create_recipient(
             &state.db,
-            &email,
             form.recipient_salutation.as_deref(),
             form.recipient_first_name.as_deref(),
             form.recipient_last_name.as_deref(),
@@ -1287,7 +1328,6 @@ pub(crate) async fn handle_submission(
     let recipient_id = if form.recipient_last_name.as_deref().map_or(false, |s| !s.trim().is_empty()) {
         Some(customer_repo::create_recipient(
             &state.db,
-            &email,
             form.recipient_salutation.as_deref(),
             form.recipient_first_name.as_deref(),
             form.recipient_last_name.as_deref(),
@@ -1329,7 +1369,7 @@ pub(crate) async fn handle_submission(
     let estimation_id = Uuid::now_v7();
 
     // Pre-create estimation record with status='processing' so polling works immediately.
-    estimation_repo::create_processing(&state.db, estimation_id, inquiry_id, "depth_sensor")
+    estimation_repo::create_processing(&state.db, estimation_id, inquiry_id, "vision")
         .await
         .map_err(|e| ApiError::Internal(format!("Schätzung konnte nicht erstellt werden: {e}")))?;
 

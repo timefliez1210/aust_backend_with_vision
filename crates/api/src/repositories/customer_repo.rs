@@ -231,7 +231,6 @@ pub(crate) async fn exists(pool: &PgPool, customer_id: Uuid) -> Result<bool, sql
 /// email as a disambiguator so that recipients without email don't collide.
 pub(crate) async fn create_recipient(
     pool: &PgPool,
-    payer_email: &str,
     salutation: Option<&str>,
     first_name: Option<&str>,
     last_name: Option<&str>,
