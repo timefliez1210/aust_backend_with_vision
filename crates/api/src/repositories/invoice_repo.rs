@@ -457,6 +457,31 @@ pub(crate) async fn fetch_moving_date(
     Ok(row.and_then(|(dt,)| dt))
 }
 
+/// Resolve the billing address ID for an inquiry.
+///
+/// **Caller**: `invoices::build_invoice_data` — determines which address goes on the invoice header.
+/// **Why**: Priority order: explicit `billing_address_id` > destination (post-move) > origin.
+///
+/// # Returns
+/// The UUID of the resolved address, or `None` if the inquiry has no addresses at all.
+pub(crate) async fn resolve_billing_address_id(
+    pool: &PgPool,
+    inquiry_id: Uuid,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT COALESCE(billing_address_id,
+            CASE WHEN status IN ('completed','invoiced','paid') AND destination_address_id IS NOT NULL
+                 THEN destination_address_id
+                 ELSE origin_address_id
+            END)
+         FROM inquiries WHERE id = $1",
+    )
+    .bind(inquiry_id)
+    .fetch_optional(pool)
+    .await
+    .map(|opt: Option<Option<Uuid>>| opt.flatten())
+}
+
 /// Fetch the latest offer netto price for an inquiry.
 ///
 /// **Caller**: `invoices::get_offer_netto`

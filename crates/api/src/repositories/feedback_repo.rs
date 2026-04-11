@@ -15,6 +15,8 @@ pub(crate) struct FeedbackReport {
     pub location: Option<String>,
     pub attachment_keys: Vec<String>,
     pub status: String,
+    /// Written by Claude/agents: fix summary, commit reference, or clarification question.
+    pub agent_notes: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -103,27 +105,33 @@ pub(crate) async fn get_report(
     .await
 }
 
-/// Update the status of a feedback report.
+/// Update status and/or agent_notes on a feedback report.
 ///
-/// **Caller**: `routes/admin.rs` — `patch_feedback` handler.
-/// **Why**: Allows the admin to track progress (open → in_progress → resolved).
+/// **Caller**: `routes/admin.rs` — `patch_feedback` handler (human admin and agents).
+/// **Why**: Agents write `agent_notes` to document what was fixed or what clarification is
+/// needed. Human admins use `status` to track progress. Both can be set independently.
 ///
 /// # Parameters
-/// - `id`     — UUID of the report
-/// - `status` — new status ("open", "in_progress", "resolved")
-pub(crate) async fn update_status(
+/// - `id`          — UUID of the report
+/// - `status`      — new status (None = leave unchanged)
+/// - `agent_notes` — agent-written notes (None = leave unchanged)
+pub(crate) async fn update_report(
     pool: &PgPool,
     id: Uuid,
-    status: &str,
+    status: Option<&str>,
+    agent_notes: Option<&str>,
 ) -> Result<FeedbackReport, sqlx::Error> {
     sqlx::query_as::<_, FeedbackReport>(
         r#"UPDATE feedback_reports
-           SET status = $2, updated_at = NOW()
+           SET status      = COALESCE($2, status),
+               agent_notes = COALESCE($3, agent_notes),
+               updated_at  = NOW()
            WHERE id = $1
            RETURNING *"#,
     )
     .bind(id)
     .bind(status)
+    .bind(agent_notes)
     .fetch_one(pool)
     .await
 }

@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::repositories::{address_repo, inquiry_repo, invoice_repo, CustomerRow};
+use crate::repositories::{address_repo, invoice_repo, CustomerRow};
 use crate::ApiError;
 use crate::AppState;
 use aust_offer_generator::{
@@ -619,19 +619,9 @@ async fn load_invoice_context(
     let moving_date = invoice_repo::fetch_moving_date(db, inquiry_id).await?;
 
     // Resolve billing address: explicit > destination (post-move) > origin (pre-move)
-    let billing_addr_id: Option<Uuid> = sqlx::query_scalar(
-        "SELECT COALESCE(billing_address_id,
-            CASE WHEN status IN ('completed','invoiced','paid') AND destination_address_id IS NOT NULL
-                 THEN destination_address_id
-                 ELSE origin_address_id
-            END)
-         FROM inquiries WHERE id = $1"
-    )
-    .bind(inquiry_id)
-    .fetch_optional(db)
-    .await
-    .map_err(|e| ApiError::Internal(e.to_string()))?
-    .flatten();
+    let billing_addr_id = invoice_repo::resolve_billing_address_id(db, inquiry_id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
     let billing = address_repo::fetch_optional(db, billing_addr_id).await?;
 
     let billing_street = billing

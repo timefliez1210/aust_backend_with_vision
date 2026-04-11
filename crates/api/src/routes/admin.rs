@@ -1119,7 +1119,12 @@ struct FeedbackListQuery {
 
 #[derive(Debug, Deserialize)]
 struct PatchFeedbackBody {
-    status: String,
+    /// New status. Valid values: "open", "in_progress", "resolved", "needs_clarification".
+    /// Omit to leave unchanged.
+    status: Option<String>,
+    /// Agent-written notes: fix summary, commit reference, or clarification question.
+    /// Omit to leave unchanged.
+    agent_notes: Option<String>,
 }
 
 /// `POST /api/v1/admin/feedback` — Create a new feedback report with optional file attachments.
@@ -1262,13 +1267,21 @@ async fn get_feedback(
     Ok(Json(report))
 }
 
-/// `PATCH /api/v1/admin/feedback/{id}` — Update the status of a feedback report (admin only).
+/// `PATCH /api/v1/admin/feedback/{id}` — Update status and/or agent notes (admin + agents).
 ///
-/// **Caller**: Admin `/admin/reports` status dropdown.
-/// **Why**: Lets the admin track progress: open → in_progress → resolved.
+/// **Caller**: Admin `/admin/reports` status dropdown; Claude/agents after fixing a bug.
+/// **Why**: Agents write `agent_notes` to document what was fixed or what clarification is
+/// needed. Human admins use `status` to track progress. Both fields are optional — omit
+/// either to leave it unchanged.
 ///
 /// # Body
-/// `{ "status": "in_progress" }`
+/// ```json
+/// { "status": "resolved", "agent_notes": "Fixed in commit abc123 — moved query to repo." }
+/// { "status": "needs_clarification", "agent_notes": "What is the expected floor behaviour for EG?" }
+/// { "agent_notes": "Under investigation." }
+/// ```
+///
+/// Valid statuses: `"open"`, `"in_progress"`, `"resolved"`, `"needs_clarification"`.
 ///
 /// # Returns
 /// `200 OK` with updated `FeedbackReport`.
@@ -1279,11 +1292,24 @@ async fn patch_feedback(
     Json(body): Json<PatchFeedbackBody>,
 ) -> Result<Json<feedback_repo::FeedbackReport>, ApiError> {
     require_admin(&claims)?;
-    let valid = ["open", "in_progress", "resolved"];
-    if !valid.contains(&body.status.as_str()) {
-        return Err(ApiError::BadRequest("Ungültiger Status.".into()));
+    if body.status.is_none() && body.agent_notes.is_none() {
+        return Err(ApiError::BadRequest("Mindestens status oder agent_notes muss gesetzt sein.".into()));
     }
-    let report = feedback_repo::update_status(&state.db, id, &body.status).await?;
+    let valid = ["open", "in_progress", "resolved", "needs_clarification"];
+    if let Some(ref s) = body.status {
+        if !valid.contains(&s.as_str()) {
+            return Err(ApiError::BadRequest(
+                format!("Ungültiger Status '{s}'. Erlaubt: open, in_progress, resolved, needs_clarification."),
+            ));
+        }
+    }
+    let report = feedback_repo::update_report(
+        &state.db,
+        id,
+        body.status.as_deref(),
+        body.agent_notes.as_deref(),
+    )
+    .await?;
     Ok(Json(report))
 }
 

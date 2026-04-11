@@ -1037,6 +1037,36 @@ pub(crate) async fn sync_flat_inquiry_employees(
     Ok(())
 }
 
+/// Count active days and employee assignments for an inquiry.
+///
+/// **Caller**: `delete_inquiry` route handler — guards hard-delete against inquiries
+/// that still have scheduled days or assigned employees.
+/// **Why**: Prevents accidental deletion of inquiries with operational data still attached.
+///
+/// # Returns
+/// `(day_count, employee_assignment_count)` — both 0 means safe to delete.
+pub(crate) async fn count_active_days_and_employees(
+    pool: &PgPool,
+    inquiry_id: Uuid,
+) -> Result<(i64, i64), sqlx::Error> {
+    let day_count: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM inquiry_days WHERE inquiry_id = $1")
+            .bind(inquiry_id)
+            .fetch_one(pool)
+            .await?;
+
+    let emp_count: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM inquiry_day_employees ide \
+         JOIN inquiry_days iday ON ide.inquiry_day_id = iday.id \
+         WHERE iday.inquiry_id = $1",
+    )
+    .bind(inquiry_id)
+    .fetch_one(pool)
+    .await?;
+
+    Ok((day_count.0, emp_count.0))
+}
+
 #[cfg(test)]
 mod tests {
     /// Verify that the submission_mode CHECK constraint values are recognized.

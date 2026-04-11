@@ -59,3 +59,8 @@ max_polls = 20
 [company]
 depot_address = "Borsigstr 6 31135 Hildesheim"
 fahrt_rate_per_km = 1.00
+rate_per_person_hour_cents = 3000
+assembly_price = 25.00
+parking_ban_price = 100.00
+packing_price = 30.00
+saturday_surcharge_cents = 5000

@@ -434,24 +434,13 @@ async fn delete_inquiry(
     }
 
     // 0. Check for active bookings — prevent hard-delete if employees are assigned
-    let day_count: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM inquiry_days WHERE inquiry_id = $1",
-    )
-    .bind(id)
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| ApiError::Internal(format!("Tag-Abfrage fehlgeschlagen: {e}")))?;
-    let emp_count: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM inquiry_day_employees ide JOIN inquiry_days iday ON ide.inquiry_day_id = iday.id WHERE iday.inquiry_id = $1",
-    )
-    .bind(id)
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| ApiError::Internal(format!("Mitarbeiter-Abfrage fehlgeschlagen: {e}")))?;
+    let (day_count, emp_count) = inquiry_repo::count_active_days_and_employees(&state.db, id)
+        .await
+        .map_err(|e| ApiError::Internal(format!("Buchungs-Abfrage fehlgeschlagen: {e}")))?;
 
-    if day_count.0 > 0 || emp_count.0 > 0 {
+    if day_count > 0 || emp_count > 0 {
         return Err(ApiError::Validation(
-            format!("Inquiry {id} hat aktive Buchungen ({} Tage, {} Mitarbeiterzuweisungen). Bitte zuerst alle Buchungen entfernen.", day_count.0, emp_count.0),
+            format!("Inquiry {id} hat aktive Buchungen ({day_count} Tage, {emp_count} Mitarbeiterzuweisungen). Bitte zuerst alle Buchungen entfernen."),
         ));
     }
 
