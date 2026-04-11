@@ -1771,4 +1771,58 @@ mod tests {
             assert!(result >= 0.0);
         }
     }
+
+    // --- M2: Configurable pricing tests ---
+
+    #[test]
+    fn configurable_service_prices_affect_line_items() {
+        let custom_prices = ServicePrices {
+            assembly_unit_price: 50.0,
+            parking_ban_unit_price: 150.0,
+            packing_unit_price: 40.0,
+        };
+        let services = Services {
+            disassembly: true,
+            assembly: true,
+            parking_ban_origin: true,
+            packing: true,
+            ..Default::default()
+        };
+        let items = build_line_items(&services, &custom_prices);
+
+        let demontage = items.iter().find(|i| i.description == "Demontage").expect("should have demontage");
+        assert_eq!(demontage.unit_price, 50.0, "custom assembly price should apply to Demontage");
+
+        let montage = items.iter().find(|i| i.description == "Montage").expect("should have montage");
+        assert_eq!(montage.unit_price, 50.0, "custom assembly price should apply to Montage");
+
+        let hv = items.iter().find(|i| i.description == "Halteverbotszone").expect("should have halteverbot");
+        assert_eq!(hv.unit_price, 150.0, "custom parking ban price should apply");
+
+        let um = items.iter().find(|i| i.description == "Umzugsmaterial").expect("should have umzugsmaterial");
+        assert_eq!(um.unit_price, 40.0, "custom packing price should apply");
+    }
+
+    #[test]
+    fn saturday_surcharge_configurable() {
+        let engine = PricingEngine::with_rate(3000, 7000);
+        let mut input = PricingInput {
+            volume_m3: 10.0,
+            distance_km: 0.0,
+            scheduled_date: Some(chrono::NaiveDate::from_ymd_opt(2026, 2, 28).unwrap()), // Saturday
+            floor_origin: None,
+            floor_destination: None,
+            has_elevator_origin: None,
+            has_elevator_destination: None,
+            floor_stop: None,
+            has_elevator_stop: None,
+        };
+        let result = engine.calculate(&input);
+        assert_eq!(result.breakdown.date_adjustment_cents, 7_000, "custom Saturday surcharge should apply");
+
+        // Sunday should still be 0 regardless
+        input.scheduled_date = Some(chrono::NaiveDate::from_ymd_opt(2026, 3, 1).unwrap());
+        let result2 = engine.calculate(&input);
+        assert_eq!(result2.breakdown.date_adjustment_cents, 0, "no surcharge on Sunday");
+    }
 }
