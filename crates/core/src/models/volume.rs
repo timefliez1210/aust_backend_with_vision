@@ -15,6 +15,8 @@ pub enum EstimationMethod {
     Inventory,
     /// 3D depth-sensor pipeline (Grounding DINO + SAM 2 + Depth Anything V2).
     DepthSensor,
+    /// AR phone scan pipeline (per-item structured 3D reconstruction).
+    Ar,
     /// 3D video reconstruction pipeline (MASt3R + SAM 2 temporal tracking).
     Video,
     /// Volume entered manually by an admin without any automated pipeline.
@@ -28,6 +30,7 @@ impl EstimationMethod {
             Self::Vision => "vision",
             Self::Inventory => "inventory",
             Self::DepthSensor => "depth_sensor",
+            Self::Ar => "ar",
             Self::Video => "video",
             Self::Manual => "manual",
         }
@@ -55,6 +58,7 @@ impl std::str::FromStr for EstimationMethod {
             "vision" => Ok(Self::Vision),
             "inventory" => Ok(Self::Inventory),
             "depth_sensor" => Ok(Self::DepthSensor),
+            "ar" => Ok(Self::Ar),
             "video" => Ok(Self::Video),
             "manual" => Ok(Self::Manual),
             other => Err(format!("unknown EstimationMethod: {other}")),

@@ -525,7 +525,7 @@ async fn process_ar_submission_background(
         &state.db,
         estimation_id,
         inquiry_id,
-        EstimationMethod::DepthSensor.as_str(),
+        EstimationMethod::Ar.as_str(),
         &source_data,
         Some(&result_data),
         response.total_volume_m3,
@@ -599,6 +599,8 @@ async fn video_inquiry(
     let mut billing_postal: Option<String> = None;
     let mut billing_city: Option<String> = None;
     let mut video_files: Vec<(Vec<u8>, String)> = Vec::new();
+    let mut volumen: Option<String> = None;
+    let mut umzugsgut: Option<String> = None;
 
     while let Some(field) = multipart
         .next_field()
@@ -670,6 +672,9 @@ async fn video_inquiry(
             "billing_number" | "billing_house_number" => billing_number = Some(read_text_field(field).await?),
             "billing_postal" | "billing_zip" | "billing_plz" => billing_postal = Some(read_text_field(field).await?),
             "billing_city" | "billing_ort" => billing_city = Some(read_text_field(field).await?),
+            // Volume fields
+            "volumen" | "volume" => volumen = Some(read_text_field(field).await?),
+            "umzugsgut" | "items" => umzugsgut = Some(read_text_field(field).await?),
             _ => continue,
         }
     }
@@ -1062,21 +1067,73 @@ async fn manual_inquiry(
 
     tracing::info!(inquiry_id = %inquiry_id, "Manual inquiry created for submission");
 
-    // 7. Trigger auto-offer and distance calculation in background
+    // 7. If customer provided volume, create a completed estimation directly.
+    let manual_volume: Option<f64> = form.volumen.as_deref()
+        .or(form.volume_m3.as_deref())
+        .and_then(|s| s.trim().parse::<f64>().ok());
+
+    if manual_volume.is_some() {
+        let volume = manual_volume.unwrap();
+        let now_update = chrono::Utc::now();
+        inquiry_repo::update_volume_and_status(&state.db, inquiry_id, volume, "estimated", now_update).await
+            .map_err(|e| ApiError::Internal(format!("Volumen konnte nicht gespeichert werden: {e}")))?;
+
+        // Create completed estimation row
+        let estimation_id = Uuid::now_v7();
+        let items_text = form.umzugsgut.as_deref().or(form.items_list.as_deref()).unwrap_or("");
+        let source_data = serde_json::json!({"source": "manual", "submission_mode": "manuell"});
+        let result_data = serde_json::json!({"items_text": items_text, "total_volume_m3": volume});
+        estimation_repo::insert_no_return(
+            &state.db,
+            estimation_id,
+            inquiry_id,
+            "manual",
+            &source_data,
+            Some(&result_data),
+            volume,
+            0.5,
+            now,
+        ).await
+            .map_err(|e| ApiError::Internal(format!("Schätzung konnte nicht erstellt werden: {e}")))?;
+    }
+
+    // 8. Distance calculation first, then offer generation
     let state_bg = Arc::clone(&state);
+    let dep_addr = departure_address.to_string();
+    let arr_addr = arrival_address.to_string();
     tokio::spawn(async move {
+        let api_key = &state_bg.config.maps.api_key;
+        if !api_key.is_empty() {
+            let calculator = aust_distance_calculator::RouteCalculator::new(api_key.clone());
+            let req = aust_distance_calculator::RouteRequest { addresses: vec![dep_addr, arr_addr] };
+            if let Ok(r) = calculator.calculate(&req).await {
+                let _ = inquiry_repo::update_distance(&state_bg.db, inquiry_id, r.total_distance_km).await;
+            }
+        }
         try_auto_generate_offer(Arc::clone(&state_bg), inquiry_id).await;
     });
 
-    Ok((
-        StatusCode::CREATED,
-        Json(SubmitInquiryResponse {
-            inquiry_id,
-            customer_id,
-            status: "pending".to_string(),
-            message: "Anfrage erstellt. Wir melden uns mit einem Angebot.".to_string(),
-        }),
-    ))
+    if manual_volume.is_some() {
+        Ok((
+            StatusCode::OK,
+            Json(SubmitInquiryResponse {
+                inquiry_id,
+                customer_id,
+                status: "estimated".to_string(),
+                message: "Anfrage erhalten. Angebot wird erstellt.".to_string(),
+            }),
+        ))
+    } else {
+        Ok((
+            StatusCode::CREATED,
+            Json(SubmitInquiryResponse {
+                inquiry_id,
+                customer_id,
+                status: "pending".to_string(),
+                message: "Anfrage erstellt. Wir melden uns mit einem Angebot.".to_string(),
+            }),
+        ))
+    }
 }
 
 
@@ -1485,12 +1542,13 @@ pub(crate) async fn handle_submission(
         ).await
             .map_err(|e| ApiError::Internal(format!("Schätzung konnte nicht erstellt werden: {e}")))?;
 
-        // Spawn distance calculation (same as AR handler)
+        // Spawn distance calculation first, then offer generation.
+        // Distance must be computed before the offer PDF is generated so that
+        // transport cost reflects the real distance.
         let state_bg = Arc::clone(&state);
         let dep_addr = departure_address.clone();
         let arr_addr = arrival_address.clone();
         tokio::spawn(async move {
-            try_auto_generate_offer(Arc::clone(&state_bg), inquiry_id).await;
             let api_key = &state_bg.config.maps.api_key;
             if !api_key.is_empty() {
                 let calculator = aust_distance_calculator::RouteCalculator::new(api_key.clone());
@@ -1499,6 +1557,7 @@ pub(crate) async fn handle_submission(
                     let _ = inquiry_repo::update_distance(&state_bg.db, inquiry_id, r.total_distance_km).await;
                 }
             }
+            try_auto_generate_offer(Arc::clone(&state_bg), inquiry_id).await;
         });
 
         return Ok((

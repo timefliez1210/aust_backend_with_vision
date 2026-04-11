@@ -394,8 +394,8 @@ pub(crate) async fn fetch_assignment(
         r#"
         SELECT ide.planned_hours::float8,
                ide.notes,
-               NULL::timestamptz AS employee_clock_in,
-               NULL::timestamptz AS employee_clock_out
+               ide.clock_in AS employee_clock_in,
+               ide.clock_out AS employee_clock_out
         FROM inquiry_day_employees ide
         JOIN inquiry_days iday ON ide.inquiry_day_id = iday.id
         WHERE iday.inquiry_id = $1 AND ide.employee_id = $2 AND iday.day_number = 1
@@ -476,6 +476,8 @@ pub(crate) async fn update_clock_times(
     clock_in: Option<DateTime<Utc>>,
     clock_out: Option<DateTime<Utc>>,
 ) -> Result<u64, sqlx::Error> {
+    // Only update the primary day (day_number = 1) to avoid overwriting
+    // clock times across all days of a multi-day inquiry.
     let result = sqlx::query(
         r#"
         UPDATE inquiry_day_employees ide
@@ -484,6 +486,7 @@ pub(crate) async fn update_clock_times(
         FROM inquiry_days iday
         WHERE ide.inquiry_day_id = iday.id
           AND iday.inquiry_id = $3
+          AND iday.day_number = 1
           AND ide.employee_id = $4
         "#,
     )
