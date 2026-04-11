@@ -106,6 +106,31 @@ impl InquiryStatus {
         }
     }
 
+    /// Check whether this status locks core inquiry fields against modification.
+    ///
+    /// **Caller**: `update_inquiry` handler (PATCH /inquiries/{id}).
+    /// **Why**: M3 — once an inquiry has an offer (offer_ready or beyond), modifying
+    /// volume, services, distance, or addresses would break the accepted offer's
+    /// pricing. This method centralises the lock check so the handler stays clean.
+    ///
+    /// Locked from: `offer_ready`, `offer_sent`, `accepted`, `scheduled`,
+    /// `completed`, `invoiced`, `paid`.
+    ///
+    /// Modifiable in: `pending`, `info_requested`, `estimating`, `estimated`,
+    /// `rejected`, `expired`, `cancelled`.
+    pub fn is_locked_for_modifications(&self) -> bool {
+        matches!(
+            self,
+            Self::OfferReady
+                | Self::OfferSent
+                | Self::Accepted
+                | Self::Scheduled
+                | Self::Completed
+                | Self::Invoiced
+                | Self::Paid
+        )
+    }
+
     /// Returns the lowercase snake_case string representation.
     ///
     /// **Caller**: DB serialization, API responses.
@@ -535,5 +560,61 @@ mod tests {
     #[test]
     fn test_inquiry_status_default() {
         assert_eq!(InquiryStatus::default(), InquiryStatus::Pending);
+    }
+
+    // M3: Tests for is_locked_for_modifications
+    #[test]
+    fn locked_status_offer_ready() {
+        assert!(InquiryStatus::OfferReady.is_locked_for_modifications());
+    }
+
+    #[test]
+    fn locked_status_offer_sent() {
+        assert!(InquiryStatus::OfferSent.is_locked_for_modifications());
+    }
+
+    #[test]
+    fn locked_status_accepted() {
+        assert!(InquiryStatus::Accepted.is_locked_for_modifications());
+    }
+
+    #[test]
+    fn locked_status_scheduled() {
+        assert!(InquiryStatus::Scheduled.is_locked_for_modifications());
+    }
+
+    #[test]
+    fn locked_status_completed() {
+        assert!(InquiryStatus::Completed.is_locked_for_modifications());
+    }
+
+    #[test]
+    fn locked_status_invoiced() {
+        assert!(InquiryStatus::Invoiced.is_locked_for_modifications());
+    }
+
+    #[test]
+    fn locked_status_paid() {
+        assert!(InquiryStatus::Paid.is_locked_for_modifications());
+    }
+
+    #[test]
+    fn modifiable_status_pending() {
+        assert!(!InquiryStatus::Pending.is_locked_for_modifications());
+    }
+
+    #[test]
+    fn modifiable_status_estimated() {
+        assert!(!InquiryStatus::Estimated.is_locked_for_modifications());
+    }
+
+    #[test]
+    fn modifiable_status_rejected() {
+        assert!(!InquiryStatus::Rejected.is_locked_for_modifications());
+    }
+
+    #[test]
+    fn modifiable_status_cancelled() {
+        assert!(!InquiryStatus::Cancelled.is_locked_for_modifications());
     }
 }

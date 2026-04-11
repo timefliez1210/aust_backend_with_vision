@@ -351,25 +351,17 @@ async fn update_inquiry(
     // M3: Gate mutable fields on current status
     // Once an inquiry has an offer (offer_ready or beyond), volume, services,
     // distance, and addresses are locked — changing them would break the accepted offer.
-    let is_locked_status = matches!(
-        current_status,
-        InquiryStatus::OfferReady
-        | InquiryStatus::OfferSent
-        | InquiryStatus::Accepted
-        | InquiryStatus::Scheduled
-        | InquiryStatus::Completed
-        | InquiryStatus::Invoiced
-        | InquiryStatus::Paid
-    );
-    let locked_fields_modified = request.estimated_volume_m3.is_some()
-        || request.services.is_some()
-        || request.distance_km.is_some()
-        || request.origin_address_id.is_some()
-        || request.destination_address_id.is_some();
-    if is_locked_status && locked_fields_modified {
-        return Err(ApiError::Validation(
-            "Inquiry mit vorhandenem Angebot kann nicht mehr inhaltlich geändert werden (Volumen, Services, Entfernung, Adressen). Bitte Angebot neu erstellen.".into(),
-        ));
+    if current_status.is_locked_for_modifications() {
+        let locked_fields_modified = request.estimated_volume_m3.is_some()
+            || request.services.is_some()
+            || request.distance_km.is_some()
+            || request.origin_address_id.is_some()
+            || request.destination_address_id.is_some();
+        if locked_fields_modified {
+            return Err(ApiError::Validation(
+                "Inquiry mit vorhandenem Angebot kann nicht mehr inhaltlich geändert werden (Volumen, Services, Entfernung, Adressen). Bitte Angebot neu erstellen.".into(),
+            ));
+        }
     }
 
     // Validate status transition if status is being changed
