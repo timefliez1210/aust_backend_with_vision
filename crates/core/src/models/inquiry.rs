@@ -49,39 +49,11 @@ impl InquiryStatus {
     /// # Returns
     /// `true` if the transition is valid, `false` otherwise.
     pub fn can_transition_to(&self, target: &InquiryStatus) -> bool {
-        use InquiryStatus::*;
-        matches!(
-            (self, target),
-            // Normal forward flow
-            (Pending, InfoRequested)
-            | (Pending, Estimating)
-            | (Pending, Estimated)
-            | (Pending, Cancelled)
-            // Skip-ahead shortcuts for direct API and auto-pipeline
-            | (Pending, OfferReady)
-            | (InfoRequested, Estimating)
-            | (InfoRequested, Estimated)
-            | (InfoRequested, Cancelled)
-            | (Estimating, Estimated)
-            | (Estimating, Cancelled)
-            | (Estimated, OfferReady)
-            | (Estimated, Cancelled)
-            // Skip intermediate: Estimated -> OfferSent
-            | (Estimated, OfferSent)
-            | (OfferReady, OfferSent)
-            | (OfferReady, Accepted)
-            | (OfferReady, Cancelled)
-            | (OfferSent, Accepted)
-            | (OfferSent, Rejected)
-            | (OfferSent, Expired)
-            | (OfferSent, Cancelled)
-            | (Accepted, Scheduled)
-            | (Accepted, Cancelled)
-            | (Scheduled, Completed)
-            | (Scheduled, Cancelled)
-            | (Completed, Invoiced)
-            | (Invoiced, Paid)
-        )
+        // No restrictions — any status change is allowed from the admin dashboard.
+        // The state machine is informational only; operators need full flexibility
+        // to correct mistakes (e.g. accepted → offer_ready, scheduled → pending).
+        let _ = target;
+        true
     }
 
     /// Derive the offer-level status string from the inquiry status.

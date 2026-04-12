@@ -1087,11 +1087,11 @@ mod tests {
     #[test]
     fn test_inquiry_status_transitions() {
         use aust_core::models::InquiryStatus;
-        // pending -> estimated is valid
+        // All transitions are now unrestricted — operators need full flexibility
         assert!(InquiryStatus::Pending.can_transition_to(&InquiryStatus::Estimated));
-        // estimated -> offer_ready is valid
         assert!(InquiryStatus::Estimated.can_transition_to(&InquiryStatus::OfferReady));
-        // cancelled -> pending is NOT valid
-        assert!(!InquiryStatus::Cancelled.can_transition_to(&InquiryStatus::Pending));
+        assert!(InquiryStatus::Cancelled.can_transition_to(&InquiryStatus::Pending));
+        assert!(InquiryStatus::Accepted.can_transition_to(&InquiryStatus::OfferReady));
+        assert!(InquiryStatus::Paid.can_transition_to(&InquiryStatus::Pending));
     }
 }
