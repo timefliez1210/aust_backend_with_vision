@@ -36,3 +36,9 @@ Inquiry hard-delete collects all S3 keys (offer PDFs + estimation images) before
 ## Configuration
 
 Uses `StorageConfig` from core: `provider` ("s3"/"local"), `bucket`, `endpoint`, `region`, `access_key`, `secret_key`.
+## ⚠️ Connected Changes
+
+| If you change... | ...also verify |
+|---|---|
+| S3 key convention | `offer_builder.rs` PDF keys, `submissions.rs` image keys, `admin.rs` employee document keys, `inquiries.rs` delete cleanup |
+| `StorageProvider` trait signature | All callers: `offer_builder.rs`, `estimates.rs`, `submissions.rs`, `admin.rs` document upload/download |

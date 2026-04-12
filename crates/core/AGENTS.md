@@ -45,3 +45,11 @@ All configurable via `config/*.toml` with `serde(default)`:
 - HTTP handlers — go in `crates/api/src/routes/`
 - Business logic that touches DB/IO — goes in `crates/api/src/services/`
 - Only pure domain models, config structs, and shared types belong here
+## ⚠️ Connected Changes
+
+| If you change... | ...also verify |
+|---|---|
+| `InquiryStatus` enum | `can_transition_to()`, `is_locked_for_modifications()`, admin frontend `INQUIRY_STATUS_LABELS`, inquiry PATCH handler status gate |
+| `CompanyConfig` struct | `PricingEngine::with_rate()` calls, `ServicePrices::from_config()`, offer generator, all unit tests using `PricingEngine::new()` |
+| `Services` struct | `build_line_items()` in offer builder, XLSX line items, foto-angebot form, admin service toggles |
+| `EstimationMethod` enum | `volume.rs` string conversion, 5 submission handlers, DB CHECK constraint, offer builder `parse_detected_items()`, vision service |

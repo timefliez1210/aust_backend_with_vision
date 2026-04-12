@@ -49,3 +49,10 @@ let result = client.estimate_images(req).await?;
 ## Configuration
 
 Uses `VisionServiceConfig` from core: `enabled`, `base_url`, `timeout_secs` (default 120), `max_retries` (default 1).
+## ⚠️ Connected Changes
+
+| If you change... | ...also verify |
+|---|---|
+| `EstimationMethod` enum variants | `volume.rs` in core, `submissions.rs` handler dispatch, DB CHECK constraint, `offer_builder.rs` `parse_detected_items()` |
+| `VisionServiceClient` interface or retry logic | `submissions.rs` photo/mobile handlers, `offer_pipeline.rs` auto-offer trigger, `vision.rs` service wrapper |
+| Method string values (e.g. "ar", "depth_sensor") | DB `volume_estimations.method` CHECK constraint, `submissions.rs` parsing, frontend estimation display |

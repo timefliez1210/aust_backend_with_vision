@@ -92,3 +92,16 @@ All pricing constants are in `CompanyConfig`:
 3. Wire route in `routes/mod.rs`
 4. Add integration test in `tests/integration_tests.rs`
 5. Update `docs/API.md`
+
+## ⚠️ Connected Changes
+
+| If you change... | ...also verify |
+|---|---|
+| Inquiry status machine | `can_transition_to()`, `is_locked_for_modifications()`, admin frontend status labels (`INQUIRY_STATUS_LABELS`), `inquiry_repo.rs` status query |
+| `CompanyConfig` pricing | `PricingEngine::with_rate()`, `ServicePrices::from_config()`, offer XLSX template pricing cells, unit tests |
+| `Services` struct flags | `build_line_items()` in offer_builder, XLSX rows 31–42, foto-angebot form, frontend service toggles |
+| `inquiry_day_employees` schema | `inquiry_employees` dual-write sync, calendar employee queries, clock-time update SQL, admin employee panel |
+| `offers` unique constraint | `offer_pipeline.rs` race guard, `offer_builder.rs` insert catch block, `offer_repo.rs` fetch_active_id |
+| DB migration | `test_helpers.rs` factory functions, integration tests, manual `deploy.sh` step |
+| `EstimationMethod` enum | `volume.rs`, all 5 submission handlers in `submissions.rs`, offer_builder `parse_detected_items()`, DB CHECK constraint migration |
+| Address schema | `merge_address_parts()` in all 5 submission handlers, offer PDF address block, XLSX cells A8-A11, frontend address editor |

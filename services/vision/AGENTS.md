@@ -44,3 +44,10 @@ GET  /health              → liveness check
 **Production**: `modal deploy modal_app.py` → serverless GPU
 
 The Rust backend calls this via `aust_volume_estimator::VisionServiceClient`.
+## ⚠️ Connected Changes
+
+| If you change... | ...also verify |
+|---|---|
+| New estimation method or `EstimationMethod` | `volume.rs` enum variants + `from_str()`/`as_str()`, `submissions.rs` handler dispatch (5 handlers), DB CHECK constraint (needs migration), `offer_builder.rs` `parse_detected_items()` |
+| Response format or detected_items schema | `offer_builder.rs` item sheet generation, `volume.rs` `DepthSensorResult`/`VisionAnalysisResult`/`ParsedInventoryItem` deserialization, frontend estimation items table |
+| Model weights or inference pipeline | GPU memory management (L4 24GB limit), Modal deployment config, processing time estimates |

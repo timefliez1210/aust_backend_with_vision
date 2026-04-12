@@ -51,3 +51,10 @@ IMAP sender for form submissions is always the company inbox (`umzug@example.com
 ## External Connections
 
 IMAP (polling), SMTP (sending), Telegram Bot API, LLM provider, Calendar service.
+## ⚠️ Connected Changes
+
+| If you change... | ...along change... |
+|---|---|
+| Email parser / `ParsedInquiry` | `submissions.rs` form parsing (shares field names like `halteverbot-auszug`), `inquiry_builder.rs` field mapping |
+| Telegram approval flow | `telegram_service.rs` callback data, `offer_pipeline.rs` auto-offer, `orchestrator.rs` event handling |
+| `MovingInquiry` struct | `inquiry_builder.rs` response builder, `inquiry_repo.rs` field names |

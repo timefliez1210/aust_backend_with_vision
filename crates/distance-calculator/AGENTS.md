@@ -47,3 +47,9 @@ Called from `offer_builder.rs::build_fahrt_item()` (Fahrkostenpauschale) and `su
 ## Testing
 
 Real API tests require `AUST__MAPS__API_KEY`. Unit tests cover parsing and error cases.
+## ⚠️ Connected Changes
+
+| If you change... | ...also verify |
+|---|---|
+| Route calculation or pricing | `offer_builder.rs` Fahrkostenpauschale (depot→origin→stop→dest→depot), `submissions.rs` ORS distance for manual inquiries, `offer_pipeline.rs` auto-offer distance calculation |
+| ORS API or response format | `geocoder.rs` address parsing, `router.rs` response deserialization, error handling tests |

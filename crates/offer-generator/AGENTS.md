@@ -72,3 +72,11 @@ rate = labor_netto / (persons × hours)
 ## Testing
 
 `PricingEngine::new()` for defaults. `PricingEngine::with_rate(rate, surcharge)` for config-driven. `ServicePrices::from_config(config)` or `ServicePrices::defaults()` for line items.
+## ⚠️ Connected Changes
+
+| If you change... | ...also verify |
+|---|---|
+| Pricing formula or rates | `CompanyConfig` in core, `PricingEngine::with_rate()` call sites, `ServicePrices.from_config()`, XLSX template pricing cells, unit tests |
+| XLSX template (rows, columns) | `xlsx.rs` row/col references, line item max (12), `offer_builder.rs` line item output order, `generate_offer_xlsx()` |
+| Line item order or max items | XLSX rows 31–42, `warn!` threshold at line_items.len() > 12, `ServicePrices` config values |
+| `build_line_items()` or service prices | foto-angebot form submission, admin dashboard service toggles, `Services` struct in core |
