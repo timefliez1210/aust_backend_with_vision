@@ -381,7 +381,7 @@ pub(crate) async fn shift_inquiry_days(
     delta_days: i64,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "UPDATE inquiry_days SET day_date = day_date + ($2 * INTERVAL '1 day') WHERE inquiry_id = $1",
+        "UPDATE inquiry_days SET day_date = day_date + make_interval(days => $2::int) WHERE inquiry_id = $1",
     )
     .bind(inquiry_id)
     .bind(delta_days)
