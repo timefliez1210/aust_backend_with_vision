@@ -274,7 +274,7 @@ pub(crate) async fn create(
                            service_type, submission_mode, recipient_id, billing_address_id, custom_fields,
                            created_at, updated_at)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-                $14, $15, $16, $17, $18, $18)
+                COALESCE($14, 'termin'), $15, $16, $17, $18, $18)
         "#,
     )
     .bind(id)
