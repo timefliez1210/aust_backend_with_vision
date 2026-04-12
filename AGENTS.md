@@ -2,6 +2,22 @@
 
 Moving company automation: customer inquiry → volume estimation → offer generation → scheduling → invoicing.
 
+## 🚨 THIS IS A PRODUCTION SYSTEM
+
+This system runs live at **www.aust-umzuege.de**. The PostgreSQL database contains **real customer PII**: names, addresses, phone numbers, email addresses, moving details. There is no staging database — only production.
+
+**Rules that follow from this:**
+
+1. **Never run destructive SQL** — no `DROP COLUMN`, `DROP TABLE`, `DELETE` without `WHERE`, or `TRUNCATE`. All migrations must be additive (add column, add table, add index). If a column must be removed, do it in two steps: stop writing → remove later.
+2. **Never log PII** — no customer names, addresses, phone numbers, or email in `tracing::info!` or `println!`. Use IDs only (`inquiry_id={}`, `customer_id={}`).
+3. **Never hard-delete customer rows** — the delete endpoints soft-delete (set `deleted_at`) or hard-delete with S3 cleanup first. See `inquiry_actions.rs` for the pattern.
+4. **Never auto-migrate on deploy** — migrations are run manually with `DATABASE_URL` set. A bad migration on production data is irreversible.
+5. **Test against factories, not production data** — `test_helpers.rs` creates test data. Never point tests at production.
+6. **GDPR applies** — customers can request data export or deletion. The `delete_customer` endpoint must clean up S3 objects (offers PDFs, estimation images, employee contracts) before removing the DB row.
+7. **Email contains real content** — offer PDFs, Telegram messages, and SMTP emails go to real customers. Never hardcode test content in production code paths.
+
+If in doubt, ask before running anything against the database.
+
 ## Quick Orientation
 
 | What | Where | One-line |
@@ -60,7 +76,7 @@ When working on a specific area, read the corresponding AGENTS.md for focused co
 
 ## Critical Constraints
 
-1. **DB migrations are one-way doors** — additive only, no destructive changes without explicit agreement
+1. **DB migrations are one-way doors** — additive only, no destructive changes without explicit agreement (see 🚨 above)
 2. **No auto-migration on deploy** — run `migrations/` manually before/after `deploy.sh`
 3. **`inquiry_employees` is being replaced by `inquiry_day_employees`** — write to both (dual-write), read from day-level
 4. **`preferred_date` is retired** — use `scheduled_date` (DATE) everywhere
