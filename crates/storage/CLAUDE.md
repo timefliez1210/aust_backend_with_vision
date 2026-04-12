@@ -1,45 +1,11 @@
-# crates/storage — File Storage Abstraction
+# crates/storage — S3 File Storage
 
-> External service map (S3/MinIO): [../../docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md#external-service-dependencies)
+> **Full context**: [AGENTS.md](AGENTS.md)
 
-Abstract file storage with pluggable backends: S3-compatible (MinIO for dev, AWS for prod) or local filesystem.
+StorageProvider trait (upload, download, delete, exists). S3 and Local implementations.
 
-## Key Files
+Key convention: `offers/{uuid}/angebot.pdf`, `estimates/{id}/images/{idx}.jpg`, `employees/{id}/arbeitsvertrag.pdf`.
 
-- `src/lib.rs` - `StorageProvider` trait, S3/local implementations, factory
+Orphan handling: inquiry hard-delete logs all failed S3 deletions.
 
-## StorageProvider Trait
-
-```rust
-#[async_trait]
-pub trait StorageProvider: Send + Sync {
-    async fn upload(&self, key: &str, data: &[u8], content_type: &str) -> Result<(), StorageError>;
-    async fn download(&self, key: &str) -> Result<Vec<u8>, StorageError>;
-}
-```
-
-## Implementations
-
-- **S3Storage** — AWS S3 / MinIO via `aws-sdk-s3`
-- **LocalStorage** — filesystem, stores under configured bucket directory
-
-## Factory
-
-```rust
-let storage = create_provider(&storage_config).await?;
-```
-
-## Usage
-
-S3 key convention for volume estimation images:
-```
-estimates/{inquiry_id}/{estimation_id}/{index}.jpg
-```
-
-## Configuration
-
-Uses `StorageConfig` from core:
-- `provider` — "s3" or "local"
-- `bucket` — bucket name (default: "aust-uploads")
-- `endpoint` — S3/MinIO URL
-- `region`, `access_key`, `secret_key`
+See [AGENTS.md](AGENTS.md) for: trait signature, S3 key convention, LocalStorage setup.

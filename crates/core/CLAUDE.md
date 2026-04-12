@@ -1,68 +1,9 @@
-# crates/core — Domain Models & Configuration
+# crates/core — Domain Models & Config
 
-> Key types and how they flow through the system: [../../docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md#key-data-types-flowing-through-the-pipeline)
+> **Full context**: [AGENTS.md](AGENTS.md)
 
-Shared foundation crate used by all other crates. Contains domain models, application configuration, and common error types.
+Shared foundation crate. Domain models, config, error types. No DB, no HTTP, no I/O.
 
-## Key Files
+**Key**: `InquiryStatus` state machine (`can_transition_to`, `is_locked_for_modifications`), `CompanyConfig` pricing constants, `Services` struct, `EstimationMethod` enum.
 
-- `src/config.rs` - Master `Config` struct with all nested sections
-- `src/models/volume.rs` - Volume estimation domain types
-- `src/models/email.rs` - Email/inquiry domain types
-- `src/error.rs` - Shared error types
-- `src/lib.rs` - Re-exports
-
-## Configuration Structs
-
-`Config` is the root, deserialized from `config/*.toml` with env var overrides (`AUST__SECTION__KEY`):
-
-| Struct | Fields | Purpose |
-|--------|--------|---------|
-| `ServerConfig` | host, port | HTTP server binding |
-| `DatabaseConfig` | url, max_connections | PostgreSQL |
-| `StorageConfig` | provider, bucket, endpoint, region, access_key, secret_key | S3/MinIO |
-| `EmailConfig` | imap_*, smtp_*, poll_interval_secs, from_address | Email I/O |
-| `LlmConfig` | default_provider, claude/openai/ollama sub-configs | LLM selection |
-| `MapsConfig` | provider, api_key | OpenRouteService |
-| `TelegramConfig` | bot_token, admin_chat_id | Telegram bot |
-| `AuthConfig` | jwt_secret, jwt_expiry_hours | JWT auth |
-| `CalendarConfig` | default_capacity, alternatives_count, search_window_days | Booking |
-| `VisionServiceConfig` | enabled, base_url, timeout_secs, max_retries | ML vision service |
-
-`Config::validate()` runs at startup — checks DB URL non-empty, port non-zero, and LLM API key present for the selected provider.
-
-## Domain Models
-
-### Inquiry (`models/inquiry.rs`)
-
-- `InquiryStatus` — state machine enum with `can_transition_to()` validation (implements `FromStr`/`Display`)
-- Status flow: `pending → info_requested → estimating → estimated → offer_ready → offer_sent → accepted|rejected|expired|cancelled → scheduled → completed → invoiced → paid`
-- `Services` — JSONB struct (packing, assembly, disassembly, storage, disposal, parking_ban_origin/destination)
-
-### Offer (`models/offer.rs`)
-
-- `OfferStatus` — enum: Draft, Active, Sent, Accepted, Rejected, Expired, Superseded (implements `FromStr`/`Display`)
-
-
-### Volume Estimation (`models/volume.rs`)
-
-- `EstimationMethod` — enum: Vision, Inventory, DepthSensor, Manual
-- `VolumeEstimation` — full DB record (id, inquiry_id, method, total_volume_m3, confidence_score, etc.)
-- `VisionAnalysisResult` / `DetectedItem` — LLM vision results
-- `DepthSensorResult` / `DepthSensorItem` — 3D pipeline results
-- `ItemDimensions` — (length_m, width_m, height_m)
-- `InventoryItem` / `InventoryForm` — manual inventory input
-
-### Email (`models/email.rs`)
-
-- `MovingInquiry` — aggregated customer inquiry state (name, phone, addresses, dates, volume, services, notes)
-- `ParsedEmail` — structured email parsing output
-- `MissingField` — tracks data gaps in an inquiry
-
-## Dependencies
-
-serde, chrono, uuid — no external API calls, pure data types.
-
-## Usage
-
-Every other crate depends on `aust-core` for shared types and config.
+See [AGENTS.md](AGENTS.md) for: full model list, config fields, status machine diagram.
