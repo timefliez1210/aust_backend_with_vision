@@ -300,8 +300,8 @@ pub(crate) async fn fetch_inquiry_days(
     sqlx::query_as(
         r#"
         SELECT iday.id, iday.day_date, iday.day_number, iday.notes,
-               COALESCE(iday.start_time, i.start_time),
-               COALESCE(iday.end_time, i.end_time)
+               COALESCE(iday.start_time, i.start_time) AS start_time,
+               COALESCE(iday.end_time, i.end_time) AS end_time
         FROM inquiry_days iday
         JOIN inquiries i ON iday.inquiry_id = i.id
         WHERE iday.inquiry_id = $1
@@ -425,8 +425,8 @@ pub(crate) async fn fetch_calendar_item_days(
     sqlx::query_as(
         r#"
         SELECT cd.id, cd.day_date, cd.day_number, cd.notes,
-               COALESCE(cd.start_time, ci.start_time),
-               COALESCE(cd.end_time, ci.end_time)
+               COALESCE(cd.start_time, ci.start_time) AS start_time,
+               COALESCE(cd.end_time, ci.end_time) AS end_time
         FROM calendar_item_days cd
         JOIN calendar_items ci ON cd.calendar_item_id = ci.id
         WHERE cd.calendar_item_id = $1
