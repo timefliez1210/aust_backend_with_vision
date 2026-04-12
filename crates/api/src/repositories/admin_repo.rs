@@ -394,7 +394,7 @@ pub(crate) async fn create_customer(
     sqlx::query_as(
         r#"
         INSERT INTO customers (id, email, name, salutation, first_name, last_name, phone, customer_type, company_name, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8, 'private'), $9, $10, $10)
         RETURNING id, email, name, salutation, first_name, last_name, phone, customer_type, company_name, billing_address_id, created_at
         "#,
     )
