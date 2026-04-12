@@ -359,7 +359,7 @@ pub(crate) async fn update_customer(
             company_name = COALESCE($9, company_name),
             billing_address_id = CASE WHEN $10 THEN $11 ELSE billing_address_id END
         WHERE id = $1
-        RETURNING id, email, name, salutation, first_name, last_name, phone, customer_type, company_name, created_at
+        RETURNING id, email, name, salutation, first_name, last_name, phone, customer_type, company_name, billing_address_id, created_at
         "#,
     )
     .bind(id)
@@ -395,7 +395,7 @@ pub(crate) async fn create_customer(
         r#"
         INSERT INTO customers (id, email, name, salutation, first_name, last_name, phone, customer_type, company_name, created_at, updated_at)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)
-        RETURNING id, email, name, salutation, first_name, last_name, phone, customer_type, company_name, created_at
+        RETURNING id, email, name, salutation, first_name, last_name, phone, customer_type, company_name, billing_address_id, created_at
         "#,
     )
     .bind(id)
