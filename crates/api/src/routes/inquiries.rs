@@ -444,6 +444,20 @@ async fn update_inquiry(
     )
     .await?;
 
+    // Shift inquiry_days when scheduled_date changes so multi-day rows stay in sync.
+    // If the inquiry has day rows, their day_date values are relative to the original
+    // start date — rescheduling the parent must shift them by the same delta.
+    if let Some(new_date) = scheduled_date {
+        if let Some(old_date) = current_inquiry.scheduled_date {
+            if new_date != old_date {
+                let delta = (new_date - old_date).num_days();
+                if let Err(e) = inquiry_repo::shift_inquiry_days(&state.db, id, delta).await {
+                    tracing::warn!(inquiry_id = %id, delta, error = %e, "Failed to shift inquiry_days after reschedule");
+                }
+            }
+        }
+    }
+
     // Auto-update billing address from origin → destination on completion
     if request.status.as_deref() == Some("completed") {
         let _ = inquiry_repo::auto_update_billing_on_completed(&state.db, id).await;

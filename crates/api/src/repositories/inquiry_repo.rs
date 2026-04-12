@@ -369,6 +369,27 @@ pub(crate) async fn update_fields(
     Ok(())
 }
 
+/// Shift all `inquiry_days.day_date` values for an inquiry by `delta` days.
+///
+/// **Caller**: `update_inquiry` handler, after `scheduled_date` changes.
+/// **Why**: Multi-day day rows store absolute dates. When the parent inquiry is
+/// rescheduled, the day rows must move by the same offset so the calendar still
+/// shows them under the correct date cells.
+pub(crate) async fn shift_inquiry_days(
+    pool: &PgPool,
+    inquiry_id: Uuid,
+    delta_days: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE inquiry_days SET day_date = day_date + ($2 * INTERVAL '1 day') WHERE inquiry_id = $1",
+    )
+    .bind(inquiry_id)
+    .bind(delta_days)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Auto-update billing_address_id from origin to destination when an inquiry
 /// transitions to "completed". Only applies when billing_address_id is currently
 /// the same as origin_address_id (booking-for-self) or NULL.
