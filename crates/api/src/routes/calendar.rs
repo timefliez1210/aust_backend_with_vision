@@ -93,6 +93,7 @@ struct ScheduleInquiry {
     day_notes: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     service_type: Option<String>,
+    scheduled_date: NaiveDate,
 }
 
 #[derive(Debug, Serialize)]
@@ -114,6 +115,7 @@ struct ScheduleCalendarItem {
     /// Per-day notes from `calendar_item_days` (None for single-day).
     #[serde(skip_serializing_if = "Option::is_none")]
     day_notes: Option<String>,
+    scheduled_date: NaiveDate,
 }
 
 #[derive(Debug, Serialize)]
@@ -302,6 +304,7 @@ async fn get_schedule(
             total_days: r.total_days,
             day_notes: r.day_notes,
             service_type: r.service_type,
+            scheduled_date: r.scheduled_date,
         });
     }
 
@@ -325,6 +328,7 @@ async fn get_schedule(
             day_number: r.day_number,
             total_days: r.total_days,
             day_notes: r.day_notes,
+            scheduled_date: r.scheduled_date,
         });
     }
 

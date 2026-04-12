@@ -30,6 +30,7 @@ pub(crate) struct ScheduleInquiryRow {
     pub day_notes: Option<String>,
     #[sqlx(default)]
     pub service_type: Option<String>,
+    pub scheduled_date: NaiveDate,
 }
 
 /// A single row from `inquiry_days` including optional per-day times.
@@ -158,7 +159,8 @@ pub(crate) async fn fetch_schedule_inquiries(
             ), '') AS employee_names,
             NULL::smallint AS day_number,
             NULL::smallint AS total_days,
-            NULL::text AS day_notes
+            NULL::text AS day_notes,
+            i.scheduled_date AS scheduled_date
         FROM inquiries i
         JOIN customers c ON i.customer_id = c.id
         LEFT JOIN addresses ao ON i.origin_address_id = ao.id
@@ -200,7 +202,8 @@ pub(crate) async fn fetch_schedule_inquiries(
             ), '') AS employee_names,
             id2.day_number,
             total.total_days,
-            id2.notes AS day_notes
+            id2.notes AS day_notes,
+            i.scheduled_date AS scheduled_date
         FROM inquiries i
         JOIN customers c ON i.customer_id = c.id
         LEFT JOIN addresses ao ON i.origin_address_id = ao.id
@@ -550,6 +553,7 @@ pub(crate) struct ScheduleCalendarItemRow {
     pub day_number: Option<i16>,
     pub total_days: Option<i16>,
     pub day_notes: Option<String>,
+    pub scheduled_date: NaiveDate,
 }
 
 /// Fetch calendar items as per-day schedule rows within a date range.
@@ -584,7 +588,8 @@ pub(crate) async fn fetch_schedule_calendar_items(
             ), '') AS employee_names,
             NULL::smallint AS day_number,
             NULL::smallint AS total_days,
-            NULL::text AS day_notes
+            NULL::text AS day_notes,
+            ci.scheduled_date AS scheduled_date
         FROM calendar_items ci
         LEFT JOIN calendar_item_employees cie ON cie.calendar_item_id = ci.id
         LEFT JOIN employees e ON cie.employee_id = e.id
@@ -611,7 +616,8 @@ pub(crate) async fn fetch_schedule_calendar_items(
             ), '') AS employee_names,
             cday.day_number,
             total.total_days,
-            cday.notes AS day_notes
+            cday.notes AS day_notes,
+            ci.scheduled_date AS scheduled_date
         FROM calendar_items ci
         JOIN calendar_item_days cday ON cday.calendar_item_id = ci.id
         JOIN (
