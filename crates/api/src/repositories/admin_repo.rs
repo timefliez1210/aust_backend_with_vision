@@ -188,6 +188,8 @@ pub(crate) struct CustomerListItem {
     pub customer_type: Option<String>,
     #[sqlx(default)]
     pub company_name: Option<String>,
+    #[sqlx(default)]
+    pub billing_address_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -231,7 +233,7 @@ pub(crate) async fn fetch_customer(
     id: Uuid,
 ) -> Result<Option<CustomerListItem>, sqlx::Error> {
     sqlx::query_as(
-        "SELECT id, email, name, salutation, first_name, last_name, phone, customer_type, company_name, created_at FROM customers WHERE id = $1",
+        "SELECT id, email, name, salutation, first_name, last_name, phone, customer_type, company_name, billing_address_id, created_at FROM customers WHERE id = $1",
     )
     .bind(id)
     .fetch_optional(pool)
@@ -336,7 +338,14 @@ pub(crate) async fn update_customer(
     email: Option<&str>,
     customer_type: Option<&str>,
     company_name: Option<&str>,
+    // `None` = don't touch, `Some(Some(id))` = set, `Some(None)` = clear
+    billing_address_id: Option<Option<Uuid>>,
 ) -> Result<Option<CustomerListItem>, sqlx::Error> {
+    // $10 = do_update_billing: true if caller wants to change billing_address_id
+    // $11 = new_billing_address_id: the value to set (NULL to clear)
+    let do_update = billing_address_id.is_some();
+    let new_value = billing_address_id.flatten();
+
     sqlx::query_as(
         r#"
         UPDATE customers SET
@@ -347,7 +356,8 @@ pub(crate) async fn update_customer(
             phone = COALESCE($6, phone),
             email = COALESCE($7, email),
             customer_type = COALESCE($8, customer_type),
-            company_name = COALESCE($9, company_name)
+            company_name = COALESCE($9, company_name),
+            billing_address_id = CASE WHEN $10 THEN $11 ELSE billing_address_id END
         WHERE id = $1
         RETURNING id, email, name, salutation, first_name, last_name, phone, customer_type, company_name, created_at
         "#,
@@ -361,6 +371,8 @@ pub(crate) async fn update_customer(
     .bind(email)
     .bind(customer_type)
     .bind(company_name)
+    .bind(do_update)
+    .bind(new_value)
     .fetch_optional(pool)
     .await
 }

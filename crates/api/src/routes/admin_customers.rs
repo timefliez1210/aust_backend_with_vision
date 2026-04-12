@@ -92,6 +92,7 @@ pub(super) struct CustomerDetailResponse {
     phone: Option<String>,
     customer_type: Option<String>,
     company_name: Option<String>,
+    billing_address_id: Option<Uuid>,
     created_at: DateTime<Utc>,
     quotes: Vec<CustomerQuote>,
     offers: Vec<CustomerOffer>,
@@ -189,6 +190,7 @@ pub(super) async fn get_customer(
         phone: repo_customer.phone,
         customer_type: repo_customer.customer_type,
         company_name: repo_customer.company_name,
+        billing_address_id: repo_customer.billing_address_id,
         created_at: repo_customer.created_at,
         quotes,
         offers,
@@ -206,6 +208,12 @@ pub(super) struct UpdateCustomerRequest {
     email: Option<String>,
     customer_type: Option<String>,
     company_name: Option<String>,
+    /// Inline billing address — if provided, creates an address record and sets billing_address_id.
+    /// If both billing_address and billing_address_id are provided, billing_address_id takes priority.
+    billing_address: Option<super::inquiries::AddressInput>,
+    billing_address_id: Option<Uuid>,
+    /// Set to true to clear the customer's billing address override.
+    clear_billing_address: Option<bool>,
 }
 
 /// `PATCH /api/v1/admin/customers/{id}` — Partially update a customer's contact fields.
@@ -230,12 +238,47 @@ pub(super) async fn update_customer(
     Path(id): Path<Uuid>,
     Json(request): Json<UpdateCustomerRequest>,
 ) -> Result<Json<CustomerListItem>, ApiError> {
+    use crate::repositories::address_repo;
+
+    // Create billing address if provided inline
+    let resolved_billing_address_id = if let Some(ref addr) = request.billing_address {
+        let street = addr.street.as_deref().unwrap_or("").trim().to_string();
+        let city = addr.city.as_deref().unwrap_or("").trim().to_string();
+        if !street.is_empty() || !city.is_empty() {
+            let aid = address_repo::create(
+                &state.db,
+                &street,
+                &city,
+                addr.postal_code.as_deref(),
+                addr.floor.as_deref(),
+                addr.elevator,
+                addr.house_number.as_deref(),
+                addr.parking_ban,
+            )
+            .await?;
+            Some(aid)
+        } else {
+            request.billing_address_id
+        }
+    } else {
+        request.billing_address_id
+    };
+
+    // If clear_billing_address is true, set to None (explicitly clear the override)
+    // Using Option<Option<Uuid>>: None = don't touch, Some(None) = clear, Some(Some(id)) = set
+    let billing_address_id: Option<Option<Uuid>> = if request.clear_billing_address.unwrap_or(false) {
+        Some(None) // clear
+    } else {
+        resolved_billing_address_id.map(Some) // set or don't touch
+    };
+
     let repo_row = admin_repo::update_customer(
         &state.db, id,
         request.name.as_deref(), request.salutation.as_deref(),
         request.first_name.as_deref(), request.last_name.as_deref(),
         request.phone.as_deref(), request.email.as_deref(),
         request.customer_type.as_deref(), request.company_name.as_deref(),
+        billing_address_id,
     )
     .await?;
 

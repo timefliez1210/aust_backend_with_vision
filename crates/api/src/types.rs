@@ -84,27 +84,113 @@ impl From<InquiryRow> for Inquiry {
 
 /// Resolve the billing address for an inquiry.
 ///
-/// Logic:
-/// - If `inquiry_billing_address_id` is set → use it (explicit override).
-/// - If inquiry status >= "completed" → use destination (they've moved).
-/// - Otherwise → use origin (they still live there).
+/// Resolution order:
+/// 1. `inquiry_billing_address_id` — explicit override (always wins)
+/// 2. `customer_billing_address_id` — B2B default ("bill to headquarters")
+/// 3. `destination_address_id` — post-move (status >= completed)
+/// 4. `origin_address_id` — default (they haven't moved yet)
 ///
 /// This function does NOT auto-mutate the billing address — that happens
 /// in the status-update handler when transitioning to "completed".
 pub(crate) fn resolve_billing_address_id(
     inquiry_billing_address_id: Option<Uuid>,
+    customer_billing_address_id: Option<Uuid>,
     origin_address_id: Option<Uuid>,
     destination_address_id: Option<Uuid>,
     status: &str,
 ) -> Option<Uuid> {
-    // Explicit billing address always wins
+    // 1. Explicit inquiry-level override always wins
     if inquiry_billing_address_id.is_some() {
         return inquiry_billing_address_id;
     }
-    // After move completion, billing goes to destination
+    // 2. Customer-level default (B2B: "always bill to headquarters")
+    if customer_billing_address_id.is_some() {
+        return customer_billing_address_id;
+    }
+    // 3. After move completion, billing goes to destination
     if matches!(status, "completed" | "invoiced" | "paid") {
         return destination_address_id;
     }
-    // Default: they still live at origin
+    // 4. Default: they still live at origin
     origin_address_id
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    fn id() -> Uuid { Uuid::now_v7() }
+
+    #[test]
+    fn inquiry_billing_address_wins_over_all() {
+        let inquiry = id();
+        let customer = id();
+        let origin = id();
+        let dest = id();
+        let result = resolve_billing_address_id(
+            Some(inquiry), Some(customer), Some(origin), Some(dest), "pending",
+        );
+        assert_eq!(result, Some(inquiry));
+    }
+
+    #[test]
+    fn customer_billing_address_used_when_inquiry_is_none() {
+        let customer = id();
+        let origin = id();
+        let dest = id();
+        let result = resolve_billing_address_id(
+            None, Some(customer), Some(origin), Some(dest), "pending",
+        );
+        assert_eq!(result, Some(customer));
+    }
+
+    #[test]
+    fn destination_used_after_completion_when_no_customer_default() {
+        let dest = id();
+        let origin = id();
+        let result = resolve_billing_address_id(
+            None, None, Some(origin), Some(dest), "completed",
+        );
+        assert_eq!(result, Some(dest));
+    }
+
+    #[test]
+    fn origin_used_before_completion_when_no_customer_default() {
+        let origin = id();
+        let dest = id();
+        let result = resolve_billing_address_id(
+            None, None, Some(origin), Some(dest), "pending",
+        );
+        assert_eq!(result, Some(origin));
+    }
+
+    #[test]
+    fn customer_default_beats_destination_after_completion() {
+        let customer = id();
+        let dest = id();
+        let origin = id();
+        let result = resolve_billing_address_id(
+            None, Some(customer), Some(origin), Some(dest), "completed",
+        );
+        assert_eq!(result, Some(customer));
+    }
+
+    #[test]
+    fn inquiry_override_beats_customer_default() {
+        let inquiry = id();
+        let customer = id();
+        let origin = id();
+        let dest = id();
+        let result = resolve_billing_address_id(
+            Some(inquiry), Some(customer), Some(origin), Some(dest), "pending",
+        );
+        assert_eq!(result, Some(inquiry));
+    }
+
+    #[test]
+    fn all_none_returns_none() {
+        let result = resolve_billing_address_id(None, None, None, None, "pending");
+        assert_eq!(result, None);
+    }
 }

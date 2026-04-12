@@ -357,9 +357,10 @@ pub(crate) async fn build_offer_with_overrides(
         .and_then(|a| a.floor.clone())
         .unwrap_or_default();
 
-    // Resolve billing address: explicit > destination (post-move) > origin (pre-move)
+    // Resolve billing address: explicit > customer default > destination (post-move) > origin (pre-move)
     let billing_addr_id = resolve_billing_address_id(
         inquiry.billing_address_id,
+        customer.billing_address_id,
         inquiry.origin_address_id,
         inquiry.destination_address_id,
         inquiry.status.as_str(),
