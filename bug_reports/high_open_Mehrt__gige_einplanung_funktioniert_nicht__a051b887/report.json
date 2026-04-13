@@ -1,0 +1,15 @@
+{
+  "id": "a051b887-4df1-4675-b766-13bca5569151",
+  "report_type": "bug",
+  "priority": "high",
+  "title": "Mehrtägige einplanung funktioniert nicht",
+  "description": "die Mehrtägige einplanung funktioniert nicht",
+  "location": "/admin/calendar",
+  "attachment_keys": [
+    "feedback/019d681f-3c5d-7d93-9b6d-801d497e694a/0.png"
+  ],
+  "status": "open",
+  "agent_notes": null,
+  "created_at": "2026-04-07T13:26:11.141404Z",
+  "updated_at": "2026-04-07T13:26:11.141404Z"
+}

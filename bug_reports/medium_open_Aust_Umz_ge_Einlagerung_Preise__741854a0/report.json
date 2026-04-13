@@ -1,0 +1,15 @@
+{
+  "id": "741854a0-8767-4d1e-9e39-3b869a0bc64e",
+  "report_type": "feature",
+  "priority": "medium",
+  "title": "Aust Umzüge / Einlagerung / Preise",
+  "description": "Preis hinterlegen , \r\n1 Monat 19€ /m²\r\n6 Monate 15€/m²\r\n12 Monate 12€/m²",
+  "location": "/admin/calendar",
+  "attachment_keys": [
+    "feedback/019d4d3c-e121-7cc1-99a7-ffe5a80a116e/0.png"
+  ],
+  "status": "open",
+  "agent_notes": null,
+  "created_at": "2026-04-02T08:08:48.824022Z",
+  "updated_at": "2026-04-02T08:08:48.824022Z"
+}

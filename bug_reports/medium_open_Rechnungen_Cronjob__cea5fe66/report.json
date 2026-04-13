@@ -1,0 +1,13 @@
+{
+  "id": "cea5fe66-08c0-4af1-8de2-a0477232e877",
+  "report_type": "feature",
+  "priority": "medium",
+  "title": "Rechnungen Cronjob",
+  "description": "7 tage zahlungserinnerung, 1. Und 2. Mahnung nach jeweils 7 tagen",
+  "location": "/admin/inquiries/019d2f19-2ec4-7bf3-8649-4c0d29b354da",
+  "attachment_keys": [],
+  "status": "open",
+  "agent_notes": null,
+  "created_at": "2026-03-29T10:50:36.098392Z",
+  "updated_at": "2026-03-29T10:50:36.098392Z"
+}

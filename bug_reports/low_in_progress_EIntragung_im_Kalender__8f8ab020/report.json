@@ -1,0 +1,15 @@
+{
+  "id": "8f8ab020-608d-4cc2-958f-14c21fa05e78",
+  "report_type": "bug",
+  "priority": "low",
+  "title": "EIntragung im Kalender",
+  "description": "Das Datum könnte schon von selbst drin stehen, da es schon im kalender eingetragen steht",
+  "location": "/admin/calendar",
+  "attachment_keys": [
+    "feedback/019d39a3-15c0-7041-9829-c3c1ac9dc0a7/0.png"
+  ],
+  "status": "in_progress",
+  "agent_notes": null,
+  "created_at": "2026-03-29T12:48:03.082254Z",
+  "updated_at": "2026-03-31T07:59:57.298955Z"
+}

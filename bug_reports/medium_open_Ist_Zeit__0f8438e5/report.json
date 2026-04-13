@@ -1,0 +1,13 @@
+{
+  "id": "0f8438e5-086f-4f82-bcb8-b72405477576",
+  "report_type": "bug",
+  "priority": "medium",
+  "title": "Ist Zeit",
+  "description": "Ist Zeit Wird nicht gespeichert",
+  "location": "/admin/calendar",
+  "attachment_keys": [],
+  "status": "open",
+  "agent_notes": null,
+  "created_at": "2026-04-06T20:26:49.439378Z",
+  "updated_at": "2026-04-06T20:26:49.439378Z"
+}

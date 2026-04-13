@@ -1,0 +1,13 @@
+{
+  "id": "435fa1e0-c61c-472c-9ab2-9c0d632cb4ac",
+  "report_type": "feature",
+  "priority": "high",
+  "title": "Verpflegungspauschalen",
+  "description": null,
+  "location": "/admin/reports",
+  "attachment_keys": [],
+  "status": "open",
+  "agent_notes": null,
+  "created_at": "2026-04-07T11:16:07.735191Z",
+  "updated_at": "2026-04-07T11:16:07.735191Z"
+}

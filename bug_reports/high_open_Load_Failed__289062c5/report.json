@@ -1,0 +1,15 @@
+{
+  "id": "289062c5-a5b5-46b0-be19-581072d2ca7e",
+  "report_type": "bug",
+  "priority": "high",
+  "title": "Load Failed",
+  "description": "Oben ist soweit alles ausgefüllt, lädt allerdings nicht hoch keine Ahnung warum",
+  "location": "/admin/inquiries",
+  "attachment_keys": [
+    "feedback/019d45d8-f5f3-7781-8f5b-ef15dddf65bc/0.png"
+  ],
+  "status": "open",
+  "agent_notes": null,
+  "created_at": "2026-03-31T21:42:28.510043Z",
+  "updated_at": "2026-03-31T21:42:28.510043Z"
+}

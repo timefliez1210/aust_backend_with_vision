@@ -1,0 +1,13 @@
+{
+  "id": "da6abc72-73fa-4b4d-985c-dabd09a99dca",
+  "report_type": "bug",
+  "priority": "high",
+  "title": "Geschäftskunden und Rechnungsadressen",
+  "description": "/foto-angebot umsetzen und einbinden",
+  "location": "/admin/inquiries",
+  "attachment_keys": [],
+  "status": "open",
+  "agent_notes": null,
+  "created_at": "2026-03-29T10:54:59.622666Z",
+  "updated_at": "2026-03-29T10:54:59.622666Z"
+}
