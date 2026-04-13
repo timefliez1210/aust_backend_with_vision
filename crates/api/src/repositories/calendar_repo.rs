@@ -67,6 +67,8 @@ pub(crate) struct DayEmployeeRow {
     pub last_name: String,
     pub planned_hours: Option<f64>,
     pub notes: Option<String>,
+    pub start_time: Option<NaiveTime>,
+    pub end_time: Option<NaiveTime>,
 }
 
 // ── Queries ──────────────────────────────────────────────────────────────────
@@ -330,7 +332,9 @@ pub(crate) async fn fetch_inquiry_day_employees(
                e.first_name,
                e.last_name,
                ide.planned_hours::float8 AS planned_hours,
-               ide.notes
+               ide.notes,
+               ide.start_time,
+               ide.end_time
         FROM inquiry_day_employees ide
         JOIN inquiry_days id2 ON ide.inquiry_day_id = id2.id
         JOIN employees e ON ide.employee_id = e.id
@@ -398,15 +402,23 @@ pub(crate) async fn insert_inquiry_day_employee(
     employee_id: Uuid,
     planned_hours: Option<f64>,
     notes: Option<&str>,
+    start_time: Option<NaiveTime>,
+    end_time: Option<NaiveTime>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO inquiry_day_employees (inquiry_day_id, employee_id, planned_hours, notes) \
-         VALUES ($1, $2, $3, $4) ON CONFLICT (inquiry_day_id, employee_id) DO NOTHING",
+        "INSERT INTO inquiry_day_employees \
+         (inquiry_day_id, employee_id, planned_hours, notes, start_time, end_time) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
+         ON CONFLICT (inquiry_day_id, employee_id) DO UPDATE \
+         SET planned_hours = EXCLUDED.planned_hours, notes = EXCLUDED.notes, \
+             start_time = EXCLUDED.start_time, end_time = EXCLUDED.end_time",
     )
     .bind(inquiry_day_id)
     .bind(employee_id)
     .bind(planned_hours)
     .bind(notes)
+    .bind(start_time)
+    .bind(end_time)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -453,7 +465,9 @@ pub(crate) async fn fetch_calendar_item_day_employees(
                e.first_name,
                e.last_name,
                cide.planned_hours::float8 AS planned_hours,
-               cide.notes
+               cide.notes,
+               cide.start_time,
+               cide.end_time
         FROM calendar_item_day_employees cide
         JOIN calendar_item_days cid ON cide.calendar_item_day_id = cid.id
         JOIN employees e ON cide.employee_id = e.id
@@ -520,15 +534,23 @@ pub(crate) async fn insert_calendar_item_day_employee(
     employee_id: Uuid,
     planned_hours: Option<f64>,
     notes: Option<&str>,
+    start_time: Option<NaiveTime>,
+    end_time: Option<NaiveTime>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO calendar_item_day_employees (calendar_item_day_id, employee_id, planned_hours, notes) \
-         VALUES ($1, $2, $3, $4) ON CONFLICT (calendar_item_day_id, employee_id) DO NOTHING",
+        "INSERT INTO calendar_item_day_employees \
+         (calendar_item_day_id, employee_id, planned_hours, notes, start_time, end_time) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
+         ON CONFLICT (calendar_item_day_id, employee_id) DO UPDATE \
+         SET planned_hours = EXCLUDED.planned_hours, notes = EXCLUDED.notes, \
+             start_time = EXCLUDED.start_time, end_time = EXCLUDED.end_time",
     )
     .bind(calendar_item_day_id)
     .bind(employee_id)
     .bind(planned_hours)
     .bind(notes)
+    .bind(start_time)
+    .bind(end_time)
     .execute(&mut **tx)
     .await?;
     Ok(())
