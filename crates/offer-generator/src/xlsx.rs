@@ -175,7 +175,7 @@ pub struct DetectedItemRow {
 /// The `Styled*` variants carry a hard-coded style index string that overrides
 /// whatever style the template cell already has. The un-styled variants
 /// (`Text`, `Number`) preserve the original template style.
-enum CellValue {
+pub enum CellValue {
     /// Plain UTF-8 text; preserves the existing template cell style.
     Text(String),
     /// Text with an explicit style index string (overrides the template cell's style).
@@ -565,7 +565,7 @@ fn apply_modifications(
 /// # Returns
 /// A new `String` with the cell replaced. Returns the original string unchanged if
 /// the cell cannot be located or its boundaries cannot be parsed.
-fn set_cell_value(xml: &str, cell_ref: &str, value: &CellValue) -> String {
+pub fn set_cell_value(xml: &str, cell_ref: &str, value: &CellValue) -> String {
     let ref_pattern = format!(r#"r="{}""#, cell_ref);
 
     if let Some(attr_pos) = xml.find(&ref_pattern) {
@@ -786,7 +786,7 @@ fn insert_cell(xml: &str, cell_ref: &str, value: &CellValue) -> String {
 ///
 /// # Returns
 /// Modified XML string. Returns the original if the row is not found.
-fn hide_row(xml: &str, row_num: u32) -> String {
+pub fn hide_row(xml: &str, row_num: u32) -> String {
     let row_r = format!(r#"<row r="{}""#, row_num);
     if let Some(pos) = xml.find(&row_r) {
         let after = &xml[pos..];
@@ -830,7 +830,7 @@ fn hide_row(xml: &str, row_num: u32) -> String {
 ///
 /// # Returns
 /// Modified XML string. Returns the original if the row is not found or already visible.
-fn unhide_row(xml: &str, row_num: u32) -> String {
+pub fn unhide_row(xml: &str, row_num: u32) -> String {
     let row_r = format!(r#"<row r="{}""#, row_num);
     if let Some(pos) = xml.find(&row_r) {
         let after = &xml[pos..];
@@ -867,7 +867,7 @@ fn unhide_row(xml: &str, row_num: u32) -> String {
 /// # Returns
 /// XML string with `<v>…</v>` and `<v/>` elements removed from every cell that
 /// also contains a `<f>…</f>` formula element.
-fn strip_formula_cached_values(xml: &str) -> String {
+pub fn strip_formula_cached_values(xml: &str) -> String {
     let mut result = String::with_capacity(xml.len());
     let mut pos = 0;
 
@@ -1450,7 +1450,7 @@ fn read_zip_entry(archive: &mut ZipArchive<Cursor<&[u8]>>, name: &str) -> Result
 ///
 /// # Returns
 /// `Some(value)` with the attribute's string value, or `None` if not found.
-fn extract_attribute(tag: &str, attr_name: &str) -> Option<String> {
+pub fn extract_attribute(tag: &str, attr_name: &str) -> Option<String> {
     let pattern = format!(r#"{}=""#, attr_name);
     if let Some(start) = tag.find(&pattern) {
         let value_start = start + pattern.len();
@@ -1498,7 +1498,7 @@ fn extract_row_number(cell_ref: &str) -> u32 {
 ///
 /// # Returns
 /// Decimal string representation, e.g. `"30"`, `"51.29"`, `"2.1"`.
-fn format_number(n: f64) -> String {
+pub fn format_number(n: f64) -> String {
     if n == n.floor() && n.abs() < 1e15 {
         format!("{}", n as i64)
     } else {
@@ -1523,7 +1523,7 @@ fn format_number(n: f64) -> String {
 /// A new `String` with the five XML special characters replaced by their entity
 /// references: `&` → `&amp;`, `<` → `&lt;`, `>` → `&gt;`, `"` → `&quot;`,
 /// `'` → `&apos;`.
-fn xml_escape(s: &str) -> String {
+pub fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")

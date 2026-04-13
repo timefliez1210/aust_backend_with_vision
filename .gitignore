@@ -43,5 +43,8 @@ __pycache__/
 
 # Backups
 backups/
+
+# Bug reports (fetched from API)
+bug_reports/
 TODO.md
 app/

@@ -23,7 +23,7 @@ use crate::repositories::{address_repo, invoice_repo, CustomerRow};
 use crate::ApiError;
 use crate::AppState;
 use aust_offer_generator::{
-    convert_xlsx_to_pdf, generate_invoice_xlsx, ExtraService, InvoiceData, InvoiceType,
+    convert_xlsx_to_pdf, generate_invoice_xlsx, ExtraService, InvoiceData, InvoiceLineItem, InvoiceType,
 };
 
 // ---------------------------------------------------------------------------
@@ -234,25 +234,48 @@ async fn create_invoice(
         };
 
         // Generate PDFs
-        let first_data = build_invoice_data(
+        // PartialFirst: single "Anzahlung" line item
+        let first_line_items = vec![InvoiceLineItem {
+            pos: 1,
+            description: format!(
+                "Anzahlung ({}%) — gemäß Angebot Nr. {}",
+                percent, invoice_context.offer.offer_number.as_deref().unwrap_or("")
+            ),
+            quantity: 1.0,
+            unit_price: first_netto as f64 / 100.0,
+            remark: None,
+        }];
+        let first_data = build_invoice_data_from_items(
             &invoice_context,
             InvoiceType::PartialFirst { percent },
             &first_num,
             today,
-            first_netto,
-            vec![],
+            first_line_items,
         );
         let first_xlsx = generate_invoice_xlsx(&first_data)
             .map_err(|e| ApiError::Internal(format!("Invoice XLSX error: {e}")))?;
         let first_pdf = generate_pdf_bytes(&first_xlsx).await;
 
-        let final_data = build_invoice_data(
+        // PartialFinal: offer line items + "Abzgl. Anzahlung" deduction line
+        // For now, we use the legacy lump-sum approach until line_items are stored on the invoice
+        let final_line_items = vec![
+            InvoiceLineItem {
+                pos: 1,
+                description: format!(
+                    "Restbetrag — gemäß Angebot Nr. {}",
+                    invoice_context.offer.offer_number.as_deref().unwrap_or("")
+                ),
+                quantity: 1.0,
+                unit_price: final_netto as f64 / 100.0,
+                remark: None,
+            },
+        ];
+        let final_data = build_invoice_data_from_items(
             &invoice_context,
             InvoiceType::PartialFinal,
             &final_num,
             today,
-            final_netto,
-            vec![],
+            final_line_items,
         );
         let final_xlsx = generate_invoice_xlsx(&final_data)
             .map_err(|e| ApiError::Internal(format!("Invoice XLSX error: {e}")))?;
@@ -298,13 +321,23 @@ async fn create_invoice(
         let invoice_num = format!("{}-{:04}", today.format("%Y"), seqs[0]);
         let inv_id = Uuid::now_v7();
 
-        let data = build_invoice_data(
+        // Full invoice: offer line items (lump-sum for now, will be itemised in future)
+        let full_line_items = vec![InvoiceLineItem {
+            pos: 1,
+            description: format!(
+                "Umzugsdienstleistung gemäß Angebot Nr. {}",
+                invoice_context.offer.offer_number.as_deref().unwrap_or("")
+            ),
+            quantity: 1.0,
+            unit_price: offer_netto as f64 / 100.0,
+            remark: None,
+        }];
+        let data = build_invoice_data_from_items(
             &invoice_context,
             InvoiceType::Full,
             &invoice_num,
             today,
-            offer_netto,
-            vec![],
+            full_line_items,
         );
         let xlsx = generate_invoice_xlsx(&data)
             .map_err(|e| ApiError::Internal(format!("Invoice XLSX error: {e}")))?;
@@ -458,13 +491,48 @@ async fn update_invoice(
         )
         .await?;
 
-        let data = build_invoice_data(
+        // Regeneration: convert extra services (legacy) to InvoiceLineItem format
+        let extra_items: Vec<InvoiceLineItem> = extras
+            .iter()
+            .enumerate()
+            .map(|(i, e)| InvoiceLineItem {
+                pos: (i + 2) as u32, // position 2+ (position 1 = base)
+                description: e.description.clone(),
+                quantity: 1.0,
+                unit_price: e.price_cents as f64 / 100.0,
+                remark: None,
+            })
+            .collect();
+
+        // Base line item (legacy approach until line_items_json is stored on invoice)
+        let mut regen_items = vec![InvoiceLineItem {
+            pos: 1,
+            description: match &inv_type {
+                InvoiceType::Full => format!(
+                    "Umzugsdienstleistung gemäß Angebot Nr. {}",
+                    invoice_context.offer.offer_number.as_deref().unwrap_or("")
+                ),
+                InvoiceType::PartialFirst { percent } => format!(
+                    "Anzahlung ({}%) — gemäß Angebot Nr. {}",
+                    percent, invoice_context.offer.offer_number.as_deref().unwrap_or("")
+                ),
+                InvoiceType::PartialFinal => format!(
+                    "Restbetrag — gemäß Angebot Nr. {}",
+                    invoice_context.offer.offer_number.as_deref().unwrap_or("")
+                ),
+            },
+            quantity: 1.0,
+            unit_price: base_netto as f64 / 100.0,
+            remark: None,
+        }];
+        regen_items.extend(extra_items);
+
+        let data = build_invoice_data_from_items(
             &invoice_context,
             inv_type,
             &row.invoice_number,
             today,
-            base_netto,
-            extra_service_vec,
+            regen_items,
         );
 
         let xlsx = generate_invoice_xlsx(&data)
@@ -651,14 +719,18 @@ async fn load_invoice_context(
     })
 }
 
-/// Build an `InvoiceData` struct from a loaded `InvoiceContext`.
-fn build_invoice_data(
+/// Build an `InvoiceData` struct from a loaded `InvoiceContext` and line items.
+///
+/// **Why**: Centralises the conversion from domain objects to the XLSX generator's
+/// input type. The `line_items` field is the single source of truth; legacy fields
+/// (`base_netto_cents`, `extra_services`, `origin_street`, `origin_city`) are filled
+/// with empty/zero defaults for backward compatibility.
+fn build_invoice_data_from_items(
     ctx: &InvoiceContext,
     invoice_type: InvoiceType,
     invoice_number: &str,
     invoice_date: chrono::NaiveDate,
-    base_netto_cents: i64,
-    extra_services: Vec<ExtraService>,
+    line_items: Vec<InvoiceLineItem>,
 ) -> InvoiceData {
     let customer_name = match (ctx.customer.first_name.as_deref(), ctx.customer.last_name.as_deref()) {
         (Some(f), Some(l)) => format!("{f} {l}"),
@@ -674,12 +746,20 @@ fn build_invoice_data(
         customer_email: ctx.customer.email.clone(),
         company_name: ctx.customer.company_name.clone(),
         attention_line: Some(ctx.customer.attention_line()).filter(|s| !s.is_empty()),
-        origin_street: ctx.billing_street.clone(),
-        origin_city: ctx.billing_city.clone(),
+        billing_street: ctx.billing_street.clone(),
+        billing_city: ctx.billing_city.clone(),
         offer_number: ctx.offer.offer_number.clone().unwrap_or_default(),
-        base_netto_cents,
-        extra_services,
         salutation: ctx.customer.formal_greeting(),
+        line_items,
+        // Legacy fields — filled with zeros/empty for backward compat
+        #[allow(deprecated)]
+        base_netto_cents: 0,
+        #[allow(deprecated)]
+        extra_services: vec![],
+        #[allow(deprecated)]
+        origin_street: String::new(),
+        #[allow(deprecated)]
+        origin_city: String::new(),
     }
 }
 

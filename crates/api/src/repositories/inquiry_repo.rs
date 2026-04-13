@@ -637,14 +637,14 @@ pub(crate) async fn update_employee_assignment(
     let result = sqlx::query(
         r#"
         UPDATE inquiry_day_employees SET
-            clock_in  = COALESCE($4, clock_in),
-            clock_out = COALESCE($5, clock_out),
+            clock_in  = COALESCE($4, inquiry_day_employees.clock_in),
+            clock_out = COALESCE($5, inquiry_day_employees.clock_out),
             planned_hours = CASE
-                WHEN COALESCE($4, clock_in) IS NOT NULL AND COALESCE($5, clock_out) IS NOT NULL
-                THEN (EXTRACT(EPOCH FROM (COALESCE($5, clock_out) - COALESCE($4, clock_in))) / 3600.0)
-                ELSE COALESCE($3, planned_hours)
+                WHEN COALESCE($4, inquiry_day_employees.clock_in) IS NOT NULL AND COALESCE($5, inquiry_day_employees.clock_out) IS NOT NULL
+                THEN (EXTRACT(EPOCH FROM (COALESCE($5, inquiry_day_employees.clock_out) - COALESCE($4, inquiry_day_employees.clock_in))) / 3600.0)
+                ELSE COALESCE($3, inquiry_day_employees.planned_hours)
             END,
-            notes = COALESCE($6, notes)
+            notes = COALESCE($6, inquiry_day_employees.notes)
         FROM inquiry_days iday
         WHERE inquiry_day_id = iday.id
           AND iday.inquiry_id = $1
