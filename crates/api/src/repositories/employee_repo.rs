@@ -1,7 +1,7 @@
 //! Employee repository — centralised queries for `employees`, `employee_otps`,
 //! `employee_sessions`, `inquiry_employees`, and `calendar_item_employees` tables.
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
@@ -377,8 +377,8 @@ pub(crate) async fn fetch_item_colleague_names(
 pub(crate) struct AssignmentRow {
     pub planned_hours: f64,
     pub notes: Option<String>,
-    pub employee_clock_in: Option<DateTime<Utc>>,
-    pub employee_clock_out: Option<DateTime<Utc>>,
+    pub employee_clock_in: Option<NaiveTime>,
+    pub employee_clock_out: Option<NaiveTime>,
 }
 
 /// Fetch assignment details for a specific employee-inquiry pair.
@@ -473,8 +473,8 @@ pub(crate) async fn update_clock_times(
     pool: &PgPool,
     inquiry_id: Uuid,
     employee_id: Uuid,
-    clock_in: Option<DateTime<Utc>>,
-    clock_out: Option<DateTime<Utc>>,
+    clock_in: Option<NaiveTime>,
+    clock_out: Option<NaiveTime>,
 ) -> Result<u64, sqlx::Error> {
     // Only update the primary day (day_number = 1) to avoid overwriting
     // clock times across all days of a multi-day inquiry.
@@ -949,8 +949,8 @@ pub(crate) struct AdminHoursRow {
     pub destination_city: Option<String>,
     pub booking_date: Option<NaiveDate>,
     pub planned_hours: f64,
-    pub clock_in: Option<DateTime<Utc>>,
-    pub clock_out: Option<DateTime<Utc>>,
+    pub clock_in: Option<NaiveTime>,
+    pub clock_out: Option<NaiveTime>,
     pub actual_hours: Option<f64>,
     pub inquiry_status: String,
 }
@@ -1007,8 +1007,8 @@ pub(crate) struct AdminCalendarItemHoursRow {
     pub location: Option<String>,
     pub scheduled_date: Option<NaiveDate>,
     pub planned_hours: f64,
-    pub clock_in: Option<DateTime<Utc>>,
-    pub clock_out: Option<DateTime<Utc>>,
+    pub clock_in: Option<NaiveTime>,
+    pub clock_out: Option<NaiveTime>,
     pub actual_hours: Option<f64>,
     pub status: String,
 }

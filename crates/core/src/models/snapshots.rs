@@ -255,11 +255,14 @@ pub struct EmployeeAssignmentSnapshot {
     pub first_name: String,
     pub last_name: String,
     pub planned_hours: f64,
-    /// Admin-set clock times
-    pub clock_in: Option<DateTime<Utc>>,
-    pub clock_out: Option<DateTime<Utc>>,
+    /// Admin-set clock times (TIME values)
+    pub clock_in: Option<NaiveTime>,
+    pub clock_out: Option<NaiveTime>,
+    pub start_time: Option<NaiveTime>,
+    pub end_time: Option<NaiveTime>,
+    pub break_minutes: i32,
     pub actual_hours: Option<f64>,
-    /// Employee self-reported clock times (from worker portal)
+    /// Employee self-reported clock times from worker portal (TIMESTAMPTZ on flat table)
     pub employee_clock_in: Option<DateTime<Utc>>,
     pub employee_clock_out: Option<DateTime<Utc>>,
     pub employee_actual_hours: Option<f64>,

@@ -110,8 +110,13 @@ struct AssignEmployeeBody {
 #[derive(Debug, Deserialize)]
 struct UpdateEmployeeBody {
     planned_hours: Option<f64>,
-    clock_in: Option<DateTime<Utc>>,
-    clock_out: Option<DateTime<Utc>>,
+    clock_in: Option<NaiveTime>,
+    clock_out: Option<NaiveTime>,
+    start_time: Option<NaiveTime>,
+    end_time: Option<NaiveTime>,
+    #[serde(default)]
+    break_minutes: i32,
+    actual_hours: Option<f64>,
     notes: Option<String>,
 }
 
@@ -487,6 +492,10 @@ async fn update_item_employee(
         body.planned_hours,
         body.clock_in,
         body.clock_out,
+        body.start_time,
+        body.end_time,
+        body.break_minutes,
+        body.actual_hours,
         body.notes.as_deref(),
     ).await?;
 

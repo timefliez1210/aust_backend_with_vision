@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -68,12 +68,18 @@ pub struct AssignEmployee {
 ///
 /// **Caller**: `PATCH /api/v1/inquiries/{id}/employees/{emp_id}`
 /// **Why**: Allows updating planned hours and clock-in/clock-out times for actual hours tracking.
-/// `clock_in` and `clock_out` must be ISO 8601 strings with timezone offset (e.g. "2026-03-15T07:00:00+01:00").
-/// Derived `actual_hours` = (clock_out − clock_in) in hours, computed by the API.
+/// `clock_in` and `clock_out` are TIME values (HH:MM:SS format, e.g. "07:00:00").
+/// `actual_hours` can be provided as a manual override; if null and both clock times are set,
+/// it is derived as (clock_out − clock_in) in hours minus break_minutes/60.
 #[derive(Debug, Default, Deserialize)]
 pub struct UpdateAssignment {
     pub planned_hours: Option<f64>,
-    pub clock_in: Option<DateTime<Utc>>,
-    pub clock_out: Option<DateTime<Utc>>,
+    pub clock_in: Option<NaiveTime>,
+    pub clock_out: Option<NaiveTime>,
+    pub start_time: Option<NaiveTime>,
+    pub end_time: Option<NaiveTime>,
+    #[serde(default)]
+    pub break_minutes: i32,
+    pub actual_hours: Option<f64>,
     pub notes: Option<String>,
 }

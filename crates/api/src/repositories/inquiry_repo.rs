@@ -481,8 +481,11 @@ pub(crate) struct EmployeeAssignmentRow {
     pub last_name: String,
     pub email: String,
     pub planned_hours: f64,
-    pub clock_in: Option<DateTime<Utc>>,
-    pub clock_out: Option<DateTime<Utc>>,
+    pub clock_in: Option<chrono::NaiveTime>,
+    pub clock_out: Option<chrono::NaiveTime>,
+    pub start_time: Option<chrono::NaiveTime>,
+    pub end_time: Option<chrono::NaiveTime>,
+    pub break_minutes: i32,
     pub actual_hours: Option<f64>,
     pub notes: Option<String>,
 }
@@ -502,6 +505,9 @@ pub(crate) async fn list_employee_assignments(
                SUM(ide.planned_hours)::float8 AS planned_hours,
                MIN(CASE WHEN iday.day_number = 1 THEN ide.clock_in END) AS clock_in,
                MAX(CASE WHEN iday.day_number = 1 THEN ide.clock_out END) AS clock_out,
+               MIN(CASE WHEN iday.day_number = 1 THEN ide.start_time END) AS start_time,
+               MAX(CASE WHEN iday.day_number = 1 THEN ide.end_time END) AS end_time,
+               COALESCE(MAX(CASE WHEN iday.day_number = 1 THEN ide.break_minutes END), 0)::int AS break_minutes,
                SUM(CASE WHEN ide.clock_out IS NOT NULL AND ide.clock_in IS NOT NULL
                          THEN (EXTRACT(EPOCH FROM (ide.clock_out - ide.clock_in)) / 3600.0)
                          ELSE NULL END)::float8 AS actual_hours,
@@ -629,22 +635,41 @@ pub(crate) async fn update_employee_assignment(
     inquiry_id: Uuid,
     employee_id: Uuid,
     planned_hours: Option<f64>,
-    clock_in: Option<DateTime<Utc>>,
-    clock_out: Option<DateTime<Utc>>,
+    clock_in: Option<chrono::NaiveTime>,
+    clock_out: Option<chrono::NaiveTime>,
+    start_time: Option<chrono::NaiveTime>,
+    end_time: Option<chrono::NaiveTime>,
+    break_minutes: i32,
+    actual_hours_override: Option<f64>,
     notes: Option<&str>,
 ) -> Result<u64, sqlx::Error> {
+    // Derive actual_hours in Rust: use override if provided, otherwise compute from clock times
+    let computed_actual_hours: Option<f64> = if let Some(ah) = actual_hours_override {
+        Some(ah)
+    } else if let (Some(ci), Some(co)) = (clock_in, clock_out) {
+        let duration_secs = (co - ci).num_seconds() as f64;
+        Some(duration_secs / 3600.0 - break_minutes as f64 / 60.0)
+    } else {
+        None
+    };
+
     // Update day-level table
     let result = sqlx::query(
         r#"
         UPDATE inquiry_day_employees SET
-            clock_in  = COALESCE($4, inquiry_day_employees.clock_in),
-            clock_out = COALESCE($5, inquiry_day_employees.clock_out),
+            clock_in      = COALESCE($4, inquiry_day_employees.clock_in),
+            clock_out     = COALESCE($5, inquiry_day_employees.clock_out),
+            start_time    = COALESCE($6, inquiry_day_employees.start_time),
+            end_time      = COALESCE($7, inquiry_day_employees.end_time),
+            break_minutes = $8,
+            actual_hours  = $9,
             planned_hours = CASE
+                WHEN $9 IS NOT NULL THEN $9
                 WHEN COALESCE($4, inquiry_day_employees.clock_in) IS NOT NULL AND COALESCE($5, inquiry_day_employees.clock_out) IS NOT NULL
                 THEN (EXTRACT(EPOCH FROM (COALESCE($5, inquiry_day_employees.clock_out) - COALESCE($4, inquiry_day_employees.clock_in))) / 3600.0)
                 ELSE COALESCE($3, inquiry_day_employees.planned_hours)
             END,
-            notes = COALESCE($6, inquiry_day_employees.notes)
+            notes = COALESCE($10, inquiry_day_employees.notes)
         FROM inquiry_days iday
         WHERE inquiry_day_id = iday.id
           AND iday.inquiry_id = $1
@@ -657,6 +682,10 @@ pub(crate) async fn update_employee_assignment(
     .bind(planned_hours)
     .bind(clock_in)
     .bind(clock_out)
+    .bind(start_time)
+    .bind(end_time)
+    .bind(break_minutes)
+    .bind(computed_actual_hours)
     .bind(notes)
     .execute(pool)
     .await?;
@@ -665,14 +694,19 @@ pub(crate) async fn update_employee_assignment(
     let _ = sqlx::query(
         r#"
         UPDATE inquiry_employees SET
-            clock_in  = COALESCE($4, clock_in),
-            clock_out = COALESCE($5, clock_out),
+            clock_in      = COALESCE($4, clock_in),
+            clock_out     = COALESCE($5, clock_out),
+            start_time    = COALESCE($6, start_time),
+            end_time      = COALESCE($7, end_time),
+            break_minutes = $8,
+            actual_hours  = $9,
             planned_hours = CASE
+                WHEN $9 IS NOT NULL THEN $9
                 WHEN COALESCE($4, clock_in) IS NOT NULL AND COALESCE($5, clock_out) IS NOT NULL
                 THEN (EXTRACT(EPOCH FROM (COALESCE($5, clock_out) - COALESCE($4, clock_in))) / 3600.0)
                 ELSE COALESCE($3, planned_hours)
             END,
-            notes = COALESCE($6, notes)
+            notes = COALESCE($10, notes)
         WHERE inquiry_id = $1 AND employee_id = $2
         "#,
     )
@@ -681,6 +715,10 @@ pub(crate) async fn update_employee_assignment(
     .bind(planned_hours)
     .bind(clock_in)
     .bind(clock_out)
+    .bind(start_time)
+    .bind(end_time)
+    .bind(break_minutes)
+    .bind(computed_actual_hours)
     .bind(notes)
     .execute(pool)
     .await;
@@ -692,8 +730,11 @@ pub(crate) async fn update_employee_assignment(
 #[derive(Debug, sqlx::FromRow)]
 pub(crate) struct UpdatedAssignmentRow {
     pub planned_hours: f64,
-    pub clock_in: Option<DateTime<Utc>>,
-    pub clock_out: Option<DateTime<Utc>>,
+    pub clock_in: Option<chrono::NaiveTime>,
+    pub clock_out: Option<chrono::NaiveTime>,
+    pub start_time: Option<chrono::NaiveTime>,
+    pub end_time: Option<chrono::NaiveTime>,
+    pub break_minutes: i32,
     pub actual_hours: Option<f64>,
     pub notes: Option<String>,
 }
@@ -712,6 +753,9 @@ pub(crate) async fn fetch_updated_assignment(
         SELECT SUM(ide.planned_hours)::float8 AS planned_hours,
                MIN(CASE WHEN iday.day_number = 1 THEN ide.clock_in END) AS clock_in,
                MAX(CASE WHEN iday.day_number = 1 THEN ide.clock_out END) AS clock_out,
+               MIN(CASE WHEN iday.day_number = 1 THEN ide.start_time END) AS start_time,
+               MAX(CASE WHEN iday.day_number = 1 THEN ide.end_time END) AS end_time,
+               COALESCE(MAX(CASE WHEN iday.day_number = 1 THEN ide.break_minutes END), 0)::int AS break_minutes,
                SUM(CASE WHEN ide.clock_out IS NOT NULL AND ide.clock_in IS NOT NULL
                          THEN (EXTRACT(EPOCH FROM (ide.clock_out - ide.clock_in)) / 3600.0)
                          ELSE NULL END)::float8 AS actual_hours,
@@ -775,8 +819,11 @@ pub(crate) struct EmployeeAssignmentSnapshotRow {
     pub first_name: String,
     pub last_name: String,
     pub planned_hours: f64,
-    pub clock_in: Option<DateTime<Utc>>,
-    pub clock_out: Option<DateTime<Utc>>,
+    pub clock_in: Option<chrono::NaiveTime>,
+    pub clock_out: Option<chrono::NaiveTime>,
+    pub start_time: Option<chrono::NaiveTime>,
+    pub end_time: Option<chrono::NaiveTime>,
+    pub break_minutes: i32,
     pub actual_hours: Option<f64>,
     pub employee_clock_in: Option<DateTime<Utc>>,
     pub employee_clock_out: Option<DateTime<Utc>>,
@@ -798,18 +845,22 @@ pub(crate) async fn fetch_employee_assignments_snapshot(
                ide.planned_hours::float8 AS planned_hours,
                ide.clock_in,
                ide.clock_out,
+               ide.start_time,
+               ide.end_time,
+               COALESCE(ide.break_minutes, 0)::int AS break_minutes,
                CASE WHEN ide.clock_out IS NOT NULL AND ide.clock_in IS NOT NULL
                     THEN (EXTRACT(EPOCH FROM (ide.clock_out - ide.clock_in)) / 3600.0)::float8
                     ELSE NULL END AS actual_hours,
-               ide.clock_in AS employee_clock_in,
-               ide.clock_out AS employee_clock_out,
-               CASE WHEN ide.clock_out IS NOT NULL AND ide.clock_in IS NOT NULL
-                    THEN (EXTRACT(EPOCH FROM (ide.clock_out - ide.clock_in)) / 3600.0)::float8
+               ie.employee_clock_in,
+               ie.employee_clock_out,
+               CASE WHEN ie.employee_clock_out IS NOT NULL AND ie.employee_clock_in IS NOT NULL
+                    THEN EXTRACT(EPOCH FROM (ie.employee_clock_out - ie.employee_clock_in)) / 3600.0
                     ELSE NULL END AS employee_actual_hours,
                ide.notes
         FROM inquiry_day_employees ide
         JOIN inquiry_days iday ON ide.inquiry_day_id = iday.id
         JOIN employees e ON ide.employee_id = e.id
+        LEFT JOIN inquiry_employees ie ON ie.inquiry_id = iday.inquiry_id AND ie.employee_id = ide.employee_id
         WHERE iday.inquiry_id = $1 AND iday.day_number = 1
         ORDER BY e.last_name, e.first_name
         "#,
@@ -1036,13 +1087,17 @@ pub(crate) async fn sync_flat_inquiry_employees(
     // Re-insert from day-level data, aggregating per employee
     sqlx::query(
         r#"
-        INSERT INTO inquiry_employees (id, inquiry_id, employee_id, planned_hours, clock_in, clock_out, notes, created_at)
+        INSERT INTO inquiry_employees (id, inquiry_id, employee_id, planned_hours, clock_in, clock_out, start_time, end_time, break_minutes, actual_hours, notes, created_at)
         SELECT gen_random_uuid(),
                iday.inquiry_id,
                ide.employee_id,
                SUM(ide.planned_hours),
                MIN(CASE WHEN iday.day_number = 1 THEN ide.clock_in END),
                MAX(CASE WHEN iday.day_number = 1 THEN ide.clock_out END),
+               MIN(CASE WHEN iday.day_number = 1 THEN ide.start_time END),
+               MAX(CASE WHEN iday.day_number = 1 THEN ide.end_time END),
+               COALESCE(MAX(CASE WHEN iday.day_number = 1 THEN ide.break_minutes END), 0),
+               MAX(ide.actual_hours),
                STRING_AGG(ide.notes, '; ' ORDER BY iday.day_number),
                NOW()
         FROM inquiry_day_employees ide
