@@ -605,6 +605,11 @@ async fn send_invoice(
         .map_err(|_| ApiError::NotFound("Customer not found for inquiry".into()))?
         .ok_or_else(|| ApiError::NotFound("Customer not found for inquiry".into()))?;
 
+    // Customer may not have an email address (e.g. elderly walk-in customers)
+    let customer_email = customer_email.ok_or_else(|| ApiError::Validation(
+        "Kunde hat keine E-Mail-Adresse — Rechnung kann nicht per E-Mail versendet werden".into(),
+    ))?;
+
     let display_name = customer_name.as_deref().unwrap_or("Kunde");
     let invoice_num = &row.invoice_number;
     let subject = format!("Ihre Rechnung Nr. {invoice_num} — Aust Umzüge & Haushaltsauflösungen");
@@ -734,7 +739,7 @@ fn build_invoice_data_from_items(
 ) -> InvoiceData {
     let customer_name = match (ctx.customer.first_name.as_deref(), ctx.customer.last_name.as_deref()) {
         (Some(f), Some(l)) => format!("{f} {l}"),
-        _ => ctx.customer.name.clone().unwrap_or_else(|| ctx.customer.email.clone()),
+        _ => ctx.customer.name.clone().unwrap_or_else(|| ctx.customer.email.clone().unwrap_or_else(|| "Kunde".to_string())),
     };
 
     InvoiceData {

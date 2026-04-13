@@ -26,7 +26,7 @@ pub(super) struct ListCustomersQuery {
 #[derive(Debug, Serialize)]
 pub(super) struct CustomerListItem {
     id: Uuid,
-    email: String,
+    email: Option<String>,
     name: Option<String>,
     salutation: Option<String>,
     first_name: Option<String>,
@@ -84,7 +84,7 @@ pub(super) async fn list_customers(
 #[derive(Debug, Serialize)]
 pub(super) struct CustomerDetailResponse {
     id: Uuid,
-    email: String,
+    email: Option<String>,
     name: Option<String>,
     salutation: Option<String>,
     first_name: Option<String>,
@@ -272,11 +272,15 @@ pub(super) async fn update_customer(
         resolved_billing_address_id.map(Some) // set or don't touch
     };
 
+    // For email updates: Option<&str> where None = don't touch, Some("value") = set value,
+    // Some("") = clear to NULL. Trim the value; empty string after trim clears email.
+    let email_update = request.email.as_deref().map(|s| s.trim());
+
     let repo_row = admin_repo::update_customer(
         &state.db, id,
         request.name.as_deref(), request.salutation.as_deref(),
         request.first_name.as_deref(), request.last_name.as_deref(),
-        request.phone.as_deref(), request.email.as_deref(),
+        request.phone.as_deref(), email_update,
         request.customer_type.as_deref(), request.company_name.as_deref(),
         billing_address_id,
     )
@@ -297,7 +301,7 @@ pub(super) async fn update_customer(
 
 #[derive(Debug, Deserialize)]
 pub(super) struct CreateCustomerRequest {
-    email: String,
+    email: Option<String>,
     name: Option<String>,
     salutation: Option<String>,
     first_name: Option<String>,
@@ -311,11 +315,12 @@ pub(super) struct CreateCustomerRequest {
 ///
 /// **Caller**: Axum router / admin dashboard "Neuer Kunde" form.
 /// **Why**: Allows manually creating a customer before creating an inquiry for walk-in or
-/// phone inquiries that bypass the email pipeline.
+/// phone inquiries that bypass the email pipeline. Email is optional — older customers
+/// who don't have email can still be registered.
 ///
 /// # Parameters
 /// - `state` — shared AppState (DB pool)
-/// - `request` — JSON body with `email` (required), optional `name` and `phone`
+/// - `request` — JSON body with optional `email`, optional `name` and `phone`
 ///
 /// # Returns
 /// `201 Created` with the new `CustomerListItem` JSON.
@@ -331,8 +336,11 @@ pub(super) async fn create_customer(
     let id = Uuid::now_v7();
     let now = Utc::now();
 
+    // Trim the email and treat empty strings as None (no email)
+    let email = request.email.as_deref().map(str::trim).filter(|s| !s.is_empty());
+
     let repo_row = admin_repo::create_customer(
-        &state.db, id, &request.email,
+        &state.db, id, email,
         request.name.as_deref(), request.salutation.as_deref(),
         request.first_name.as_deref(), request.last_name.as_deref(),
         request.phone.as_deref(), request.customer_type.as_deref(),

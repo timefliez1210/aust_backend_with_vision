@@ -25,7 +25,7 @@ pub(super) struct ListEmailThreadsQuery {
 pub(super) struct EmailThreadListItem {
     id: Uuid,
     customer_id: Uuid,
-    customer_email: String,
+    customer_email: Option<String>,
     customer_name: Option<String>,
     inquiry_id: Option<Uuid>,
     subject: Option<String>,
@@ -92,7 +92,7 @@ pub(super) struct EmailThreadDetailResponse {
 pub(super) struct EmailThreadDetail {
     id: Uuid,
     customer_id: Uuid,
-    customer_email: String,
+    customer_email: Option<String>,
     customer_name: Option<String>,
     inquiry_id: Option<Uuid>,
     subject: Option<String>,

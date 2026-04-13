@@ -904,7 +904,7 @@ pub(crate) async fn fetch_scheduled_days(
 pub(crate) struct ListItemDbRow {
     pub id: Uuid,
     pub customer_name: Option<String>,
-    pub customer_email: String,
+    pub customer_email: Option<String>,
     pub customer_salutation: Option<String>,
     #[sqlx(default)]
     pub customer_type: Option<String>,

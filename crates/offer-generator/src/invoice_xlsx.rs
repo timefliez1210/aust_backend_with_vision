@@ -57,9 +57,9 @@ pub struct InvoiceData {
     pub service_date: Option<NaiveDate>,
     /// Customer full name for the address block (A8).
     pub customer_name: String,
-    /// Customer email address (A9).
-    pub customer_email: String,
-    /// Company name for business customers — rendered above customer name.
+    /// Customer email address (A9). Optional because some customers don't have email.
+    pub customer_email: Option<String>,
+    /// Company name for business customers — rendered above customer name in the address block.
     pub company_name: Option<String>,
     /// Attention line for business customers, e.g. `"z.Hd. Herrn Schmidt"`.
     pub attention_line: Option<String>,
@@ -224,16 +224,14 @@ fn build_cell_modifications(data: &InvoiceData) -> (Vec<(String, CellValue)>, Ve
         data.billing_city.clone()
     };
 
-    // Customer address block
+    // Address block: for business, A8=company A9=attention; for private, A8=name A9=email or fallback
     if let Some(ref company) = data.company_name {
         mods.push(("A8".into(), CellValue::Text(company.clone())));
         let attn = data.attention_line.clone().unwrap_or_default();
-        mods.push(("A9".into(), CellValue::Text(
-            if attn.is_empty() { data.customer_email.clone() } else { attn }
-        )));
+        mods.push(("A9".into(), CellValue::Text(if attn.is_empty() { data.customer_email.as_deref().unwrap_or("").to_string() } else { attn })));
     } else {
         mods.push(("A8".into(), CellValue::Text(data.customer_name.clone())));
-        mods.push(("A9".into(), CellValue::Text(data.customer_email.clone())));
+        mods.push(("A9".into(), CellValue::Text(data.customer_email.clone().unwrap_or_default())));
     }
     mods.push(("A10".into(), CellValue::Text(billing_street.clone())));
     mods.push(("A11".into(), CellValue::Text(billing_city.clone())));

@@ -14,7 +14,7 @@ use crate::ApiError;
 pub(crate) struct CustomerRow {
     #[allow(dead_code)]
     pub id: Uuid,
-    pub email: String,
+    pub email: Option<String>,
     pub name: Option<String>,
     pub salutation: Option<String>,
     pub first_name: Option<String>,
@@ -48,7 +48,7 @@ impl CustomerRow {
             (Some("Frau"), Some(ln)) => format!("Sehr geehrte Frau {ln},"),
             (Some("D"), Some(ln)) => format!("Sehr geehrte Person {ln},"),
             _ => {
-                let name = self.name.as_deref().unwrap_or(&self.email);
+                let name = self.name.as_deref().or(self.email.as_deref()).unwrap_or("Kunde");
                 crate::services::offer_builder::detect_salutation_and_greeting(name).1
             }
         }
@@ -70,7 +70,7 @@ impl CustomerRow {
             Some("Frau") => "Frau".to_string(),
             Some("D") => "Divers".to_string(),
             _ => {
-                let name = self.name.as_deref().unwrap_or(&self.email);
+                let name = self.name.as_deref().or(self.email.as_deref()).unwrap_or("Kunde");
                 crate::services::offer_builder::detect_salutation_and_greeting(name).0
             }
         }
@@ -101,7 +101,7 @@ impl CustomerRow {
             (Some(f), Some(l)) => format!("{f} {l}"),
             (Some(f), None) => f.to_string(),
             (None, Some(l)) => l.to_string(),
-            _ => self.name.clone().unwrap_or_else(|| self.email.clone()),
+            _ => self.name.clone().unwrap_or_else(|| self.email.clone().unwrap_or_else(|| "Kunde".to_string())),
         }
     }
 }

@@ -174,7 +174,7 @@ struct ListOrdersQuery {
 struct OrderListItem {
     id: Uuid,
     customer_name: Option<String>,
-    customer_email: String,
+    customer_email: Option<String>,
     origin_city: Option<String>,
     destination_city: Option<String>,
     #[serde(rename = "volume_m3")]

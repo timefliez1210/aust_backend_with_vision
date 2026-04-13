@@ -393,7 +393,7 @@ pub(crate) async fn fetch_sibling_percent(
 pub(crate) async fn fetch_customer_for_invoice(
     pool: &PgPool,
     inquiry_id: Uuid,
-) -> Result<Option<(String, Option<String>)>, sqlx::Error> {
+) -> Result<Option<(Option<String>, Option<String>)>, sqlx::Error> {
     sqlx::query_as(
         "SELECT c.email, c.name FROM customers c
          JOIN inquiries i ON i.customer_id = c.id
