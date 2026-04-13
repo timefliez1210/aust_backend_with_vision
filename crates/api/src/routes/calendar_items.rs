@@ -197,7 +197,7 @@ async fn create_item(
         return Err(ApiError::Validation("Titel darf nicht leer sein".into()));
     }
 
-    let category = body.category.unwrap_or_else(|| "internal".to_string());
+    let category = body.category.unwrap_or_else(|| "intern".to_string());
     let duration_hours = body.duration_hours.unwrap_or(0.0);
 
     let new_id = calendar_item_repo::insert_item(
