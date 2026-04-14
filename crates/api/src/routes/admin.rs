@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use aust_core::models::TokenClaims;
 use aust_offer_generator::{generate_timesheet_xlsx, TimesheetData, TimesheetEntry};
-use crate::repositories::{admin_repo, employee_repo, feedback_repo, review_repo};
+use crate::repositories::{admin_repo, employee_repo, feedback_repo, review_repo, invoice_reminder_repo};
 use crate::{ApiError, AppState};
 
 use super::admin_customers;
@@ -62,6 +62,8 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/inquiries/{id}/review-request", post(create_review_request))
         .route("/review-reminders", get(list_review_reminders))
         .route("/morning-workflow", get(morning_workflow))
+        .route("/invoice-reminders", get(list_invoice_reminders))
+        .route("/invoice-reminders/{id}/action", post(invoice_reminder_action))
 }
 
 // --- Dashboard ---
@@ -1394,6 +1396,150 @@ fn mime_from_ext(ext: &str) -> &'static str {
         "mp4"  => "video/mp4",
         _      => "application/octet-stream",
     }
+}
+
+// ---------------------------------------------------------------------------
+// Invoice reminders (dunning)
+// ---------------------------------------------------------------------------
+
+const DUNNING_LEVEL_LABEL: [&str; 3] = ["Zahlungserinnerung", "1. Mahnung", "2. Mahnung"];
+
+#[derive(Debug, Serialize)]
+struct InvoiceReminderItem {
+    id: Uuid,
+    invoice_id: Uuid,
+    inquiry_id: Uuid,
+    invoice_number: String,
+    level: i32,
+    level_label: &'static str,
+    remind_after: NaiveDate,
+    customer_name: Option<String>,
+    customer_email: Option<String>,
+}
+
+/// `GET /api/v1/admin/invoice-reminders` — List due payment reminders (admin only).
+///
+/// **Caller**: Admin dashboard on load.
+/// **Why**: Shows invoices that have been sent but not paid within 7-day intervals,
+/// so Alex can decide to send a dunning notice, snooze, or mark as paid.
+async fn list_invoice_reminders(
+    State(state): State<Arc<AppState>>,
+    Extension(_claims): Extension<TokenClaims>,
+) -> Result<Json<Vec<InvoiceReminderItem>>, ApiError> {
+    let rows = invoice_reminder_repo::fetch_due(&state.db).await?;
+    let items = rows.into_iter().map(|r| {
+        let label_idx = ((r.level - 1) as usize).min(2);
+        InvoiceReminderItem {
+            id: r.id,
+            invoice_id: r.invoice_id,
+            inquiry_id: r.inquiry_id,
+            invoice_number: r.invoice_number,
+            level: r.level,
+            level_label: DUNNING_LEVEL_LABEL[label_idx],
+            remind_after: r.remind_after,
+            customer_name: r.customer_name,
+            customer_email: r.customer_email,
+        }
+    }).collect();
+    Ok(Json(items))
+}
+
+#[derive(Debug, Deserialize)]
+struct InvoiceReminderActionBody {
+    /// "send" | "later" | "paid"
+    action: String,
+    /// Days to snooze when action = "later". Defaults to 7.
+    snooze_days: Option<u32>,
+}
+
+/// `POST /api/v1/admin/invoice-reminders/{id}/action` — Act on a due invoice reminder.
+///
+/// **Caller**: Admin dashboard dunning card buttons.
+/// **Why**: Lets Alex handle each overdue invoice individually — send a dunning email,
+/// postpone the reminder, or acknowledge payment — without automated bulk sending.
+///
+/// # Actions
+/// - `"send"` — sends the appropriate dunning email (Zahlungserinnerung / 1. Mahnung /
+///              2. Mahnung); advances to the next level 7 days from now, or closes after level 3
+/// - `"later"` — postpones the reminder by `snooze_days` (default 7)
+/// - `"paid"` — marks the invoice as paid and closes the reminder
+///
+/// # Returns
+/// `200 OK` with `{ "status": "sent" | "snoozed" | "paid" }`.
+async fn invoice_reminder_action(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<TokenClaims>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<InvoiceReminderActionBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&claims)?;
+
+    let row = invoice_reminder_repo::fetch_one(&state.db, id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Erinnerung nicht gefunden".into()))?;
+
+    match body.action.as_str() {
+        "send" => {
+            let email = row.customer_email.as_deref()
+                .ok_or_else(|| ApiError::BadRequest("Kunde hat keine E-Mail-Adresse".into()))?;
+            let name = row.customer_name.as_deref().unwrap_or("Sehr geehrte Damen und Herren");
+            let label_idx = ((row.level - 1) as usize).min(2);
+            let label = DUNNING_LEVEL_LABEL[label_idx];
+            let subject = format!("{label}: Rechnung {}", row.invoice_number);
+            let body_text = build_dunning_email(name, &row.invoice_number, label, row.level);
+
+            admin_emails::send_plain_email(&state.config.email, email, &subject, &body_text)
+                .await
+                .map_err(|e| ApiError::Internal(format!("E-Mail-Versand fehlgeschlagen: {e}")))?;
+
+            let next = Utc::now().date_naive() + chrono::Days::new(7);
+            invoice_reminder_repo::advance(&state.db, id, next).await?;
+            Ok(Json(serde_json::json!({ "status": "sent", "level": row.level })))
+        }
+        "later" => {
+            let days = body.snooze_days.unwrap_or(7);
+            let remind_after = Utc::now().date_naive() + chrono::Days::new(days as u64);
+            invoice_reminder_repo::snooze(&state.db, id, remind_after).await?;
+            Ok(Json(serde_json::json!({ "status": "snoozed", "remind_after": remind_after.to_string() })))
+        }
+        "paid" => {
+            // Mark invoice as paid (reuses invoice_repo)
+            use crate::repositories::invoice_repo;
+            let now = Utc::now();
+            invoice_repo::mark_paid(&state.db, row.invoice_id, now).await?;
+            // Check if all invoices for this inquiry are now paid
+            let unpaid = invoice_repo::count_unpaid(&state.db, row.inquiry_id).await?;
+            if unpaid == 0 {
+                invoice_repo::transition_inquiry_to_paid(&state.db, row.inquiry_id, now).await?;
+            }
+            invoice_reminder_repo::close(&state.db, id).await?;
+            Ok(Json(serde_json::json!({ "status": "paid" })))
+        }
+        _ => Err(ApiError::BadRequest("Ungültige Aktion. Erlaubt: send, later, paid".into())),
+    }
+}
+
+fn build_dunning_email(name: &str, invoice_number: &str, label: &str, level: i32) -> String {
+    let urgency = match level {
+        1 => "Möglicherweise ist die Zahlung in Bearbeitung — bitte prüfen Sie Ihre Unterlagen.",
+        2 => "Wir bitten Sie dringend, den ausstehenden Betrag umgehend zu begleichen.",
+        _ => "Dies ist unsere letzte Erinnerung vor weiteren rechtlichen Schritten.",
+    };
+    format!(
+        "Guten Tag {name},\n\n\
+         {label} für Rechnung {invoice_number}\n\n\
+         laut unseren Unterlagen ist die oben genannte Rechnung noch offen.\n\
+         {urgency}\n\n\
+         Sollten Sie die Zahlung bereits veranlasst haben, bitten wir Sie, \
+         diese E-Mail als gegenstandslos zu betrachten.\n\n\
+         Bei Fragen stehen wir Ihnen gerne zur Verfügung.\n\n\
+         Mit freundlichen Grüßen\n\
+         Ihr Team von Aust Umzüge & Haushaltsauflösungen",
+        name = name,
+        label = label,
+        invoice_number = invoice_number,
+        urgency = urgency,
+    )
 }
 
 // ---------------------------------------------------------------------------

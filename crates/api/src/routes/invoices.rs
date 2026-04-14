@@ -652,6 +652,11 @@ async fn send_invoice(
     // Auto-transition inquiry to 'invoiced' if still in an earlier stage
     invoice_repo::transition_inquiry_to_invoiced(&state.db, inquiry_id, now).await?;
 
+    // Schedule a payment-reminder dashboard alert for 7 days from now
+    let remind_after = now.date_naive() + chrono::Days::new(7);
+    let _ = crate::repositories::invoice_reminder_repo::create(&state.db, inv_id, remind_after).await;
+    // (non-fatal — invoice sending succeeds even if reminder creation fails)
+
     let updated_row = fetch_invoice_row(&state.db, inv_id).await?;
     let offer_netto = get_offer_netto(&state.db, inquiry_id).await?;
     Ok(Json(build_invoice_response(updated_row, offer_netto)))

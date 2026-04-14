@@ -19,6 +19,7 @@ pub(crate) mod inquiry_repo;
 pub(crate) mod invoice_repo;
 pub(crate) mod offer_repo;
 pub(crate) mod review_repo;
+pub(crate) mod invoice_reminder_repo;
 
 // Re-export row types that are used across multiple modules.
 pub(crate) use address_repo::AddressRow;
