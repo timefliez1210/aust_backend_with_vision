@@ -11,8 +11,8 @@
 //! B8  Zeitraum…                   E8  Überstunden
 //! B9  Monat: | C9: {MM.YYYY}      E9  {overtime}
 //!
-//! B11 Datum | C11 Arbeitsbeginn | D11 Arbeitsende | E11 Arbeitsstunden
-//! B12…  date     clock_in          clock_out          actual_hours
+//! B11 Datum | C11 Arbeitsbeginn | D11 Arbeitsende | E11 Pause (Min.) | F11 Arbeitsstunden
+//! B12…  date     clock_in          clock_out          break_minutes      actual_hours
 //! ```
 //!
 //! Times are converted from UTC to CET (UTC+1). DST is not accounted for;
@@ -37,6 +37,8 @@ pub struct TimesheetEntry {
     pub clock_in: Option<NaiveTime>,
     /// Clock-out time. `None` if not recorded.
     pub clock_out: Option<NaiveTime>,
+    /// Break duration in minutes — deducted from clock_in/clock_out derived hours.
+    pub break_minutes: i32,
     /// Pre-computed actual hours. Used when clock times are absent.
     pub actual_hours: Option<f64>,
 }
@@ -126,12 +128,13 @@ pub fn generate_timesheet_xlsx(data: &TimesheetData) -> Result<Vec<u8>, OfferErr
 // ---------------------------------------------------------------------------
 
 /// Returns the effective hours for an entry:
-/// computed from clock_in/clock_out if both present, otherwise actual_hours.
+/// computed from clock_in/clock_out minus break_minutes if both times present,
+/// otherwise falls back to the pre-computed actual_hours.
 fn effective_hours(e: &TimesheetEntry) -> Option<f64> {
     if let (Some(ci), Some(co)) = (e.clock_in, e.clock_out) {
         let secs = (co - ci).num_seconds();
         if secs > 0 {
-            return Some(secs as f64 / 3600.0);
+            return Some(secs as f64 / 3600.0 - e.break_minutes as f64 / 60.0);
         }
     }
     e.actual_hours
@@ -228,11 +231,12 @@ fn build_sheet_xml(
     rows.push(row(
         11,
         &format!(
-            "{}{}{}{}",
+            "{}{}{}{}{}",
             str_cell("B11", "Datum", true),
             str_cell("C11", "Arbeitsbeginn", true),
             str_cell("D11", "Arbeitsende", true),
-            str_cell("E11", "Arbeitsstunden", true)
+            str_cell("E11", "Pause (Min.)", true),
+            str_cell("F11", "Arbeitsstunden", true)
         ),
     ));
 
@@ -252,8 +256,11 @@ fn build_sheet_xml(
         if let Some(cout) = &clock_out_str {
             cells += &str_cell(&format!("D{r}"), cout, false);
         }
+        if entry.break_minutes > 0 {
+            cells += &num_cell(&format!("E{r}"), entry.break_minutes as f64);
+        }
         if let Some(h) = hours {
-            cells += &num_cell(&format!("E{r}"), h);
+            cells += &num_cell(&format!("F{r}"), h);
         }
         rows.push(row(r, &cells));
     }
@@ -266,7 +273,8 @@ fn build_sheet_xml(
 <col min="2" max="2" width="22" customWidth="1"/>
 <col min="3" max="3" width="14" customWidth="1"/>
 <col min="4" max="4" width="14" customWidth="1"/>
-<col min="5" max="5" width="18" customWidth="1"/>
+<col min="5" max="5" width="14" customWidth="1"/>
+<col min="6" max="6" width="18" customWidth="1"/>
 </cols>
 <sheetData>
 {rows}

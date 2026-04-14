@@ -630,8 +630,11 @@ async fn employee_hours_summary(
                 "destination_city": r.destination_city,
                 "booking_date": r.booking_date,
                 "planned_hours": r.planned_hours,
+                "start_time": r.start_time,
+                "end_time": r.end_time,
                 "clock_in": r.clock_in,
                 "clock_out": r.clock_out,
+                "break_minutes": r.break_minutes,
                 "actual_hours": r.actual_hours,
                 "status": r.inquiry_status,
             })
@@ -652,8 +655,11 @@ async fn employee_hours_summary(
                 "location": r.location,
                 "scheduled_date": r.scheduled_date,
                 "planned_hours": r.planned_hours,
+                "start_time": r.start_time,
+                "end_time": r.end_time,
                 "clock_in": r.clock_in,
                 "clock_out": r.clock_out,
+                "break_minutes": r.break_minutes,
                 "actual_hours": r.actual_hours,
                 "status": r.status,
             })
@@ -717,6 +723,7 @@ async fn employee_hours_export(
                 date,
                 clock_in: r.clock_in,
                 clock_out: r.clock_out,
+                break_minutes: r.break_minutes,
                 actual_hours: r.actual_hours,
             });
         }
@@ -727,6 +734,7 @@ async fn employee_hours_export(
                 date,
                 clock_in: r.clock_in,
                 clock_out: r.clock_out,
+                break_minutes: r.break_minutes,
                 actual_hours: r.actual_hours,
             });
         }

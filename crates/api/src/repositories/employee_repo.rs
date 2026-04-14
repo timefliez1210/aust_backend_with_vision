@@ -949,8 +949,11 @@ pub(crate) struct AdminHoursRow {
     pub destination_city: Option<String>,
     pub booking_date: Option<NaiveDate>,
     pub planned_hours: f64,
+    pub start_time: Option<NaiveTime>,
+    pub end_time: Option<NaiveTime>,
     pub clock_in: Option<NaiveTime>,
     pub clock_out: Option<NaiveTime>,
+    pub break_minutes: i32,
     pub actual_hours: Option<f64>,
     pub inquiry_status: String,
 }
@@ -973,11 +976,15 @@ pub(crate) async fn fetch_admin_hours(
                da.city AS destination_city,
                iday.day_date AS booking_date,
                ide.planned_hours::float8 AS planned_hours,
+               ide.start_time,
+               ide.end_time,
                ide.clock_in,
                ide.clock_out,
+               COALESCE(ide.break_minutes, 0) AS break_minutes,
                CASE WHEN ide.clock_out IS NOT NULL AND ide.clock_in IS NOT NULL
-                    THEN (EXTRACT(EPOCH FROM (ide.clock_out - ide.clock_in)) / 3600.0)::float8
-                    ELSE NULL END AS actual_hours,
+                    THEN (EXTRACT(EPOCH FROM (ide.clock_out - ide.clock_in)) / 3600.0
+                          - COALESCE(ide.break_minutes, 0)::float8 / 60.0)::float8
+                    ELSE ide.actual_hours END AS actual_hours,
                i.status AS inquiry_status
         FROM inquiry_day_employees ide
         JOIN inquiry_days iday ON ide.inquiry_day_id = iday.id
@@ -1007,8 +1014,11 @@ pub(crate) struct AdminCalendarItemHoursRow {
     pub location: Option<String>,
     pub scheduled_date: Option<NaiveDate>,
     pub planned_hours: f64,
+    pub start_time: Option<NaiveTime>,
+    pub end_time: Option<NaiveTime>,
     pub clock_in: Option<NaiveTime>,
     pub clock_out: Option<NaiveTime>,
+    pub break_minutes: i32,
     pub actual_hours: Option<f64>,
     pub status: String,
 }
@@ -1031,11 +1041,15 @@ pub(crate) async fn fetch_admin_calendar_item_hours(
                ci.location,
                cday.day_date AS scheduled_date,
                cdde.planned_hours::float8 AS planned_hours,
+               cdde.start_time,
+               cdde.end_time,
                cdde.clock_in,
                cdde.clock_out,
+               COALESCE(cdde.break_minutes, 0) AS break_minutes,
                CASE WHEN cdde.clock_out IS NOT NULL AND cdde.clock_in IS NOT NULL
-                    THEN (EXTRACT(EPOCH FROM (cdde.clock_out - cdde.clock_in)) / 3600.0)::float8
-                    ELSE NULL END AS actual_hours,
+                    THEN (EXTRACT(EPOCH FROM (cdde.clock_out - cdde.clock_in)) / 3600.0
+                          - COALESCE(cdde.break_minutes, 0)::float8 / 60.0)::float8
+                    ELSE cdde.actual_hours END AS actual_hours,
                ci.status
         FROM calendar_item_day_employees cdde
         JOIN calendar_item_days cday ON cdde.calendar_item_day_id = cday.id
