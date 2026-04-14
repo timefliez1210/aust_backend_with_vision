@@ -441,7 +441,7 @@ pub(super) async fn compose_email(
 /// # Errors
 /// Returns `Err(String)` describing the failure if building the message or the SMTP
 /// transmission fails.
-async fn send_plain_email(
+pub(crate) async fn send_plain_email(
     email_config: &aust_core::config::EmailConfig,
     to: &str,
     subject: &str,

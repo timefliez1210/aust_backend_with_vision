@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use aust_core::models::TokenClaims;
 use aust_offer_generator::{generate_timesheet_xlsx, TimesheetData, TimesheetEntry};
-use crate::repositories::{admin_repo, employee_repo, feedback_repo};
+use crate::repositories::{admin_repo, employee_repo, feedback_repo, review_repo};
 use crate::{ApiError, AppState};
 
 use super::admin_customers;
@@ -59,6 +59,8 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/feedback", get(list_feedback).post(create_feedback))
         .route("/feedback/{id}", get(get_feedback).patch(patch_feedback))
         .route("/feedback/{id}/attachments/{idx}", get(download_feedback_attachment))
+        .route("/inquiries/{id}/review-request", post(create_review_request))
+        .route("/review-reminders", get(list_review_reminders))
 }
 
 // --- Dashboard ---
@@ -71,6 +73,7 @@ struct DashboardResponse {
     total_customers: i64,
     recent_activity: Vec<ActivityItem>,
     conflict_dates: Vec<ConflictDate>,
+    pending_review_count: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -150,6 +153,11 @@ async fn dashboard(
         });
     }
 
+    let pending_review_count = review_repo::fetch_pending_reminders(&state.db)
+        .await
+        .map(|rows| rows.len())
+        .unwrap_or(0);
+
     Ok(Json(DashboardResponse {
         open_quotes,
         pending_offers,
@@ -157,6 +165,7 @@ async fn dashboard(
         total_customers,
         recent_activity,
         conflict_dates,
+        pending_review_count,
     }))
 }
 
@@ -1384,6 +1393,128 @@ fn mime_from_ext(ext: &str) -> &'static str {
         "mp4"  => "video/mp4",
         _      => "application/octet-stream",
     }
+}
+
+// ---------------------------------------------------------------------------
+// Review requests
+// ---------------------------------------------------------------------------
+
+/// Google-review link sent to customers in the review request email.
+/// Direct write-a-review URL for Aust Umzüge & Haushaltsauflösungen.
+const GOOGLE_REVIEW_URL: &str =
+    "https://www.google.com/search?q=Aust+Umz%C3%BCge+%26+Haushaltsaufl%C3%B6sungen+Reviews";
+
+#[derive(Debug, Deserialize)]
+struct CreateReviewRequestBody {
+    /// "now" — send immediately; "later" — schedule reminder; "skip" — do nothing.
+    action: String,
+    /// Only required when `action == "later"`. Number of days until the reminder appears.
+    remind_after_days: Option<u32>,
+}
+
+/// `POST /api/v1/admin/inquiries/{id}/review-request` — Send or schedule a Google-review email.
+///
+/// **Caller**: Admin inquiry detail page — popup shown after marking inquiry `completed`.
+/// **Why**: Lets Alex decide immediately whether to solicit a review, defer the reminder,
+/// or skip entirely without requiring a separate "cronjob" process.
+///
+/// # Body
+/// ```json
+/// { "action": "now" }
+/// { "action": "later", "remind_after_days": 3 }
+/// { "action": "skip" }
+/// ```
+///
+/// # Returns
+/// `200 OK` with `{ "status": "sent" | "pending" | "skipped" }`.
+async fn create_review_request(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<TokenClaims>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<CreateReviewRequestBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&claims)?;
+
+    // Fetch customer linked to this inquiry
+    let customer = crate::repositories::customer_repo::fetch_by_inquiry_id(&state.db, id).await?;
+
+    match body.action.as_str() {
+        "now" => {
+            let customer_email = customer
+                .email
+                .as_deref()
+                .ok_or_else(|| ApiError::BadRequest("Kunde hat keine E-Mail-Adresse".into()))?;
+            let customer_name = customer.display_name();
+            let subject = "Wie war Ihr Umzug? Wir freuen uns über Ihre Bewertung!";
+            let body_text = format!(
+                "Guten Tag {name},\n\n\
+                 vielen Dank, dass Sie Aust Umzüge & Haushaltsauflösungen für Ihren Umzug gewählt haben.\n\n\
+                 Wir würden uns sehr freuen, wenn Sie uns eine kurze Bewertung hinterlassen würden:\n\
+                 {url}\n\n\
+                 Ihre Meinung hilft uns, unsere Dienstleistungen stetig zu verbessern.\n\n\
+                 Mit freundlichen Grüßen\n\
+                 Ihr Team von Aust Umzüge & Haushaltsauflösungen",
+                name = customer_name,
+                url = GOOGLE_REVIEW_URL,
+            );
+
+            admin_emails::send_plain_email(&state.config.email, customer_email, subject, &body_text)
+                .await
+                .map_err(|e| ApiError::Internal(format!("E-Mail-Versand fehlgeschlagen: {e}")))?;
+
+            review_repo::upsert(
+                &state.db, id, "sent", None, Some(Utc::now()),
+            ).await?;
+
+            Ok(Json(serde_json::json!({ "status": "sent" })))
+        }
+        "later" => {
+            let days = body.remind_after_days.unwrap_or(3);
+            let remind_after = Utc::now().date_naive() + chrono::Days::new(days as u64);
+            review_repo::upsert(&state.db, id, "pending", Some(remind_after), None).await?;
+            Ok(Json(serde_json::json!({ "status": "pending", "remind_after": remind_after.to_string() })))
+        }
+        "skip" => {
+            review_repo::upsert(&state.db, id, "skipped", None, None).await?;
+            Ok(Json(serde_json::json!({ "status": "skipped" })))
+        }
+        _ => Err(ApiError::BadRequest(
+            "Ungültige Aktion. Erlaubt: now, later, skip".into(),
+        )),
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ReviewReminderItem {
+    inquiry_id: Uuid,
+    remind_after: NaiveDate,
+    customer_name: Option<String>,
+    customer_email: Option<String>,
+}
+
+/// `GET /api/v1/admin/review-reminders` — List overdue review request reminders.
+///
+/// **Caller**: Admin dashboard widget; shown when `pending_review_count > 0`.
+/// **Why**: Surfaces inquiries where Alex chose "Später" and the reminder date has arrived.
+///
+/// # Returns
+/// `200 OK` with array of `{ inquiry_id, remind_after, customer_name, customer_email }`.
+async fn list_review_reminders(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<TokenClaims>,
+) -> Result<Json<Vec<ReviewReminderItem>>, ApiError> {
+    require_admin(&claims)?;
+    let rows = review_repo::fetch_pending_reminders(&state.db).await?;
+    let items = rows
+        .into_iter()
+        .map(|r| ReviewReminderItem {
+            inquiry_id: r.inquiry_id,
+            remind_after: r.remind_after,
+            customer_name: r.customer_name,
+            customer_email: r.customer_email,
+        })
+        .collect();
+    Ok(Json(items))
 }
 
 #[cfg(test)]
