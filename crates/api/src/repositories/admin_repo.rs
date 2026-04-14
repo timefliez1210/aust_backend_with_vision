@@ -178,7 +178,7 @@ pub(crate) async fn fetch_capacity_override(
 #[derive(Debug, FromRow)]
 pub(crate) struct CustomerListItem {
     pub id: Uuid,
-    pub email: String,
+    pub email: Option<String>,
     pub name: Option<String>,
     pub salutation: Option<String>,
     pub first_name: Option<String>,
@@ -343,8 +343,18 @@ pub(crate) async fn update_customer(
 ) -> Result<Option<CustomerListItem>, sqlx::Error> {
     // $10 = do_update_billing: true if caller wants to change billing_address_id
     // $11 = new_billing_address_id: the value to set (NULL to clear)
-    let do_update = billing_address_id.is_some();
-    let new_value = billing_address_id.flatten();
+    // $12 = do_update_email: true if caller wants to change email
+    // $13 = new_email: the value to set (NULL to clear)
+    // When email is provided in the request (even as empty string), we update it.
+    // When email is omitted (None), we leave it unchanged.
+    let do_update_billing = billing_address_id.is_some();
+    let new_billing = billing_address_id.flatten();
+
+    // Treat the email update similarly: Option<&str> where None means
+    // "don't touch" and Some(value) means "set to this value".
+    // An empty string Some("") means "clear the email".
+    let do_update_email = email.is_some();
+    let new_email: Option<&str> = email.filter(|s| !s.is_empty());
 
     sqlx::query_as(
         r#"
@@ -354,10 +364,10 @@ pub(crate) async fn update_customer(
             first_name = COALESCE($4, first_name),
             last_name = COALESCE($5, last_name),
             phone = COALESCE($6, phone),
-            email = COALESCE($7, email),
-            customer_type = COALESCE($8, customer_type),
-            company_name = COALESCE($9, company_name),
-            billing_address_id = CASE WHEN $10 THEN $11 ELSE billing_address_id END
+            email = CASE WHEN $7 THEN $8 ELSE email END,
+            customer_type = COALESCE($9, customer_type),
+            company_name = COALESCE($10, company_name),
+            billing_address_id = CASE WHEN $11 THEN $12 ELSE billing_address_id END
         WHERE id = $1
         RETURNING id, email, name, salutation, first_name, last_name, phone, customer_type, company_name, billing_address_id, created_at
         "#,
@@ -368,20 +378,24 @@ pub(crate) async fn update_customer(
     .bind(first_name)
     .bind(last_name)
     .bind(phone)
-    .bind(email)
+    .bind(do_update_email)
+    .bind(new_email)
     .bind(customer_type)
     .bind(company_name)
-    .bind(do_update)
-    .bind(new_value)
+    .bind(do_update_billing)
+    .bind(new_billing)
     .fetch_optional(pool)
     .await
 }
 
 /// Create a new customer.
+///
+/// `email` is optional — when `None`, the customer is created without an email
+/// address (useful for walk-in or phone customers who don't have email).
 pub(crate) async fn create_customer(
     pool: &PgPool,
     id: Uuid,
-    email: &str,
+    email: Option<&str>,
     name: Option<&str>,
     salutation: Option<&str>,
     first_name: Option<&str>,
@@ -430,7 +444,7 @@ pub(crate) async fn delete_customer(pool: &PgPool, id: Uuid) -> Result<u64, sqlx
 pub(crate) struct OrderListItem {
     pub id: Uuid,
     pub customer_name: Option<String>,
-    pub customer_email: String,
+    pub customer_email: Option<String>,
     pub origin_city: Option<String>,
     pub destination_city: Option<String>,
     pub estimated_volume_m3: Option<f64>,
@@ -661,7 +675,7 @@ pub(crate) async fn delete_user(pool: &PgPool, id: Uuid) -> Result<u64, sqlx::Er
 pub(crate) struct EmailThreadListItem {
     pub id: Uuid,
     pub customer_id: Uuid,
-    pub customer_email: String,
+    pub customer_email: Option<String>,
     pub customer_name: Option<String>,
     pub inquiry_id: Option<Uuid>,
     pub subject: Option<String>,
@@ -729,7 +743,7 @@ pub(crate) async fn count_email_threads(pool: &PgPool, search: &str) -> Result<i
 pub(crate) struct EmailThreadDetail {
     pub id: Uuid,
     pub customer_id: Uuid,
-    pub customer_email: String,
+    pub customer_email: Option<String>,
     pub customer_name: Option<String>,
     pub inquiry_id: Option<Uuid>,
     pub subject: Option<String>,

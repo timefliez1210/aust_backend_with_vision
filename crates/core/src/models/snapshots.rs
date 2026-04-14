@@ -104,7 +104,7 @@ pub struct InquiryDaySnapshot {
 pub struct InquiryListItem {
     pub id: Uuid,
     pub customer_name: Option<String>,
-    pub customer_email: String,
+    pub customer_email: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub salutation: Option<String>,
     pub origin_city: Option<String>,
@@ -128,7 +128,7 @@ pub struct CustomerSnapshot {
     pub salutation: Option<String>,
     pub first_name: Option<String>,
     pub last_name: Option<String>,
-    pub email: String,
+    pub email: Option<String>,
     pub phone: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub customer_type: Option<String>,

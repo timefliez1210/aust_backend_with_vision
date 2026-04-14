@@ -169,7 +169,8 @@ pub struct Customer {
     /// UUID v7 primary key (time-ordered for efficient B-tree indexing).
     pub id: Uuid,
     /// Unique email address; used as the primary business identifier.
-    pub email: String,
+    /// May be None for walk-in or phone customers who don't have email.
+    pub email: Option<String>,
     /// Full display name (Vorname + Nachname); kept for display and backwards compat.
     pub name: Option<String>,
     /// Explicit salutation chosen by the customer: "Herr", "Frau", or "D" (divers).
@@ -215,9 +216,11 @@ impl Customer {
 /// accidentally supplying server-generated fields like `id` or timestamps.
 #[derive(Debug, Clone, Serialize, Deserialize, Validate)]
 pub struct CreateCustomer {
-    /// Must be a syntactically valid email address.
+    /// Email address; optional because some customers (especially elderly) may not have one.
+    /// When present, must be unique across all customers. NULL values are allowed
+    /// and do not conflict with each other under the UNIQUE constraint.
     #[validate(email(message = "Ungültige E-Mail-Adresse"))]
-    pub email: String,
+    pub email: Option<String>,
     pub name: Option<String>,
     pub salutation: Option<String>,
     pub first_name: Option<String>,

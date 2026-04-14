@@ -64,7 +64,7 @@ pub(crate) struct TelegramSummary {
 pub(crate) struct GeneratedOffer {
     pub offer: Offer,
     pub pdf_bytes: Vec<u8>,
-    pub customer_email: String,
+    pub customer_email: Option<String>,
     pub customer_name: String,
     pub summary: TelegramSummary,
 }

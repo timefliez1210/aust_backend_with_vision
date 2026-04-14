@@ -47,7 +47,8 @@ pub struct OfferData {
     /// Customer phone number (cell B18).
     pub customer_phone: String,
     /// Customer e-mail address (cell F18, same row as phone — rendered as plain text).
-    pub customer_email: String,
+    /// Optional because some customers don't have email.
+    pub customer_email: Option<String>,
     /// Company name for business customers — rendered above customer name in the address block.
     /// When set, A8 = company name, A9 = "z.Hd. …" attention line.
     #[serde(default)]
@@ -363,7 +364,10 @@ fn build_cell_modifications(
     mods.push(("B17".into(), CellValue::Text(data.moving_date.clone())));
     mods.push(("B18".into(), CellValue::Text(data.customer_phone.clone())));
     // E-Mail on the same row as the phone number (F18), matching the template label at E18.
-    mods.push(("F18".into(), CellValue::StyledText(data.customer_email.clone(), "0")));
+    // Only write email if present; customers without email leave this cell empty.
+    if let Some(ref email) = data.customer_email {
+        mods.push(("F18".into(), CellValue::StyledText(email.clone(), "0")));
+    }
 
     // Greeting
     mods.push(("A20".into(), CellValue::Text(data.greeting.clone())));
@@ -1644,7 +1648,7 @@ mod tests {
             customer_street: "Musterstr. 1".to_string(),
             customer_city: "31135 Hildesheim".to_string(),
             customer_phone: "+491234567890".to_string(),
-            customer_email: "max@example.com".to_string(),
+            customer_email: Some("max@example.com".to_string()),
             company_name: None,
             attention_line: None,
             greeting: "Sehr geehrter Herr Mustermann,".to_string(),

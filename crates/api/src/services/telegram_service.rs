@@ -85,12 +85,13 @@ pub(crate) async fn send_offer_to_telegram(config: &TelegramConfig, generated: &
     let origin_line = format_address_line(&s.origin_address, &s.origin_floor, s.origin_elevator);
     let dest_line = format_address_line(&s.dest_address, &s.dest_floor, s.dest_elevator);
 
+    let email_display = generated.customer_email.as_deref().unwrap_or("(keine E-Mail)");
     let mut caption = format!(
         "📋 *Neues Angebot erstellt*\n\n\
          *Kunde:* {}\n\
          *E-Mail:* `{}`",
         generated.customer_name,
-        generated.customer_email,
+        email_display,
     );
     if !s.customer_phone.is_empty() {
         caption.push_str(&format!("\n*Tel:* {}", s.customer_phone));
