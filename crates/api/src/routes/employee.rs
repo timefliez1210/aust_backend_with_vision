@@ -4,7 +4,7 @@ use axum::{
     routing::{get, post},
     Extension, Json, Router,
 };
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::collections::HashMap;
@@ -396,8 +396,8 @@ struct JobDetail {
     planned_hours: f64,
     notes: Option<String>,
     // Employee self-reported times (editable via PATCH /jobs/{id}/clock)
-    employee_clock_in: Option<DateTime<Utc>>,
-    employee_clock_out: Option<DateTime<Utc>>,
+    employee_clock_in: Option<NaiveTime>,
+    employee_clock_out: Option<NaiveTime>,
     employee_actual_hours: Option<f64>,
     // Team
     colleague_names: Vec<String>,
@@ -506,19 +506,26 @@ async fn patch_employee_clock(
     Path(inquiry_id): Path<Uuid>,
     Json(body): Json<ClockBody>,
 ) -> Result<StatusCode, ApiError> {
-    let parse_dt = |s: Option<String>| -> Result<Option<DateTime<Utc>>, ApiError> {
+    // Parse a time string — accepts HH:MM, HH:MM:SS, or ISO 8601 datetime (time portion extracted).
+    let parse_time = |s: Option<String>| -> Result<Option<NaiveTime>, ApiError> {
         match s {
             None => Ok(None),
             Some(ref v) if v.is_empty() => Ok(None),
-            Some(v) => v
-                .parse::<DateTime<Utc>>()
-                .map(Some)
-                .map_err(|_| ApiError::Validation(format!("Ungültiges Datumsformat: {v}"))),
+            Some(v) => {
+                // Try HH:MM:SS first, then HH:MM, then extract from ISO datetime
+                if let Ok(t) = v.parse::<NaiveTime>() {
+                    return Ok(Some(t));
+                }
+                if let Ok(dt) = v.parse::<DateTime<Utc>>() {
+                    return Ok(Some(dt.time()));
+                }
+                Err(ApiError::Validation(format!("Ungültiges Zeitformat: {v}")))
+            }
         }
     };
 
-    let clock_in = parse_dt(body.employee_clock_in)?;
-    let clock_out = parse_dt(body.employee_clock_out)?;
+    let clock_in = parse_time(body.employee_clock_in)?;
+    let clock_out = parse_time(body.employee_clock_out)?;
 
     let rows_affected = employee_repo::update_clock_times(&state.db, inquiry_id, claims.employee_id, clock_in, clock_out).await?;
 

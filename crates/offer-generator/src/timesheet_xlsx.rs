@@ -19,7 +19,7 @@
 //! for correct CEST handling add the `chrono-tz` crate later.
 
 use crate::OfferError;
-use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
+use chrono::{NaiveDate, NaiveTime};
 use std::io::{Cursor, Write};
 use zip::write::SimpleFileOptions;
 use zip::ZipWriter;
@@ -33,10 +33,10 @@ use zip::ZipWriter;
 pub struct TimesheetEntry {
     /// Calendar date of the assignment.
     pub date: NaiveDate,
-    /// Clock-in timestamp (UTC). `None` if not recorded.
-    pub clock_in: Option<DateTime<Utc>>,
-    /// Clock-out timestamp (UTC). `None` if not recorded.
-    pub clock_out: Option<DateTime<Utc>>,
+    /// Clock-in time. `None` if not recorded.
+    pub clock_in: Option<NaiveTime>,
+    /// Clock-out time. `None` if not recorded.
+    pub clock_out: Option<NaiveTime>,
     /// Pre-computed actual hours. Used when clock times are absent.
     pub actual_hours: Option<f64>,
 }
@@ -137,11 +137,9 @@ fn effective_hours(e: &TimesheetEntry) -> Option<f64> {
     e.actual_hours
 }
 
-/// Converts a UTC timestamp to CET (UTC+1) and formats as "HH:MM".
-/// DST is not applied; use chrono-tz for precise CEST handling.
-fn fmt_time_cet(dt: DateTime<Utc>) -> String {
-    let cet = FixedOffset::east_opt(3600).expect("valid offset");
-    dt.with_timezone(&cet).format("%H:%M").to_string()
+/// Formats a NaiveTime as "HH:MM".
+fn fmt_time(t: NaiveTime) -> String {
+    t.format("%H:%M").to_string()
 }
 
 /// Escapes special XML characters in a string value.
@@ -243,8 +241,8 @@ fn build_sheet_xml(
         let r = 12 + i;
         let date_str = entry.date.format("%d.%m.%Y").to_string();
 
-        let clock_in_str = entry.clock_in.map(fmt_time_cet);
-        let clock_out_str = entry.clock_out.map(fmt_time_cet);
+        let clock_in_str = entry.clock_in.map(fmt_time);
+        let clock_out_str = entry.clock_out.map(fmt_time);
         let hours = effective_hours(entry);
 
         let mut cells = str_cell(&format!("B{r}"), &date_str, false);

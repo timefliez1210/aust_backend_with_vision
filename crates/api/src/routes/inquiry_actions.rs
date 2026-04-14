@@ -737,6 +737,10 @@ pub(crate) async fn update_assignment(
         body.planned_hours,
         body.clock_in,
         body.clock_out,
+        body.start_time,
+        body.end_time,
+        body.break_minutes,
+        body.actual_hours,
         body.notes.as_deref(),
     )
     .await?;
@@ -753,6 +757,9 @@ pub(crate) async fn update_assignment(
         "planned_hours": row.planned_hours,
         "clock_in": row.clock_in,
         "clock_out": row.clock_out,
+        "start_time": row.start_time,
+        "end_time": row.end_time,
+        "break_minutes": row.break_minutes,
         "actual_hours": row.actual_hours,
         "notes": row.notes,
     })))

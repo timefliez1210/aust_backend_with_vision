@@ -391,6 +391,18 @@ struct DayEmployeeInput {
     planned_hours: Option<f64>,
     #[serde(default)]
     notes: Option<String>,
+    #[serde(default)]
+    start_time: Option<NaiveTime>,
+    #[serde(default)]
+    end_time: Option<NaiveTime>,
+    #[serde(default)]
+    clock_in: Option<NaiveTime>,
+    #[serde(default)]
+    clock_out: Option<NaiveTime>,
+    #[serde(default)]
+    break_minutes: i32,
+    #[serde(default)]
+    actual_hours: Option<f64>,
 }
 
 /// One employee assignment within a day, as returned to the client.
@@ -403,6 +415,17 @@ struct DayEmployeeResponse {
     planned_hours: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     notes: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start_time: Option<NaiveTime>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end_time: Option<NaiveTime>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    clock_in: Option<NaiveTime>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    clock_out: Option<NaiveTime>,
+    break_minutes: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    actual_hours: Option<f64>,
 }
 
 /// Input body for one day within a PUT /days request.
@@ -495,6 +518,8 @@ async fn put_inquiry_days(
         for emp in &d.employees {
             calendar_repo::insert_inquiry_day_employee(
                 &mut tx, day_id, emp.employee_id, emp.planned_hours, emp.notes.as_deref(),
+                emp.start_time, emp.end_time, emp.clock_in, emp.clock_out,
+                emp.break_minutes, emp.actual_hours,
             )
             .await
             .map_err(|e| ApiError::Internal(e.to_string()))?;
@@ -575,6 +600,8 @@ async fn put_calendar_item_days(
         for emp in &d.employees {
             calendar_repo::insert_calendar_item_day_employee(
                 &mut tx, day_id, emp.employee_id, emp.planned_hours, emp.notes.as_deref(),
+                emp.start_time, emp.end_time, emp.clock_in, emp.clock_out,
+                emp.break_minutes, emp.actual_hours,
             )
             .await
             .map_err(|e| ApiError::Internal(e.to_string()))?;
@@ -642,6 +669,12 @@ fn build_day_responses(
             last_name: e.last_name,
             planned_hours: e.planned_hours,
             notes: e.notes,
+            start_time: e.start_time,
+            end_time: e.end_time,
+            clock_in: e.clock_in,
+            clock_out: e.clock_out,
+            break_minutes: e.break_minutes,
+            actual_hours: e.actual_hours,
         });
     }
 

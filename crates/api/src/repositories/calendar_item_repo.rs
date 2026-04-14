@@ -39,8 +39,11 @@ pub(crate) struct CalendarItemEmployee {
     pub first_name: String,
     pub last_name: String,
     pub planned_hours: f64,
-    pub clock_in: Option<DateTime<Utc>>,
-    pub clock_out: Option<DateTime<Utc>>,
+    pub clock_in: Option<NaiveTime>,
+    pub clock_out: Option<NaiveTime>,
+    pub start_time: Option<NaiveTime>,
+    pub end_time: Option<NaiveTime>,
+    pub break_minutes: i32,
     pub actual_hours: Option<f64>,
     pub notes: Option<String>,
 }
@@ -277,22 +280,41 @@ pub(crate) async fn update_item_employee(
     calendar_item_id: Uuid,
     employee_id: Uuid,
     planned_hours: Option<f64>,
-    clock_in: Option<DateTime<Utc>>,
-    clock_out: Option<DateTime<Utc>>,
+    clock_in: Option<NaiveTime>,
+    clock_out: Option<NaiveTime>,
+    start_time: Option<NaiveTime>,
+    end_time: Option<NaiveTime>,
+    break_minutes: i32,
+    actual_hours_override: Option<f64>,
     notes: Option<&str>,
 ) -> Result<u64, sqlx::Error> {
+    // Derive actual_hours in Rust
+    let computed_actual_hours: Option<f64> = if let Some(ah) = actual_hours_override {
+        Some(ah)
+    } else if let (Some(ci), Some(co)) = (clock_in, clock_out) {
+        let duration_secs = (co - ci).num_seconds() as f64;
+        Some(duration_secs / 3600.0 - break_minutes as f64 / 60.0)
+    } else {
+        None
+    };
+
     // Update day-level table
     let result = sqlx::query(
         r#"
         UPDATE calendar_item_day_employees SET
-            clock_in  = COALESCE($4, clock_in),
-            clock_out = COALESCE($5, clock_out),
+            clock_in      = COALESCE($4, clock_in),
+            clock_out     = COALESCE($5, clock_out),
+            start_time    = COALESCE($6, start_time),
+            end_time      = COALESCE($7, end_time),
+            break_minutes = $8,
+            actual_hours  = $9,
             planned_hours = CASE
+                WHEN $9 IS NOT NULL THEN $9
                 WHEN COALESCE($4, clock_in) IS NOT NULL AND COALESCE($5, clock_out) IS NOT NULL
                 THEN (EXTRACT(EPOCH FROM (COALESCE($5, clock_out) - COALESCE($4, clock_in))) / 3600.0)
                 ELSE COALESCE($3, planned_hours)
             END,
-            notes = COALESCE($6, notes)
+            notes = COALESCE($10, notes)
         FROM calendar_item_days cday
         WHERE calendar_item_day_id = cday.id
           AND cday.calendar_item_id = $1
@@ -305,6 +327,10 @@ pub(crate) async fn update_item_employee(
     .bind(planned_hours)
     .bind(clock_in)
     .bind(clock_out)
+    .bind(start_time)
+    .bind(end_time)
+    .bind(break_minutes)
+    .bind(computed_actual_hours)
     .bind(notes)
     .execute(pool)
     .await?;
@@ -313,14 +339,19 @@ pub(crate) async fn update_item_employee(
     let _ = sqlx::query(
         r#"
         UPDATE calendar_item_employees SET
-            clock_in  = COALESCE($4, clock_in),
-            clock_out = COALESCE($5, clock_out),
+            clock_in      = COALESCE($4, clock_in),
+            clock_out     = COALESCE($5, clock_out),
+            start_time    = COALESCE($6, start_time),
+            end_time      = COALESCE($7, end_time),
+            break_minutes = $8,
+            actual_hours  = $9,
             planned_hours = CASE
+                WHEN $9 IS NOT NULL THEN $9
                 WHEN COALESCE($4, clock_in) IS NOT NULL AND COALESCE($5, clock_out) IS NOT NULL
                 THEN (EXTRACT(EPOCH FROM (COALESCE($5, clock_out) - COALESCE($4, clock_in))) / 3600.0)
                 ELSE COALESCE($3, planned_hours)
             END,
-            notes = COALESCE($6, notes)
+            notes = COALESCE($10, notes)
         WHERE calendar_item_id = $1 AND employee_id = $2
         "#,
     )
@@ -329,6 +360,10 @@ pub(crate) async fn update_item_employee(
     .bind(planned_hours)
     .bind(clock_in)
     .bind(clock_out)
+    .bind(start_time)
+    .bind(end_time)
+    .bind(break_minutes)
+    .bind(computed_actual_hours)
     .bind(notes)
     .execute(pool)
     .await;
@@ -353,6 +388,9 @@ pub(crate) async fn fetch_item_employee(
                SUM(cdde.planned_hours)::float8 AS planned_hours,
                MIN(CASE WHEN cday.day_number = 1 THEN cdde.clock_in END) AS clock_in,
                MAX(CASE WHEN cday.day_number = 1 THEN cdde.clock_out END) AS clock_out,
+               MIN(CASE WHEN cday.day_number = 1 THEN cdde.start_time END) AS start_time,
+               MAX(CASE WHEN cday.day_number = 1 THEN cdde.end_time END) AS end_time,
+               COALESCE(MAX(CASE WHEN cday.day_number = 1 THEN cdde.break_minutes END), 0)::int AS break_minutes,
                SUM(CASE WHEN cdde.clock_out IS NOT NULL AND cdde.clock_in IS NOT NULL
                          THEN (EXTRACT(EPOCH FROM (cdde.clock_out - cdde.clock_in)) / 3600.0)
                          ELSE NULL END)::float8 AS actual_hours,
@@ -430,6 +468,9 @@ pub(crate) async fn fetch_item_employees(
                SUM(cdde.planned_hours)::float8 AS planned_hours,
                MIN(CASE WHEN cday.day_number = 1 THEN cdde.clock_in END) AS clock_in,
                MAX(CASE WHEN cday.day_number = 1 THEN cdde.clock_out END) AS clock_out,
+               MIN(CASE WHEN cday.day_number = 1 THEN cdde.start_time END) AS start_time,
+               MAX(CASE WHEN cday.day_number = 1 THEN cdde.end_time END) AS end_time,
+               COALESCE(MAX(CASE WHEN cday.day_number = 1 THEN cdde.break_minutes END), 0)::int AS break_minutes,
                SUM(CASE WHEN cdde.clock_out IS NOT NULL AND cdde.clock_in IS NOT NULL
                          THEN (EXTRACT(EPOCH FROM (cdde.clock_out - cdde.clock_in)) / 3600.0)
                          ELSE NULL END)::float8 AS actual_hours,
@@ -468,12 +509,16 @@ pub(crate) async fn sync_flat_calendar_item_employees(
     // Re-insert from day-level data, aggregating per employee
     sqlx::query(
         r#"
-        INSERT INTO calendar_item_employees (calendar_item_id, employee_id, planned_hours, clock_in, clock_out, notes, created_at)
+        INSERT INTO calendar_item_employees (calendar_item_id, employee_id, planned_hours, clock_in, clock_out, start_time, end_time, break_minutes, actual_hours, notes, created_at)
         SELECT cday.calendar_item_id,
                cdde.employee_id,
                SUM(cdde.planned_hours),
                MIN(CASE WHEN cday.day_number = 1 THEN cdde.clock_in END),
                MAX(CASE WHEN cday.day_number = 1 THEN cdde.clock_out END),
+               MIN(CASE WHEN cday.day_number = 1 THEN cdde.start_time END),
+               MAX(CASE WHEN cday.day_number = 1 THEN cdde.end_time END),
+               COALESCE(MAX(CASE WHEN cday.day_number = 1 THEN cdde.break_minutes END), 0),
+               MAX(cdde.actual_hours),
                STRING_AGG(cdde.notes, '; ' ORDER BY cday.day_number),
                NOW()
         FROM calendar_item_day_employees cdde
