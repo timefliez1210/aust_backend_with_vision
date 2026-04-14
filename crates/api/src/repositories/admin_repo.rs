@@ -1096,3 +1096,116 @@ pub(crate) async fn delete_note(pool: &PgPool, id: Uuid) -> Result<u64, sqlx::Er
         .await?;
     Ok(result.rows_affected())
 }
+
+// ---------------------------------------------------------------------------
+// Morning workflow
+// ---------------------------------------------------------------------------
+
+/// Inquiry row returned by the morning-workflow query.
+///
+/// Includes the last working day, current status, latest invoice info,
+/// and whether a review-request was already handled.
+#[derive(Debug, FromRow)]
+pub(crate) struct MorningInquiryRow {
+    pub id: Uuid,
+    pub customer_name: Option<String>,
+    pub customer_email: Option<String>,
+    pub last_day: Option<NaiveDate>,
+    pub status: String,
+    pub invoice_status: Option<String>,
+    pub invoice_id: Option<Uuid>,
+    pub invoice_type: Option<String>,
+    pub has_review_request: bool,
+}
+
+/// Calendar-item row returned by the morning-workflow query.
+#[derive(Debug, FromRow)]
+pub(crate) struct MorningCalendarItemRow {
+    pub id: Uuid,
+    pub title: String,
+    pub last_day: Option<NaiveDate>,
+    pub status: String,
+}
+
+/// Returns inquiries whose last working day has already passed (within 14 days)
+/// but that still need action: not yet marked complete, invoice not sent, or review pending.
+///
+/// **Caller**: `routes::admin::morning_workflow`
+/// **Why**: Powers the "morning checklist" dialog — shown to admins on dashboard load.
+pub(crate) async fn fetch_morning_inquiries(pool: &PgPool) -> Result<Vec<MorningInquiryRow>, sqlx::Error> {
+    sqlx::query_as::<_, MorningInquiryRow>(
+        r#"
+        WITH last_inquiry_days AS (
+            SELECT inquiry_id, MAX(day_date) AS last_day
+            FROM inquiry_days
+            GROUP BY inquiry_id
+        ),
+        latest_invoices AS (
+            SELECT DISTINCT ON (inquiry_id)
+                inquiry_id, id, status, invoice_type
+            FROM invoices
+            ORDER BY inquiry_id, created_at DESC
+        )
+        SELECT
+            i.id,
+            c.name AS customer_name,
+            c.email AS customer_email,
+            COALESCE(ld.last_day, i.scheduled_date)        AS last_day,
+            i.status,
+            li.status                                       AS invoice_status,
+            li.id                                           AS invoice_id,
+            li.invoice_type,
+            EXISTS(
+                SELECT 1 FROM review_requests rr
+                WHERE rr.inquiry_id = i.id
+                  AND rr.status IN ('sent', 'skipped')
+            )                                               AS has_review_request
+        FROM inquiries i
+        LEFT JOIN customers c                ON c.id = i.customer_id
+        LEFT JOIN last_inquiry_days ld       ON ld.inquiry_id = i.id
+        LEFT JOIN latest_invoices li         ON li.inquiry_id = i.id
+        WHERE i.status IN ('scheduled', 'accepted', 'completed', 'invoiced')
+          AND COALESCE(ld.last_day, i.scheduled_date) < CURRENT_DATE
+          AND COALESCE(ld.last_day, i.scheduled_date) >= CURRENT_DATE - INTERVAL '14 days'
+          AND NOT (
+              i.status IN ('invoiced', 'paid')
+              AND EXISTS(
+                  SELECT 1 FROM review_requests rr
+                  WHERE rr.inquiry_id = i.id AND rr.status IN ('sent', 'skipped')
+              )
+          )
+        ORDER BY COALESCE(ld.last_day, i.scheduled_date) DESC
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// Returns calendar items whose last working day has already passed (within 14 days)
+/// and whose status is still 'scheduled' (not yet marked complete).
+///
+/// **Caller**: `routes::admin::morning_workflow`
+pub(crate) async fn fetch_morning_calendar_items(pool: &PgPool) -> Result<Vec<MorningCalendarItemRow>, sqlx::Error> {
+    sqlx::query_as::<_, MorningCalendarItemRow>(
+        r#"
+        WITH last_ci_days AS (
+            SELECT calendar_item_id, MAX(day_date) AS last_day
+            FROM calendar_item_days
+            GROUP BY calendar_item_id
+        )
+        SELECT
+            ci.id,
+            ci.title,
+            COALESCE(lcd.last_day, ci.scheduled_date) AS last_day,
+            ci.status
+        FROM calendar_items ci
+        LEFT JOIN last_ci_days lcd ON lcd.calendar_item_id = ci.id
+        WHERE ci.status = 'scheduled'
+          AND COALESCE(lcd.last_day, ci.scheduled_date) < CURRENT_DATE
+          AND COALESCE(lcd.last_day, ci.scheduled_date) >= CURRENT_DATE - INTERVAL '14 days'
+        ORDER BY COALESCE(lcd.last_day, ci.scheduled_date) DESC
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+}

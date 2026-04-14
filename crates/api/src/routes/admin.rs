@@ -61,6 +61,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/feedback/{id}/attachments/{idx}", get(download_feedback_attachment))
         .route("/inquiries/{id}/review-request", post(create_review_request))
         .route("/review-reminders", get(list_review_reminders))
+        .route("/morning-workflow", get(morning_workflow))
 }
 
 // --- Dashboard ---
@@ -1393,6 +1394,81 @@ fn mime_from_ext(ext: &str) -> &'static str {
         "mp4"  => "video/mp4",
         _      => "application/octet-stream",
     }
+}
+
+// ---------------------------------------------------------------------------
+// Morning workflow
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+struct MorningInquiryItem {
+    id: Uuid,
+    customer_name: Option<String>,
+    customer_email: Option<String>,
+    last_day: Option<NaiveDate>,
+    status: String,
+    invoice_status: Option<String>,
+    invoice_id: Option<Uuid>,
+    invoice_type: Option<String>,
+    has_review_request: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct MorningCalendarItem {
+    id: Uuid,
+    title: String,
+    last_day: Option<NaiveDate>,
+    status: String,
+}
+
+#[derive(Debug, Serialize)]
+struct MorningWorkflowResponse {
+    inquiries: Vec<MorningInquiryItem>,
+    calendar_items: Vec<MorningCalendarItem>,
+}
+
+/// `GET /api/v1/admin/morning-workflow` — Return jobs that ended but still need action.
+///
+/// **Caller**: Admin dashboard on load — powers the "Guten Morgen" checklist dialog.
+/// **Why**: Finds inquiries / calendar items whose last working day has already passed
+/// (within 14 days) but that aren't fully closed yet:
+///   - Inquiries still in 'scheduled' → need to be marked completed
+///   - Inquiries in 'completed' with no sent invoice → need invoice sent
+///   - Inquiries without a review request handled → need review step
+///   - Calendar items still 'scheduled' → need to be marked complete
+///
+/// # Returns
+/// `200 OK` with `{ inquiries: [...], calendar_items: [...] }`.
+async fn morning_workflow(
+    State(state): State<Arc<AppState>>,
+    Extension(_claims): Extension<TokenClaims>,
+) -> Result<Json<MorningWorkflowResponse>, ApiError> {
+    let (inq_rows, ci_rows) = tokio::try_join!(
+        admin_repo::fetch_morning_inquiries(&state.db),
+        admin_repo::fetch_morning_calendar_items(&state.db),
+    )
+    .map_err(|e| ApiError::Database(e))?;
+
+    let inquiries = inq_rows.into_iter().map(|r| MorningInquiryItem {
+        id: r.id,
+        customer_name: r.customer_name,
+        customer_email: r.customer_email,
+        last_day: r.last_day,
+        status: r.status,
+        invoice_status: r.invoice_status,
+        invoice_id: r.invoice_id,
+        invoice_type: r.invoice_type,
+        has_review_request: r.has_review_request,
+    }).collect();
+
+    let calendar_items = ci_rows.into_iter().map(|r| MorningCalendarItem {
+        id: r.id,
+        title: r.title,
+        last_day: r.last_day,
+        status: r.status,
+    }).collect();
+
+    Ok(Json(MorningWorkflowResponse { inquiries, calendar_items }))
 }
 
 // ---------------------------------------------------------------------------
