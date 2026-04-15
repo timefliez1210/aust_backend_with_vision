@@ -754,7 +754,7 @@ pub(crate) async fn update_assignment(
     Ok(Json(serde_json::json!({
         "employee_id": emp_id,
         "inquiry_id": id,
-        "planned_hours": row.planned_hours,
+        "planned_hours": row.planned_hours.unwrap_or(0.0),
         "clock_in": row.clock_in,
         "clock_out": row.clock_out,
         "start_time": row.start_time,

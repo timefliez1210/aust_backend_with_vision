@@ -38,7 +38,7 @@ pub(crate) struct CalendarItemEmployee {
     pub employee_id: Uuid,
     pub first_name: String,
     pub last_name: String,
-    pub planned_hours: f64,
+    pub planned_hours: Option<f64>,
     pub clock_in: Option<NaiveTime>,
     pub clock_out: Option<NaiveTime>,
     pub start_time: Option<NaiveTime>,
@@ -284,16 +284,17 @@ pub(crate) async fn update_item_employee(
     clock_out: Option<NaiveTime>,
     start_time: Option<NaiveTime>,
     end_time: Option<NaiveTime>,
-    break_minutes: i32,
+    break_minutes: Option<i32>,
     actual_hours_override: Option<f64>,
     notes: Option<&str>,
 ) -> Result<u64, sqlx::Error> {
     // Derive actual_hours in Rust
+    let break_min_f = break_minutes.unwrap_or(0) as f64;
     let computed_actual_hours: Option<f64> = if let Some(ah) = actual_hours_override {
         Some(ah)
     } else if let (Some(ci), Some(co)) = (clock_in, clock_out) {
         let duration_secs = (co - ci).num_seconds() as f64;
-        Some(duration_secs / 3600.0 - break_minutes as f64 / 60.0)
+        Some(duration_secs / 3600.0 - break_min_f / 60.0)
     } else {
         None
     };
@@ -306,7 +307,7 @@ pub(crate) async fn update_item_employee(
             clock_out     = COALESCE($5, clock_out),
             start_time    = COALESCE($6, start_time),
             end_time      = COALESCE($7, end_time),
-            break_minutes = $8,
+            break_minutes = COALESCE($8, break_minutes),
             actual_hours  = $9,
             planned_hours = CASE
                 WHEN $9 IS NOT NULL THEN $9
@@ -343,7 +344,7 @@ pub(crate) async fn update_item_employee(
             clock_out     = COALESCE($5, clock_out),
             start_time    = COALESCE($6, start_time),
             end_time      = COALESCE($7, end_time),
-            break_minutes = $8,
+            break_minutes = COALESCE($8, break_minutes),
             actual_hours  = $9,
             planned_hours = CASE
                 WHEN $9 IS NOT NULL THEN $9

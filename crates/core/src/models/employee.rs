@@ -78,8 +78,7 @@ pub struct UpdateAssignment {
     pub clock_out: Option<NaiveTime>,
     pub start_time: Option<NaiveTime>,
     pub end_time: Option<NaiveTime>,
-    #[serde(default)]
-    pub break_minutes: i32,
+    pub break_minutes: Option<i32>,
     pub actual_hours: Option<f64>,
     pub notes: Option<String>,
 }

@@ -114,8 +114,7 @@ struct UpdateEmployeeBody {
     clock_out: Option<NaiveTime>,
     start_time: Option<NaiveTime>,
     end_time: Option<NaiveTime>,
-    #[serde(default)]
-    break_minutes: i32,
+    break_minutes: Option<i32>,
     actual_hours: Option<f64>,
     notes: Option<String>,
 }
