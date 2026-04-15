@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use aust_core::models::TokenClaims;
 use aust_offer_generator::{generate_timesheet_xlsx, TimesheetData, TimesheetEntry};
-use crate::repositories::{admin_repo, employee_repo, feedback_repo};
+use crate::repositories::{admin_repo, employee_repo, feedback_repo, review_repo, invoice_reminder_repo};
 use crate::{ApiError, AppState};
 
 use super::admin_customers;
@@ -59,6 +59,11 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/feedback", get(list_feedback).post(create_feedback))
         .route("/feedback/{id}", get(get_feedback).patch(patch_feedback))
         .route("/feedback/{id}/attachments/{idx}", get(download_feedback_attachment))
+        .route("/inquiries/{id}/review-request", post(create_review_request))
+        .route("/review-reminders", get(list_review_reminders))
+        .route("/morning-workflow", get(morning_workflow))
+        .route("/invoice-reminders", get(list_invoice_reminders))
+        .route("/invoice-reminders/{id}/action", post(invoice_reminder_action))
 }
 
 // --- Dashboard ---
@@ -71,6 +76,7 @@ struct DashboardResponse {
     total_customers: i64,
     recent_activity: Vec<ActivityItem>,
     conflict_dates: Vec<ConflictDate>,
+    pending_review_count: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -150,6 +156,11 @@ async fn dashboard(
         });
     }
 
+    let pending_review_count = review_repo::fetch_pending_reminders(&state.db)
+        .await
+        .map(|rows| rows.len())
+        .unwrap_or(0);
+
     Ok(Json(DashboardResponse {
         open_quotes,
         pending_offers,
@@ -157,6 +168,7 @@ async fn dashboard(
         total_customers,
         recent_activity,
         conflict_dates,
+        pending_review_count,
     }))
 }
 
@@ -630,8 +642,11 @@ async fn employee_hours_summary(
                 "destination_city": r.destination_city,
                 "booking_date": r.booking_date,
                 "planned_hours": r.planned_hours,
+                "start_time": r.start_time,
+                "end_time": r.end_time,
                 "clock_in": r.clock_in,
                 "clock_out": r.clock_out,
+                "break_minutes": r.break_minutes,
                 "actual_hours": r.actual_hours,
                 "status": r.inquiry_status,
             })
@@ -652,8 +667,11 @@ async fn employee_hours_summary(
                 "location": r.location,
                 "scheduled_date": r.scheduled_date,
                 "planned_hours": r.planned_hours,
+                "start_time": r.start_time,
+                "end_time": r.end_time,
                 "clock_in": r.clock_in,
                 "clock_out": r.clock_out,
+                "break_minutes": r.break_minutes,
                 "actual_hours": r.actual_hours,
                 "status": r.status,
             })
@@ -717,6 +735,7 @@ async fn employee_hours_export(
                 date,
                 clock_in: r.clock_in,
                 clock_out: r.clock_out,
+                break_minutes: r.break_minutes,
                 actual_hours: r.actual_hours,
             });
         }
@@ -727,6 +746,7 @@ async fn employee_hours_export(
                 date,
                 clock_in: r.clock_in,
                 clock_out: r.clock_out,
+                break_minutes: r.break_minutes,
                 actual_hours: r.actual_hours,
             });
         }
@@ -1376,6 +1396,347 @@ fn mime_from_ext(ext: &str) -> &'static str {
         "mp4"  => "video/mp4",
         _      => "application/octet-stream",
     }
+}
+
+// ---------------------------------------------------------------------------
+// Invoice reminders (dunning)
+// ---------------------------------------------------------------------------
+
+const DUNNING_LEVEL_LABEL: [&str; 3] = ["Zahlungserinnerung", "1. Mahnung", "2. Mahnung"];
+
+#[derive(Debug, Serialize)]
+struct InvoiceReminderItem {
+    id: Uuid,
+    invoice_id: Uuid,
+    inquiry_id: Uuid,
+    invoice_number: String,
+    level: i32,
+    level_label: &'static str,
+    remind_after: NaiveDate,
+    customer_name: Option<String>,
+    customer_email: Option<String>,
+}
+
+/// `GET /api/v1/admin/invoice-reminders` — List due payment reminders (admin only).
+///
+/// **Caller**: Admin dashboard on load.
+/// **Why**: Shows invoices that have been sent but not paid within 7-day intervals,
+/// so Alex can decide to send a dunning notice, snooze, or mark as paid.
+async fn list_invoice_reminders(
+    State(state): State<Arc<AppState>>,
+    Extension(_claims): Extension<TokenClaims>,
+) -> Result<Json<Vec<InvoiceReminderItem>>, ApiError> {
+    let rows = invoice_reminder_repo::fetch_due(&state.db).await?;
+    let items = rows.into_iter().map(|r| {
+        let label_idx = ((r.level - 1) as usize).min(2);
+        InvoiceReminderItem {
+            id: r.id,
+            invoice_id: r.invoice_id,
+            inquiry_id: r.inquiry_id,
+            invoice_number: r.invoice_number,
+            level: r.level,
+            level_label: DUNNING_LEVEL_LABEL[label_idx],
+            remind_after: r.remind_after,
+            customer_name: r.customer_name,
+            customer_email: r.customer_email,
+        }
+    }).collect();
+    Ok(Json(items))
+}
+
+#[derive(Debug, Deserialize)]
+struct InvoiceReminderActionBody {
+    /// "send" | "later" | "paid"
+    action: String,
+    /// Days to snooze when action = "later". Defaults to 7.
+    snooze_days: Option<u32>,
+}
+
+/// `POST /api/v1/admin/invoice-reminders/{id}/action` — Act on a due invoice reminder.
+///
+/// **Caller**: Admin dashboard dunning card buttons.
+/// **Why**: Lets Alex handle each overdue invoice individually — send a dunning email,
+/// postpone the reminder, or acknowledge payment — without automated bulk sending.
+///
+/// # Actions
+/// - `"send"` — sends the appropriate dunning email (Zahlungserinnerung / 1. Mahnung /
+///              2. Mahnung); advances to the next level 7 days from now, or closes after level 3
+/// - `"later"` — postpones the reminder by `snooze_days` (default 7)
+/// - `"paid"` — marks the invoice as paid and closes the reminder
+///
+/// # Returns
+/// `200 OK` with `{ "status": "sent" | "snoozed" | "paid" }`.
+async fn invoice_reminder_action(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<TokenClaims>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<InvoiceReminderActionBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&claims)?;
+
+    let row = invoice_reminder_repo::fetch_one(&state.db, id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Erinnerung nicht gefunden".into()))?;
+
+    match body.action.as_str() {
+        "send" => {
+            let email = row.customer_email.as_deref()
+                .ok_or_else(|| ApiError::BadRequest("Kunde hat keine E-Mail-Adresse".into()))?;
+            let name = row.customer_name.as_deref().unwrap_or("Sehr geehrte Damen und Herren");
+            let label_idx = ((row.level - 1) as usize).min(2);
+            let label = DUNNING_LEVEL_LABEL[label_idx];
+            let subject = format!("{label}: Rechnung {}", row.invoice_number);
+            let body_text = build_dunning_email(name, &row.invoice_number, label, row.level);
+
+            admin_emails::send_plain_email(&state.config.email, email, &subject, &body_text)
+                .await
+                .map_err(|e| ApiError::Internal(format!("E-Mail-Versand fehlgeschlagen: {e}")))?;
+
+            let next = Utc::now().date_naive() + chrono::Days::new(7);
+            invoice_reminder_repo::advance(&state.db, id, next).await?;
+            Ok(Json(serde_json::json!({ "status": "sent", "level": row.level })))
+        }
+        "later" => {
+            let days = body.snooze_days.unwrap_or(7);
+            let remind_after = Utc::now().date_naive() + chrono::Days::new(days as u64);
+            invoice_reminder_repo::snooze(&state.db, id, remind_after).await?;
+            Ok(Json(serde_json::json!({ "status": "snoozed", "remind_after": remind_after.to_string() })))
+        }
+        "paid" => {
+            // Mark invoice as paid (reuses invoice_repo)
+            use crate::repositories::invoice_repo;
+            let now = Utc::now();
+            invoice_repo::mark_paid(&state.db, row.invoice_id, now).await?;
+            // Check if all invoices for this inquiry are now paid
+            let unpaid = invoice_repo::count_unpaid(&state.db, row.inquiry_id).await?;
+            if unpaid == 0 {
+                invoice_repo::transition_inquiry_to_paid(&state.db, row.inquiry_id, now).await?;
+            }
+            invoice_reminder_repo::close(&state.db, id).await?;
+            Ok(Json(serde_json::json!({ "status": "paid" })))
+        }
+        _ => Err(ApiError::BadRequest("Ungültige Aktion. Erlaubt: send, later, paid".into())),
+    }
+}
+
+fn build_dunning_email(name: &str, invoice_number: &str, label: &str, level: i32) -> String {
+    let urgency = match level {
+        1 => "Möglicherweise ist die Zahlung in Bearbeitung — bitte prüfen Sie Ihre Unterlagen.",
+        2 => "Wir bitten Sie dringend, den ausstehenden Betrag umgehend zu begleichen.",
+        _ => "Dies ist unsere letzte Erinnerung vor weiteren rechtlichen Schritten.",
+    };
+    format!(
+        "Guten Tag {name},\n\n\
+         {label} für Rechnung {invoice_number}\n\n\
+         laut unseren Unterlagen ist die oben genannte Rechnung noch offen.\n\
+         {urgency}\n\n\
+         Sollten Sie die Zahlung bereits veranlasst haben, bitten wir Sie, \
+         diese E-Mail als gegenstandslos zu betrachten.\n\n\
+         Bei Fragen stehen wir Ihnen gerne zur Verfügung.\n\n\
+         Mit freundlichen Grüßen\n\
+         Ihr Team von Aust Umzüge & Haushaltsauflösungen",
+        name = name,
+        label = label,
+        invoice_number = invoice_number,
+        urgency = urgency,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Morning workflow
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+struct MorningInquiryItem {
+    id: Uuid,
+    customer_name: Option<String>,
+    customer_email: Option<String>,
+    last_day: Option<NaiveDate>,
+    status: String,
+    invoice_status: Option<String>,
+    invoice_id: Option<Uuid>,
+    invoice_type: Option<String>,
+    has_review_request: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct MorningCalendarItem {
+    id: Uuid,
+    title: String,
+    last_day: Option<NaiveDate>,
+    status: String,
+}
+
+#[derive(Debug, Serialize)]
+struct MorningWorkflowResponse {
+    inquiries: Vec<MorningInquiryItem>,
+    calendar_items: Vec<MorningCalendarItem>,
+}
+
+/// `GET /api/v1/admin/morning-workflow` — Return jobs that ended but still need action.
+///
+/// **Caller**: Admin dashboard on load — powers the "Guten Morgen" checklist dialog.
+/// **Why**: Finds inquiries / calendar items whose last working day has already passed
+/// (within 14 days) but that aren't fully closed yet:
+///   - Inquiries still in 'scheduled' → need to be marked completed
+///   - Inquiries in 'completed' with no sent invoice → need invoice sent
+///   - Inquiries without a review request handled → need review step
+///   - Calendar items still 'scheduled' → need to be marked complete
+///
+/// # Returns
+/// `200 OK` with `{ inquiries: [...], calendar_items: [...] }`.
+async fn morning_workflow(
+    State(state): State<Arc<AppState>>,
+    Extension(_claims): Extension<TokenClaims>,
+) -> Result<Json<MorningWorkflowResponse>, ApiError> {
+    let (inq_rows, ci_rows) = tokio::try_join!(
+        admin_repo::fetch_morning_inquiries(&state.db),
+        admin_repo::fetch_morning_calendar_items(&state.db),
+    )
+    .map_err(|e| ApiError::Database(e))?;
+
+    let inquiries = inq_rows.into_iter().map(|r| MorningInquiryItem {
+        id: r.id,
+        customer_name: r.customer_name,
+        customer_email: r.customer_email,
+        last_day: r.last_day,
+        status: r.status,
+        invoice_status: r.invoice_status,
+        invoice_id: r.invoice_id,
+        invoice_type: r.invoice_type,
+        has_review_request: r.has_review_request,
+    }).collect();
+
+    let calendar_items = ci_rows.into_iter().map(|r| MorningCalendarItem {
+        id: r.id,
+        title: r.title,
+        last_day: r.last_day,
+        status: r.status,
+    }).collect();
+
+    Ok(Json(MorningWorkflowResponse { inquiries, calendar_items }))
+}
+
+// ---------------------------------------------------------------------------
+// Review requests
+// ---------------------------------------------------------------------------
+
+/// Google-review link sent to customers in the review request email.
+/// Direct write-a-review URL for Aust Umzüge & Haushaltsauflösungen.
+const GOOGLE_REVIEW_URL: &str =
+    "https://www.google.com/search?q=Aust+Umz%C3%BCge+%26+Haushaltsaufl%C3%B6sungen+Reviews";
+
+#[derive(Debug, Deserialize)]
+struct CreateReviewRequestBody {
+    /// "now" — send immediately; "later" — schedule reminder; "skip" — do nothing.
+    action: String,
+    /// Only required when `action == "later"`. Number of days until the reminder appears.
+    remind_after_days: Option<u32>,
+}
+
+/// `POST /api/v1/admin/inquiries/{id}/review-request` — Send or schedule a Google-review email.
+///
+/// **Caller**: Admin inquiry detail page — popup shown after marking inquiry `completed`.
+/// **Why**: Lets Alex decide immediately whether to solicit a review, defer the reminder,
+/// or skip entirely without requiring a separate "cronjob" process.
+///
+/// # Body
+/// ```json
+/// { "action": "now" }
+/// { "action": "later", "remind_after_days": 3 }
+/// { "action": "skip" }
+/// ```
+///
+/// # Returns
+/// `200 OK` with `{ "status": "sent" | "pending" | "skipped" }`.
+async fn create_review_request(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<TokenClaims>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<CreateReviewRequestBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&claims)?;
+
+    // Fetch customer linked to this inquiry
+    let customer = crate::repositories::customer_repo::fetch_by_inquiry_id(&state.db, id).await?;
+
+    match body.action.as_str() {
+        "now" => {
+            let customer_email = customer
+                .email
+                .as_deref()
+                .ok_or_else(|| ApiError::BadRequest("Kunde hat keine E-Mail-Adresse".into()))?;
+            let customer_name = customer.display_name();
+            let subject = "Wie war Ihr Umzug? Wir freuen uns über Ihre Bewertung!";
+            let body_text = format!(
+                "Guten Tag {name},\n\n\
+                 vielen Dank, dass Sie Aust Umzüge & Haushaltsauflösungen für Ihren Umzug gewählt haben.\n\n\
+                 Wir würden uns sehr freuen, wenn Sie uns eine kurze Bewertung hinterlassen würden:\n\
+                 {url}\n\n\
+                 Ihre Meinung hilft uns, unsere Dienstleistungen stetig zu verbessern.\n\n\
+                 Mit freundlichen Grüßen\n\
+                 Ihr Team von Aust Umzüge & Haushaltsauflösungen",
+                name = customer_name,
+                url = GOOGLE_REVIEW_URL,
+            );
+
+            admin_emails::send_plain_email(&state.config.email, customer_email, subject, &body_text)
+                .await
+                .map_err(|e| ApiError::Internal(format!("E-Mail-Versand fehlgeschlagen: {e}")))?;
+
+            review_repo::upsert(
+                &state.db, id, "sent", None, Some(Utc::now()),
+            ).await?;
+
+            Ok(Json(serde_json::json!({ "status": "sent" })))
+        }
+        "later" => {
+            let days = body.remind_after_days.unwrap_or(3);
+            let remind_after = Utc::now().date_naive() + chrono::Days::new(days as u64);
+            review_repo::upsert(&state.db, id, "pending", Some(remind_after), None).await?;
+            Ok(Json(serde_json::json!({ "status": "pending", "remind_after": remind_after.to_string() })))
+        }
+        "skip" => {
+            review_repo::upsert(&state.db, id, "skipped", None, None).await?;
+            Ok(Json(serde_json::json!({ "status": "skipped" })))
+        }
+        _ => Err(ApiError::BadRequest(
+            "Ungültige Aktion. Erlaubt: now, later, skip".into(),
+        )),
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ReviewReminderItem {
+    inquiry_id: Uuid,
+    remind_after: NaiveDate,
+    customer_name: Option<String>,
+    customer_email: Option<String>,
+}
+
+/// `GET /api/v1/admin/review-reminders` — List overdue review request reminders.
+///
+/// **Caller**: Admin dashboard widget; shown when `pending_review_count > 0`.
+/// **Why**: Surfaces inquiries where Alex chose "Später" and the reminder date has arrived.
+///
+/// # Returns
+/// `200 OK` with array of `{ inquiry_id, remind_after, customer_name, customer_email }`.
+async fn list_review_reminders(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<TokenClaims>,
+) -> Result<Json<Vec<ReviewReminderItem>>, ApiError> {
+    require_admin(&claims)?;
+    let rows = review_repo::fetch_pending_reminders(&state.db).await?;
+    let items = rows
+        .into_iter()
+        .map(|r| ReviewReminderItem {
+            inquiry_id: r.inquiry_id,
+            remind_after: r.remind_after,
+            customer_name: r.customer_name,
+            customer_email: r.customer_email,
+        })
+        .collect();
+    Ok(Json(items))
 }
 
 #[cfg(test)]
