@@ -65,6 +65,17 @@ pub struct CreateInvoiceRequest {
     pub partial_percent: Option<u8>,
 }
 
+/// Optional request body for `POST /inquiries/{id}/invoices/{inv_id}/send`.
+///
+/// All fields are optional — if omitted the server falls back to the default template.
+#[derive(Debug, Deserialize, Default)]
+pub struct SendInvoiceRequest {
+    /// Custom email subject. Falls back to "Ihre Rechnung Nr. {n} — Aust Umzüge…".
+    pub subject: Option<String>,
+    /// Custom email body. Falls back to the standard payment-request template.
+    pub body: Option<String>,
+}
+
 /// Request body for `PATCH /inquiries/{id}/invoices/{inv_id}`.
 #[derive(Debug, Deserialize)]
 pub struct UpdateInvoiceRequest {
@@ -566,7 +577,9 @@ async fn update_invoice(
 async fn send_invoice(
     State(state): State<Arc<AppState>>,
     Path((inquiry_id, inv_id)): Path<(Uuid, Uuid)>,
+    body: Option<Json<SendInvoiceRequest>>,
 ) -> Result<Json<InvoiceResponse>, ApiError> {
+    let req = body.map(|Json(r)| r).unwrap_or_default();
     let row = fetch_invoice_by_inquiry(&state.db, inv_id, inquiry_id).await?;
 
     // Sendability gate
@@ -612,15 +625,19 @@ async fn send_invoice(
 
     let display_name = customer_name.as_deref().unwrap_or("Kunde");
     let invoice_num = &row.invoice_number;
-    let subject = format!("Ihre Rechnung Nr. {invoice_num} — Aust Umzüge & Haushaltsauflösungen");
-    let body = format!(
-        "Sehr geehrte/r {display_name},\n\n\
-         im Anhang finden Sie Ihre Rechnung Nr. {invoice_num}.\n\n\
-         Bitte überweisen Sie den Rechnungsbetrag innerhalb von 7 Tagen \
-         unter Angabe der Rechnungsnummer auf unser Konto.\n\n\
-         Mit freundlichen Grüßen\n\
-         Aust Umzüge & Haushaltsauflösungen"
-    );
+    let subject = req.subject.unwrap_or_else(|| {
+        format!("Ihre Rechnung Nr. {invoice_num} — Aust Umzüge & Haushaltsauflösungen")
+    });
+    let body = req.body.unwrap_or_else(|| {
+        format!(
+            "Sehr geehrte/r {display_name},\n\n\
+             im Anhang finden Sie Ihre Rechnung Nr. {invoice_num}.\n\n\
+             Bitte überweisen Sie den Rechnungsbetrag innerhalb von 7 Tagen \
+             unter Angabe der Rechnungsnummer auf unser Konto.\n\n\
+             Mit freundlichen Grüßen\n\
+             Aust Umzüge & Haushaltsauflösungen"
+        )
+    });
 
     let filename = format!("Rechnung_{invoice_num}.pdf");
     let email = crate::services::email::build_email_with_attachment(
