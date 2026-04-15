@@ -323,6 +323,7 @@ pub(crate) async fn update_fields(
     recipient_id: Option<Uuid>,
     billing_address_id: Option<Uuid>,
     custom_fields: Option<&serde_json::Value>,
+    employee_notes: Option<&str>,
     now: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
@@ -343,7 +344,8 @@ pub(crate) async fn update_fields(
             recipient_id = COALESCE($14, recipient_id),
             billing_address_id = COALESCE($15, billing_address_id),
             custom_fields = COALESCE($16, custom_fields),
-            updated_at = $17
+            employee_notes = COALESCE($17, employee_notes),
+            updated_at = $18
         WHERE id = $1
         "#,
     )
@@ -363,6 +365,7 @@ pub(crate) async fn update_fields(
     .bind(recipient_id)
     .bind(billing_address_id)
     .bind(custom_fields)
+    .bind(employee_notes)
     .bind(now)
     .execute(pool)
     .await?;

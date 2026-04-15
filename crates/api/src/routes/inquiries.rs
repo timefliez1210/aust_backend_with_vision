@@ -139,6 +139,7 @@ struct UpdateInquiryRequest {
     /// Set to `null` explicitly to clear the billing address override.
     clear_billing_address: Option<bool>,
     custom_fields: Option<serde_json::Value>,
+    employee_notes: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -440,6 +441,7 @@ async fn update_inquiry(
         request.recipient_id,
         billing_address_id,
         request.custom_fields.as_ref(),
+        request.employee_notes.as_deref(),
         now,
     )
     .await?;

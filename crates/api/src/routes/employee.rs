@@ -251,6 +251,7 @@ struct ScheduleJob {
     planned_hours: f64,
     actual_hours: Option<f64>,
     colleague_names: Vec<String>,
+    employee_notes: Option<String>,
 }
 
 /// `GET /employee/schedule?month=YYYY-MM` — list assigned jobs and calendar items for a given month.
@@ -310,6 +311,7 @@ async fn get_schedule(
                 planned_hours: r.planned_hours,
                 actual_hours: r.actual_hours,
                 colleague_names: colleagues,
+                employee_notes: r.employee_notes,
             }
         })
         .collect();
@@ -351,6 +353,7 @@ async fn get_schedule(
             planned_hours: r.planned_hours,
             actual_hours: r.actual_hours,
             colleague_names: colleagues,
+            employee_notes: r.employee_notes,
         });
     }
 
@@ -395,6 +398,8 @@ struct JobDetail {
     // Assignment
     planned_hours: f64,
     notes: Option<String>,
+    // Admin note visible to all employees on this job
+    employee_notes: Option<String>,
     // Employee self-reported times (editable via PATCH /jobs/{id}/clock)
     employee_clock_in: Option<NaiveTime>,
     employee_clock_out: Option<NaiveTime>,
@@ -472,6 +477,7 @@ async fn get_job_detail(
         customer_phone: row.customer_phone,
         planned_hours: assign.planned_hours,
         notes: assign.notes,
+        employee_notes: row.employee_notes,
         employee_clock_in: assign.employee_clock_in,
         employee_clock_out: assign.employee_clock_out,
         employee_actual_hours,

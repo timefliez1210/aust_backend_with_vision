@@ -95,6 +95,7 @@ struct UpdateItemBody {
     /// Set to true to explicitly remove the customer assignment.
     #[serde(default)]
     remove_customer: bool,
+    employee_notes: Option<String>,
 }
 
 /// Body for assigning an employee to a calendar item.
@@ -322,6 +323,10 @@ async fn update_item(
         sets.push(format!("customer_id = ${idx}"));
         idx += 1;
     }
+    if body.employee_notes.is_some() {
+        sets.push(format!("employee_notes = ${idx}"));
+        idx += 1;
+    }
 
     // Always update updated_at
     sets.push(format!("updated_at = ${idx}"));
@@ -370,6 +375,9 @@ async fn update_item(
         if let Some(v) = body.customer_id {
             q = q.bind(v);
         }
+    }
+    if let Some(v) = body.employee_notes {
+        q = q.bind(v);
     }
     q = q.bind(Utc::now()); // updated_at
     q = q.bind(id);         // WHERE id

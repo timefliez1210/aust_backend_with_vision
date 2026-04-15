@@ -180,6 +180,7 @@ pub(crate) struct ScheduleJobRow {
     pub customer_phone: Option<String>,
     pub planned_hours: f64,
     pub actual_hours: Option<f64>,
+    pub employee_notes: Option<String>,
 }
 
 /// Fetch assigned moving jobs for an employee in a date range.
@@ -210,7 +211,8 @@ pub(crate) async fn fetch_schedule_jobs(
             ide.planned_hours::float8 AS planned_hours,
             CASE WHEN ide.clock_out IS NOT NULL AND ide.clock_in IS NOT NULL
                  THEN (EXTRACT(EPOCH FROM (ide.clock_out - ide.clock_in)) / 3600.0)::float8
-                 ELSE NULL END AS actual_hours
+                 ELSE NULL END AS actual_hours,
+            i.employee_notes
         FROM inquiry_day_employees ide
         JOIN inquiry_days iday ON ide.inquiry_day_id = iday.id
         JOIN inquiries  i  ON iday.inquiry_id = i.id
@@ -241,6 +243,7 @@ pub(crate) struct CalendarItemRow {
     pub status: String,
     pub planned_hours: f64,
     pub actual_hours: Option<f64>,
+    pub employee_notes: Option<String>,
 }
 
 /// Fetch calendar item assignments for an employee in a date range.
@@ -265,7 +268,8 @@ pub(crate) async fn fetch_schedule_items(
             cdde.planned_hours::float8 AS planned_hours,
             CASE WHEN cdde.clock_out IS NOT NULL AND cdde.clock_in IS NOT NULL
                  THEN (EXTRACT(EPOCH FROM (cdde.clock_out - cdde.clock_in)) / 3600.0)::float8
-                 ELSE NULL END AS actual_hours
+                 ELSE NULL END AS actual_hours,
+            ci.employee_notes
         FROM calendar_item_day_employees cdde
         JOIN calendar_item_days cday ON cdde.calendar_item_day_id = cday.id
         JOIN calendar_items ci ON ci.id = cday.calendar_item_id
@@ -425,6 +429,7 @@ pub(crate) struct JobInquiryRow {
     pub destination_elevator: Option<bool>,
     pub customer_name: Option<String>,
     pub customer_phone: Option<String>,
+    pub employee_notes: Option<String>,
 }
 
 /// Fetch inquiry + addresses + customer for job detail (no financial data).
@@ -452,7 +457,8 @@ pub(crate) async fn fetch_job_inquiry(
             da.floor       AS destination_floor,
             da.elevator    AS destination_elevator,
             COALESCE(c.first_name || ' ' || c.last_name, c.name) AS customer_name,
-            c.phone  AS customer_phone
+            c.phone  AS customer_phone,
+            i.employee_notes
         FROM inquiries i
         JOIN customers c ON i.customer_id = c.id
         LEFT JOIN addresses oa ON i.origin_address_id      = oa.id
