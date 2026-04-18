@@ -88,6 +88,10 @@ pub(crate) struct ParsedInquiryForm {
     pub arrival_floor: Option<String>,
     pub arrival_parking_ban: Option<bool>,
     pub arrival_elevator: Option<bool>,
+    pub stop_address: Option<String>,
+    pub stop_floor: Option<String>,
+    pub stop_elevator: Option<bool>,
+    pub stop_parking_ban: Option<bool>,
     /// Volume in m³ provided by customer (manuell mode)
     pub volumen: Option<String>,
     /// Item list text provided by customer (manuell mode)
@@ -297,6 +301,7 @@ async fn handle_ar_submission(
         customer_id,
         Some(origin_id),
         Some(dest_id),
+        None,
         "pending",
         scheduled_date_naive,
         Some(&notes),
@@ -601,6 +606,10 @@ async fn video_inquiry(
     let mut video_files: Vec<(Vec<u8>, String)> = Vec::new();
     let mut volumen: Option<String> = None;
     let mut umzugsgut: Option<String> = None;
+    let mut stop_address: Option<String> = None;
+    let mut stop_floor: Option<String> = None;
+    let mut stop_elevator: Option<bool> = None;
+    let mut stop_parking_ban: Option<bool> = None;
 
     while let Some(field) = multipart
         .next_field()
@@ -674,7 +683,21 @@ async fn video_inquiry(
             "billing_city" | "billing_ort" => billing_city = Some(read_text_field(field).await?),
             // Volume fields
             "volumen" | "volume" => volumen = Some(read_text_field(field).await?),
-            "umzugsgut" | "items" => umzugsgut = Some(read_text_field(field).await?),
+            "umzugsgut" | "items" | "gegenstaende-liste" => umzugsgut = Some(read_text_field(field).await?),
+            "zwischenstopp-adresse" | "stop_address" => {
+                stop_address = Some(read_text_field(field).await?);
+            }
+            "etage-zwischenstopp" | "stop_floor" => {
+                stop_floor = Some(read_text_field(field).await?);
+            }
+            "aufzug-zwischenstopp" | "stop_elevator" => {
+                let t = read_text_field(field).await?;
+                stop_elevator = Some(parse_bool_field(&t));
+            }
+            "halteverbot-zwischenstopp" | "stop_parking_ban" => {
+                let t = read_text_field(field).await?;
+                stop_parking_ban = Some(parse_bool_field(&t));
+            }
             _ => continue,
         }
     }
@@ -801,6 +824,32 @@ async fn video_inquiry(
         None
     };
 
+    // Create stop address if provided
+    let stop_id: Option<uuid::Uuid> = if let Some(ref addr) = stop_address {
+        let trimmed = addr.trim();
+        if !trimmed.is_empty() {
+            let (stop_street, stop_city, stop_postal) = services::vision::parse_address(trimmed);
+            Some(
+                address_repo::create(
+                    &state.db,
+                    &stop_street,
+                    &stop_city,
+                    Some(stop_postal.as_str()).filter(|s| !s.is_empty()),
+                    stop_floor.as_deref(),
+                    stop_elevator,
+                    None,
+                    stop_parking_ban,
+                )
+                .await
+                .map_err(|e| ApiError::Internal(format!("Zwischenstoppadresse konnte nicht erstellt werden: {e}")))?,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     // Create inquiry
     let inquiry_id = Uuid::now_v7();
     inquiry_repo::create_minimal(
@@ -809,6 +858,7 @@ async fn video_inquiry(
         customer_id,
         Some(origin_id),
         Some(dest_id),
+        stop_id,
         "pending",
         scheduled_date_naive,
         Some(&notes),
@@ -1050,6 +1100,7 @@ async fn manual_inquiry(
         customer_id,
         Some(origin_id),
         Some(dest_id),
+        None,
         "pending",
         scheduled_date_naive,
         Some(&notes),
@@ -1174,6 +1225,10 @@ pub(crate) async fn parse_inquiry_form(
         arrival_floor: None,
         arrival_parking_ban: None,
         arrival_elevator: None,
+        stop_address: None,
+        stop_floor: None,
+        stop_elevator: None,
+        stop_parking_ban: None,
         scheduled_date: None,
         volumen: None,
         umzugsgut: None,
@@ -1229,6 +1284,20 @@ pub(crate) async fn parse_inquiry_form(
             "arrival_elevator" | "aufzug_einzug" | "aufzug-einzug" => {
                 let text = read_text_field(field).await?;
                 form.arrival_elevator = Some(parse_bool_field(&text));
+            }
+            "zwischenstopp-adresse" | "stop_address" => {
+                form.stop_address = Some(read_text_field(field).await?);
+            }
+            "etage-zwischenstopp" | "stop_floor" => {
+                form.stop_floor = Some(read_text_field(field).await?);
+            }
+            "aufzug-zwischenstopp" | "stop_elevator" => {
+                let text = read_text_field(field).await?;
+                form.stop_elevator = Some(parse_bool_field(&text));
+            }
+            "halteverbot-zwischenstopp" | "stop_parking_ban" => {
+                let text = read_text_field(field).await?;
+                form.stop_parking_ban = Some(parse_bool_field(&text));
             }
             "wunschtermin" | "preferred_date" | "scheduled_date" => {
                 form.scheduled_date = Some(read_text_field(field).await?);
@@ -1296,7 +1365,7 @@ pub(crate) async fn parse_inquiry_form(
             "endPlz" => form.arrival_postal = Some(read_text_field(field).await?),
             // Volume and items from different submission modes
             "volumen" | "volume" => form.volumen = Some(read_text_field(field).await?),
-            "umzugsgut" | "items" => form.umzugsgut = Some(read_text_field(field).await?),
+            "umzugsgut" | "items" | "gegenstaende-liste" => form.umzugsgut = Some(read_text_field(field).await?),
             "volume_m3" => form.volume_m3 = Some(read_text_field(field).await?),
             "items_list" => form.items_list = Some(read_text_field(field).await?),
             _ => continue,
@@ -1465,6 +1534,31 @@ pub(crate) async fn handle_submission(
         None
     };
 
+    // Create stop address if provided
+    let stop_id: Option<Uuid> = if let Some(ref addr) = form.stop_address {
+        let trimmed = addr.trim();
+        if !trimmed.is_empty() {
+            let (stop_street, stop_city, stop_postal) = services::vision::parse_address(trimmed);
+            Some(
+                address_repo::create(
+                    &state.db,
+                    &stop_street,
+                    &stop_city,
+                    Some(stop_postal.as_str()).filter(|s| !s.is_empty()),
+                    form.stop_floor.as_deref(),
+                    form.stop_elevator,
+                    None,
+                    form.stop_parking_ban,
+                )
+                .await
+                .map_err(|e| ApiError::Internal(format!("Zwischenstoppadresse konnte nicht erstellt werden: {e}")))?,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     // 6b. Create recipient customer if provided (booking for someone else)
     let recipient_id = if form.recipient_last_name.as_deref().map_or(false, |s| !s.trim().is_empty()) {
@@ -1489,6 +1583,7 @@ pub(crate) async fn handle_submission(
         customer_id,
         Some(origin_id),
         Some(dest_id),
+        stop_id,
         "pending",
         scheduled_date_naive,
         Some(&notes),
@@ -2150,5 +2245,71 @@ mod tests {
     fn notes_empty() {
         let notes = build_notes(None, None, None, None);
         assert!(notes.is_empty());
+    }
+
+    // ── parse_inquiry_form: gegenstaende-liste alias ─────────────────────
+
+    #[tokio::test]
+    async fn gegenstaende_liste_populates_umzugsgut() {
+        use axum::{
+            body::Body,
+            extract::Multipart,
+            http::Request,
+        };
+        use axum::extract::FromRequest;
+
+        let boundary = "testboundary1234";
+        let items_json = r#"[{"name":"Sofa","volume_re":8}]"#;
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"gegenstaende-liste\"\r\n\r\n{items_json}\r\n--{boundary}--\r\n"
+        );
+
+        let request = Request::post("/")
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap();
+
+        let multipart = Multipart::from_request(request, &()).await.unwrap();
+        let form = parse_inquiry_form(multipart, false).await.unwrap();
+        assert_eq!(form.umzugsgut, Some(items_json.to_string()));
+    }
+
+    // ── parse_inquiry_form: Zwischenstopp fields ───────────────────────────
+
+    #[tokio::test]
+    async fn zwischenstopp_fields_populate_form() {
+        use axum::{
+            body::Body,
+            extract::Multipart,
+            http::Request,
+        };
+        use axum::extract::FromRequest;
+
+        let boundary = "stopboundary5678";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"zwischenstopp-adresse\"\r\n\r\nHauptstr. 5, 12345 Berlin\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"etage-zwischenstopp\"\r\n\r\n2\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"aufzug-zwischenstopp\"\r\n\r\ntrue\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"halteverbot-zwischenstopp\"\r\n\r\nfalse\r\n\
+             --{boundary}--\r\n"
+        );
+
+        let request = Request::post("/")
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap();
+
+        let multipart = Multipart::from_request(request, &()).await.unwrap();
+        let form = parse_inquiry_form(multipart, false).await.unwrap();
+        assert_eq!(form.stop_address, Some("Hauptstr. 5, 12345 Berlin".to_string()));
+        assert_eq!(form.stop_floor, Some("2".to_string()));
+        assert_eq!(form.stop_elevator, Some(true));
+        assert_eq!(form.stop_parking_ban, Some(false));
     }
 }

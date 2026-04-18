@@ -1028,6 +1028,7 @@ pub(crate) async fn create_minimal(
     customer_id: Uuid,
     origin_id: Option<Uuid>,
     dest_id: Option<Uuid>,
+    stop_id: Option<Uuid>,
     status: &str,
     scheduled_date: Option<NaiveDate>,
     notes: Option<&str>,
@@ -1043,16 +1044,17 @@ pub(crate) async fn create_minimal(
     sqlx::query(
         r#"
         INSERT INTO inquiries (id, customer_id, origin_address_id, destination_address_id,
-                           status, scheduled_date, notes, services, source,
+                           stop_address_id, status, scheduled_date, notes, services, source,
                            service_type, submission_mode, recipient_id, billing_address_id, custom_fields,
                            created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $15)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $16)
         "#,
     )
     .bind(id)
     .bind(customer_id)
     .bind(origin_id)
     .bind(dest_id)
+    .bind(stop_id)
     .bind(status)
     .bind(scheduled_date)
     .bind(notes)

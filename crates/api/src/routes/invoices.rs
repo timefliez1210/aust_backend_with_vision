@@ -63,6 +63,9 @@ pub struct CreateInvoiceRequest {
     pub invoice_type: String,
     /// Required when `invoice_type = "partial"`. Range: 1–99.
     pub partial_percent: Option<u8>,
+    /// Manual netto amount in cents. Used when no active offer exists for the inquiry.
+    /// Ignored when an offer is present — the offer price always takes precedence.
+    pub price_cents_netto: Option<i64>,
 }
 
 /// Optional request body for `POST /inquiries/{id}/invoices/{inv_id}/send`.
@@ -211,7 +214,7 @@ async fn create_invoice(
     }
 
     // Load data needed for PDF generation
-    let invoice_context = load_invoice_context(&state.db, inquiry_id).await?;
+    let invoice_context = load_invoice_context(&state.db, inquiry_id, req.price_cents_netto).await?;
     let offer_netto = invoice_context.offer.price_cents;
 
     // Guard: offer must have a positive amount
@@ -484,7 +487,7 @@ async fn update_invoice(
         invoice_repo::update_extra_services(&state.db, inv_id, &extra_services_json).await?;
 
         // Regenerate PDF with updated extras
-        let invoice_context = load_invoice_context(&state.db, inquiry_id).await?;
+        let invoice_context = load_invoice_context(&state.db, inquiry_id, None).await?;
         let today = now.date_naive();
 
         let inv_type = match row.invoice_type.as_str() {
@@ -696,16 +699,28 @@ struct InvoiceContext {
 ///
 /// **Why**: Centralised data loading used by both create and update (PDF regeneration) paths.
 ///
+/// `price_fallback_netto` is used when no active offer exists (e.g. direct Termin invoicing).
+/// When an offer exists the offer price always takes precedence over the fallback.
+///
 /// # Errors
-/// Returns `NotFound` if there is no active offer for the inquiry.
+/// Returns `NotFound` if there is no active offer and no fallback price was provided.
 async fn load_invoice_context(
     db: &sqlx::PgPool,
     inquiry_id: Uuid,
+    price_fallback_netto: Option<i64>,
 ) -> Result<InvoiceContext, ApiError> {
-    // Active offer (most recent)
-    let offer: ActiveOfferRow = invoice_repo::fetch_active_offer(db, inquiry_id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound("No offer found for inquiry — generate an offer first".into()))?;
+    // Active offer (most recent); fall back to manual price when absent
+    let offer: ActiveOfferRow = match invoice_repo::fetch_active_offer(db, inquiry_id).await? {
+        Some(o) => o,
+        None => {
+            let cents = price_fallback_netto.ok_or_else(|| {
+                ApiError::NotFound(
+                    "Kein Angebot vorhanden — bitte erst ein Angebot erstellen oder einen Betrag angeben".into(),
+                )
+            })?;
+            ActiveOfferRow { price_cents: cents, offer_number: None }
+        }
+    };
 
     // Customer + moving date
     let customer: CustomerRow =

@@ -341,7 +341,8 @@ pub(crate) async fn build_offer_with_overrides(
         .unwrap_or_default();
     let origin_floor_info = origin
         .as_ref()
-        .and_then(|a| a.floor.clone())
+        .and_then(|a| a.floor.as_deref())
+        .map(format_floor_display)
         .unwrap_or_default();
 
     let dest_street = destination
@@ -354,7 +355,8 @@ pub(crate) async fn build_offer_with_overrides(
         .unwrap_or_default();
     let dest_floor_info = destination
         .as_ref()
-        .and_then(|a| a.floor.clone())
+        .and_then(|a| a.floor.as_deref())
+        .map(format_floor_display)
         .unwrap_or_default();
 
     // Resolve billing address: explicit > customer default > destination (post-move) > origin (pre-move)
@@ -638,6 +640,24 @@ pub(crate) async fn build_offer_with_overrides(
 /// - `services` — structured `Services` flags from the inquiry
 ///
 /// # Returns
+/// Maps a stored floor value to a German display label for the offer PDF.
+///
+/// The admin address editor stores numeric strings ("0", "1", ...) while the public
+/// quote form stores full German labels ("Erdgeschoss", "3. Stock"). Both are handled
+/// so the XLSX always shows a human-readable string.
+fn format_floor_display(floor: &str) -> String {
+    match floor.trim() {
+        "0" => "Erdgeschoss".to_string(),
+        "-1" => "Keller".to_string(),
+        "1" => "1. OG".to_string(),
+        "2" => "2. OG".to_string(),
+        "3" => "3. OG".to_string(),
+        "4" => "4. OG".to_string(),
+        "5" => "5. OG".to_string(),
+        other => other.to_string(), // pass-through for "Erdgeschoss", "3. Stock", etc.
+    }
+}
+
 /// Comma-separated string of active services in German, e.g.
 /// `"Verpackungsservice, Montage, Halteverbot Beladestelle"`. Empty string when no flags are set.
 fn format_services_display(services: &Services) -> String {

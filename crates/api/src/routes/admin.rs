@@ -1557,6 +1557,7 @@ struct MorningInquiryItem {
     invoice_id: Option<Uuid>,
     invoice_type: Option<String>,
     has_review_request: bool,
+    offer_price_cents: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1605,6 +1606,7 @@ async fn morning_workflow(
         invoice_id: r.invoice_id,
         invoice_type: r.invoice_type,
         has_review_request: r.has_review_request,
+        offer_price_cents: r.offer_price_cents,
     }).collect();
 
     let calendar_items = ci_rows.into_iter().map(|r| MorningCalendarItem {

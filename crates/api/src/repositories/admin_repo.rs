@@ -1116,6 +1116,7 @@ pub(crate) struct MorningInquiryRow {
     pub invoice_id: Option<Uuid>,
     pub invoice_type: Option<String>,
     pub has_review_request: bool,
+    pub offer_price_cents: Option<i64>,
 }
 
 /// Calendar-item row returned by the morning-workflow query.
@@ -1159,7 +1160,8 @@ pub(crate) async fn fetch_morning_inquiries(pool: &PgPool) -> Result<Vec<Morning
                 SELECT 1 FROM review_requests rr
                 WHERE rr.inquiry_id = i.id
                   AND rr.status IN ('sent', 'skipped')
-            )                                               AS has_review_request
+            )                                               AS has_review_request,
+            (SELECT price_cents FROM offers o WHERE o.inquiry_id = i.id ORDER BY o.created_at DESC LIMIT 1) AS offer_price_cents
         FROM inquiries i
         LEFT JOIN customers c                ON c.id = i.customer_id
         LEFT JOIN last_inquiry_days ld       ON ld.inquiry_id = i.id
