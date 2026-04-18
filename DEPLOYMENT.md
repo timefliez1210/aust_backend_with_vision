@@ -86,6 +86,41 @@ MinIO UI  : http://localhost:9011
 
 Health timeout is 120 s; the script polls every 5 s and exits non-zero on `unhealthy`.
 
+### Dev mode (hot reload against production data)
+
+```
+bash scripts/dev-up.sh [FLAG]
+```
+
+Runs backend as `cargo watch -x run` on `:8080` and frontend as `npm run dev`
+(Vite) on `:5173`, both with file-watch hot reload. Infra (postgres, minio,
+mailpit) is reused from the staging stack so the DB can hold a restored
+production backup. The staging backend/frontend containers are stopped while
+dev is active to avoid port and version confusion.
+
+| Flag            | Behaviour                                                     |
+|-----------------|---------------------------------------------------------------|
+| *(none)*        | Start against current staging data                            |
+| `--fresh`       | Pull newest VPS backup + restore before starting              |
+| `--no-frontend` | Backend only (skip Vite)                                      |
+| `--no-watch`    | `cargo run` one-shot instead of `cargo watch`                 |
+
+URLs after start:
+
+```
+Backend  : http://localhost:8080   (hot reload)
+Frontend : http://localhost:5173   (hot reload, VITE_API_BASE=backend)
+Mailpit  : http://localhost:8025
+MinIO UI : http://localhost:9011
+DB       : postgres://aust_staging:aust_staging_password@localhost:5435/aust_staging
+```
+
+`Ctrl-C` stops backend + frontend; staging infra keeps running
+(`scripts/staging-up.sh --down` to stop it).
+
+Requires `cargo-watch` (`cargo install cargo-watch`) for hot reload; falls
+back to plain `cargo run` if missing.
+
 ---
 
 ## 3. Backup & Restore Pipeline
