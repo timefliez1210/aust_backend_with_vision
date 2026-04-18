@@ -50,9 +50,9 @@ services:
       "
 
   backend:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.backend
+    # Image is built locally by scripts/deploy-prod.sh and loaded on the VPS via tarball.
+    # Do NOT use `build:` here — the source tree is not on the VPS.
+    image: aust_backend:latest
     container_name: aust_backend
     restart: always
     env_file:

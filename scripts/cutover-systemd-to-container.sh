@@ -75,8 +75,8 @@ bash "${PROJECT_DIR}/scripts/deploy-prod.sh"
 # ---------------------------------------------------------------------------
 step "Verifying public endpoint"
 sleep 3
-if curl -sf https://aufraeumhelden.com/health >/dev/null 2>&1; then
-    ok "https://aufraeumhelden.com/health responded"
+if curl -sf https://api.aufraeumhelden.com/health >/dev/null 2>&1; then
+    ok "https://api.aufraeumhelden.com/health responded"
 else
     echo -e "  ${RED}Public health check failed.${RESET}"
     echo ""
