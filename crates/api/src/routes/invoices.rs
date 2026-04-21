@@ -23,7 +23,8 @@ use crate::repositories::{address_repo, invoice_repo, CustomerRow};
 use crate::ApiError;
 use crate::AppState;
 use aust_offer_generator::{
-    convert_xlsx_to_pdf, generate_invoice_xlsx, ExtraService, InvoiceData, InvoiceLineItem, InvoiceType,
+    convert_xlsx_to_pdf, generate_invoice_xlsx, InvoiceData, InvoiceLineItem, InvoiceType,
+    OfferLineItem,
 };
 
 // ---------------------------------------------------------------------------
@@ -205,12 +206,27 @@ async fn create_invoice(
         )));
     }
 
-    // Guard: only one invoice (or pair) per inquiry
-    let existing_count = invoice_repo::count_by_inquiry(&state.db, inquiry_id).await?;
-    if existing_count > 0 {
-        return Err(ApiError::BadRequest(
-            "Invoices already exist for this inquiry".into(),
-        ));
+    // Idempotent: if invoice(s) already exist for this inquiry, return them so
+    // the caller can continue the send flow instead of being blocked by a 400.
+    // Self-heal any row whose PDF is missing in storage (e.g. restored-from-backup
+    // DBs whose object store lacks the corresponding files) — otherwise the
+    // caller would be deadlocked: create returns the existing row, download 404s.
+    let existing_rows = invoice_repo::list_by_inquiry(&state.db, inquiry_id).await?;
+    if !existing_rows.is_empty() {
+        for row in &existing_rows {
+            ensure_invoice_pdf(&state, row).await?;
+        }
+        // Re-fetch to pick up any updated pdf_s3_key values.
+        let refreshed = invoice_repo::list_by_inquiry(&state.db, inquiry_id).await?;
+        let offer_netto = invoice_repo::fetch_active_offer(&state.db, inquiry_id)
+            .await?
+            .map(|o| o.price_cents)
+            .unwrap_or(0);
+        let responses: Vec<InvoiceResponse> = refreshed
+            .into_iter()
+            .map(|row| build_invoice_response(row, offer_netto))
+            .collect();
+        return Ok(Json(responses));
     }
 
     // Load data needed for PDF generation
@@ -247,13 +263,16 @@ async fn create_invoice(
             )
         };
 
+        let first_id = Uuid::now_v7();
+        let final_id = Uuid::now_v7();
+
         // Generate PDFs
-        // PartialFirst: single "Anzahlung" line item
+        // PartialFirst: single "Anzahlung" line item per KVA reference
+        let kva_nr = invoice_context.offer.offer_number.as_deref().unwrap_or("");
         let first_line_items = vec![InvoiceLineItem {
             pos: 1,
             description: format!(
-                "Anzahlung ({}%) — gemäß Angebot Nr. {}",
-                percent, invoice_context.offer.offer_number.as_deref().unwrap_or("")
+                "Anzahlung {percent}% gemäß Kostenvoranschlag Nr. {kva_nr}"
             ),
             quantity: 1.0,
             unit_price: first_netto as f64 / 100.0,
@@ -270,20 +289,14 @@ async fn create_invoice(
             .map_err(|e| ApiError::Internal(format!("Invoice XLSX error: {e}")))?;
         let first_pdf = generate_pdf_bytes(&first_xlsx).await;
 
-        // PartialFinal: offer line items + "Abzgl. Anzahlung" deduction line
-        // For now, we use the legacy lump-sum approach until line_items are stored on the invoice
-        let final_line_items = vec![
-            InvoiceLineItem {
-                pos: 1,
-                description: format!(
-                    "Restbetrag — gemäß Angebot Nr. {}",
-                    invoice_context.offer.offer_number.as_deref().unwrap_or("")
-                ),
-                quantity: 1.0,
-                unit_price: final_netto as f64 / 100.0,
-                remark: None,
-            },
-        ];
+        // PartialFinal: KVA line items + "Abzgl. Anzahlung" deduction line
+        let final_line_items = build_final_line_items(
+            &state.db,
+            &invoice_context,
+            first_netto,
+            &first_num,
+            None, // no extras at creation time
+        ).await?;
         let final_data = build_invoice_data_from_items(
             &invoice_context,
             InvoiceType::PartialFinal,
@@ -294,9 +307,6 @@ async fn create_invoice(
         let final_xlsx = generate_invoice_xlsx(&final_data)
             .map_err(|e| ApiError::Internal(format!("Invoice XLSX error: {e}")))?;
         let final_pdf = generate_pdf_bytes(&final_xlsx).await;
-
-        let first_id = Uuid::now_v7();
-        let final_id = Uuid::now_v7();
 
         // Upload PDFs to S3
         let first_key = upload_invoice_pdf(
@@ -318,7 +328,7 @@ async fn create_invoice(
             &mut tx, first_id, inquiry_id, &first_num, group_id, percent as i32, &first_key, now,
         ).await?;
         invoice_repo::insert_partial_final(
-            &mut tx, final_id, inquiry_id, &final_num, group_id, percent as i32, &final_key, now,
+            &mut tx, final_id, inquiry_id, &final_num, group_id, percent as i32, first_id, &final_key, now,
         ).await?;
         tx.commit().await?;
 
@@ -388,15 +398,29 @@ async fn get_invoice_pdf(
 ) -> Result<Response, ApiError> {
     let (key_opt, invoice_number) = invoice_repo::fetch_pdf_key(&state.db, inv_id, inquiry_id)
         .await?
-        .ok_or_else(|| ApiError::NotFound(format!("Invoice {inv_id} not found")))?;
-    let key = key_opt
-        .ok_or_else(|| ApiError::NotFound("Invoice PDF not yet generated".into()))?;
+        .ok_or_else(|| {
+            tracing::warn!(%inv_id, %inquiry_id, "Invoice row not found");
+            ApiError::NotFound(format!("Invoice {inv_id} not found"))
+        })?;
+    let key = key_opt.ok_or_else(|| {
+        tracing::warn!(%inv_id, "Invoice PDF key is NULL");
+        ApiError::NotFound("Invoice PDF not yet generated".into())
+    })?;
 
     let bytes = state
         .storage
         .download(&key)
         .await
-        .map_err(|e| ApiError::Internal(format!("Failed to download invoice PDF: {e}")))?;
+        .map_err(|e| match e {
+            aust_storage::StorageError::NotFound(k) => {
+                tracing::warn!(key = %k, "Storage NotFound for invoice PDF");
+                ApiError::NotFound("Rechnung-PDF nicht gefunden.".into())
+            }
+            other => {
+                tracing::error!(error = %other, %key, "Storage download failed");
+                ApiError::Internal(format!("Failed to download invoice PDF: {other}"))
+            }
+        })?;
 
     let (content_type, filename) = if key.ends_with(".pdf") {
         (
@@ -466,11 +490,11 @@ async fn update_invoice(
             ));
         }
 
-        // Validate each extra service
+        // Validate each extra service — price_cents may be negative (Gutschrift)
         for (i, extra) in extras.iter().enumerate() {
-            if extra.price_cents < 0 {
+            if extra.price_cents == 0 {
                 return Err(ApiError::BadRequest(format!(
-                    "extra_services[{i}].price_cents must be >= 0"
+                    "extra_services[{i}].price_cents must not be zero"
                 )));
             }
             if extra.description.trim().is_empty() {
@@ -495,51 +519,64 @@ async fn update_invoice(
             _ => InvoiceType::Full,
         };
 
-        let (base_netto, extra_service_vec) = compute_invoice_amounts(
-            invoice_context.offer.price_cents,
-            &inv_type,
-            row.partial_percent,
-            &state.db,
-            row.partial_group_id,
-            extras,
-        )
-        .await?;
+        let regen_items = match inv_type {
+            InvoiceType::PartialFinal => {
+                // Resolve deposit netto (first_netto) from partial_percent
+                let offer_netto = invoice_context.offer.price_cents;
+                let offer_brutto = (offer_netto as f64 * 1.19).round() as i64;
+                let pct = row.partial_percent.unwrap_or_else(|| {
+                    // fall back to sibling lookup (pre-migration rows)
+                    row.deposit_percent.map(|p| p as i32).unwrap_or(0)
+                });
+                let first_brutto = (offer_brutto as f64 * pct as f64 / 100.0).round() as i64;
+                let first_netto = (first_brutto as f64 / 1.19).round() as i64;
 
-        // Regeneration: convert extra services (legacy) to InvoiceLineItem format
-        let extra_items: Vec<InvoiceLineItem> = extras
-            .iter()
-            .enumerate()
-            .map(|(i, e)| InvoiceLineItem {
-                pos: (i + 2) as u32, // position 2+ (position 1 = base)
-                description: e.description.clone(),
-                quantity: 1.0,
-                unit_price: e.price_cents as f64 / 100.0,
-                remark: None,
-            })
-            .collect();
+                // Resolve deposit invoice number
+                let deposit_number = resolve_deposit_number(&state.db, &row).await;
 
-        // Base line item (legacy approach until line_items_json is stored on invoice)
-        let mut regen_items = vec![InvoiceLineItem {
-            pos: 1,
-            description: match &inv_type {
-                InvoiceType::Full => format!(
-                    "Umzugsdienstleistung gemäß Angebot Nr. {}",
-                    invoice_context.offer.offer_number.as_deref().unwrap_or("")
-                ),
-                InvoiceType::PartialFirst { percent } => format!(
-                    "Anzahlung ({}%) — gemäß Angebot Nr. {}",
-                    percent, invoice_context.offer.offer_number.as_deref().unwrap_or("")
-                ),
-                InvoiceType::PartialFinal => format!(
-                    "Restbetrag — gemäß Angebot Nr. {}",
-                    invoice_context.offer.offer_number.as_deref().unwrap_or("")
-                ),
-            },
-            quantity: 1.0,
-            unit_price: base_netto as f64 / 100.0,
-            remark: None,
-        }];
-        regen_items.extend(extra_items);
+                build_final_line_items(
+                    &state.db,
+                    &invoice_context,
+                    first_netto,
+                    &deposit_number,
+                    Some(extras),
+                ).await?
+            }
+            _ => {
+                // Full invoice: base line + extras
+                let offer_netto = invoice_context.offer.price_cents;
+                let kva_nr = invoice_context.offer.offer_number.as_deref().unwrap_or("");
+                let kva_items = kva_line_items_from_offer(&invoice_context, kva_nr);
+                let base_items = if kva_items.is_empty() {
+                    vec![InvoiceLineItem {
+                        pos: 1,
+                        description: format!(
+                            "Umzugsdienstleistung gemäß Angebot Nr. {kva_nr}"
+                        ),
+                        quantity: 1.0,
+                        unit_price: offer_netto as f64 / 100.0,
+                        remark: None,
+                    }]
+                } else {
+                    kva_items
+                };
+                let extra_offset = base_items.len() as u32 + 1;
+                let extra_items: Vec<InvoiceLineItem> = extras
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| InvoiceLineItem {
+                        pos: extra_offset + i as u32,
+                        description: e.description.clone(),
+                        quantity: 1.0,
+                        unit_price: e.price_cents as f64 / 100.0,
+                        remark: None,
+                    })
+                    .collect();
+                let mut items = base_items;
+                items.extend(extra_items);
+                items
+            }
+        };
 
         let data = build_invoice_data_from_items(
             &invoice_context,
@@ -718,7 +755,7 @@ async fn load_invoice_context(
                     "Kein Angebot vorhanden — bitte erst ein Angebot erstellen oder einen Betrag angeben".into(),
                 )
             })?;
-            ActiveOfferRow { price_cents: cents, offer_number: None }
+            ActiveOfferRow { price_cents: cents, offer_number: None, line_items_json: None }
         }
     };
 
@@ -805,53 +842,125 @@ fn build_invoice_data_from_items(
     }
 }
 
-/// Compute the base netto and extra service vec for a regeneration (PATCH extra_services).
-///
-/// For `partial_final`, the base netto is derived from the sibling `partial_first` percent.
-/// `extra_percent` comes from the `partial_first` row looked up via `partial_group_id`.
-async fn compute_invoice_amounts(
-    offer_netto: i64,
-    inv_type: &InvoiceType,
-    partial_percent: Option<i32>,
-    db: &sqlx::PgPool,
-    partial_group_id: Option<Uuid>,
-    extras: &[ExtraServiceRequest],
-) -> Result<(i64, Vec<ExtraService>), ApiError> {
-    let offer_brutto = (offer_netto as f64 * 1.19).round() as i64;
+// ---------------------------------------------------------------------------
+// Final-invoice line-item helpers
+// ---------------------------------------------------------------------------
 
-    let base_netto = match inv_type {
-        InvoiceType::Full => offer_netto,
-        InvoiceType::PartialFirst { percent } => {
-            let brutto = (offer_brutto as f64 * *percent as f64 / 100.0).round() as i64;
-            (brutto as f64 / 1.19).round() as i64
-        }
-        InvoiceType::PartialFinal => {
-            // partial_percent is stored on both rows since creation, but fall back to sibling lookup
-            let pct = if let Some(p) = partial_percent {
-                p as u8
-            } else if let Some(gid) = partial_group_id {
-                invoice_repo::fetch_sibling_percent(db, gid)
-                    .await?
-                    .unwrap_or(0) as u8
+/// Convert offer `line_items_json` (OfferLineItem array) to InvoiceLineItem vec.
+///
+/// Returns an empty vec when `line_items_json` is NULL or cannot be parsed —
+/// the caller falls back to a single lump-sum line.
+fn kva_line_items_from_offer(ctx: &InvoiceContext, _kva_nr: &str) -> Vec<InvoiceLineItem> {
+    let json = match ctx.offer.line_items_json.as_ref() {
+        Some(j) => j,
+        None => return vec![],
+    };
+    let offer_items: Vec<OfferLineItem> = match serde_json::from_value(json.clone()) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+    offer_items
+        .into_iter()
+        .enumerate()
+        .map(|(i, item)| {
+            // Compute netto unit price in EUR for the invoice line.
+            // OfferLineItem stores unit_price per hour/unit in EUR.
+            // For labor items the total is unit_price × quantity × persons,
+            // but we flatten to a single line item: quantity=1, unit_price=total.
+            // For flat_total items we use the flat value directly.
+            let unit_price_eur = if let Some(flat) = item.flat_total {
+                flat
             } else {
-                0
+                item.unit_price * item.quantity
             };
-            // Mirror creation math so first + final == offer netto exactly
-            let first_brutto = (offer_brutto as f64 * pct as f64 / 100.0).round() as i64;
-            let first_netto = (first_brutto as f64 / 1.19).round() as i64;
-            offer_netto - first_netto
-        }
+            InvoiceLineItem {
+                pos: (i + 1) as u32,
+                description: item.description.clone(),
+                quantity: 1.0,
+                unit_price: unit_price_eur,
+                remark: item.remark.clone(),
+            }
+        })
+        .collect()
+}
+
+/// Build the complete line-item list for a PartialFinal (Schlussrechnung).
+///
+/// Layout:
+/// 1..N  KVA items (copied verbatim from offer line_items_json, or a lump-sum fallback)
+/// N+1.. extras (Zusatzleistungen / Gutschriften, positive or negative)
+/// last  "Abzüglich Anzahlung gemäß Rechnung Nr. {deposit_number}" (negative amount)
+///
+/// `first_netto` is the Anzahlung amount (netto cents) to deduct.
+/// `extras` is `None` at creation time (no extras yet) or `Some(&[…])` on PATCH regen.
+async fn build_final_line_items(
+    _db: &sqlx::PgPool,
+    ctx: &InvoiceContext,
+    first_netto: i64,
+    deposit_number: &str,
+    extras: Option<&[ExtraServiceRequest]>,
+) -> Result<Vec<InvoiceLineItem>, ApiError> {
+    let kva_nr = ctx.offer.offer_number.as_deref().unwrap_or("");
+
+    // Build KVA base items
+    let kva_items = kva_line_items_from_offer(ctx, kva_nr);
+    let mut items: Vec<InvoiceLineItem> = if kva_items.is_empty() {
+        // Fallback: single lump-sum for the full offer amount
+        vec![InvoiceLineItem {
+            pos: 1,
+            description: format!("Umzugsdienstleistung gemäß Angebot Nr. {kva_nr}"),
+            quantity: 1.0,
+            unit_price: ctx.offer.price_cents as f64 / 100.0,
+            remark: None,
+        }]
+    } else {
+        kva_items
     };
 
-    let extra_services = extras
-        .iter()
-        .map(|e| ExtraService {
-            description: e.description.clone(),
-            price_cents: e.price_cents,
-        })
-        .collect();
+    // Append extras (if any)
+    let extra_offset = items.len() as u32 + 1;
+    if let Some(ex) = extras {
+        for (i, e) in ex.iter().enumerate() {
+            items.push(InvoiceLineItem {
+                pos: extra_offset + i as u32,
+                description: e.description.clone(),
+                quantity: 1.0,
+                unit_price: e.price_cents as f64 / 100.0,
+                remark: None,
+            });
+        }
+    }
 
-    Ok((base_netto, extra_services))
+    // Append deduction line (negative)
+    let deduction_pos = items.len() as u32 + 1;
+    items.push(InvoiceLineItem {
+        pos: deduction_pos,
+        description: format!(
+            "Abzüglich Anzahlung gemäß Rechnung Nr. {deposit_number}"
+        ),
+        quantity: 1.0,
+        unit_price: -(first_netto as f64 / 100.0),
+        remark: None,
+    });
+
+    Ok(items)
+}
+
+/// Resolve the deposit (Anzahlung) invoice number for a partial_final row.
+///
+/// Priority: `deposit_invoice_id` column → `partial_group_id` sibling lookup → empty string.
+async fn resolve_deposit_number(db: &sqlx::PgPool, row: &InvoiceRow) -> String {
+    if let Some(dep_id) = row.deposit_invoice_id {
+        if let Ok(Some(n)) = invoice_repo::fetch_deposit_invoice_number(db, dep_id).await {
+            return n;
+        }
+    }
+    if let Some(gid) = row.partial_group_id {
+        if let Ok(Some(n)) = invoice_repo::fetch_deposit_number_by_group(db, gid).await {
+            return n;
+        }
+    }
+    String::new()
 }
 
 // ---------------------------------------------------------------------------
@@ -893,6 +1002,124 @@ async fn generate_pdf_bytes(xlsx: &[u8]) -> Vec<u8> {
             xlsx.to_vec()
         }
     }
+}
+
+/// Regenerate the PDF for an existing invoice row when its stored PDF is
+/// missing or unreadable. Updates `pdf_s3_key` in the DB on success.
+///
+/// **Why**: DB rows restored from backups may point at objects that no longer
+/// exist in storage, or a prior generation may have failed after the row was
+/// inserted. Without this self-heal, the user is deadlocked — the "create"
+/// button returns the existing row (idempotent), the download returns 404,
+/// and nothing can progress.
+async fn ensure_invoice_pdf(
+    state: &AppState,
+    row: &InvoiceRow,
+) -> Result<(), ApiError> {
+    // Fast path: key exists in DB and storage has the object.
+    if let Some(key) = row.pdf_s3_key.as_deref() {
+        match state.storage.download(key).await {
+            Ok(_) => return Ok(()),
+            Err(aust_storage::StorageError::NotFound(_)) => {
+                tracing::warn!(invoice_id = %row.id, %key, "Invoice PDF missing in storage — regenerating");
+            }
+            Err(e) => {
+                return Err(ApiError::Internal(format!(
+                    "Storage check failed for invoice {}: {e}", row.id
+                )));
+            }
+        }
+    } else {
+        tracing::warn!(invoice_id = %row.id, "Invoice row has no pdf_s3_key — regenerating");
+    }
+
+    // Load invoice context. No manual price fallback here — we are healing an
+    // existing row, the offer price (or its absence) is already reflected in
+    // the invoice's stored amounts, and we cannot safely invent a price.
+    let ctx = load_invoice_context(&state.db, row.inquiry_id, None).await?;
+    let today = Utc::now().date_naive();
+
+    // Parse existing extras to preserve them across regeneration.
+    let extras: Vec<ExtraServiceRequest> = row
+        .extra_services
+        .as_array()
+        .map(|arr| arr.iter().filter_map(|v| serde_json::from_value(v.clone()).ok()).collect())
+        .unwrap_or_default();
+
+    let (inv_type, items) = match row.invoice_type.as_str() {
+        "partial_first" => {
+            let pct = row.partial_percent.unwrap_or(0);
+            let offer_brutto = (ctx.offer.price_cents as f64 * 1.19).round() as i64;
+            let first_brutto = (offer_brutto as f64 * pct as f64 / 100.0).round() as i64;
+            let first_netto = (first_brutto as f64 / 1.19).round() as i64;
+            let kva_nr = ctx.offer.offer_number.as_deref().unwrap_or("");
+            let items = vec![InvoiceLineItem {
+                pos: 1,
+                description: format!("Anzahlung {pct}% gemäß Kostenvoranschlag Nr. {kva_nr}"),
+                quantity: 1.0,
+                unit_price: first_netto as f64 / 100.0,
+                remark: None,
+            }];
+            (InvoiceType::PartialFirst { percent: pct as u8 }, items)
+        }
+        "partial_final" => {
+            let offer_brutto = (ctx.offer.price_cents as f64 * 1.19).round() as i64;
+            let pct = row.partial_percent
+                .or_else(|| row.deposit_percent.map(|p| p as i32))
+                .unwrap_or(0);
+            let first_brutto = (offer_brutto as f64 * pct as f64 / 100.0).round() as i64;
+            let first_netto = (first_brutto as f64 / 1.19).round() as i64;
+            let deposit_number = resolve_deposit_number(&state.db, row).await;
+            let items = build_final_line_items(
+                &state.db,
+                &ctx,
+                first_netto,
+                &deposit_number,
+                if extras.is_empty() { None } else { Some(&extras) },
+            ).await?;
+            (InvoiceType::PartialFinal, items)
+        }
+        _ => {
+            // Full invoice
+            let offer_netto = ctx.offer.price_cents;
+            let kva_nr = ctx.offer.offer_number.as_deref().unwrap_or("");
+            let kva_items = kva_line_items_from_offer(&ctx, kva_nr);
+            let base_items = if kva_items.is_empty() {
+                vec![InvoiceLineItem {
+                    pos: 1,
+                    description: format!("Umzugsdienstleistung gemäß Angebot Nr. {kva_nr}"),
+                    quantity: 1.0,
+                    unit_price: offer_netto as f64 / 100.0,
+                    remark: None,
+                }]
+            } else {
+                kva_items
+            };
+            let extra_offset = base_items.len() as u32 + 1;
+            let extra_items: Vec<InvoiceLineItem> = extras
+                .iter()
+                .enumerate()
+                .map(|(i, e)| InvoiceLineItem {
+                    pos: extra_offset + i as u32,
+                    description: e.description.clone(),
+                    quantity: 1.0,
+                    unit_price: e.price_cents as f64 / 100.0,
+                    remark: None,
+                })
+                .collect();
+            let mut items = base_items;
+            items.extend(extra_items);
+            (InvoiceType::Full, items)
+        }
+    };
+
+    let data = build_invoice_data_from_items(&ctx, inv_type, &row.invoice_number, today, items);
+    let xlsx = generate_invoice_xlsx(&data)
+        .map_err(|e| ApiError::Internal(format!("Invoice XLSX error: {e}")))?;
+    let pdf = generate_pdf_bytes(&xlsx).await;
+    let new_key = upload_invoice_pdf(&*state.storage, row.id, &pdf).await?;
+    invoice_repo::update_pdf_key(&state.db, row.id, &new_key).await?;
+    Ok(())
 }
 
 /// Upload invoice PDF (or XLSX fallback) to S3 and return the storage key.

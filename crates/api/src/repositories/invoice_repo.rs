@@ -21,6 +21,10 @@ pub(crate) struct InvoiceRow {
     pub sent_at: Option<DateTime<Utc>>,
     pub paid_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
+    /// Anzahlung percent stored on `partial_first`; NULL otherwise.
+    pub deposit_percent: Option<i16>,
+    /// FK to the sibling `partial_first` invoice, stored on `partial_final`; NULL otherwise.
+    pub deposit_invoice_id: Option<Uuid>,
 }
 
 /// Minimal offer projection for invoice amount calculation.
@@ -28,6 +32,8 @@ pub(crate) struct InvoiceRow {
 pub(crate) struct ActiveOfferRow {
     pub price_cents: i64,
     pub offer_number: Option<String>,
+    /// KVA line items stored as JSONB; NULL when no offer exists or for pre-migration offers.
+    pub line_items_json: Option<serde_json::Value>,
 }
 
 // ── Queries ──────────────────────────────────────────────────────────────────
@@ -42,7 +48,8 @@ pub(crate) async fn list_by_inquiry(
 ) -> Result<Vec<InvoiceRow>, sqlx::Error> {
     sqlx::query_as(
         "SELECT id, inquiry_id, invoice_number, invoice_type, partial_group_id,
-                partial_percent, status, extra_services, pdf_s3_key, sent_at, paid_at, created_at
+                partial_percent, status, extra_services, pdf_s3_key, sent_at, paid_at, created_at,
+                deposit_percent, deposit_invoice_id
          FROM invoices WHERE inquiry_id = $1 ORDER BY created_at",
     )
     .bind(inquiry_id)
@@ -59,7 +66,7 @@ pub(crate) async fn fetch_active_offer(
     inquiry_id: Uuid,
 ) -> Result<Option<ActiveOfferRow>, sqlx::Error> {
     sqlx::query_as(
-        "SELECT price_cents, offer_number FROM offers WHERE inquiry_id = $1
+        "SELECT price_cents, offer_number, line_items_json FROM offers WHERE inquiry_id = $1
          ORDER BY created_at DESC LIMIT 1",
     )
     .bind(inquiry_id)
@@ -81,22 +88,6 @@ pub(crate) async fn fetch_inquiry_status(
             .fetch_optional(pool)
             .await?;
     Ok(row.map(|(s,)| s))
-}
-
-/// Count existing invoices for an inquiry.
-///
-/// **Caller**: `invoices::create_invoice`
-/// **Why**: Guards against creating duplicate invoices.
-pub(crate) async fn count_by_inquiry(
-    pool: &PgPool,
-    inquiry_id: Uuid,
-) -> Result<i64, sqlx::Error> {
-    let (count,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM invoices WHERE inquiry_id = $1")
-            .bind(inquiry_id)
-            .fetch_one(pool)
-            .await?;
-    Ok(count)
 }
 
 /// Allocate N sequential invoice numbers in a single round-trip.
@@ -140,7 +131,8 @@ pub(crate) async fn next_invoice_numbers(
 /// Insert a partial_first invoice row.
 ///
 /// **Caller**: `invoices::create_invoice` (partial flow)
-/// **Why**: Creates the Anzahlung invoice with status `ready`.
+/// **Why**: Creates the Anzahlung invoice with status `ready`. Also persists
+/// `deposit_percent` so the final invoice can reference it without a sibling lookup.
 pub(crate) async fn insert_partial_first(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     id: Uuid,
@@ -153,8 +145,8 @@ pub(crate) async fn insert_partial_first(
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO invoices (id, inquiry_id, invoice_number, invoice_type,
-            partial_group_id, partial_percent, status, extra_services, pdf_s3_key, created_at)
-         VALUES ($1,$2,$3,'partial_first',$4,$5,'ready','[]',$6,$7)",
+            partial_group_id, partial_percent, deposit_percent, status, extra_services, pdf_s3_key, created_at)
+         VALUES ($1,$2,$3,'partial_first',$4,$5,$5::smallint,'ready','[]',$6,$7)",
     )
     .bind(id)
     .bind(inquiry_id)
@@ -171,7 +163,9 @@ pub(crate) async fn insert_partial_first(
 /// Insert a partial_final invoice row.
 ///
 /// **Caller**: `invoices::create_invoice` (partial flow)
-/// **Why**: Creates the Restbetrag invoice with status `draft`.
+/// **Why**: Creates the Schlussrechnung with status `draft`. Stores `deposit_invoice_id`
+/// (FK to the sibling `partial_first`) so the deduction line can reference the exact
+/// Anzahlung invoice number without another DB round-trip.
 pub(crate) async fn insert_partial_final(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     id: Uuid,
@@ -179,24 +173,60 @@ pub(crate) async fn insert_partial_final(
     invoice_number: &str,
     group_id: Uuid,
     percent: i32,
+    first_id: Uuid,
     pdf_s3_key: &str,
     created_at: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO invoices (id, inquiry_id, invoice_number, invoice_type,
-            partial_group_id, partial_percent, status, extra_services, pdf_s3_key, created_at)
-         VALUES ($1,$2,$3,'partial_final',$4,$5,'draft','[]',$6,$7)",
+            partial_group_id, partial_percent, deposit_invoice_id, status, extra_services, pdf_s3_key, created_at)
+         VALUES ($1,$2,$3,'partial_final',$4,$5,$6,'draft','[]',$7,$8)",
     )
     .bind(id)
     .bind(inquiry_id)
     .bind(invoice_number)
     .bind(group_id)
     .bind(percent)
+    .bind(first_id)
     .bind(pdf_s3_key)
     .bind(created_at)
     .execute(&mut **tx)
     .await?;
     Ok(())
+}
+
+/// Fetch the invoice number of the partial_first sibling for a partial_final invoice.
+///
+/// **Caller**: `invoices::build_final_line_items` (PDF regeneration on PATCH)
+/// **Why**: The Schlussrechnung needs to print "Abzüglich Anzahlung gemäß Rechnung Nr. {n}".
+pub(crate) async fn fetch_deposit_invoice_number(
+    pool: &PgPool,
+    deposit_invoice_id: Uuid,
+) -> Result<Option<String>, sqlx::Error> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT invoice_number FROM invoices WHERE id = $1")
+            .bind(deposit_invoice_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|(n,)| n))
+}
+
+/// Fetch the partial_first invoice number via group_id (fallback when deposit_invoice_id is NULL).
+///
+/// **Caller**: `invoices::build_final_line_items`
+/// **Why**: Pre-migration rows don't have `deposit_invoice_id`; look up via `partial_group_id`.
+pub(crate) async fn fetch_deposit_number_by_group(
+    pool: &PgPool,
+    group_id: Uuid,
+) -> Result<Option<String>, sqlx::Error> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT invoice_number FROM invoices
+         WHERE partial_group_id = $1 AND invoice_type = 'partial_first'",
+    )
+    .bind(group_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(n,)| n))
 }
 
 /// Insert a full invoice row.
@@ -236,7 +266,8 @@ pub(crate) async fn fetch_by_id(
 ) -> Result<Option<InvoiceRow>, sqlx::Error> {
     sqlx::query_as(
         "SELECT id, inquiry_id, invoice_number, invoice_type, partial_group_id,
-                partial_percent, status, extra_services, pdf_s3_key, sent_at, paid_at, created_at
+                partial_percent, status, extra_services, pdf_s3_key, sent_at, paid_at, created_at,
+                deposit_percent, deposit_invoice_id
          FROM invoices WHERE id = $1",
     )
     .bind(inv_id)
@@ -255,7 +286,8 @@ pub(crate) async fn fetch_by_id_and_inquiry(
 ) -> Result<Option<InvoiceRow>, sqlx::Error> {
     sqlx::query_as(
         "SELECT id, inquiry_id, invoice_number, invoice_type, partial_group_id,
-                partial_percent, status, extra_services, pdf_s3_key, sent_at, paid_at, created_at
+                partial_percent, status, extra_services, pdf_s3_key, sent_at, paid_at, created_at,
+                deposit_percent, deposit_invoice_id
          FROM invoices WHERE id = $1 AND inquiry_id = $2",
     )
     .bind(inv_id)
@@ -366,24 +398,6 @@ pub(crate) async fn update_pdf_key(
         .execute(pool)
         .await?;
     Ok(())
-}
-
-/// Fetch partial_percent from a sibling partial_first invoice.
-///
-/// **Caller**: `invoices::compute_invoice_amounts`
-/// **Why**: Fallback lookup for partial_final base netto calculation.
-pub(crate) async fn fetch_sibling_percent(
-    pool: &PgPool,
-    group_id: Uuid,
-) -> Result<Option<i32>, sqlx::Error> {
-    let row: Option<(Option<i32>,)> = sqlx::query_as(
-        "SELECT partial_percent FROM invoices
-         WHERE partial_group_id = $1 AND invoice_type = 'partial_first'",
-    )
-    .bind(group_id)
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.and_then(|(p,)| p))
 }
 
 /// Fetch customer email and name for invoice email dispatch.
