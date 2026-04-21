@@ -16,6 +16,7 @@ use crate::repositories::{
     address_repo, customer_repo, estimation_repo, inquiry_repo, offer_repo,
 };
 use crate::services::offer_builder::{parse_detected_items, VolumeEstimationRow};
+use crate::types::resolve_billing_address_id;
 use crate::ApiError;
 
 // ---------------------------------------------------------------------------
@@ -80,6 +81,16 @@ pub async fn build_inquiry_response(
         None
     };
     let billing_address = fetch_address(pool, row.inquiry_billing_address_id).await?;
+
+    // Compute effective billing address (the one that lands on KVA/invoice)
+    let effective_billing_address_id = resolve_billing_address_id(
+        row.inquiry_billing_address_id,
+        customer.billing_address_id,
+        row.origin_address_id,
+        row.destination_address_id,
+        row.status.as_str(),
+    );
+    let effective_billing_address = fetch_address(pool, effective_billing_address_id).await?;
 
     // 4. Fetch latest completed estimation + items
     let est = estimation_repo::fetch_completed_for_inquiry(pool, inquiry_id).await?;
@@ -278,6 +289,7 @@ pub async fn build_inquiry_response(
         submission_mode: row.submission_mode,
         recipient,
         billing_address,
+        effective_billing_address,
         customer: Some(CustomerSnapshot {
             id: customer.id,
             name: customer.name,

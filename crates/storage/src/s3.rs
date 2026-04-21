@@ -83,7 +83,16 @@ impl StorageProvider for S3Storage {
             .key(key)
             .send()
             .await
-            .map_err(|e| StorageError::S3(e.to_string()))?;
+            .map_err(|e| {
+                if e.as_service_error()
+                    .map(|s| s.is_no_such_key())
+                    .unwrap_or(false)
+                {
+                    StorageError::NotFound(key.to_string())
+                } else {
+                    StorageError::S3(e.to_string())
+                }
+            })?;
 
         let data = response
             .body

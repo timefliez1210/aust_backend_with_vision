@@ -58,6 +58,8 @@ pub struct InquiryResponse {
     pub recipient: Option<CustomerSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub billing_address: Option<AddressSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_billing_address: Option<AddressSnapshot>,
 
     // Related entities
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -567,7 +567,12 @@ async fn download_inquiry_pdf(
         .storage
         .download(&storage_key)
         .await
-        .map_err(|e| ApiError::Internal(format!("PDF-Download fehlgeschlagen: {e}")))?;
+        .map_err(|e| match e {
+            aust_storage::StorageError::NotFound(_) => {
+                ApiError::NotFound("Angebot-PDF nicht gefunden.".into())
+            }
+            _ => ApiError::Internal(format!("PDF-Download fehlgeschlagen: {e}")),
+        })?;
 
     Ok(axum::response::Response::builder()
         .header("Content-Type", "application/pdf")

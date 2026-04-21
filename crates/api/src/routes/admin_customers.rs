@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use aust_core::models::TokenClaims;
-use crate::repositories::admin_repo;
+use aust_core::models::{AddressSnapshot, TokenClaims};
+use crate::repositories::{address_repo, admin_repo};
 use crate::{ApiError, AppState};
 
 use super::admin::require_admin;
@@ -93,6 +93,7 @@ pub(super) struct CustomerDetailResponse {
     customer_type: Option<String>,
     company_name: Option<String>,
     billing_address_id: Option<Uuid>,
+    billing_address: Option<AddressSnapshot>,
     created_at: DateTime<Utc>,
     quotes: Vec<CustomerQuote>,
     offers: Vec<CustomerOffer>,
@@ -180,6 +181,25 @@ pub(super) async fn get_customer(
         })
         .collect();
 
+    let billing_address = if let Some(addr_id) = repo_customer.billing_address_id {
+        address_repo::fetch_full(&state.db, addr_id).await?.map(|a| AddressSnapshot {
+            id: a.id,
+            street: a.street,
+            house_number: a.house_number,
+            city: a.city,
+            postal_code: a.postal_code.unwrap_or_default(),
+            country: if a.country.is_empty() { "Deutschland".to_string() } else { a.country },
+            floor: a.floor,
+            elevator: a.elevator,
+            needs_parking_ban: Some(a.parking_ban),
+            parking_ban: a.parking_ban,
+            latitude: a.latitude,
+            longitude: a.longitude,
+        })
+    } else {
+        None
+    };
+
     Ok(Json(CustomerDetailResponse {
         id: repo_customer.id,
         email: repo_customer.email,
@@ -191,6 +211,7 @@ pub(super) async fn get_customer(
         customer_type: repo_customer.customer_type,
         company_name: repo_customer.company_name,
         billing_address_id: repo_customer.billing_address_id,
+        billing_address,
         created_at: repo_customer.created_at,
         quotes,
         offers,

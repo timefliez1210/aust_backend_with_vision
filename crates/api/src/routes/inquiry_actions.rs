@@ -742,6 +742,7 @@ pub(crate) async fn update_assignment(
         body.break_minutes,
         body.actual_hours,
         body.notes.as_deref(),
+        body.day_date,
     )
     .await?;
 

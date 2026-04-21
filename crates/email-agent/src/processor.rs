@@ -9,6 +9,7 @@ use chrono::NaiveDate;
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
@@ -58,6 +59,11 @@ pub struct EmailProcessor {
     offer_tx: Option<mpsc::UnboundedSender<ApprovalDecision>>,
     /// The configured from address for outbound emails.
     from_address: String,
+    /// Telegram poll health — summarised every 15 min instead of per-iteration spam.
+    telegram_last_status_log: Instant,
+    telegram_poll_successes: u32,
+    telegram_poll_failures: u32,
+    telegram_last_error: Option<String>,
 }
 
 impl EmailProcessor {
@@ -94,6 +100,10 @@ impl EmailProcessor {
             pending_capacity: HashMap::new(),
             offer_tx: None,
             from_address,
+            telegram_last_status_log: Instant::now(),
+            telegram_poll_successes: 0,
+            telegram_poll_failures: 0,
+            telegram_last_error: None,
         }
     }
 
@@ -594,16 +604,49 @@ impl EmailProcessor {
         }
     }
 
+    /// Emit a single summary line every 15 min covering Telegram poll health.
+    /// Replaces per-iteration error spam from invalid-token / network hiccups.
+    fn maybe_log_telegram_status(&mut self) {
+        const INTERVAL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+        if self.telegram_last_status_log.elapsed() < INTERVAL {
+            return;
+        }
+        let ok = self.telegram_poll_successes;
+        let fail = self.telegram_poll_failures;
+        match (ok, fail) {
+            (_, 0) => info!("Telegram poll healthy: {ok} successes in last 15min"),
+            (0, _) => warn!(
+                "Telegram poll unhealthy: {fail} failures in last 15min (last error: {})",
+                self.telegram_last_error.as_deref().unwrap_or("?")
+            ),
+            _ => info!(
+                "Telegram poll mixed: {ok} ok / {fail} fail in last 15min (last error: {})",
+                self.telegram_last_error.as_deref().unwrap_or("?")
+            ),
+        }
+        self.telegram_last_status_log = Instant::now();
+        self.telegram_poll_successes = 0;
+        self.telegram_poll_failures = 0;
+        self.telegram_last_error = None;
+    }
+
     /// Check Telegram for approval decisions and process them.
     async fn check_approvals(&mut self) {
-        let responses = {
+        let poll_result = {
             let mut tg = self.telegram.lock().await;
-            match tg.poll_approvals().await {
-                Ok(r) => r,
-                Err(e) => {
-                    error!("Telegram poll failed: {e}");
-                    return;
-                }
+            tg.poll_approvals().await
+        };
+        let responses = match poll_result {
+            Ok(r) => {
+                self.telegram_poll_successes = self.telegram_poll_successes.saturating_add(1);
+                self.maybe_log_telegram_status();
+                r
+            }
+            Err(e) => {
+                self.telegram_poll_failures = self.telegram_poll_failures.saturating_add(1);
+                self.telegram_last_error = Some(e.to_string());
+                self.maybe_log_telegram_status();
+                return;
             }
         };
 

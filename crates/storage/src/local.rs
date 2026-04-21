@@ -59,3 +59,32 @@ impl StorageProvider for LocalStorage {
     }
 
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn download_missing_key_returns_not_found() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let storage = LocalStorage::new(dir.path().to_str().unwrap()).unwrap();
+
+        let err = storage.download("nonexistent/file.pdf").await.unwrap_err();
+        assert!(
+            matches!(err, StorageError::NotFound(_)),
+            "expected NotFound, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_existing_key_returns_bytes() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let storage = LocalStorage::new(dir.path().to_str().unwrap()).unwrap();
+
+        let data = Bytes::from_static(b"hello pdf");
+        storage.upload("offers/test.pdf", data.clone(), "application/pdf").await.unwrap();
+
+        let result = storage.download("offers/test.pdf").await.unwrap();
+        assert_eq!(result, data);
+    }
+}

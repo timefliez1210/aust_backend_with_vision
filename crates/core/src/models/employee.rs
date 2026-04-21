@@ -81,4 +81,7 @@ pub struct UpdateAssignment {
     pub break_minutes: Option<i32>,
     pub actual_hours: Option<f64>,
     pub notes: Option<String>,
+    /// When set, scopes the update to the single day at this date (multi-day inquiries).
+    /// When omitted, updates day_number = 1 and the flat table (legacy single-day path).
+    pub day_date: Option<chrono::NaiveDate>,
 }

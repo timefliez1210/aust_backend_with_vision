@@ -645,6 +645,7 @@ pub(crate) async fn update_employee_assignment(
     break_minutes: Option<i32>,
     actual_hours_override: Option<f64>,
     notes: Option<&str>,
+    day_date: Option<chrono::NaiveDate>,
 ) -> Result<u64, sqlx::Error> {
     // Derive actual_hours in Rust: use override if provided, otherwise compute from clock times
     let break_min_f = break_minutes.unwrap_or(0) as f64;
@@ -678,7 +679,8 @@ pub(crate) async fn update_employee_assignment(
         WHERE inquiry_day_id = iday.id
           AND iday.inquiry_id = $1
           AND employee_id = $2
-          AND iday.day_number = 1
+          AND ($11::date IS NULL OR iday.day_date = $11)
+          AND ($11::date IS NOT NULL OR iday.day_number = 1)
         "#,
     )
     .bind(inquiry_id)
@@ -691,10 +693,13 @@ pub(crate) async fn update_employee_assignment(
     .bind(break_minutes)
     .bind(computed_actual_hours)
     .bind(notes)
+    .bind(day_date)
     .execute(pool)
     .await?;
 
-    // Also update flat table for backwards compat
+    // Also update flat table for backwards compat — only when editing the single-day default.
+    // Per-day edits would otherwise overwrite the aggregate with a single day's values.
+    if day_date.is_none() {
     let _ = sqlx::query(
         r#"
         UPDATE inquiry_employees SET
@@ -726,6 +731,7 @@ pub(crate) async fn update_employee_assignment(
     .bind(notes)
     .execute(pool)
     .await;
+    }
 
     Ok(result.rows_affected())
 }

@@ -560,7 +560,12 @@ async fn get_inquiry_pdf(
         .storage
         .download(&storage_key)
         .await
-        .map_err(|e| ApiError::Internal(format!("Download fehlgeschlagen: {e}")))?;
+        .map_err(|e| match e {
+            aust_storage::StorageError::NotFound(_) => {
+                ApiError::NotFound("Angebot-PDF nicht gefunden.".into())
+            }
+            _ => ApiError::Internal(format!("Download fehlgeschlagen: {e}")),
+        })?;
 
     let (content_type, ext) = if storage_key.ends_with(".pdf") {
         ("application/pdf", "pdf")

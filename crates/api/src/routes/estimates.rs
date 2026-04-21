@@ -835,7 +835,12 @@ async fn serve_image(
         .storage
         .download(&key)
         .await
-        .map_err(|e| ApiError::Internal(format!("Failed to download image: {e}")))?;
+        .map_err(|e| match e {
+            aust_storage::StorageError::NotFound(_) => {
+                ApiError::NotFound("Bild nicht gefunden.".into())
+            }
+            _ => ApiError::Internal(format!("Failed to download image: {e}")),
+        })?;
 
     let key_lower = key.to_lowercase();
     let content_type = if key_lower.ends_with(".png") {

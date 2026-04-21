@@ -195,7 +195,12 @@ pub(super) async fn send_draft_email(
             .storage
             .download(key)
             .await
-            .map_err(|e| ApiError::Internal(format!("PDF-Download fehlgeschlagen: {e}")))?;
+            .map_err(|e| match e {
+                aust_storage::StorageError::NotFound(_) => {
+                    ApiError::NotFound("Angebot-PDF nicht gefunden.".into())
+                }
+                _ => ApiError::Internal(format!("PDF-Download fehlgeschlagen: {e}")),
+            })?;
 
         let attach_filename = if let Ok(Some((offer_num, last_name))) =
             offer_repo::fetch_offer_filename_parts(&state.db, oid).await

@@ -1357,9 +1357,15 @@ async fn download_feedback_attachment(
     let key = report.attachment_keys.get(idx)
         .ok_or_else(|| ApiError::NotFound("Anhang nicht gefunden.".into()))?;
 
-    let data = state.storage.download(key).await.map_err(|e| {
-        tracing::error!("S3 download for feedback attachment {key}: {e}");
-        ApiError::NotFound("Anhang konnte nicht abgerufen werden.".into())
+    let data = state.storage.download(key).await.map_err(|e| match e {
+        aust_storage::StorageError::NotFound(_) => {
+            tracing::warn!("Feedback attachment not found in storage: {key}");
+            ApiError::NotFound("Anhang nicht gefunden.".into())
+        }
+        _ => {
+            tracing::error!("S3 download for feedback attachment {key}: {e}");
+            ApiError::NotFound("Anhang konnte nicht abgerufen werden.".into())
+        }
     })?;
 
     let filename = key.rsplit('/').next().unwrap_or("attachment");
