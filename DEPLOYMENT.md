@@ -222,7 +222,39 @@ emergency rollback: `systemctl enable aust-backend && systemctl start aust-backe
 
 ---
 
-## 5. Open Follow-ups
+## 5. Restore Drill — Quarterly
+
+Run this drill every ~3 months to verify backups are actually usable.
+
+```bash
+# Step 1 — pull latest backups from VPS
+bash scripts/pull-backups.sh
+
+# Step 2 — start staging stack if not running
+bash scripts/staging-up.sh
+
+# Step 3 — restore into staging containers
+bash scripts/restore-local.sh -y
+
+# Step 4 — verify Postgres row count (should be > 0)
+docker exec aust_staging_postgres psql -U aust_staging -d aust_staging \
+  -c "SELECT COUNT(*) AS inquiries FROM inquiries;"
+
+# Step 5 — verify MinIO bucket size (should match VPS, > 100 KB)
+docker exec aust_staging_minio mc du local/aust-uploads
+```
+
+Expected results:
+- `inquiries` row count matches production (check via admin dashboard before the drill).
+- MinIO `aust-uploads` bucket size is within ~5% of the latest production backup tarball size.
+- No errors in `restore-local.sh` output.
+
+If the drill fails, check `/var/log/aust-backup.log` on the VPS and `~/aust-backups/pull-cron.log`
+locally. Alert the team and do not skip the next scheduled backup until the root cause is resolved.
+
+---
+
+## 6. Open Follow-ups  <!-- was §5 -->
 
 These must be addressed before (or as part of) the cutover:
 
@@ -243,7 +275,7 @@ and the web UI regardless.
 
 ---
 
-## 6. Rollback
+## 7. Rollback
 
 **Backend (Docker)**
 

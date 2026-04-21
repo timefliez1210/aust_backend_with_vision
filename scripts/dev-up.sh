@@ -118,7 +118,7 @@ export AUST__DATABASE__URL="postgres://aust_staging:aust_staging_password@localh
 
 export AUST__STORAGE__PROVIDER=s3
 export AUST__STORAGE__ENDPOINT="http://localhost:9010"
-export AUST__STORAGE__BUCKET=aust-staging-uploads
+export AUST__STORAGE__BUCKET=aust-uploads  # restored prod volume uses the prod bucket name
 export AUST__STORAGE__REGION=us-east-1
 export AUST__STORAGE__ACCESS_KEY_ID=minioadmin
 export AUST__STORAGE__SECRET_ACCESS_KEY=minioadmin

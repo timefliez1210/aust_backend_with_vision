@@ -18,6 +18,35 @@ This system runs live at **www.aust-umzuege.de**. The PostgreSQL database contai
 
 If in doubt, ask before running anything against the database.
 
+## Data Integrity
+
+Production data lives in exactly three stateful resources. Losing any one of them is irreversible.
+
+### Stateful resources
+
+- **`aust_postgres_data`** — Docker named volume on the VPS (`/var/lib/docker/volumes/aust_postgres_data/`). Contains all customer PII, inquiries, offers, invoices, calendar items, and employee data in relational form. Primary source of truth.
+- **`aust_minio_data`** — Docker named volume on the VPS (`/var/lib/docker/volumes/aust_minio_data/`). Contains all binary objects: offer PDFs, invoice PDFs, vision-estimation crop images, feedback attachments, and any uploaded media. PostgreSQL rows reference S3 keys stored here — if the volume is wiped, DB references become dangling pointers with no recovery path.
+- **`/opt/aust/.env`** — Secrets file on the VPS. Regeneratable from password manager; not a backup concern, but losing it stops the service.
+
+The compose file declares both volumes `external: true` — this is intentional. It means `docker compose down -v` **cannot** silently destroy them.
+
+### Never-do list
+
+- **Never `docker compose down -v`** in prod or staging against these volumes. The `external: true` declaration in the compose file exists specifically to block accidental deletion; do not change that line.
+- **Never `docker volume rm aust_postgres_data`** or **`docker volume rm aust_minio_data`**. Both are production data. There is no undo.
+- **Never delete DB rows or MinIO objects independently.** If a DB row references an S3 key, both must be cleaned up atomically. Use the hard-delete helpers in `inquiry_actions.rs` which handle both sides. See rule 3 in the 🚨 block above.
+- **Never deploy with anonymous or renamed volumes.** Volume names must stay stable across every deploy. A renamed volume silently creates a new empty volume and leaves the old data orphaned.
+
+### Backups
+
+- **VPS cron** (`scripts/backup.sh`): runs nightly at 03:00 UTC. Produces a `pg_dump` + a tar of `aust_minio_data` → `/opt/aust/backups/` with 7-day retention. The MinIO tarball size is checked — a Telegram alert fires if it shrinks by >50% or drops under 100 KB (this check would have caught the April-02-2026 data-loss incident immediately). See [`scripts/backup.sh`](scripts/backup.sh) and [`DEPLOYMENT.md §Backups`](DEPLOYMENT.md#backups).
+- **Off-VPS replication** (`scripts/pull-backups.sh`): rsyncs `/opt/aust/backups/` to `~/aust-backups/` on the dev machine. Install the local cron via `scripts/setup-local-backup-cron.sh` so this runs nightly independent of the VPS. **The VPS backup alone is not a real backup** — a failed VPS or a mistaken volume-rm destroys both the data and the only copy simultaneously.
+- **Alerting**: `backup.sh` sends a Telegram message on success and a different alert on size anomaly. If nightly Telegram confirmations stop arriving, investigate immediately.
+
+### Restore drill
+
+Run `scripts/pull-backups.sh && scripts/restore-local.sh -y` quarterly. After restore, verify row count in `inquiries` and bucket object count/size in `aust_staging_minio`. Log the result to [`DEPLOYMENT.md §Restore Drill`](DEPLOYMENT.md#restore-drill). See also [`scripts/restore-local.sh`](scripts/restore-local.sh).
+
 ## Quick Orientation
 
 | What | Where | One-line |

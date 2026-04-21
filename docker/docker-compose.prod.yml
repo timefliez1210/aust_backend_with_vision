@@ -1,3 +1,7 @@
+# DO NOT REMOVE external: true — protects prod data from accidental `docker compose down -v`.
+# Pre-create volumes once before first deploy:
+#   docker volume create aust_postgres_data
+#   docker volume create aust_minio_data
 services:
   postgres:
     image: postgres:16-alpine
@@ -81,4 +85,8 @@ services:
 
 volumes:
   postgres_data:
+    external: true
+    name: aust_postgres_data
   minio_data:
+    external: true
+    name: aust_minio_data
