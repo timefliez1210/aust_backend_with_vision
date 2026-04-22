@@ -249,7 +249,7 @@ pub(crate) async fn link_email_thread(
 /// **Why**: Centralises the INSERT with all columns including volume, distance, services, source.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn create(
-    pool: &PgPool,
+    executor: impl sqlx::Executor<'_, Database = sqlx::Postgres>,
     id: Uuid,
     customer_id: Uuid,
     origin_id: Option<Uuid>,
@@ -297,7 +297,7 @@ pub(crate) async fn create(
     .bind(billing_address_id)
     .bind(custom_fields)
     .bind(now)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }
@@ -879,7 +879,7 @@ pub(crate) async fn count_items(
 /// **Caller**: `handle_submission`, `video_inquiry`
 /// **Why**: Public form submissions create inquiries without volume/distance initially.
 pub(crate) async fn create_minimal(
-    pool: &PgPool,
+    executor: impl sqlx::Executor<'_, Database = sqlx::Postgres>,
     id: Uuid,
     customer_id: Uuid,
     origin_id: Option<Uuid>,
@@ -922,7 +922,7 @@ pub(crate) async fn create_minimal(
     .bind(billing_address_id)
     .bind(custom_fields)
     .bind(now)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }

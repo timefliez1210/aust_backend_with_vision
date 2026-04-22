@@ -193,7 +193,6 @@ async fn handle_complete_inquiry(
 
     let now = chrono::Utc::now();
 
-    // 1. Create or find customer by email
     // Split "Vorname Nachname" into structured fields for the PDF greeting logic.
     let (inq_first_name, inq_last_name) = inquiry
         .name
@@ -209,110 +208,8 @@ async fn handle_complete_inquiry(
         })
         .unwrap_or((None, None));
 
-    let customer_id: Uuid = match customer_repo::upsert(
-        &state.db,
-        &inquiry.email,
-        inquiry.name.as_deref(),
-        inquiry.salutation.as_deref(),
-        inq_first_name.as_deref(),
-        inq_last_name.as_deref(),
-        inquiry.phone.as_deref(),
-        None,
-        None,
-        now,
-    )
-    .await
-    {
-        Ok(id) => id,
-        Err(e) => {
-            error!("Failed to create customer: {e}");
-            return;
-        }
-    };
-
-    // 2. Create origin address (if we have departure address)
-    let origin_id = if let Some(ref addr) = inquiry.departure_address {
-        let (street, city, postal) = services::vision::parse_address(addr);
-        let postal_opt = if postal.is_empty() { None } else { Some(postal.as_str()) };
-        match address_repo::create(
-            &state.db,
-            &street,
-            &city,
-            postal_opt,
-            inquiry.departure_floor.as_deref(),
-            inquiry.departure_elevator,
-        None,
-        None,
-        )
-        .await
-        {
-            Ok(id) => Some(id),
-            Err(e) => {
-                warn!("Failed to create origin address: {e}");
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    // 3. Create destination address (if we have arrival address)
-    let dest_id = if let Some(ref addr) = inquiry.arrival_address {
-        let (street, city, postal) = services::vision::parse_address(addr);
-        let postal_opt = if postal.is_empty() { None } else { Some(postal.as_str()) };
-        match address_repo::create(
-            &state.db,
-            &street,
-            &city,
-            postal_opt,
-            inquiry.arrival_floor.as_deref(),
-            inquiry.arrival_elevator,
-        None,
-        None,
-        )
-        .await
-        {
-            Ok(id) => Some(id),
-            Err(e) => {
-                warn!("Failed to create destination address: {e}");
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    // 3b. Create intermediate stop address (if any)
-    let stop_id = if inquiry.has_intermediate_stop {
-        if let Some(ref addr) = inquiry.intermediate_address {
-            let (street, city, postal) = services::vision::parse_address(addr);
-            let postal_opt = if postal.is_empty() { None } else { Some(postal.as_str()) };
-            match address_repo::create(
-                &state.db,
-                &street,
-                &city,
-                postal_opt,
-                inquiry.intermediate_floor.as_deref(),
-                inquiry.intermediate_elevator,
-        None,
-        None,
-            )
-            .await
-            {
-                Ok(id) => Some(id),
-                Err(e) => {
-                    warn!("Failed to create stop address: {e}");
-                    None
-                }
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    // 3c. Calculate distance if both addresses exist (include intermediate stop in route)
+    // Calculate distance before the transaction (external HTTP call, no DB side-effects)
+    // Calculate distance if both addresses exist (include intermediate stop in route)
     let distance_km = if let (Some(dep), Some(arr)) =
         (&inquiry.departure_address, &inquiry.arrival_address)
     {
@@ -369,45 +266,99 @@ async fn handle_complete_inquiry(
         }
     });
 
-    // 5. Create quote
+    // 5. Create quote — wrap customer + addresses + inquiry in a single transaction
     let inquiry_id = Uuid::now_v7();
     let scheduled_date = inquiry.scheduled_date;
 
     let inquiry_services = build_services(&inquiry);
     let services_json = serde_json::to_value(&inquiry_services).unwrap_or_default();
-    // notes now contains ONLY the customer's free-text message
     let notes = inquiry.notes.clone();
     let source = serde_json::to_value(&inquiry.source)
         .ok()
         .and_then(|v| v.as_str().map(String::from))
         .unwrap_or_else(|| "direct_email".to_string());
 
-    if let Err(e) = inquiry_repo::create(
-        &state.db,
-        inquiry_id,
-        customer_id,
-        origin_id,
-        dest_id,
-        stop_id,
-        "estimated",
-        Some(volume_m3),
-        distance_km,
-        scheduled_date,
-        notes.as_deref(),
-        &services_json,
-        &source,
-        None,  // service_type — legacy orchestrator path
-        None,  // submission_mode
-        None,  // recipient_id
-        None,  // billing_address_id
-        &serde_json::json!({}),  // custom_fields
-        now,
-    )
-    .await
-    {
-        error!("Failed to create quote: {e}");
-        return;
-    }
+    let customer_id: Uuid = {
+        let mut tx = match state.db.begin().await {
+            Ok(tx) => tx,
+            Err(e) => { error!("Failed to begin transaction: {e}"); return; }
+        };
+
+        let customer_id_tx: Uuid = match customer_repo::upsert(
+            &mut *tx,
+            &inquiry.email,
+            inquiry.name.as_deref(),
+            inquiry.salutation.as_deref(),
+            inq_first_name.as_deref(),
+            inq_last_name.as_deref(),
+            inquiry.phone.as_deref(),
+            None,
+            None,
+            now,
+        ).await {
+            Ok(id) => id,
+            Err(e) => { error!("Failed to create customer in tx: {e}"); return; }
+        };
+        // Ensure address IDs written in the transaction match what we already resolved above.
+        // We re-insert them inside the tx so they're covered by the rollback boundary.
+        let origin_id_tx = if let Some(ref addr) = inquiry.departure_address {
+            let (street, city, postal) = crate::services::vision::parse_address(addr);
+            let postal_opt = if postal.is_empty() { None } else { Some(postal.as_str()) };
+            match address_repo::create(&mut *tx, &street, &city, postal_opt, inquiry.departure_floor.as_deref(), inquiry.departure_elevator, None, None).await {
+                Ok(id) => Some(id),
+                Err(e) => { warn!("Failed to create origin address in tx: {e}"); None }
+            }
+        } else { None };
+        let dest_id_tx = if let Some(ref addr) = inquiry.arrival_address {
+            let (street, city, postal) = crate::services::vision::parse_address(addr);
+            let postal_opt = if postal.is_empty() { None } else { Some(postal.as_str()) };
+            match address_repo::create(&mut *tx, &street, &city, postal_opt, inquiry.arrival_floor.as_deref(), inquiry.arrival_elevator, None, None).await {
+                Ok(id) => Some(id),
+                Err(e) => { warn!("Failed to create destination address in tx: {e}"); None }
+            }
+        } else { None };
+        let stop_id_tx = if inquiry.has_intermediate_stop {
+            if let Some(ref addr) = inquiry.intermediate_address {
+                let (street, city, postal) = crate::services::vision::parse_address(addr);
+                let postal_opt = if postal.is_empty() { None } else { Some(postal.as_str()) };
+                match address_repo::create(&mut *tx, &street, &city, postal_opt, inquiry.intermediate_floor.as_deref(), inquiry.intermediate_elevator, None, None).await {
+                    Ok(id) => Some(id),
+                    Err(e) => { warn!("Failed to create stop address in tx: {e}"); None }
+                }
+            } else { None }
+        } else { None };
+
+        if let Err(e) = inquiry_repo::create(
+            &mut *tx,
+            inquiry_id,
+            customer_id_tx,
+            origin_id_tx,
+            dest_id_tx,
+            stop_id_tx,
+            "estimated",
+            Some(volume_m3),
+            distance_km,
+            scheduled_date,
+            notes.as_deref(),
+            &services_json,
+            &source,
+            None,
+            None,
+            None,
+            None,
+            &serde_json::json!({}),
+            now,
+        ).await {
+            error!("Failed to create inquiry in tx: {e}");
+            return;
+        }
+
+        if let Err(e) = tx.commit().await {
+            error!("Failed to commit inquiry transaction: {e}");
+            return;
+        }
+        customer_id_tx
+    };
 
     // 6. Create a volume estimation record (manual, from inquiry data)
     let estimation_id = Uuid::now_v7();

@@ -120,7 +120,7 @@ pub(crate) async fn fetch_full(
 /// **Caller**: `create_inquiry`, `handle_submission`, `handle_complete_inquiry`
 /// **Why**: Multiple entry points create addresses; centralises the INSERT.
 pub(crate) async fn create(
-    pool: &PgPool,
+    executor: impl sqlx::Executor<'_, Database = sqlx::Postgres>,
     street: &str,
     city: &str,
     postal_code: Option<&str>,
@@ -140,7 +140,7 @@ pub(crate) async fn create(
     .bind(elevator)
     .bind(house_number)
     .bind(parking_ban.unwrap_or(false))
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await?;
     Ok(id)
 }

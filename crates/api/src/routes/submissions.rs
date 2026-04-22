@@ -185,64 +185,21 @@ async fn handle_ar_submission(
 
     let now = chrono::Utc::now();
 
-    // 1. Upsert customer
-    let customer_id = customer_repo::upsert(
-        &state.db,
-        &email,
-        Some(&name),
-        form.salutation.as_deref(),
-        form.first_name.as_deref(),
-        form.last_name.as_deref(),
-        form.phone.as_deref(),
-        form.customer_type.as_deref(),
-        form.company_name.as_deref(),
-        now,
-    )
-    .await
-    .map_err(|e| ApiError::Internal(format!("Kunde konnte nicht erstellt werden: {e}")))?;
-
-    // 2. Create addresses
+    // Pre-compute pure values before acquiring the transaction
     let (dep_street, dep_city, dep_postal) = merge_address_parts(
         services::vision::parse_address(&departure_address),
         form.departure_city.as_deref(),
         form.departure_postal.as_deref(),
     );
-    let origin_id = address_repo::create(
-        &state.db,
-        &dep_street,
-        &dep_city,
-        Some(dep_postal.as_str()).filter(|s| !s.is_empty()),
-        form.departure_floor.as_deref(),
-        form.departure_elevator,
-        None,  // house_number not available from parsed address string
-        form.departure_parking_ban,
-    )
-    .await
-    .map_err(|e| ApiError::Internal(format!("Auszugsadresse konnte nicht erstellt werden: {e}")))?;
-
     let (arr_street, arr_city, arr_postal) = merge_address_parts(
         services::vision::parse_address(&arrival_address),
         form.arrival_city.as_deref(),
         form.arrival_postal.as_deref(),
     );
-    let dest_id = address_repo::create(
-        &state.db,
-        &arr_street,
-        &arr_city,
-        Some(arr_postal.as_str()).filter(|s| !s.is_empty()),
-        form.arrival_floor.as_deref(),
-        form.arrival_elevator,
-        None,  // house_number not available from parsed address string
-        form.arrival_parking_ban,
-    )
-    .await
-    .map_err(|e| ApiError::Internal(format!("Einzugsadresse konnte nicht erstellt werden: {e}")))?;
-
     let scheduled_date_naive = form
         .scheduled_date
         .as_deref()
         .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok());
-
     let notes = build_notes(
         form.services.as_deref(),
         form.departure_parking_ban,
@@ -255,67 +212,116 @@ async fn handle_ar_submission(
         form.arrival_parking_ban,
     );
     let services_json = serde_json::to_value(&services_struct).unwrap_or(serde_json::json!({}));
+    let inquiry_id = Uuid::now_v7();
 
-    // Create recipient customer if provided (booking for someone else)
-    let recipient_id = if form.recipient_last_name.as_deref().map_or(false, |s| !s.trim().is_empty()) {
-        Some(customer_repo::create_recipient(
-            &state.db,
-            form.recipient_salutation.as_deref(),
-            form.recipient_first_name.as_deref(),
-            form.recipient_last_name.as_deref(),
-            form.recipient_phone.as_deref(),
-            form.recipient_email.as_deref(),
+    // Wrap all DB writes in a single transaction so a mid-flight failure leaves no orphans
+    let (customer_id, inquiry_id) = {
+        let mut tx = state.db.begin().await
+            .map_err(|e| ApiError::Internal(format!("Transaktion konnte nicht gestartet werden: {e}")))?;
+
+        let customer_id = customer_repo::upsert(
+            &mut *tx,
+            &email,
+            Some(&name),
+            form.salutation.as_deref(),
+            form.first_name.as_deref(),
+            form.last_name.as_deref(),
+            form.phone.as_deref(),
+            form.customer_type.as_deref(),
+            form.company_name.as_deref(),
             now,
-        ).await?)
-    } else {
-        None
-    };
+        )
+        .await
+        .map_err(|e| ApiError::Internal(format!("Kunde konnte nicht erstellt werden: {e}")))?;
 
-    // Create billing address if provided
-    let billing_address_id = if form.billing_street.is_some() || form.billing_city.is_some() {
-        let b_street = form.billing_street.as_deref().unwrap_or("");
-        let b_city = form.billing_city.as_deref().unwrap_or("");
-        if !b_street.is_empty() && !b_city.is_empty() {
-            Some(address_repo::create(
-                &state.db,
-                b_street,
-                b_city,
-                form.billing_postal.as_deref().filter(|s| !s.is_empty()),
-                None,
-                None,
-                form.billing_number.as_deref(),
-                Some(false),
-            ).await.map_err(|e| ApiError::Internal(format!("Rechnungsadresse konnte nicht erstellt werden: {e}")))?)
+        let origin_id = address_repo::create(
+            &mut *tx,
+            &dep_street,
+            &dep_city,
+            Some(dep_postal.as_str()).filter(|s| !s.is_empty()),
+            form.departure_floor.as_deref(),
+            form.departure_elevator,
+            None,
+            form.departure_parking_ban,
+        )
+        .await
+        .map_err(|e| ApiError::Internal(format!("Auszugsadresse konnte nicht erstellt werden: {e}")))?;
+
+        let dest_id = address_repo::create(
+            &mut *tx,
+            &arr_street,
+            &arr_city,
+            Some(arr_postal.as_str()).filter(|s| !s.is_empty()),
+            form.arrival_floor.as_deref(),
+            form.arrival_elevator,
+            None,
+            form.arrival_parking_ban,
+        )
+        .await
+        .map_err(|e| ApiError::Internal(format!("Einzugsadresse konnte nicht erstellt werden: {e}")))?;
+
+        let recipient_id = if form.recipient_last_name.as_deref().map_or(false, |s| !s.trim().is_empty()) {
+            Some(customer_repo::create_recipient(
+                &mut *tx,
+                form.recipient_salutation.as_deref(),
+                form.recipient_first_name.as_deref(),
+                form.recipient_last_name.as_deref(),
+                form.recipient_phone.as_deref(),
+                form.recipient_email.as_deref(),
+                now,
+            ).await?)
         } else {
             None
-        }
-    } else {
-        None
-    };
+        };
 
-    // 3. Create inquiry
-    let inquiry_id = Uuid::now_v7();
-    inquiry_repo::create_minimal(
-        &state.db,
-        inquiry_id,
-        customer_id,
-        Some(origin_id),
-        Some(dest_id),
-        None,
-        "pending",
-        scheduled_date_naive,
-        Some(&notes),
-        Some(&services_json),
-        "mobile_app_ar",
-        form.service_type.as_deref(),      // service_type
-        Some("ar"),                       // submission_mode
-        recipient_id,                      // recipient_id
-        billing_address_id,                 // billing_address_id
-        None,                              // custom_fields
-        now,
-    )
-    .await
-    .map_err(|e| ApiError::Internal(format!("Anfrage konnte nicht erstellt werden: {e}")))?;
+        let billing_address_id = if form.billing_street.is_some() || form.billing_city.is_some() {
+            let b_street = form.billing_street.as_deref().unwrap_or("");
+            let b_city = form.billing_city.as_deref().unwrap_or("");
+            if !b_street.is_empty() && !b_city.is_empty() {
+                Some(address_repo::create(
+                    &mut *tx,
+                    b_street,
+                    b_city,
+                    form.billing_postal.as_deref().filter(|s| !s.is_empty()),
+                    None,
+                    None,
+                    form.billing_number.as_deref(),
+                    Some(false),
+                ).await.map_err(|e| ApiError::Internal(format!("Rechnungsadresse konnte nicht erstellt werden: {e}")))?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        inquiry_repo::create_minimal(
+            &mut *tx,
+            inquiry_id,
+            customer_id,
+            Some(origin_id),
+            Some(dest_id),
+            None,
+            "pending",
+            scheduled_date_naive,
+            Some(&notes),
+            Some(&services_json),
+            "mobile_app_ar",
+            form.service_type.as_deref(),
+            Some("ar"),
+            recipient_id,
+            billing_address_id,
+            None,
+            now,
+        )
+        .await
+        .map_err(|e| ApiError::Internal(format!("Anfrage konnte nicht erstellt werden: {e}")))?;
+
+        tx.commit().await
+            .map_err(|e| ApiError::Internal(format!("Transaktion konnte nicht abgeschlossen werden: {e}")))?;
+
+        (customer_id, inquiry_id)
+    };
 
     // 4. Pre-create estimation row
     let estimation_id = Uuid::now_v7();
@@ -716,122 +722,112 @@ async fn video_inquiry(
 
     let now = chrono::Utc::now();
 
-    // Upsert customer
-    let customer_id = customer_repo::upsert(
-        &state.db,
-        &email,
-        Some(&name),
-        salutation.as_deref(),
-        first_name.as_deref(),
-        last_name.as_deref(),
-        phone.as_deref(),
-        customer_type.as_deref(),
-        company_name.as_deref(),
-        now,
-    )
-    .await
-    .map_err(|e| ApiError::Internal(format!("Kunde konnte nicht erstellt werden: {e}")))?;
-
-    // Create addresses
+    // Pre-compute pure values before acquiring the transaction
     let (dep_street, dep_city, dep_postal) = merge_address_parts(
         services::vision::parse_address(&departure_address),
         departure_city.as_deref(),
         departure_postal.as_deref(),
     );
-    let origin_id = address_repo::create(
-        &state.db,
-        &dep_street,
-        &dep_city,
-        Some(dep_postal.as_str()).filter(|s| !s.is_empty()),
-        departure_floor.as_deref(),
-        departure_elevator,
-        None,
-        departure_parking_ban,
-    )
-    .await
-    .map_err(|e| ApiError::Internal(format!("Auszugsadresse konnte nicht erstellt werden: {e}")))?;
-
     let (arr_street, arr_city, arr_postal) = merge_address_parts(
         services::vision::parse_address(&arrival_address),
         arrival_city.as_deref(),
         arrival_postal.as_deref(),
     );
-    let dest_id = address_repo::create(
-        &state.db,
-        &arr_street,
-        &arr_city,
-        Some(arr_postal.as_str()).filter(|s| !s.is_empty()),
-        arrival_floor.as_deref(),
-        arrival_elevator,
-        None,
-        arrival_parking_ban,
-    )
-    .await
-    .map_err(|e| ApiError::Internal(format!("Einzugsadresse konnte nicht erstellt werden: {e}")))?;
-
+    let stop_parsed = stop_address.as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(|a| services::vision::parse_address(a));
     let scheduled_date_naive = scheduled_date.as_deref()
         .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok());
-
-    let notes = build_notes(
-        services_text.as_deref(),
-        departure_parking_ban,
-        arrival_parking_ban,
-        message.as_deref(),
-    );
-
-    // Parse services into structured JSON
-    let services_struct = parse_services_string(
-        services_text.as_deref(),
-        departure_parking_ban,
-        arrival_parking_ban,
-    );
+    let notes = build_notes(services_text.as_deref(), departure_parking_ban, arrival_parking_ban, message.as_deref());
+    let services_struct = parse_services_string(services_text.as_deref(), departure_parking_ban, arrival_parking_ban);
     let services_json = serde_json::to_value(&services_struct).unwrap_or(serde_json::json!({}));
+    let inquiry_id = Uuid::now_v7();
 
-    // Create recipient customer if provided (booking for someone else)
-    let recipient_id = if recipient_last_name.as_deref().map_or(false, |s| !s.trim().is_empty()) {
-        Some(customer_repo::create_recipient(
-            &state.db,
-            recipient_salutation.as_deref(),
-            recipient_first_name.as_deref(),
-            recipient_last_name.as_deref(),
-            recipient_phone.as_deref(),
-            recipient_email.as_deref(),
+    // Wrap all DB writes in a single transaction so a mid-flight failure leaves no orphans
+    let (customer_id, inquiry_id) = {
+        let mut tx = state.db.begin().await
+            .map_err(|e| ApiError::Internal(format!("Transaktion konnte nicht gestartet werden: {e}")))?;
+
+        let customer_id = customer_repo::upsert(
+            &mut *tx,
+            &email,
+            Some(&name),
+            salutation.as_deref(),
+            first_name.as_deref(),
+            last_name.as_deref(),
+            phone.as_deref(),
+            customer_type.as_deref(),
+            company_name.as_deref(),
             now,
-        ).await?)
-    } else {
-        None
-    };
+        )
+        .await
+        .map_err(|e| ApiError::Internal(format!("Kunde konnte nicht erstellt werden: {e}")))?;
 
-    // Create billing address if provided
-    let billing_address_id = if billing_street.is_some() || billing_city.is_some() {
-        let b_street = billing_street.as_deref().unwrap_or("");
-        let b_city = billing_city.as_deref().unwrap_or("");
-        if !b_street.is_empty() && !b_city.is_empty() {
-            Some(address_repo::create(
-                &state.db,
-                b_street,
-                b_city,
-                billing_postal.as_deref().filter(|s| !s.is_empty()),
-                None,
-                None,
-                billing_number.as_deref(),
-                Some(false),
-            ).await.map_err(|e| ApiError::Internal(format!("Rechnungsadresse konnte nicht erstellt werden: {e}")))?)
+        let origin_id = address_repo::create(
+            &mut *tx,
+            &dep_street,
+            &dep_city,
+            Some(dep_postal.as_str()).filter(|s| !s.is_empty()),
+            departure_floor.as_deref(),
+            departure_elevator,
+            None,
+            departure_parking_ban,
+        )
+        .await
+        .map_err(|e| ApiError::Internal(format!("Auszugsadresse konnte nicht erstellt werden: {e}")))?;
+
+        let dest_id = address_repo::create(
+            &mut *tx,
+            &arr_street,
+            &arr_city,
+            Some(arr_postal.as_str()).filter(|s| !s.is_empty()),
+            arrival_floor.as_deref(),
+            arrival_elevator,
+            None,
+            arrival_parking_ban,
+        )
+        .await
+        .map_err(|e| ApiError::Internal(format!("Einzugsadresse konnte nicht erstellt werden: {e}")))?;
+
+        let recipient_id = if recipient_last_name.as_deref().map_or(false, |s| !s.trim().is_empty()) {
+            Some(customer_repo::create_recipient(
+                &mut *tx,
+                recipient_salutation.as_deref(),
+                recipient_first_name.as_deref(),
+                recipient_last_name.as_deref(),
+                recipient_phone.as_deref(),
+                recipient_email.as_deref(),
+                now,
+            ).await?)
         } else {
             None
-        }
-    } else {
-        None
-    };
+        };
 
-    // Create stop address if provided
-    let stop_id: Option<uuid::Uuid> = if let Some(ref addr) = stop_address {
-        let trimmed = addr.trim();
-        if !trimmed.is_empty() {
-            let (stop_street, stop_city, stop_postal) = services::vision::parse_address(trimmed);
+        let billing_address_id = if billing_street.is_some() || billing_city.is_some() {
+            let b_street = billing_street.as_deref().unwrap_or("");
+            let b_city = billing_city.as_deref().unwrap_or("");
+            if !b_street.is_empty() && !b_city.is_empty() {
+                Some(address_repo::create(
+                    &mut *tx,
+                    b_street,
+                    b_city,
+                    billing_postal.as_deref().filter(|s| !s.is_empty()),
+                    None,
+                    None,
+                    billing_number.as_deref(),
+                    Some(false),
+                ).await.map_err(|e| ApiError::Internal(format!("Rechnungsadresse konnte nicht erstellt werden: {e}")))?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let stop_id: Option<Uuid> = if let Some((stop_street, stop_city, stop_postal)) = stop_parsed {
             Some(
                 address_repo::create(
-                    &state.db,
+                    &mut *tx,
                     &stop_street,
                     &stop_city,
                     Some(stop_postal.as_str()).filter(|s| !s.is_empty()),
@@ -845,34 +841,35 @@ async fn video_inquiry(
             )
         } else {
             None
-        }
-    } else {
-        None
-    };
+        };
 
-    // Create inquiry
-    let inquiry_id = Uuid::now_v7();
-    inquiry_repo::create_minimal(
-        &state.db,
-        inquiry_id,
-        customer_id,
-        Some(origin_id),
-        Some(dest_id),
-        stop_id,
-        "pending",
-        scheduled_date_naive,
-        Some(&notes),
-        Some(&services_json),
-        "video_webapp",
-        service_type.as_deref(),
-        Some("video"),  // submission_mode
-        recipient_id,
-        billing_address_id,
-        None,  // custom_fields
-        now,
-    )
-    .await
-    .map_err(|e| ApiError::Internal(format!("Anfrage konnte nicht erstellt werden: {e}")))?;
+        inquiry_repo::create_minimal(
+            &mut *tx,
+            inquiry_id,
+            customer_id,
+            Some(origin_id),
+            Some(dest_id),
+            stop_id,
+            "pending",
+            scheduled_date_naive,
+            Some(&notes),
+            Some(&services_json),
+            "video_webapp",
+            service_type.as_deref(),
+            Some("video"),
+            recipient_id,
+            billing_address_id,
+            None,
+            now,
+        )
+        .await
+        .map_err(|e| ApiError::Internal(format!("Anfrage konnte nicht erstellt werden: {e}")))?;
+
+        tx.commit().await
+            .map_err(|e| ApiError::Internal(format!("Transaktion konnte nicht abgeschlossen werden: {e}")))?;
+
+        (customer_id, inquiry_id)
+    };
 
     // Pre-create one estimation row per uploaded video and upload each video to S3
     // synchronously before returning 202, so the frontend can reference the files
@@ -980,141 +977,134 @@ async fn manual_inquiry(
 
     let now = chrono::Utc::now();
 
-    // 1. Upsert customer
-    let customer_id = customer_repo::upsert(
-        &state.db,
-        email,
-        Some(name),
-        form.salutation.as_deref(),
-        form.first_name.as_deref(),
-        form.last_name.as_deref(),
-        form.phone.as_deref(),
-        form.customer_type.as_deref(),
-        form.company_name.as_deref(),
-        now,
-    )
-    .await
-    .map_err(|e| ApiError::Internal(format!("Kunde konnte nicht erstellt werden: {e}")))?;
-
-    // 2. Create origin address
+    // Pre-compute pure values before acquiring the transaction
     let (dep_street, dep_city, dep_postal) = merge_address_parts(
         services::vision::parse_address(departure_address),
         form.departure_city.as_deref(),
         form.departure_postal.as_deref(),
     );
-    let origin_id = address_repo::create(
-        &state.db,
-        &dep_street,
-        &dep_city,
-        Some(dep_postal.as_str()).filter(|s| !s.is_empty()),
-        form.departure_floor.as_deref(),
-        form.departure_elevator,
-        None,
-        form.departure_parking_ban,
-    )
-    .await
-    .map_err(|e| ApiError::Internal(format!("Auszugsadresse konnte nicht erstellt werden: {e}")))?;
-
-    // 3. Create destination address
     let (arr_street, arr_city, arr_postal) = merge_address_parts(
         services::vision::parse_address(arrival_address),
         form.arrival_city.as_deref(),
         form.arrival_postal.as_deref(),
     );
-    let dest_id = address_repo::create(
-        &state.db,
-        &arr_street,
-        &arr_city,
-        Some(arr_postal.as_str()).filter(|s| !s.is_empty()),
-        form.arrival_floor.as_deref(),
-        form.arrival_elevator,
-        None,
-        form.arrival_parking_ban,
-    )
-    .await
-    .map_err(|e| ApiError::Internal(format!("Einzugsadresse konnte nicht erstellt werden: {e}")))?;
-
-    // 3b. Create billing address if provided
-    let billing_address_id = if form.billing_street.is_some() || form.billing_city.is_some() {
-        let b_street = form.billing_street.as_deref().unwrap_or("");
-        let b_city = form.billing_city.as_deref().unwrap_or("");
-        if !b_street.is_empty() && !b_city.is_empty() {
-            Some(address_repo::create(
-                &state.db,
-                b_street,
-                b_city,
-                form.billing_postal.as_deref().filter(|s| !s.is_empty()),
-                None,
-                None,
-                form.billing_number.as_deref(),
-                Some(false),
-            ).await.map_err(|e| ApiError::Internal(format!("Rechnungsadresse konnte nicht erstellt werden: {e}")))?)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    // 4. Parse scheduled date
     let scheduled_date_naive = form
         .scheduled_date
         .as_deref()
         .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok());
-
-    // 5. Build notes from services, parking bans, and message
-    let notes = build_notes(
-        form.services.as_deref(),
-        form.departure_parking_ban,
-        form.arrival_parking_ban,
-        form.message.as_deref(),
-    );
-
-    let services_struct = parse_services_string(
-        form.services.as_deref(),
-        form.departure_parking_ban,
-        form.arrival_parking_ban,
-    );
+    let notes = build_notes(form.services.as_deref(), form.departure_parking_ban, form.arrival_parking_ban, form.message.as_deref());
+    let services_struct = parse_services_string(form.services.as_deref(), form.departure_parking_ban, form.arrival_parking_ban);
     let services_json = serde_json::to_value(&services_struct).unwrap_or(serde_json::json!({}));
-
-    // Create recipient customer if provided (booking for someone else)
-    let recipient_id = if form.recipient_last_name.as_deref().map_or(false, |s| !s.trim().is_empty()) {
-        Some(customer_repo::create_recipient(
-            &state.db,
-            form.recipient_salutation.as_deref(),
-            form.recipient_first_name.as_deref(),
-            form.recipient_last_name.as_deref(),
-            form.recipient_phone.as_deref(),
-            form.recipient_email.as_deref(),
-            now,
-        ).await?)
-    } else {
-        None
-    };
-
-    // 6. Create inquiry
     let inquiry_id = Uuid::now_v7();
-    inquiry_repo::create_minimal(
-        &state.db,
-        inquiry_id,
-        customer_id,
-        Some(origin_id),
-        Some(dest_id),
-        None,
-        "pending",
-        scheduled_date_naive,
-        Some(&notes),
-        Some(&services_json),
-        "manuell",
-        form.service_type.as_deref(),
-        Some("manuell"),  // submission_mode
-        recipient_id,                    // recipient_id
-        billing_address_id,
-        None,              // custom_fields
-        now,
-    )
-    .await
-    .map_err(|e| ApiError::Internal(format!("Anfrage konnte nicht erstellt werden: {e}")))?;
+
+    // Wrap all DB writes in a single transaction so a mid-flight failure leaves no orphans
+    let (customer_id, inquiry_id) = {
+        let mut tx = state.db.begin().await
+            .map_err(|e| ApiError::Internal(format!("Transaktion konnte nicht gestartet werden: {e}")))?;
+
+        let customer_id = customer_repo::upsert(
+            &mut *tx,
+            email,
+            Some(name),
+            form.salutation.as_deref(),
+            form.first_name.as_deref(),
+            form.last_name.as_deref(),
+            form.phone.as_deref(),
+            form.customer_type.as_deref(),
+            form.company_name.as_deref(),
+            now,
+        )
+        .await
+        .map_err(|e| ApiError::Internal(format!("Kunde konnte nicht erstellt werden: {e}")))?;
+
+        let origin_id = address_repo::create(
+            &mut *tx,
+            &dep_street,
+            &dep_city,
+            Some(dep_postal.as_str()).filter(|s| !s.is_empty()),
+            form.departure_floor.as_deref(),
+            form.departure_elevator,
+            None,
+            form.departure_parking_ban,
+        )
+        .await
+        .map_err(|e| ApiError::Internal(format!("Auszugsadresse konnte nicht erstellt werden: {e}")))?;
+
+        let dest_id = address_repo::create(
+            &mut *tx,
+            &arr_street,
+            &arr_city,
+            Some(arr_postal.as_str()).filter(|s| !s.is_empty()),
+            form.arrival_floor.as_deref(),
+            form.arrival_elevator,
+            None,
+            form.arrival_parking_ban,
+        )
+        .await
+        .map_err(|e| ApiError::Internal(format!("Einzugsadresse konnte nicht erstellt werden: {e}")))?;
+
+        let billing_address_id = if form.billing_street.is_some() || form.billing_city.is_some() {
+            let b_street = form.billing_street.as_deref().unwrap_or("");
+            let b_city = form.billing_city.as_deref().unwrap_or("");
+            if !b_street.is_empty() && !b_city.is_empty() {
+                Some(address_repo::create(
+                    &mut *tx,
+                    b_street,
+                    b_city,
+                    form.billing_postal.as_deref().filter(|s| !s.is_empty()),
+                    None,
+                    None,
+                    form.billing_number.as_deref(),
+                    Some(false),
+                ).await.map_err(|e| ApiError::Internal(format!("Rechnungsadresse konnte nicht erstellt werden: {e}")))?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let recipient_id = if form.recipient_last_name.as_deref().map_or(false, |s| !s.trim().is_empty()) {
+            Some(customer_repo::create_recipient(
+                &mut *tx,
+                form.recipient_salutation.as_deref(),
+                form.recipient_first_name.as_deref(),
+                form.recipient_last_name.as_deref(),
+                form.recipient_phone.as_deref(),
+                form.recipient_email.as_deref(),
+                now,
+            ).await?)
+        } else {
+            None
+        };
+
+        inquiry_repo::create_minimal(
+            &mut *tx,
+            inquiry_id,
+            customer_id,
+            Some(origin_id),
+            Some(dest_id),
+            None,
+            "pending",
+            scheduled_date_naive,
+            Some(&notes),
+            Some(&services_json),
+            "manuell",
+            form.service_type.as_deref(),
+            Some("manuell"),
+            recipient_id,
+            billing_address_id,
+            None,
+            now,
+        )
+        .await
+        .map_err(|e| ApiError::Internal(format!("Anfrage konnte nicht erstellt werden: {e}")))?;
+
+        tx.commit().await
+            .map_err(|e| ApiError::Internal(format!("Transaktion konnte nicht abgeschlossen werden: {e}")))?;
+
+        (customer_id, inquiry_id)
+    };
 
     tracing::info!(inquiry_id = %inquiry_id, "Manual inquiry created for submission");
 
@@ -1434,114 +1424,100 @@ pub(crate) async fn handle_submission(
 
     let now = chrono::Utc::now();
 
-    // 1. Create or update customer by email
-    let customer_id = customer_repo::upsert(
-        &state.db,
-        &email,
-        Some(&name),
-        form.salutation.as_deref(),
-        form.first_name.as_deref(),
-        form.last_name.as_deref(),
-        form.phone.as_deref(),
-        form.customer_type.as_deref(),
-        form.company_name.as_deref(),
-        now,
-    )
-    .await
-    .map_err(|e| ApiError::Internal(format!("Kunde konnte nicht erstellt werden: {e}")))?;
-
-    tracing::info!(customer_id = %customer_id, email = %email, "Customer created/updated");
-
-    // 2. Create origin address
+    // Pre-compute pure values before acquiring the transaction
     let (dep_street, dep_city, dep_postal) = merge_address_parts(
         services::vision::parse_address(&departure_address),
         form.departure_city.as_deref(),
         form.departure_postal.as_deref(),
     );
-    let origin_id = address_repo::create(
-        &state.db,
-        &dep_street,
-        &dep_city,
-        Some(dep_postal.as_str()).filter(|s| !s.is_empty()),
-        form.departure_floor.as_deref(),
-        form.departure_elevator,
-        None,
-        form.departure_parking_ban,
-    )
-    .await
-    .map_err(|e| ApiError::Internal(format!("Auszugsadresse konnte nicht erstellt werden: {e}")))?;
-
-    // 3. Create destination address
     let (arr_street, arr_city, arr_postal) = merge_address_parts(
         services::vision::parse_address(&arrival_address),
         form.arrival_city.as_deref(),
         form.arrival_postal.as_deref(),
     );
-    let dest_id = address_repo::create(
-        &state.db,
-        &arr_street,
-        &arr_city,
-        Some(arr_postal.as_str()).filter(|s| !s.is_empty()),
-        form.arrival_floor.as_deref(),
-        form.arrival_elevator,
-        None,
-        form.arrival_parking_ban,
-    )
-    .await
-    .map_err(|e| ApiError::Internal(format!("Einzugsadresse konnte nicht erstellt werden: {e}")))?;
-
-    // 4. Parse preferred date
+    let stop_parsed = form.stop_address.as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(|a| services::vision::parse_address(a));
     let scheduled_date_naive = form
         .scheduled_date
         .as_deref()
         .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok());
-
-    // 5. Build notes from services, parking bans, and message
-    let notes = build_notes(
-        form.services.as_deref(),
-        form.departure_parking_ban,
-        form.arrival_parking_ban,
-        form.message.as_deref(),
-    );
-
-    // 5b. Parse services string into JSONB struct
-    let services_struct = parse_services_string(
-        form.services.as_deref(),
-        form.departure_parking_ban,
-        form.arrival_parking_ban,
-    );
+    let notes = build_notes(form.services.as_deref(), form.departure_parking_ban, form.arrival_parking_ban, form.message.as_deref());
+    let services_struct = parse_services_string(form.services.as_deref(), form.departure_parking_ban, form.arrival_parking_ban);
     let services_json = serde_json::to_value(&services_struct).unwrap_or(serde_json::json!({}));
+    let inquiry_id = Uuid::now_v7();
 
-    // Create billing address if provided
-    let billing_address_id = if form.billing_street.is_some() || form.billing_city.is_some() {
-        let b_street = form.billing_street.as_deref().unwrap_or("");
-        let b_city = form.billing_city.as_deref().unwrap_or("");
-        if !b_street.is_empty() && !b_city.is_empty() {
-            Some(address_repo::create(
-                &state.db,
-                b_street,
-                b_city,
-                form.billing_postal.as_deref().filter(|s| !s.is_empty()),
-                None,
-                None,
-                form.billing_number.as_deref(),
-                Some(false),
-            ).await.map_err(|e| ApiError::Internal(format!("Rechnungsadresse konnte nicht erstellt werden: {e}")))?)
+    // Wrap all DB writes in a single transaction so a mid-flight failure leaves no orphans
+    let (customer_id, inquiry_id) = {
+        let mut tx = state.db.begin().await
+            .map_err(|e| ApiError::Internal(format!("Transaktion konnte nicht gestartet werden: {e}")))?;
+
+        let customer_id = customer_repo::upsert(
+            &mut *tx,
+            &email,
+            Some(&name),
+            form.salutation.as_deref(),
+            form.first_name.as_deref(),
+            form.last_name.as_deref(),
+            form.phone.as_deref(),
+            form.customer_type.as_deref(),
+            form.company_name.as_deref(),
+            now,
+        )
+        .await
+        .map_err(|e| ApiError::Internal(format!("Kunde konnte nicht erstellt werden: {e}")))?;
+
+        let origin_id = address_repo::create(
+            &mut *tx,
+            &dep_street,
+            &dep_city,
+            Some(dep_postal.as_str()).filter(|s| !s.is_empty()),
+            form.departure_floor.as_deref(),
+            form.departure_elevator,
+            None,
+            form.departure_parking_ban,
+        )
+        .await
+        .map_err(|e| ApiError::Internal(format!("Auszugsadresse konnte nicht erstellt werden: {e}")))?;
+
+        let dest_id = address_repo::create(
+            &mut *tx,
+            &arr_street,
+            &arr_city,
+            Some(arr_postal.as_str()).filter(|s| !s.is_empty()),
+            form.arrival_floor.as_deref(),
+            form.arrival_elevator,
+            None,
+            form.arrival_parking_ban,
+        )
+        .await
+        .map_err(|e| ApiError::Internal(format!("Einzugsadresse konnte nicht erstellt werden: {e}")))?;
+
+        let billing_address_id = if form.billing_street.is_some() || form.billing_city.is_some() {
+            let b_street = form.billing_street.as_deref().unwrap_or("");
+            let b_city = form.billing_city.as_deref().unwrap_or("");
+            if !b_street.is_empty() && !b_city.is_empty() {
+                Some(address_repo::create(
+                    &mut *tx,
+                    b_street,
+                    b_city,
+                    form.billing_postal.as_deref().filter(|s| !s.is_empty()),
+                    None,
+                    None,
+                    form.billing_number.as_deref(),
+                    Some(false),
+                ).await.map_err(|e| ApiError::Internal(format!("Rechnungsadresse konnte nicht erstellt werden: {e}")))?)
+            } else {
+                None
+            }
         } else {
             None
-        }
-    } else {
-        None
-    };
+        };
 
-    // Create stop address if provided
-    let stop_id: Option<Uuid> = if let Some(ref addr) = form.stop_address {
-        let trimmed = addr.trim();
-        if !trimmed.is_empty() {
-            let (stop_street, stop_city, stop_postal) = services::vision::parse_address(trimmed);
+        let stop_id: Option<Uuid> = if let Some((stop_street, stop_city, stop_postal)) = stop_parsed {
             Some(
                 address_repo::create(
-                    &state.db,
+                    &mut *tx,
                     &stop_street,
                     &stop_city,
                     Some(stop_postal.as_str()).filter(|s| !s.is_empty()),
@@ -1555,51 +1531,51 @@ pub(crate) async fn handle_submission(
             )
         } else {
             None
-        }
-    } else {
-        None
-    };
+        };
 
-    // 6b. Create recipient customer if provided (booking for someone else)
-    let recipient_id = if form.recipient_last_name.as_deref().map_or(false, |s| !s.trim().is_empty()) {
-        Some(customer_repo::create_recipient(
-            &state.db,
-            form.recipient_salutation.as_deref(),
-            form.recipient_first_name.as_deref(),
-            form.recipient_last_name.as_deref(),
-            form.recipient_phone.as_deref(),
-            form.recipient_email.as_deref(),
+        let recipient_id = if form.recipient_last_name.as_deref().map_or(false, |s| !s.trim().is_empty()) {
+            Some(customer_repo::create_recipient(
+                &mut *tx,
+                form.recipient_salutation.as_deref(),
+                form.recipient_first_name.as_deref(),
+                form.recipient_last_name.as_deref(),
+                form.recipient_phone.as_deref(),
+                form.recipient_email.as_deref(),
+                now,
+            ).await?)
+        } else {
+            None
+        };
+
+        inquiry_repo::create_minimal(
+            &mut *tx,
+            inquiry_id,
+            customer_id,
+            Some(origin_id),
+            Some(dest_id),
+            stop_id,
+            "pending",
+            scheduled_date_naive,
+            Some(&notes),
+            Some(&services_json),
+            source,
+            form.service_type.as_deref(),
+            Some(submission_mode),
+            recipient_id,
+            billing_address_id,
+            None,
             now,
-        ).await?)
-    } else {
-        None
+        )
+        .await
+        .map_err(|e| ApiError::Internal(format!("Anfrage konnte nicht erstellt werden: {e}")))?;
+
+        tx.commit().await
+            .map_err(|e| ApiError::Internal(format!("Transaktion konnte nicht abgeschlossen werden: {e}")))?;
+
+        (customer_id, inquiry_id)
     };
 
-    // 6c. Create inquiry
-    let inquiry_id = Uuid::now_v7();
-    inquiry_repo::create_minimal(
-        &state.db,
-        inquiry_id,
-        customer_id,
-        Some(origin_id),
-        Some(dest_id),
-        stop_id,
-        "pending",
-        scheduled_date_naive,
-        Some(&notes),
-        Some(&services_json),
-        source,
-        form.service_type.as_deref(),      // service_type
-        Some(submission_mode),              // submission_mode
-        recipient_id,                       // recipient_id
-        billing_address_id,                 // billing_address_id
-        None,                              // custom_fields
-        now,
-    )
-    .await
-    .map_err(|e| ApiError::Internal(format!("Anfrage konnte nicht erstellt werden: {e}")))?;
-
-    tracing::info!(inquiry_id = %inquiry_id, "Inquiry created for submission");
+    tracing::info!(customer_id = %customer_id, email = %email, inquiry_id = %inquiry_id, "Submission committed");
 
     // 7. Check for manual volume (manuell mode) — skip vision pipeline if provided.
     let manual_volume: Option<f64> = form.volumen.as_deref()

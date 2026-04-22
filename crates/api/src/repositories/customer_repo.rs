@@ -146,7 +146,7 @@ pub(crate) async fn fetch_by_email(
 /// # Returns
 /// The customer's UUID (either newly created or existing).
 pub(crate) async fn upsert(
-    pool: &PgPool,
+    executor: impl sqlx::Executor<'_, Database = sqlx::Postgres>,
     email: &str,
     name: Option<&str>,
     salutation: Option<&str>,
@@ -183,7 +183,7 @@ pub(crate) async fn upsert(
     .bind(customer_type)
     .bind(company_name)
     .bind(now)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await?;
     Ok(id)
 }
@@ -230,7 +230,7 @@ pub(crate) async fn exists(pool: &PgPool, customer_id: Uuid) -> Result<bool, sql
 /// UNIQUE constraint on customers.email. The placeholder includes the payer's
 /// email as a disambiguator so that recipients without email don't collide.
 pub(crate) async fn create_recipient(
-    pool: &PgPool,
+    executor: impl sqlx::Executor<'_, Database = sqlx::Postgres>,
     salutation: Option<&str>,
     first_name: Option<&str>,
     last_name: Option<&str>,
@@ -280,7 +280,7 @@ pub(crate) async fn create_recipient(
     .bind(last)
     .bind(phone)
     .bind(now)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
     .map(|(id,): (Uuid,)| id)
     .map_err(|e| ApiError::Internal(format!("Empfaenger konnte nicht erstellt werden: {e}")))
