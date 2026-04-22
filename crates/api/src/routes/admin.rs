@@ -13,7 +13,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use aust_core::models::TokenClaims;
-use aust_offer_generator::{generate_timesheet_xlsx, TimesheetData, TimesheetEntry};
+use aust_offer_generator::{convert_xlsx_to_pdf, generate_timesheet_xlsx, TimesheetData, TimesheetEntry};
 use crate::repositories::{admin_repo, employee_repo, feedback_repo, review_repo, invoice_reminder_repo};
 use crate::{ApiError, AppState};
 
@@ -507,7 +507,7 @@ async fn get_employee(
                 "origin_city": a.origin_city,
                 "destination_city": a.destination_city,
                 "booking_date": a.booking_date,
-                "planned_hours": a.planned_hours,
+                "planned_hours": a.planned_hours.unwrap_or(0.0),
                 "actual_hours": a.actual_hours,
                 "notes": a.notes,
                 "status": a.inquiry_status,
@@ -710,6 +710,7 @@ async fn employee_hours_export(
     let month_str = query.get("month").cloned().unwrap_or_else(|| {
         Utc::now().format("%Y-%m").to_string()
     });
+    let as_pdf = query.get("format").map(|f| f == "pdf").unwrap_or(false);
     let (from_date, to_date) = parse_month_range(&month_str)
         .ok_or_else(|| ApiError::BadRequest("Ungueltiges Monatsformat. Erwartet: YYYY-MM".into()))?;
 
@@ -769,23 +770,38 @@ async fn employee_hours_export(
     })
     .map_err(|e| ApiError::Internal(format!("Timesheet XLSX generation failed: {e}")))?;
 
-    let filename = format!(
-        "Stundenzettel_{}_{}_{}_{}.xlsx",
-        emp.last_name,
-        emp.first_name,
-        month_parts.get(1).unwrap_or(&""),
-        month_parts.first().unwrap_or(&"")
-    );
-
-    Ok(axum::response::Response::builder()
-        .status(200)
-        .header(header::CONTENT_TYPE, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        .header(
-            header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{filename}\""),
-        )
-        .body(axum::body::Body::from(xlsx_data))
-        .unwrap())
+    if as_pdf {
+        let pdf_data = convert_xlsx_to_pdf(&xlsx_data)
+            .await
+            .map_err(|e| ApiError::Internal(format!("PDF-Konvertierung fehlgeschlagen: {e}")))?;
+        let filename = format!(
+            "Stundenzettel_{}_{}_{}_{}.pdf",
+            emp.last_name,
+            emp.first_name,
+            month_parts.get(1).unwrap_or(&""),
+            month_parts.first().unwrap_or(&"")
+        );
+        Ok(axum::response::Response::builder()
+            .status(200)
+            .header(header::CONTENT_TYPE, "application/pdf")
+            .header(header::CONTENT_DISPOSITION, format!("attachment; filename=\"{filename}\""))
+            .body(axum::body::Body::from(pdf_data))
+            .unwrap())
+    } else {
+        let filename = format!(
+            "Stundenzettel_{}_{}_{}_{}.xlsx",
+            emp.last_name,
+            emp.first_name,
+            month_parts.get(1).unwrap_or(&""),
+            month_parts.first().unwrap_or(&"")
+        );
+        Ok(axum::response::Response::builder()
+            .status(200)
+            .header(header::CONTENT_TYPE, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            .header(header::CONTENT_DISPOSITION, format!("attachment; filename=\"{filename}\""))
+            .body(axum::body::Body::from(xlsx_data))
+            .unwrap())
+    }
 }
 
 /// Parse "YYYY-MM" into (first_day, last_day) NaiveDate range.

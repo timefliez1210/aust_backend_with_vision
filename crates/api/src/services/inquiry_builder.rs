@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use aust_core::models::{
     AddressSnapshot, CustomerSnapshot, EmployeeAssignmentSnapshot, EstimationSnapshot,
-    InquiryDaySnapshot, InquiryListItem, InquiryResponse, InquiryStatus, ItemSnapshot,
+    InquiryListItem, InquiryResponse, InquiryStatus, ItemSnapshot,
     LineItemSnapshot, OfferSnapshot, Services,
 };
 
@@ -248,17 +248,8 @@ pub async fn build_inquiry_response(
         })
         .collect();
 
-    // 6b. Fetch scheduled days (empty for single-day inquiries)
-    let day_rows = inquiry_repo::fetch_scheduled_days(pool, inquiry_id).await?;
-    let scheduled_days: Vec<InquiryDaySnapshot> = day_rows
-        .into_iter()
-        .map(|r| InquiryDaySnapshot {
-            day_date: r.day_date,
-            day_number: r.day_number,
-            notes: r.notes,
-        })
-        .collect();
-    let is_multi_day = scheduled_days.len() > 1;
+    let end_date = row.end_date;
+    let is_multi_day = end_date.is_some();
 
     // 7. Extract customer message from notes
     let customer_message = extract_customer_message(row.notes.as_deref());
@@ -309,7 +300,7 @@ pub async fn build_inquiry_response(
         items,
         offer,
         employees,
-        scheduled_days,
+        end_date,
         is_multi_day,
     })
 }

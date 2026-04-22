@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::repositories::{email_repo, estimation_repo, inquiry_repo, offer_repo};
+use crate::repositories::{calendar_repo, email_repo, estimation_repo, inquiry_repo, offer_repo};
 use crate::routes::offers::{build_offer_with_overrides, OfferOverrides};
 use crate::routes::submissions::{
     parse_inquiry_form, process_submission_background, process_video_background,
@@ -656,11 +656,11 @@ pub(crate) async fn trigger_video_upload(
 pub(crate) async fn list_inquiry_employees(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let rows: Vec<inquiry_repo::EmployeeAssignmentRow> =
-        inquiry_repo::list_employee_assignments(&state.db, id).await?;
-
-    Ok(Json(serde_json::json!({ "employees": rows })))
+) -> Result<Json<Vec<calendar_repo::EmployeeAssignmentRow>>, ApiError> {
+    let rows = calendar_repo::fetch_inquiry_employees(&state.db, id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(Json(rows))
 }
 
 /// `POST /api/v1/inquiries/{id}/employees` — Assign an employee to this inquiry.

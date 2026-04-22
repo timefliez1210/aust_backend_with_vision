@@ -10,7 +10,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use aust_core::models::TokenClaims;
-use crate::repositories::calendar_item_repo;
+use crate::repositories::{calendar_item_repo, calendar_repo};
 use crate::{error::ApiError, AppState};
 
 /// Register all calendar-items routes (protected under admin JWT middleware).
@@ -23,12 +23,11 @@ pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/", get(list_items).post(create_item))
         .route("/{id}", get(get_item).patch(update_item).delete(delete_item))
-        .route("/{id}/employees", get(list_item_employees).post(assign_employee))
+        .route("/{id}/employees", get(list_item_employees).post(assign_employee).put(put_item_employees))
         .route(
             "/{id}/employees/{emp_id}",
             patch(update_item_employee).delete(remove_item_employee),
         )
-        .merge(super::calendar::calendar_item_days_router())
 }
 
 // ---------------------------------------------------------------------------
@@ -96,6 +95,8 @@ struct UpdateItemBody {
     #[serde(default)]
     remove_customer: bool,
     employee_notes: Option<String>,
+    /// Set end_date for multi-day items; send null to clear (single-day).
+    end_date: Option<serde_json::Value>,
 }
 
 /// Body for assigning an employee to a calendar item.
@@ -330,6 +331,11 @@ async fn update_item(
         sets.push(format!("employee_notes = ${idx}"));
         idx += 1;
     }
+    let update_end_date = body.end_date.is_some();
+    if update_end_date {
+        sets.push(format!("end_date = ${idx}"));
+        idx += 1;
+    }
 
     // Always update updated_at
     sets.push(format!("updated_at = ${idx}"));
@@ -382,6 +388,14 @@ async fn update_item(
     if let Some(v) = body.employee_notes {
         q = q.bind(v);
     }
+    if update_end_date {
+        // end_date is stored as Option<serde_json::Value>; null → None, date string → Some(NaiveDate)
+        let end_date_val: Option<NaiveDate> = body.end_date
+            .as_ref()
+            .and_then(|v| v.as_str())
+            .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok());
+        q = q.bind(end_date_val);
+    }
     q = q.bind(Utc::now()); // updated_at
     q = q.bind(id);         // WHERE id
 
@@ -426,14 +440,14 @@ async fn list_item_employees(
     State(state): State<Arc<AppState>>,
     Extension(_claims): Extension<TokenClaims>,
     Path(id): Path<Uuid>,
-) -> Result<Json<Vec<calendar_item_repo::CalendarItemEmployee>>, ApiError> {
-    // Verify item exists
+) -> Result<Json<Vec<calendar_repo::EmployeeAssignmentRow>>, ApiError> {
     if !calendar_item_repo::item_exists(&state.db, id).await? {
         return Err(ApiError::NotFound("Kalendereintrag nicht gefunden".into()));
     }
-
-    let employees = calendar_item_repo::fetch_item_employees(&state.db, id).await?;
-    Ok(Json(employees))
+    let rows = calendar_repo::fetch_calendar_item_employees(&state.db, id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(Json(rows))
 }
 
 /// `POST /api/v1/admin/calendar-items/{id}/employees` — Assign an employee to a calendar item.
@@ -540,4 +554,50 @@ async fn remove_item_employee(
         return Err(ApiError::NotFound("Zuweisung nicht gefunden".into()));
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+struct BulkItemEmployeeBody {
+    employee_id: Uuid,
+    job_date: NaiveDate,
+    planned_hours: Option<f64>,
+    notes: Option<String>,
+    start_time: Option<NaiveTime>,
+    end_time: Option<NaiveTime>,
+    clock_in: Option<NaiveTime>,
+    clock_out: Option<NaiveTime>,
+    break_minutes: Option<i32>,
+    actual_hours: Option<f64>,
+}
+
+/// `PUT /api/v1/admin/calendar-items/{id}/employees` — Full-replace all employee assignments.
+async fn put_item_employees(
+    State(state): State<Arc<AppState>>,
+    Extension(_claims): Extension<TokenClaims>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<Vec<BulkItemEmployeeBody>>,
+) -> Result<Json<Vec<calendar_repo::EmployeeAssignmentRow>>, ApiError> {
+    let inputs: Vec<calendar_repo::EmployeeAssignmentInput> = body.into_iter().map(|b| {
+        calendar_repo::EmployeeAssignmentInput {
+            employee_id: b.employee_id,
+            job_date: b.job_date,
+            planned_hours: b.planned_hours,
+            notes: b.notes,
+            start_time: b.start_time,
+            end_time: b.end_time,
+            clock_in: b.clock_in,
+            clock_out: b.clock_out,
+            break_minutes: b.break_minutes.unwrap_or(0),
+            actual_hours: b.actual_hours,
+        }
+    }).collect();
+
+    calendar_repo::put_calendar_item_employees(&state.db, id, &inputs)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    let rows = calendar_repo::fetch_calendar_item_employees(&state.db, id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(Json(rows))
 }

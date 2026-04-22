@@ -107,7 +107,7 @@ When working on a specific area, read the corresponding AGENTS.md for focused co
 
 1. **DB migrations are one-way doors** — additive only, no destructive changes without explicit agreement (see 🚨 above)
 2. **No auto-migration on deploy** — run `migrations/` manually before/after `deploy.sh`
-3. **`inquiry_employees` is being replaced by `inquiry_day_employees`** — write to both (dual-write), read from day-level
+3. **Multi-day appointments use `end_date` on the parent** — `inquiries.end_date` and `calendar_items.end_date` (NULL = single day). Employee assignments are in `inquiry_employees` / `calendar_item_employees` with a `job_date` column (one row per employee per day). The old `inquiry_days`, `inquiry_day_employees`, `calendar_item_days`, `calendar_item_day_employees` tables no longer exist.
 4. **`preferred_date` is retired** — use `scheduled_date` (DATE) everywhere
 5. **Money is stored as cents** (`i64`), never floats. Display: `cents / 100.0`, format DE: `30,00 €`
 6. **Customer-facing strings are German** — error messages, emails, offer PDFs, Telegram captions
@@ -137,7 +137,7 @@ Once `offer_ready` or beyond, core fields (volume, services, distance, addresses
 
 - **Unit tests**: `cargo test --lib --workspace` (219 tests, zero DB dependency)
 - **Integration tests**: `DATABASE_URL=... cargo test -p aust-api --test integration_tests` (20 tests, needs Postgres)
-- **Test helpers**: `crates/api/src/test_helpers.rs` — DB pool, factories for customer/address/inquiry/employee/day
+- **Test helpers**: `crates/api/src/test_helpers.rs` — DB pool, factories for customer/address/inquiry/employee
 
 ## ⚠️ Connected Changes — Touch One, Check These
 
@@ -149,7 +149,7 @@ When you modify something in column A, verify or update everything in column B. 
 | `CompanyConfig` pricing fields | `PricingEngine::with_rate()`, `ServicePrices::from_config()`, offer XLSX template, unit tests | Price constants flow through 4 layers |
 | `Services` struct (flags like `packing`, `assembly`) | `build_line_items()`, `format_services_display()`, XLSX rows 31–42, foto-angebot form | Adding a service flag touches submission, offer, and PDF |
 | `PricingInput` / `PricingResult` | `build_offer_with_overrides()`, `ServicePrices`, XLSX `persons` cell (J50), Telegram edit flow | Pricing inputs flow into offer generation and Telegram editing |
-| `inquiry_day_employees` table | `inquiry_employees` sync (dual-write), calendar queries, clock-time updates, admin employee assignment panel | Day-level is primary but flat table must stay in sync |
+| `inquiry_employees` / `calendar_item_employees` schema | `calendar_repo` schedule queries, `employee_repo` hours/schedule queries, admin employee panel, `inquiry_builder` snapshot | One row per (entity, employee, job_date) — all reads go through this single flat table |
 | `offers` table or unique constraint | `offer_pipeline.rs` (race guard), `offer_builder.rs` (insert_returning catch), `offer_repo.rs` | Unique partial index prevents duplicates, insert path must handle constraint violation |
 | DB migration | `test_helpers.rs` (factory functions), integration tests, `deploy.sh` (manual migrate) | Migrations are one-way; test factories must match new columns |
 | Frontend `api.svelte.ts` | All admin pages that call the API | Adding/removing endpoints requires updating both API routes and fetch functions |

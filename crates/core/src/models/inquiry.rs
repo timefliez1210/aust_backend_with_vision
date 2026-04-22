@@ -143,7 +143,7 @@ impl std::str::FromStr for InquiryStatus {
             "estimating" => Ok(Self::Estimating),
             "estimated" => Ok(Self::Estimated),
             "offer_ready" => Ok(Self::OfferReady),
-            "offer_sent" => Ok(Self::OfferSent),
+            "offer_sent" | "sent" => Ok(Self::OfferSent),
             "accepted" => Ok(Self::Accepted),
             "rejected" => Ok(Self::Rejected),
             "expired" => Ok(Self::Expired),

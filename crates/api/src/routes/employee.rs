@@ -308,7 +308,7 @@ async fn get_schedule(
                 estimated_volume_m3: r.estimated_volume_m3,
                 customer_name: r.customer_name,
                 customer_phone: r.customer_phone,
-                planned_hours: r.planned_hours,
+                planned_hours: r.planned_hours.unwrap_or(0.0),
                 actual_hours: r.actual_hours,
                 colleague_names: colleagues,
                 employee_notes: r.employee_notes,
@@ -350,7 +350,7 @@ async fn get_schedule(
             estimated_volume_m3: None,
             customer_name: None,
             customer_phone: None,
-            planned_hours: r.planned_hours,
+            planned_hours: r.planned_hours.unwrap_or(0.0),
             actual_hours: r.actual_hours,
             colleague_names: colleagues,
             employee_notes: r.employee_notes,
@@ -475,7 +475,7 @@ async fn get_job_detail(
         items,
         customer_name: row.customer_name,
         customer_phone: row.customer_phone,
-        planned_hours: assign.planned_hours,
+        planned_hours: assign.planned_hours.unwrap_or(0.0),
         notes: assign.notes,
         employee_notes: row.employee_notes,
         employee_clock_in: assign.employee_clock_in,
@@ -605,7 +605,7 @@ async fn get_hours(
     let assignments: Vec<HoursEntry> = rows
         .into_iter()
         .map(|r| {
-            planned_sum += r.planned_hours;
+            planned_sum += r.planned_hours.unwrap_or(0.0);
             if let Some(a) = r.actual_hours {
                 actual_sum += a;
             }
@@ -618,7 +618,7 @@ async fn get_hours(
                 job_date: r.job_date,
                 origin_city: r.origin_city,
                 destination_city: r.destination_city,
-                planned_hours: r.planned_hours,
+                planned_hours: r.planned_hours.unwrap_or(0.0),
                 actual_hours: r.actual_hours,
                 status: r.status,
             }

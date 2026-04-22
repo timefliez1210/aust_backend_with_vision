@@ -1,4 +1,4 @@
-//! Calendar repository — centralised queries for calendar, inquiry_days, and calendar_item_days.
+//! Calendar repository — queries for schedule, availability, and employee assignments.
 
 use chrono::{NaiveDate, NaiveTime};
 use sqlx::{FromRow, PgPool};
@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 // ── Row types ────────────────────────────────────────────────────────────────
 
-/// Schedule inquiry row — full projection used by `get_schedule`.
+/// Schedule inquiry row — one row per (inquiry × job_date) in the window.
 #[derive(Debug, FromRow)]
 pub(crate) struct ScheduleInquiryRow {
     pub effective_date: NaiveDate,
@@ -21,50 +21,43 @@ pub(crate) struct ScheduleInquiryRow {
     pub volume_m3: Option<f64>,
     pub status: String,
     pub notes: Option<String>,
-    pub start_time: chrono::NaiveTime,
-    pub end_time: chrono::NaiveTime,
+    pub employee_notes: Option<String>,
+    pub start_time: NaiveTime,
+    pub end_time: NaiveTime,
     pub employees_assigned: i64,
     pub employee_names: Option<String>,
-    pub day_number: Option<i16>,
-    pub total_days: Option<i16>,
-    pub day_notes: Option<String>,
+    pub day_number: i32,
+    pub total_days: i32,
     #[sqlx(default)]
     pub service_type: Option<String>,
     pub scheduled_date: NaiveDate,
 }
 
-/// A single row from `inquiry_days` including optional per-day times.
+/// Schedule calendar item row — one row per (item × job_date) in the window.
 #[derive(Debug, FromRow)]
-pub(crate) struct InquiryDayRow {
-    pub id: Uuid,
-    pub day_date: NaiveDate,
-    pub day_number: i16,
-    pub notes: Option<String>,
-    pub start_time: Option<NaiveTime>,
+pub(crate) struct ScheduleCalendarItemRow {
+    pub effective_date: NaiveDate,
+    pub calendar_item_id: Uuid,
+    pub title: String,
+    pub category: String,
+    pub location: Option<String>,
+    pub start_time: NaiveTime,
     pub end_time: Option<NaiveTime>,
+    pub employees_assigned: i64,
+    pub employee_names: Option<String>,
+    pub day_number: i32,
+    pub total_days: i32,
+    pub scheduled_date: NaiveDate,
 }
 
-/// A single row from `calendar_item_days` including optional per-day times.
-#[derive(Debug, FromRow)]
-pub(crate) struct CalendarItemDayRow {
-    pub id: Uuid,
-    pub day_date: NaiveDate,
-    pub day_number: i16,
-    pub notes: Option<String>,
-    pub start_time: Option<NaiveTime>,
-    pub end_time: Option<NaiveTime>,
-}
-
-/// A per-day employee assignment row (used for both inquiry days and calendar item days).
-///
-/// The `day_id` field holds the UUID of the parent `inquiry_days` or
-/// `calendar_item_days` row so callers can group by day.
-#[derive(Debug, FromRow)]
-pub(crate) struct DayEmployeeRow {
-    pub day_id: Uuid,
+/// One employee assignment row returned by `fetch_inquiry_employees` /
+/// `fetch_calendar_item_employees`.
+#[derive(Debug, FromRow, serde::Serialize)]
+pub(crate) struct EmployeeAssignmentRow {
     pub employee_id: Uuid,
     pub first_name: String,
     pub last_name: String,
+    pub job_date: NaiveDate,
     pub planned_hours: Option<f64>,
     pub notes: Option<String>,
     pub start_time: Option<NaiveTime>,
@@ -75,12 +68,25 @@ pub(crate) struct DayEmployeeRow {
     pub actual_hours: Option<f64>,
 }
 
-// ── Queries ──────────────────────────────────────────────────────────────────
+/// Input for one employee assignment (used by put_inquiry_employees / put_calendar_item_employees).
+pub(crate) struct EmployeeAssignmentInput {
+    pub employee_id: Uuid,
+    pub job_date: NaiveDate,
+    pub planned_hours: Option<f64>,
+    pub notes: Option<String>,
+    pub start_time: Option<NaiveTime>,
+    pub end_time: Option<NaiveTime>,
+    pub clock_in: Option<NaiveTime>,
+    pub clock_out: Option<NaiveTime>,
+    pub break_minutes: i32,
+    pub actual_hours: Option<f64>,
+}
 
-/// Count active (non-cancelled/rejected/expired) inquiries on a given date.
+// ── Availability ──────────────────────────────────────────────────────────────
+
+/// Count active inquiries and calendar items that span a given date.
 ///
 /// **Caller**: `calendar::count_active_on_date`
-/// **Why**: Used to compute availability for a date.
 pub(crate) async fn count_active_on_date(
     pool: &PgPool,
     date: NaiveDate,
@@ -89,13 +95,12 @@ pub(crate) async fn count_active_on_date(
         r#"
         SELECT (
             (SELECT COUNT(*) FROM inquiries
-             WHERE scheduled_date = $1
+             WHERE $1 BETWEEN scheduled_date AND COALESCE(end_date, scheduled_date)
                AND status NOT IN ('cancelled', 'rejected', 'expired'))
             +
-            (SELECT COUNT(*) FROM calendar_items ci
-             JOIN calendar_item_days cid ON ci.id = cid.calendar_item_id
-             WHERE cid.day_date = $1
-               AND ci.status NOT IN ('cancelled'))
+            (SELECT COUNT(*) FROM calendar_items
+             WHERE $1 BETWEEN scheduled_date AND COALESCE(end_date, scheduled_date)
+               AND status NOT IN ('cancelled'))
         )
         "#,
     )
@@ -108,7 +113,6 @@ pub(crate) async fn count_active_on_date(
 /// Fetch capacity override for a specific date.
 ///
 /// **Caller**: `calendar::effective_capacity`
-/// **Why**: Returns the custom capacity if one exists.
 pub(crate) async fn fetch_capacity_override(
     pool: &PgPool,
     date: NaiveDate,
@@ -122,17 +126,14 @@ pub(crate) async fn fetch_capacity_override(
     Ok(row.map(|(c,)| c))
 }
 
-/// Fetch all schedule inquiries (single-day + multi-day) in a date range.
+// ── Schedule queries ──────────────────────────────────────────────────────────
+
+/// Fetch all schedule inquiries in a date range.
 ///
 /// **Caller**: `calendar::get_schedule`
-/// **Why**: Returns one row per inquiry-day for schedule display.
 ///
-/// Single-day branch uses inquiry-level `start_time`/`end_time` and
-/// `inquiry_day_employees` (via inquiry_days) for the employee count.
-///
-/// Multi-day branch uses per-day `start_time`/`end_time` (falling back to
-/// parent via COALESCE) and `inquiry_day_employees` for the employee count and
-/// names, giving per-day staffing visibility in the calendar view.
+/// One row per (inquiry × day) using `generate_series` to expand multi-day
+/// inquiries. Employee assignments are joined by job_date.
 pub(crate) async fn fetch_schedule_inquiries(
     pool: &PgPool,
     from: NaiveDate,
@@ -140,94 +141,47 @@ pub(crate) async fn fetch_schedule_inquiries(
 ) -> Result<Vec<ScheduleInquiryRow>, sqlx::Error> {
     sqlx::query_as(
         r#"
-        -- Single-day branch: inquiry has no rows in inquiry_days
         SELECT
-            i.scheduled_date AS effective_date,
-            i.id AS inquiry_id,
+            gs.day::date                                              AS effective_date,
+            i.id                                                      AS inquiry_id,
             COALESCE(
                 NULLIF(TRIM(COALESCE(c.first_name,'') || ' ' || COALESCE(c.last_name,'')), ''),
                 c.name, c.email
-            ) AS customer_name,
+            )                                                         AS customer_name,
             c.customer_type,
             c.company_name,
             CASE WHEN ao.id IS NOT NULL THEN ao.street || ', ' || ao.city END AS departure_address,
             CASE WHEN ad.id IS NOT NULL THEN ad.street || ', ' || ad.city END AS arrival_address,
-            i.estimated_volume_m3 AS volume_m3,
+            i.estimated_volume_m3                                     AS volume_m3,
             i.status,
             i.service_type,
             i.notes,
-            i.start_time,
-            i.end_time,
-            COUNT(ide.id) AS employees_assigned,
+            i.employee_notes,
+            COALESCE(i.start_time, '08:00'::time)                    AS start_time,
+            COALESCE(i.end_time,   '17:00'::time)                    AS end_time,
+            COUNT(ie.employee_id)                                     AS employees_assigned,
             NULLIF(STRING_AGG(
-                e.first_name || ' ' || LEFT(e.last_name, 1) || '.',
-                ', ' ORDER BY e.last_name, e.first_name
-            ), '') AS employee_names,
-            NULL::smallint AS day_number,
-            NULL::smallint AS total_days,
-            NULL::text AS day_notes,
-            i.scheduled_date AS scheduled_date
+                DISTINCT e.first_name || ' ' || LEFT(e.last_name, 1) || '.',
+                ', '
+            ), '')                                                    AS employee_names,
+            (gs.day::date - i.scheduled_date)::int + 1               AS day_number,
+            (COALESCE(i.end_date, i.scheduled_date) - i.scheduled_date)::int + 1 AS total_days,
+            i.scheduled_date
         FROM inquiries i
         JOIN customers c ON i.customer_id = c.id
-        LEFT JOIN addresses ao ON i.origin_address_id = ao.id
+        LEFT JOIN addresses ao ON i.origin_address_id      = ao.id
         LEFT JOIN addresses ad ON i.destination_address_id = ad.id
-        LEFT JOIN inquiry_days iday ON iday.inquiry_id = i.id
-        LEFT JOIN inquiry_day_employees ide ON ide.inquiry_day_id = iday.id
-        LEFT JOIN employees e ON ide.employee_id = e.id
-        WHERE NOT EXISTS (SELECT 1 FROM inquiry_days WHERE inquiry_id = i.id)
-          AND i.scheduled_date BETWEEN $1 AND $2
+        CROSS JOIN LATERAL generate_series(
+            i.scheduled_date,
+            COALESCE(i.end_date, i.scheduled_date),
+            '1 day'::interval
+        ) AS gs(day)
+        LEFT JOIN inquiry_employees ie ON ie.inquiry_id = i.id AND ie.job_date = gs.day::date
+        LEFT JOIN employees e ON ie.employee_id = e.id
+        WHERE gs.day::date BETWEEN $1 AND $2
           AND i.status NOT IN ('cancelled', 'rejected', 'expired')
-        GROUP BY i.id, c.id, ao.id, ad.id
-
-        UNION ALL
-
-        -- Multi-day branch: one row per day from inquiry_days.
-        -- Times: per-day if set, else parent inquiry times (COALESCE).
-        -- Employees: per-day inquiry_day_employees (not inquiry_employees).
-        SELECT
-            id2.day_date AS effective_date,
-            i.id AS inquiry_id,
-            COALESCE(
-                NULLIF(TRIM(COALESCE(c.first_name,'') || ' ' || COALESCE(c.last_name,'')), ''),
-                c.name, c.email
-            ) AS customer_name,
-            c.customer_type,
-            c.company_name,
-            CASE WHEN ao.id IS NOT NULL THEN ao.street || ', ' || ao.city END AS departure_address,
-            CASE WHEN ad.id IS NOT NULL THEN ad.street || ', ' || ad.city END AS arrival_address,
-            i.estimated_volume_m3 AS volume_m3,
-            i.status,
-            i.service_type,
-            i.notes,
-            COALESCE(id2.start_time, i.start_time) AS start_time,
-            COALESCE(id2.end_time,   i.end_time)   AS end_time,
-            COUNT(ide.id) AS employees_assigned,
-            NULLIF(STRING_AGG(
-                e.first_name || ' ' || LEFT(e.last_name, 1) || '.',
-                ', ' ORDER BY e.last_name, e.first_name
-            ), '') AS employee_names,
-            id2.day_number,
-            total.total_days,
-            id2.notes AS day_notes,
-            i.scheduled_date AS scheduled_date
-        FROM inquiries i
-        JOIN customers c ON i.customer_id = c.id
-        LEFT JOIN addresses ao ON i.origin_address_id = ao.id
-        LEFT JOIN addresses ad ON i.destination_address_id = ad.id
-        JOIN inquiry_days id2 ON id2.inquiry_id = i.id
-        JOIN (
-            SELECT inquiry_id, COUNT(*)::smallint AS total_days
-            FROM inquiry_days
-            GROUP BY inquiry_id
-        ) total ON total.inquiry_id = i.id
-        LEFT JOIN inquiry_day_employees ide ON ide.inquiry_day_id = id2.id
-        LEFT JOIN employees e ON ide.employee_id = e.id
-        WHERE id2.day_date BETWEEN $1 AND $2
-          AND i.status NOT IN ('cancelled', 'rejected', 'expired')
-        GROUP BY i.id, c.id, ao.id, ad.id, id2.id, id2.day_date, id2.day_number,
-                 id2.notes, id2.start_time, id2.end_time, total.total_days
-
-        ORDER BY effective_date
+        GROUP BY gs.day, i.id, c.id, ao.id, ad.id
+        ORDER BY gs.day
         "#,
     )
     .bind(from)
@@ -239,13 +193,14 @@ pub(crate) async fn fetch_schedule_inquiries(
 /// Fetch offer prices for a set of inquiry IDs.
 ///
 /// **Caller**: `calendar::get_schedule`
-/// **Why**: Builds a price map for schedule display.
 pub(crate) async fn fetch_offer_prices(
     pool: &PgPool,
     inquiry_ids: &[Uuid],
 ) -> Result<Vec<(Uuid, i64)>, sqlx::Error> {
     sqlx::query_as(
-        "SELECT inquiry_id, price_cents FROM offers WHERE inquiry_id = ANY($1) AND status != 'rejected' ORDER BY created_at DESC",
+        "SELECT inquiry_id, price_cents FROM offers \
+         WHERE inquiry_id = ANY($1) AND status != 'rejected' \
+         ORDER BY created_at DESC",
     )
     .bind(inquiry_ids)
     .fetch_all(pool)
@@ -255,14 +210,14 @@ pub(crate) async fn fetch_offer_prices(
 /// Fetch capacity overrides for a date range.
 ///
 /// **Caller**: `calendar::get_schedule`
-/// **Why**: Pre-loads overrides to avoid per-day queries.
 pub(crate) async fn fetch_capacity_overrides_range(
     pool: &PgPool,
     from: NaiveDate,
     to: NaiveDate,
 ) -> Result<Vec<(NaiveDate, i32)>, sqlx::Error> {
     sqlx::query_as(
-        "SELECT override_date, capacity FROM calendar_capacity_overrides WHERE override_date BETWEEN $1 AND $2",
+        "SELECT override_date, capacity FROM calendar_capacity_overrides \
+         WHERE override_date BETWEEN $1 AND $2",
     )
     .bind(from)
     .bind(to)
@@ -273,7 +228,6 @@ pub(crate) async fn fetch_capacity_overrides_range(
 /// Upsert a capacity override for a specific date.
 ///
 /// **Caller**: `calendar::set_capacity`
-/// **Why**: Creates or updates the capacity override.
 pub(crate) async fn upsert_capacity(
     pool: &PgPool,
     date: NaiveDate,
@@ -293,342 +247,9 @@ pub(crate) async fn upsert_capacity(
     Ok(())
 }
 
-// ── Inquiry days ─────────────────────────────────────────────────────────────
-
-/// Fetch `inquiry_days` for an inquiry ordered by `day_number`.
-///
-/// **Caller**: `calendar::get_inquiry_days`
-/// **Why**: Returns the multi-day schedule (with per-day times) for one inquiry.
-pub(crate) async fn fetch_inquiry_days(
-    pool: &PgPool,
-    inquiry_id: Uuid,
-) -> Result<Vec<InquiryDayRow>, sqlx::Error> {
-    sqlx::query_as(
-        r#"
-        SELECT iday.id, iday.day_date, iday.day_number, iday.notes,
-               COALESCE(iday.start_time, i.start_time) AS start_time,
-               COALESCE(iday.end_time, i.end_time) AS end_time
-        FROM inquiry_days iday
-        JOIN inquiries i ON iday.inquiry_id = i.id
-        WHERE iday.inquiry_id = $1
-        ORDER BY iday.day_number
-        "#,
-    )
-    .bind(inquiry_id)
-    .fetch_all(pool)
-    .await
-}
-
-/// Fetch all per-day employee assignments for every day of a given inquiry.
-///
-/// **Caller**: `calendar::get_inquiry_days`
-/// **Why**: Lets the handler merge employees into each `InquiryDayRow` without N+1 queries.
-///
-/// Returns rows keyed by `day_id` (the `inquiry_days.id`), joined with employee names.
-pub(crate) async fn fetch_inquiry_day_employees(
-    pool: &PgPool,
-    inquiry_id: Uuid,
-) -> Result<Vec<DayEmployeeRow>, sqlx::Error> {
-    sqlx::query_as(
-        r#"
-        SELECT ide.inquiry_day_id AS day_id,
-               ide.employee_id,
-               e.first_name,
-               e.last_name,
-               ide.planned_hours::float8 AS planned_hours,
-               ide.notes,
-               ide.start_time,
-               ide.end_time,
-               ide.clock_in,
-               ide.clock_out,
-               COALESCE(ide.break_minutes, 0) AS break_minutes,
-               ide.actual_hours::float8 AS actual_hours
-        FROM inquiry_day_employees ide
-        JOIN inquiry_days id2 ON ide.inquiry_day_id = id2.id
-        JOIN employees e ON ide.employee_id = e.id
-        WHERE id2.inquiry_id = $1
-        ORDER BY id2.day_number, e.last_name, e.first_name
-        "#,
-    )
-    .bind(inquiry_id)
-    .fetch_all(pool)
-    .await
-}
-
-/// Delete all `inquiry_days` for an inquiry (within a transaction).
-///
-/// **Caller**: `calendar::put_inquiry_days`
-/// **Why**: Full-replace semantics — delete all before re-inserting.
-///          Cascade on the FK also deletes `inquiry_day_employees`.
-pub(crate) async fn delete_inquiry_days(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    inquiry_id: Uuid,
-) -> Result<(), sqlx::Error> {
-    sqlx::query("DELETE FROM inquiry_days WHERE inquiry_id = $1")
-        .bind(inquiry_id)
-        .execute(&mut **tx)
-        .await?;
-    Ok(())
-}
-
-/// Insert a single `inquiry_day` (within a transaction).
-///
-/// **Caller**: `calendar::put_inquiry_days`
-/// **Why**: Inserts one day in the multi-day schedule. Returns the new row's UUID
-///          so the caller can insert `inquiry_day_employees` against it.
-pub(crate) async fn insert_inquiry_day(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    inquiry_id: Uuid,
-    day_date: NaiveDate,
-    day_number: i16,
-    notes: Option<&str>,
-    start_time: Option<NaiveTime>,
-    end_time: Option<NaiveTime>,
-) -> Result<Uuid, sqlx::Error> {
-    let (id,): (Uuid,) = sqlx::query_as(
-        "INSERT INTO inquiry_days (inquiry_id, day_date, day_number, notes, start_time, end_time) \
-         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
-    )
-    .bind(inquiry_id)
-    .bind(day_date)
-    .bind(day_number)
-    .bind(notes)
-    .bind(start_time)
-    .bind(end_time)
-    .fetch_one(&mut **tx)
-    .await?;
-    Ok(id)
-}
-
-/// Insert one per-day employee assignment for an inquiry day (within a transaction).
-///
-/// **Caller**: `calendar::put_inquiry_days`
-/// **Why**: Upserts an employee assignment — DO UPDATE overwrites stale times on re-save.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn insert_inquiry_day_employee(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    inquiry_day_id: Uuid,
-    employee_id: Uuid,
-    planned_hours: Option<f64>,
-    notes: Option<&str>,
-    start_time: Option<NaiveTime>,
-    end_time: Option<NaiveTime>,
-    clock_in: Option<NaiveTime>,
-    clock_out: Option<NaiveTime>,
-    break_minutes: i32,
-    actual_hours: Option<f64>,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "INSERT INTO inquiry_day_employees \
-           (inquiry_day_id, employee_id, planned_hours, notes, start_time, end_time, clock_in, clock_out, break_minutes, actual_hours) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
-         ON CONFLICT (inquiry_day_id, employee_id) DO UPDATE SET \
-           planned_hours = EXCLUDED.planned_hours, \
-           notes = EXCLUDED.notes, \
-           start_time = EXCLUDED.start_time, \
-           end_time = EXCLUDED.end_time, \
-           clock_in = EXCLUDED.clock_in, \
-           clock_out = EXCLUDED.clock_out, \
-           break_minutes = EXCLUDED.break_minutes, \
-           actual_hours = EXCLUDED.actual_hours",
-    )
-    .bind(inquiry_day_id)
-    .bind(employee_id)
-    .bind(planned_hours)
-    .bind(notes)
-    .bind(start_time)
-    .bind(end_time)
-    .bind(clock_in)
-    .bind(clock_out)
-    .bind(break_minutes)
-    .bind(actual_hours)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
-}
-
-// ── Calendar item days ────────────────────────────────────────────────────────
-
-/// Fetch `calendar_item_days` for a calendar item ordered by `day_number`.
-///
-/// **Caller**: `calendar::get_calendar_item_days`
-/// **Why**: Returns the multi-day schedule (with per-day times) for one Termin.
-pub(crate) async fn fetch_calendar_item_days(
-    pool: &PgPool,
-    calendar_item_id: Uuid,
-) -> Result<Vec<CalendarItemDayRow>, sqlx::Error> {
-    sqlx::query_as(
-        r#"
-        SELECT cd.id, cd.day_date, cd.day_number, cd.notes,
-               COALESCE(cd.start_time, ci.start_time) AS start_time,
-               COALESCE(cd.end_time, ci.end_time) AS end_time
-        FROM calendar_item_days cd
-        JOIN calendar_items ci ON cd.calendar_item_id = ci.id
-        WHERE cd.calendar_item_id = $1
-        ORDER BY cd.day_number
-        "#,
-    )
-    .bind(calendar_item_id)
-    .fetch_all(pool)
-    .await
-}
-
-/// Fetch all per-day employee assignments for every day of a given calendar item.
-///
-/// **Caller**: `calendar::get_calendar_item_days`
-/// **Why**: Lets the handler merge employees into each `CalendarItemDayRow` without N+1 queries.
-pub(crate) async fn fetch_calendar_item_day_employees(
-    pool: &PgPool,
-    calendar_item_id: Uuid,
-) -> Result<Vec<DayEmployeeRow>, sqlx::Error> {
-    sqlx::query_as(
-        r#"
-        SELECT cide.calendar_item_day_id AS day_id,
-               cide.employee_id,
-               e.first_name,
-               e.last_name,
-               cide.planned_hours::float8 AS planned_hours,
-               cide.notes,
-               cide.start_time,
-               cide.end_time,
-               cide.clock_in,
-               cide.clock_out,
-               COALESCE(cide.break_minutes, 0) AS break_minutes,
-               cide.actual_hours::float8 AS actual_hours
-        FROM calendar_item_day_employees cide
-        JOIN calendar_item_days cid ON cide.calendar_item_day_id = cid.id
-        JOIN employees e ON cide.employee_id = e.id
-        WHERE cid.calendar_item_id = $1
-        ORDER BY cid.day_number, e.last_name, e.first_name
-        "#,
-    )
-    .bind(calendar_item_id)
-    .fetch_all(pool)
-    .await
-}
-
-/// Delete all `calendar_item_days` for a calendar item (within a transaction).
-///
-/// **Caller**: `calendar::put_calendar_item_days`
-/// **Why**: Full-replace semantics. Cascade also deletes `calendar_item_day_employees`.
-pub(crate) async fn delete_calendar_item_days(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    calendar_item_id: Uuid,
-) -> Result<(), sqlx::Error> {
-    sqlx::query("DELETE FROM calendar_item_days WHERE calendar_item_id = $1")
-        .bind(calendar_item_id)
-        .execute(&mut **tx)
-        .await?;
-    Ok(())
-}
-
-/// Insert a single `calendar_item_day` (within a transaction).
-///
-/// **Caller**: `calendar::put_calendar_item_days`
-/// **Why**: Inserts one day in the multi-day Termin schedule. Returns the new row's UUID
-///          so the caller can insert `calendar_item_day_employees` against it.
-pub(crate) async fn insert_calendar_item_day(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    calendar_item_id: Uuid,
-    day_date: NaiveDate,
-    day_number: i16,
-    notes: Option<&str>,
-    start_time: Option<NaiveTime>,
-    end_time: Option<NaiveTime>,
-) -> Result<Uuid, sqlx::Error> {
-    let (id,): (Uuid,) = sqlx::query_as(
-        "INSERT INTO calendar_item_days (calendar_item_id, day_date, day_number, notes, start_time, end_time) \
-         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
-    )
-    .bind(calendar_item_id)
-    .bind(day_date)
-    .bind(day_number)
-    .bind(notes)
-    .bind(start_time)
-    .bind(end_time)
-    .fetch_one(&mut **tx)
-    .await?;
-    Ok(id)
-}
-
-/// Insert one per-day employee assignment for a calendar item day (within a transaction).
-///
-/// **Caller**: `calendar::put_calendar_item_days`
-/// **Why**: Upserts an employee assignment — DO UPDATE overwrites stale times on re-save.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn insert_calendar_item_day_employee(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    calendar_item_day_id: Uuid,
-    employee_id: Uuid,
-    planned_hours: Option<f64>,
-    notes: Option<&str>,
-    start_time: Option<NaiveTime>,
-    end_time: Option<NaiveTime>,
-    clock_in: Option<NaiveTime>,
-    clock_out: Option<NaiveTime>,
-    break_minutes: i32,
-    actual_hours: Option<f64>,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "INSERT INTO calendar_item_day_employees \
-           (calendar_item_day_id, employee_id, planned_hours, notes, start_time, end_time, clock_in, clock_out, break_minutes, actual_hours) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
-         ON CONFLICT (calendar_item_day_id, employee_id) DO UPDATE SET \
-           planned_hours = EXCLUDED.planned_hours, \
-           notes = EXCLUDED.notes, \
-           start_time = EXCLUDED.start_time, \
-           end_time = EXCLUDED.end_time, \
-           clock_in = EXCLUDED.clock_in, \
-           clock_out = EXCLUDED.clock_out, \
-           break_minutes = EXCLUDED.break_minutes, \
-           actual_hours = EXCLUDED.actual_hours",
-    )
-    .bind(calendar_item_day_id)
-    .bind(employee_id)
-    .bind(planned_hours)
-    .bind(notes)
-    .bind(start_time)
-    .bind(end_time)
-    .bind(clock_in)
-    .bind(clock_out)
-    .bind(break_minutes)
-    .bind(actual_hours)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
-}
-
-// ── Calendar item schedule queries ────────────────────────────────────────────
-
-/// Schedule calendar item row — per-day projection used by `get_schedule`.
-///
-/// Mirrors `ScheduleInquiryRow` for calendar items (Termine).
-#[derive(Debug, FromRow)]
-pub(crate) struct ScheduleCalendarItemRow {
-    pub effective_date: NaiveDate,
-    pub calendar_item_id: Uuid,
-    pub title: String,
-    pub category: String,
-    pub location: Option<String>,
-    pub start_time: chrono::NaiveTime,
-    pub end_time: Option<chrono::NaiveTime>,
-    pub employees_assigned: i64,
-    pub employee_names: Option<String>,
-    pub day_number: Option<i16>,
-    pub total_days: Option<i16>,
-    pub day_notes: Option<String>,
-    pub scheduled_date: NaiveDate,
-}
-
 /// Fetch calendar items as per-day schedule rows within a date range.
 ///
 /// **Caller**: `calendar::get_schedule`
-/// **Why**: Returns one row per calendar-item-day for multi-day items, or one row
-///          per single-day item. Mirrors `fetch_schedule_inquiries` for Termine.
-///
-/// Single-day branch uses `calendar_item_employees` for the employee count
-/// (only fires for items with no `calendar_item_days` rows — i.e. unassigned).
-/// Multi-day branch uses `calendar_item_day_employees` for per-day staffing.
 pub(crate) async fn fetch_schedule_calendar_items(
     pool: &PgPool,
     from: NaiveDate,
@@ -636,67 +257,34 @@ pub(crate) async fn fetch_schedule_calendar_items(
 ) -> Result<Vec<ScheduleCalendarItemRow>, sqlx::Error> {
     sqlx::query_as(
         r#"
-        -- Single-day branch: calendar item has no rows in calendar_item_days
         SELECT
-            ci.scheduled_date AS effective_date,
-            ci.id AS calendar_item_id,
+            gs.day::date                                                AS effective_date,
+            ci.id                                                       AS calendar_item_id,
             ci.title,
             ci.category,
             ci.location,
-            ci.start_time,
+            COALESCE(ci.start_time, '08:00'::time)                     AS start_time,
             ci.end_time,
-            COUNT(cie.id) AS employees_assigned,
+            COUNT(cie.employee_id)                                      AS employees_assigned,
             NULLIF(STRING_AGG(
-                e.first_name || ' ' || LEFT(e.last_name, 1) || '.',
-                ', ' ORDER BY e.last_name, e.first_name
-            ), '') AS employee_names,
-            NULL::smallint AS day_number,
-            NULL::smallint AS total_days,
-            NULL::text AS day_notes,
-            ci.scheduled_date AS scheduled_date
+                DISTINCT e.first_name || ' ' || LEFT(e.last_name, 1) || '.',
+                ', '
+            ), '')                                                      AS employee_names,
+            (gs.day::date - ci.scheduled_date)::int + 1                AS day_number,
+            (COALESCE(ci.end_date, ci.scheduled_date) - ci.scheduled_date)::int + 1 AS total_days,
+            ci.scheduled_date
         FROM calendar_items ci
-        LEFT JOIN calendar_item_employees cie ON cie.calendar_item_id = ci.id
+        CROSS JOIN LATERAL generate_series(
+            ci.scheduled_date,
+            COALESCE(ci.end_date, ci.scheduled_date),
+            '1 day'::interval
+        ) AS gs(day)
+        LEFT JOIN calendar_item_employees cie ON cie.calendar_item_id = ci.id AND cie.job_date = gs.day::date
         LEFT JOIN employees e ON cie.employee_id = e.id
-        WHERE NOT EXISTS (SELECT 1 FROM calendar_item_days WHERE calendar_item_id = ci.id)
-          AND ci.scheduled_date BETWEEN $1 AND $2
+        WHERE gs.day::date BETWEEN $1 AND $2
           AND ci.status NOT IN ('cancelled')
-        GROUP BY ci.id
-
-        UNION ALL
-
-        -- Multi-day branch: one row per day from calendar_item_days.
-        SELECT
-            cday.day_date AS effective_date,
-            ci.id AS calendar_item_id,
-            ci.title,
-            ci.category,
-            ci.location,
-            COALESCE(cday.start_time, ci.start_time) AS start_time,
-            COALESCE(cday.end_time,   ci.end_time)     AS end_time,
-            COUNT(cdde.id) AS employees_assigned,
-            NULLIF(STRING_AGG(
-                e.first_name || ' ' || LEFT(e.last_name, 1) || '.',
-                ', ' ORDER BY e.last_name, e.first_name
-            ), '') AS employee_names,
-            cday.day_number,
-            total.total_days,
-            cday.notes AS day_notes,
-            ci.scheduled_date AS scheduled_date
-        FROM calendar_items ci
-        JOIN calendar_item_days cday ON cday.calendar_item_id = ci.id
-        JOIN (
-            SELECT calendar_item_id, COUNT(*)::smallint AS total_days
-            FROM calendar_item_days
-            GROUP BY calendar_item_id
-        ) total ON total.calendar_item_id = ci.id
-        LEFT JOIN calendar_item_day_employees cdde ON cdde.calendar_item_day_id = cday.id
-        LEFT JOIN employees e ON cdde.employee_id = e.id
-        WHERE cday.day_date BETWEEN $1 AND $2
-          AND ci.status NOT IN ('cancelled')
-        GROUP BY ci.id, cday.id, cday.day_date, cday.day_number,
-                 cday.start_time, cday.end_time, cday.notes, total.total_days
-
-        ORDER BY effective_date
+        GROUP BY gs.day, ci.id
+        ORDER BY gs.day
         "#,
     )
     .bind(from)
@@ -705,25 +293,143 @@ pub(crate) async fn fetch_schedule_calendar_items(
     .await
 }
 
-#[cfg(test)]
-mod tests {
-    /// Verify the SQL query for single-day branch uses inquiry_day_employees
-    /// instead of the flat inquiry_employees table. The bug was that
-    /// submission-created inquiries never called sync_flat_inquiry_employees,
-    /// so their employee count was always 0 in the calendar.
-    ///
-    /// We verify this by checking that the query text contains the correct JOIN.
-    #[test]
-    fn single_day_query_uses_day_employees() {
-        // This is a static check: the single-day branch must JOIN
-        // inquiry_day_employees, not inquiry_employees.
-        let query = r#"
-            SELECT ... FROM inquiries i
-            LEFT JOIN inquiry_days iday ON iday.inquiry_id = i.id
-            LEFT JOIN inquiry_day_employees ide ON ide.inquiry_day_id = iday.id
-            LEFT JOIN employees e ON ide.employee_id = e.id
-        "#;
-        assert!(query.contains("inquiry_day_employees"));
-        assert!(!query.contains("inquiry_employees"));
+// ── Employee assignment CRUD ──────────────────────────────────────────────────
+
+/// Fetch all employee assignments for an inquiry, ordered by job_date then name.
+///
+/// **Caller**: `calendar::get_inquiry_employees`
+pub(crate) async fn fetch_inquiry_employees(
+    pool: &PgPool,
+    inquiry_id: Uuid,
+) -> Result<Vec<EmployeeAssignmentRow>, sqlx::Error> {
+    sqlx::query_as(
+        r#"
+        SELECT ie.employee_id, e.first_name, e.last_name,
+               ie.job_date,
+               ie.planned_hours::float8 AS planned_hours,
+               ie.notes,
+               ie.start_time, ie.end_time, ie.clock_in, ie.clock_out,
+               COALESCE(ie.break_minutes, 0) AS break_minutes,
+               ie.actual_hours::float8 AS actual_hours
+        FROM inquiry_employees ie
+        JOIN employees e ON ie.employee_id = e.id
+        WHERE ie.inquiry_id = $1
+        ORDER BY ie.job_date, e.last_name, e.first_name
+        "#,
+    )
+    .bind(inquiry_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// Replace all employee assignments for an inquiry (full-replace semantics).
+///
+/// **Caller**: `calendar::put_inquiry_employees`
+pub(crate) async fn put_inquiry_employees(
+    pool: &PgPool,
+    inquiry_id: Uuid,
+    assignments: &[EmployeeAssignmentInput],
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+
+    sqlx::query("DELETE FROM inquiry_employees WHERE inquiry_id = $1")
+        .bind(inquiry_id)
+        .execute(&mut *tx)
+        .await?;
+
+    for a in assignments {
+        sqlx::query(
+            r#"
+            INSERT INTO inquiry_employees
+                (id, inquiry_id, employee_id, job_date, planned_hours, notes,
+                 start_time, end_time, clock_in, clock_out, break_minutes, actual_hours)
+            VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            "#,
+        )
+        .bind(inquiry_id)
+        .bind(a.employee_id)
+        .bind(a.job_date)
+        .bind(a.planned_hours)
+        .bind(&a.notes)
+        .bind(a.start_time)
+        .bind(a.end_time)
+        .bind(a.clock_in)
+        .bind(a.clock_out)
+        .bind(a.break_minutes)
+        .bind(a.actual_hours)
+        .execute(&mut *tx)
+        .await?;
     }
+
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Fetch all employee assignments for a calendar item, ordered by job_date then name.
+///
+/// **Caller**: `calendar::get_calendar_item_employees`
+pub(crate) async fn fetch_calendar_item_employees(
+    pool: &PgPool,
+    calendar_item_id: Uuid,
+) -> Result<Vec<EmployeeAssignmentRow>, sqlx::Error> {
+    sqlx::query_as(
+        r#"
+        SELECT cie.employee_id, e.first_name, e.last_name,
+               cie.job_date,
+               cie.planned_hours::float8 AS planned_hours,
+               cie.notes,
+               cie.start_time, cie.end_time, cie.clock_in, cie.clock_out,
+               COALESCE(cie.break_minutes, 0) AS break_minutes,
+               cie.actual_hours::float8 AS actual_hours
+        FROM calendar_item_employees cie
+        JOIN employees e ON cie.employee_id = e.id
+        WHERE cie.calendar_item_id = $1
+        ORDER BY cie.job_date, e.last_name, e.first_name
+        "#,
+    )
+    .bind(calendar_item_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// Replace all employee assignments for a calendar item (full-replace semantics).
+///
+/// **Caller**: `calendar::put_calendar_item_employees`
+pub(crate) async fn put_calendar_item_employees(
+    pool: &PgPool,
+    calendar_item_id: Uuid,
+    assignments: &[EmployeeAssignmentInput],
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+
+    sqlx::query("DELETE FROM calendar_item_employees WHERE calendar_item_id = $1")
+        .bind(calendar_item_id)
+        .execute(&mut *tx)
+        .await?;
+
+    for a in assignments {
+        sqlx::query(
+            r#"
+            INSERT INTO calendar_item_employees
+                (id, calendar_item_id, employee_id, job_date, planned_hours,
+                 start_time, end_time, clock_in, clock_out, break_minutes, actual_hours)
+            VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            "#,
+        )
+        .bind(calendar_item_id)
+        .bind(a.employee_id)
+        .bind(a.job_date)
+        .bind(a.planned_hours)
+        .bind(a.start_time)
+        .bind(a.end_time)
+        .bind(a.clock_in)
+        .bind(a.clock_out)
+        .bind(a.break_minutes)
+        .bind(a.actual_hours)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    tx.commit().await?;
+    Ok(())
 }

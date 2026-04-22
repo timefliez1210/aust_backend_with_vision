@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::repositories::{address_repo, customer_repo, estimation_repo, inquiry_repo, offer_repo};
+use crate::repositories::{address_repo, calendar_repo, customer_repo, estimation_repo, inquiry_repo, offer_repo};
 use crate::routes::estimates::collect_estimation_s3_keys;
 use crate::routes::inquiry_actions::{
     assign_employee, generate_inquiry_offer, list_inquiry_employees, remove_assignment,
@@ -53,7 +53,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/{id}/emails", get(get_inquiry_emails))
         .route(
             "/{id}/employees",
-            get(list_inquiry_employees).post(assign_employee),
+            get(list_inquiry_employees).post(assign_employee).put(put_inquiry_employees),
         )
         .route(
             "/{id}/employees/{emp_id}",
@@ -61,7 +61,6 @@ pub fn router() -> Router<Arc<AppState>> {
                 .delete(remove_assignment),
         )
         .merge(super::invoices::router())
-        .merge(super::calendar::inquiry_days_router())
 }
 
 // ---------------------------------------------------------------------------
@@ -140,6 +139,10 @@ struct UpdateInquiryRequest {
     clear_billing_address: Option<bool>,
     custom_fields: Option<serde_json::Value>,
     employee_notes: Option<String>,
+    /// Set end_date (YYYY-MM-DD) for multi-day inquiries. Set to `null` to clear (single-day).
+    end_date: Option<String>,
+    /// Set to true to explicitly clear end_date (single-day inquiry).
+    clear_end_date: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -423,6 +426,14 @@ async fn update_inquiry(
         chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
     });
 
+    let end_date: Option<Option<chrono::NaiveDate>> = if request.clear_end_date.unwrap_or(false) {
+        Some(None)
+    } else {
+        request.end_date.as_deref().and_then(|s| {
+            chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
+        }).map(Some)
+    };
+
     inquiry_repo::update_fields(
         &state.db,
         id,
@@ -442,23 +453,10 @@ async fn update_inquiry(
         billing_address_id,
         request.custom_fields.as_ref(),
         request.employee_notes.as_deref(),
+        end_date,
         now,
     )
     .await?;
-
-    // Shift inquiry_days when scheduled_date changes so multi-day rows stay in sync.
-    // If the inquiry has day rows, their day_date values are relative to the original
-    // start date — rescheduling the parent must shift them by the same delta.
-    if let Some(new_date) = scheduled_date {
-        if let Some(old_date) = current_inquiry.scheduled_date {
-            if new_date != old_date {
-                let delta = (new_date - old_date).num_days();
-                if let Err(e) = inquiry_repo::shift_inquiry_days(&state.db, id, delta).await {
-                    tracing::warn!(inquiry_id = %id, delta, error = %e, "Failed to shift inquiry_days after reschedule");
-                }
-            }
-        }
-    }
 
     // Auto-update billing address from origin → destination on completion
     if request.status.as_deref() == Some("completed") {
@@ -605,4 +603,54 @@ async fn get_inquiry_emails(
 ) -> Result<Json<Vec<inquiry_repo::EmailThreadSummary>>, ApiError> {
     let threads = inquiry_repo::fetch_email_threads(&state.db, inquiry_id).await?;
     Ok(Json(threads))
+}
+
+#[derive(Debug, Deserialize)]
+struct BulkEmployeeAssignmentBody {
+    employee_id: Uuid,
+    job_date: chrono::NaiveDate,
+    planned_hours: Option<f64>,
+    notes: Option<String>,
+    start_time: Option<NaiveTime>,
+    end_time: Option<NaiveTime>,
+    clock_in: Option<NaiveTime>,
+    clock_out: Option<NaiveTime>,
+    break_minutes: Option<i32>,
+    actual_hours: Option<f64>,
+}
+
+/// `PUT /api/v1/inquiries/{id}/employees` — Full-replace all employee assignments.
+///
+/// **Caller**: Admin calendar side panel (multi-day scheduling).
+/// **Why**: Atomic replace of the entire assignment set — deletes all existing rows for this
+///          inquiry and inserts the provided flat array (one row per employee per job_date).
+async fn put_inquiry_employees(
+    State(state): State<Arc<AppState>>,
+    Extension(_claims): Extension<TokenClaims>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<Vec<BulkEmployeeAssignmentBody>>,
+) -> Result<Json<Vec<calendar_repo::EmployeeAssignmentRow>>, ApiError> {
+    let inputs: Vec<calendar_repo::EmployeeAssignmentInput> = body.into_iter().map(|b| {
+        calendar_repo::EmployeeAssignmentInput {
+            employee_id: b.employee_id,
+            job_date: b.job_date,
+            planned_hours: b.planned_hours,
+            notes: b.notes,
+            start_time: b.start_time,
+            end_time: b.end_time,
+            clock_in: b.clock_in,
+            clock_out: b.clock_out,
+            break_minutes: b.break_minutes.unwrap_or(0),
+            actual_hours: b.actual_hours,
+        }
+    }).collect();
+
+    calendar_repo::put_inquiry_employees(&state.db, id, &inputs)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    let rows = calendar_repo::fetch_inquiry_employees(&state.db, id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(Json(rows))
 }

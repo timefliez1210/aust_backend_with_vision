@@ -268,17 +268,20 @@ fn build_sheet_xml(
     format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<sheetPr><pageSetUpPr fitToPage="1"/></sheetPr>
 <cols>
 <col min="1" max="1" width="2" customWidth="1"/>
-<col min="2" max="2" width="22" customWidth="1"/>
-<col min="3" max="3" width="14" customWidth="1"/>
-<col min="4" max="4" width="14" customWidth="1"/>
-<col min="5" max="5" width="14" customWidth="1"/>
-<col min="6" max="6" width="18" customWidth="1"/>
+<col min="2" max="2" width="18" customWidth="1"/>
+<col min="3" max="3" width="13" customWidth="1"/>
+<col min="4" max="4" width="13" customWidth="1"/>
+<col min="5" max="5" width="13" customWidth="1"/>
+<col min="6" max="6" width="14" customWidth="1"/>
 </cols>
 <sheetData>
 {rows}
 </sheetData>
+<pageMargins left="0.5" right="0.5" top="0.75" bottom="0.75" header="0.3" footer="0.3"/>
+<pageSetup paperSize="9" orientation="portrait" fitToWidth="1" fitToHeight="0"/>
 </worksheet>"#,
         rows = rows.join("\n")
     )

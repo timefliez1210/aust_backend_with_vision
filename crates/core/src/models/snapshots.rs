@@ -82,23 +82,10 @@ pub struct InquiryResponse {
     pub estimations: Vec<EstimationSnapshot>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub employees: Vec<EmployeeAssignmentSnapshot>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub scheduled_days: Vec<InquiryDaySnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_date: Option<NaiveDate>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_multi_day: bool,
-}
-
-/// One scheduled day within a multi-day inquiry.
-///
-/// **Caller**: `build_inquiry_response()`, `GET /api/v1/inquiries/{id}/days`
-/// **Why**: Multi-day moves need per-day records so the calendar can display
-/// the inquiry on every day it spans.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InquiryDaySnapshot {
-    pub day_date: NaiveDate,
-    pub day_number: i16,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub notes: Option<String>,
 }
 
 /// Summary item for list endpoints.

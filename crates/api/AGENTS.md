@@ -26,10 +26,10 @@ The main backend crate. Axum HTTP server with JWT middleware, 18 route files, 13
 
 | File | Key Tables | Notes |
 |------|-----------|-------|
-| `inquiry_repo.rs` | `inquiries`, `inquiry_days`, `inquiry_day_employees` | 37KB — largest, most complex |
-| `employee_repo.rs` | `employees`, `inquiry_day_employees` | Document keys use `resolve_doc_column()` allowlist |
+| `inquiry_repo.rs` | `inquiries`, `inquiry_employees` | 37KB — largest, most complex |
+| `employee_repo.rs` | `employees`, `inquiry_employees` | Document keys use `resolve_doc_column()` allowlist |
 | `admin_repo.rs` | Aggregation queries (dashboard, orders) | |
-| `calendar_repo.rs` | `calendar_items`, day-employees | Single-day branch uses `inquiry_day_employees` |
+| `calendar_repo.rs` | `inquiries`, `calendar_items`, employee assignments | Schedule queries use `generate_series` to expand multi-day spans |
 | `customer_repo.rs` | `customers` | |
 | `offer_repo.rs` | `offers` | Unique partial index `offers_inquiry_active_unique` prevents duplicate active offers |
 | `estimation_repo.rs` | `volume_estimations` | |
@@ -56,8 +56,19 @@ The main backend crate. Axum HTTP server with JWT middleware, 18 route files, 13
 ### Repository Pattern
 ALL SQL goes in `src/repositories/*_repo.rs`. Route handlers never contain inline `sqlx::query`. If you need a new query, add a function to the appropriate repo module.
 
-### Dual-Write: `inquiry_employees` → `inquiry_day_employees`
-Write paths mirror to both flat (`inquiry_employees`) and day-level (`inquiry_day_employees`) tables. Read paths use day-level as primary. The flat table still exists for backward compat but should not be used for new reads.
+### Scheduling Model (single code path)
+Multi-day appointments are expressed via `inquiries.end_date` (NULL = same day as `scheduled_date`) and `calendar_items.end_date`. Employee assignments live in one flat table per entity type:
+
+- `inquiry_employees` — one row per `(inquiry_id, employee_id, job_date)`. Unique key includes `job_date`.
+- `calendar_item_employees` — same shape for calendar items.
+
+The old `inquiry_days`, `inquiry_day_employees`, `calendar_item_days`, `calendar_item_day_employees` tables were dropped in migration `20260601000000_simplify_scheduling.sql`.
+
+**Calendar schedule query** (`calendar_repo::fetch_schedule_inquiries`) uses `CROSS JOIN LATERAL generate_series(scheduled_date, COALESCE(end_date, scheduled_date), '1 day')` to expand multi-day inquiries into one row per day, then LEFT JOINs `inquiry_employees ie ON ie.job_date = gs.day` for per-day staffing.
+
+**Employee assignment endpoints**: `GET/PUT /api/v1/inquiries/{id}/employees` and `GET/PUT /api/v1/calendar-items/{id}/employees`. PUT does full-replace (delete all + insert). Body is a flat array of `{employee_id, job_date, planned_hours, ...}`.
+
+**`day_number` and `total_days`** are computed on the fly: `(job_date - scheduled_date + 1)` and `(end_date - scheduled_date + 1)`.
 
 ### Status Gate (M3)
 `InquiryStatus::is_locked_for_modifications()` returns true for `offer_ready` through `paid`. When locked, PATCH `/inquiries/{id}` rejects changes to `estimated_volume_m3`, `services`, `distance_km`, `origin_address_id`, `destination_address_id`.
@@ -100,7 +111,7 @@ All pricing constants are in `CompanyConfig`:
 | Inquiry status machine | `can_transition_to()`, `is_locked_for_modifications()`, admin frontend status labels (`INQUIRY_STATUS_LABELS`), `inquiry_repo.rs` status query |
 | `CompanyConfig` pricing | `PricingEngine::with_rate()`, `ServicePrices::from_config()`, offer XLSX template pricing cells, unit tests |
 | `Services` struct flags | `build_line_items()` in offer_builder, XLSX rows 31–42, foto-angebot form, frontend service toggles |
-| `inquiry_day_employees` schema | `inquiry_employees` dual-write sync, calendar employee queries, clock-time update SQL, admin employee panel |
+| `inquiry_employees` schema (add/remove columns) | `calendar_item_employees` mirror, `calendar_repo` schedule queries, `employee_repo` hours queries, admin employee panel |
 | `offers` unique constraint | `offer_pipeline.rs` race guard, `offer_builder.rs` insert catch block, `offer_repo.rs` fetch_active_id |
 | DB migration | `test_helpers.rs` factory functions, integration tests, manual `deploy.sh` step |
 | `EstimationMethod` enum | `volume.rs`, all 5 submission handlers in `submissions.rs`, offer_builder `parse_detected_items()`, DB CHECK constraint migration |

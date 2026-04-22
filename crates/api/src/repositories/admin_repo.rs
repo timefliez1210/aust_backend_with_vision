@@ -478,7 +478,7 @@ pub(crate) async fn list_orders_single_status(
                (SELECT ROUND(o.price_cents * 1.19)::bigint FROM offers o WHERE o.inquiry_id = q.id ORDER BY o.created_at DESC LIMIT 1) AS offer_price_brutto,
                q.scheduled_date AS booking_date,
                q.created_at,
-               (SELECT COUNT(DISTINCT ide.employee_id)::bigint FROM inquiry_day_employees ide JOIN inquiry_days iday ON ide.inquiry_day_id = iday.id WHERE iday.inquiry_id = q.id) AS employees_assigned,
+               (SELECT COUNT(DISTINCT employee_id)::bigint FROM inquiry_employees WHERE inquiry_id = q.id) AS employees_assigned,
                (SELECT o.persons FROM offers o WHERE o.inquiry_id = q.id ORDER BY o.created_at DESC LIMIT 1) AS employees_quoted
         FROM inquiries q
         JOIN customers c ON q.customer_id = c.id
@@ -518,7 +518,7 @@ pub(crate) async fn list_orders_all_statuses(
                (SELECT ROUND(o.price_cents * 1.19)::bigint FROM offers o WHERE o.inquiry_id = q.id ORDER BY o.created_at DESC LIMIT 1) AS offer_price_brutto,
                q.scheduled_date AS booking_date,
                q.created_at,
-               (SELECT COUNT(DISTINCT ide.employee_id)::bigint FROM inquiry_day_employees ide JOIN inquiry_days iday ON ide.inquiry_day_id = iday.id WHERE iday.inquiry_id = q.id) AS employees_assigned,
+               (SELECT COUNT(DISTINCT employee_id)::bigint FROM inquiry_employees WHERE inquiry_id = q.id) AS employees_assigned,
                (SELECT o.persons FROM offers o WHERE o.inquiry_id = q.id ORDER BY o.created_at DESC LIMIT 1) AS employees_quoted
         FROM inquiries q
         JOIN customers c ON q.customer_id = c.id
@@ -1137,9 +1137,8 @@ pub(crate) async fn fetch_morning_inquiries(pool: &PgPool) -> Result<Vec<Morning
     sqlx::query_as::<_, MorningInquiryRow>(
         r#"
         WITH last_inquiry_days AS (
-            SELECT inquiry_id, MAX(day_date) AS last_day
-            FROM inquiry_days
-            GROUP BY inquiry_id
+            SELECT id AS inquiry_id, COALESCE(end_date, scheduled_date) AS last_day
+            FROM inquiries
         ),
         latest_invoices AS (
             SELECT DISTINCT ON (inquiry_id)
@@ -1190,22 +1189,16 @@ pub(crate) async fn fetch_morning_inquiries(pool: &PgPool) -> Result<Vec<Morning
 pub(crate) async fn fetch_morning_calendar_items(pool: &PgPool) -> Result<Vec<MorningCalendarItemRow>, sqlx::Error> {
     sqlx::query_as::<_, MorningCalendarItemRow>(
         r#"
-        WITH last_ci_days AS (
-            SELECT calendar_item_id, MAX(day_date) AS last_day
-            FROM calendar_item_days
-            GROUP BY calendar_item_id
-        )
         SELECT
             ci.id,
             ci.title,
-            COALESCE(lcd.last_day, ci.scheduled_date) AS last_day,
+            COALESCE(ci.end_date, ci.scheduled_date) AS last_day,
             ci.status
         FROM calendar_items ci
-        LEFT JOIN last_ci_days lcd ON lcd.calendar_item_id = ci.id
         WHERE ci.status = 'scheduled'
-          AND COALESCE(lcd.last_day, ci.scheduled_date) < CURRENT_DATE
-          AND COALESCE(lcd.last_day, ci.scheduled_date) >= CURRENT_DATE - INTERVAL '14 days'
-        ORDER BY COALESCE(lcd.last_day, ci.scheduled_date) DESC
+          AND COALESCE(ci.end_date, ci.scheduled_date) < CURRENT_DATE
+          AND COALESCE(ci.end_date, ci.scheduled_date) >= CURRENT_DATE - INTERVAL '14 days'
+        ORDER BY COALESCE(ci.end_date, ci.scheduled_date) DESC
         "#,
     )
     .fetch_all(pool)
