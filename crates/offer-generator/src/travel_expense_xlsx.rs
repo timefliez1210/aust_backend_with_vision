@@ -417,5 +417,17 @@ mod tests {
             sheet1.contains("Mustermann"),
             "sheet1 should contain the employee last name"
         );
+        assert!(
+            sheet1.contains("D27*F27"),
+            "G27 should contain small-days subtotal formula"
+        );
+        assert!(
+            sheet1.contains("D29*F29"),
+            "G29 should contain large-days subtotal formula"
+        );
+        assert!(
+            sheet1.contains("D26+G27+G29+D32+D33-D30-D31"),
+            "D34 total should include meal deduction and reference subtotals"
+        );
     }
 }
