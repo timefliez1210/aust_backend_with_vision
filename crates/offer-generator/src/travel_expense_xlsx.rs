@@ -33,12 +33,13 @@ pub struct TravelExpenseData {
 
 /// Convert a `NaiveDate` to an Excel serial number (Windows date system).
 ///
-/// Excel's epoch is 1899-12-30, with the 1900 leap-year bug (non-existent
-/// 1900-02-29 is counted as day 60, so all serials ≥ 61 are off by +1).
+/// Excel's epoch is 1899-12-31 (serial 0), and the 1900 leap-year bug means
+/// serials on or after 1900-03-01 are off by +1 relative to actual day count.
 fn date_to_excel_serial(date: chrono::NaiveDate) -> f64 {
-    let epoch = chrono::NaiveDate::from_ymd_opt(1899, 12, 30).unwrap();
+    let epoch = chrono::NaiveDate::from_ymd_opt(1899, 12, 31).unwrap();
     let days = (date - epoch).num_days();
-    if days > 60 {
+    if days >= 60 {
+        // Account for Excel's non-existent 1900-02-29
         (days + 1) as f64
     } else {
         days as f64

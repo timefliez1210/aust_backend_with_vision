@@ -690,7 +690,8 @@ fn build_cell_xml(cell_ref: &str, style: Option<&str>, value: &CellValue) -> Str
             )
         }
         CellValue::Number(n) => {
-            // Format: avoid scientific notation, trim trailing zeros
+            // Format: avoid scientific notation, preserve full precision for
+            // round-tripping through Excel's float64 parser.
             let formatted = format_number(*n);
             format!(r#"<c r="{}"{} t="n"><v>{}</v></c>"#, cell_ref, s_attr, formatted)
         }
@@ -1506,11 +1507,15 @@ pub fn format_number(n: f64) -> String {
     if n == n.floor() && n.abs() < 1e15 {
         format!("{}", n as i64)
     } else {
-        // Up to 10 decimal places, trim trailing zeros
-        let s = format!("{:.10}", n);
-        let s = s.trim_end_matches('0');
-        let s = s.trim_end_matches('.');
-        s.to_string()
+        let s = format!("{}", n);
+        // Trim trailing zeros after decimal point to keep output compact
+        if s.contains('.') {
+            let s = s.trim_end_matches('0');
+            let s = s.trim_end_matches('.');
+            s.to_string()
+        } else {
+            s
+        }
     }
 }
 
