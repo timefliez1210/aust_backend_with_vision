@@ -89,6 +89,18 @@ pub fn generate_travel_expense_xlsx(data: &TravelExpenseData) -> Result<Vec<u8>,
         &CellValue::Number(time_to_excel_fraction(data.end_time)),
     );
 
+    // Employee name (overwrites pre-filled template data)
+    modified_sheet1 = set_cell_value(
+        &modified_sheet1,
+        "D13",
+        &CellValue::Text(data.employee_first_name.clone()),
+    );
+    modified_sheet1 = set_cell_value(
+        &modified_sheet1,
+        "G13",
+        &CellValue::Text(data.employee_last_name.clone()),
+    );
+
     // Destination & Reason
     modified_sheet1 = set_cell_value(
         &modified_sheet1,
@@ -370,5 +382,20 @@ mod tests {
             s
         };
         assert!(!rels.contains("sheet2.xml"));
+
+        let sheet1 = {
+            let mut f = zip.by_name("xl/worksheets/sheet1.xml").unwrap();
+            let mut s = String::new();
+            std::io::Read::read_to_string(&mut f, &mut s).unwrap();
+            s
+        };
+        assert!(
+            sheet1.contains("Max"),
+            "sheet1 should contain the employee first name"
+        );
+        assert!(
+            sheet1.contains("Mustermann"),
+            "sheet1 should contain the employee last name"
+        );
     }
 }
