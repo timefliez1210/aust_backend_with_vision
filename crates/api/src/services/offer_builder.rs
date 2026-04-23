@@ -683,6 +683,9 @@ fn format_services_display(services: &Services) -> String {
     if services.parking_ban_destination {
         parts.push("Halteverbot Entladestelle".to_string());
     }
+    if services.transporter {
+        parts.push("3,5t Transporter m. Koffer".to_string());
+    }
     parts.join(", ")
 }
 
@@ -862,6 +865,7 @@ pub(crate) struct ServicePrices {
     pub assembly_unit_price: f64,
     pub parking_ban_unit_price: f64,
     pub packing_unit_price: f64,
+    pub transporter_unit_price: f64,
 }
 
 impl ServicePrices {
@@ -871,6 +875,7 @@ impl ServicePrices {
             assembly_unit_price: config.company.assembly_price,
             parking_ban_unit_price: config.company.parking_ban_price,
             packing_unit_price: config.company.packing_price,
+            transporter_unit_price: config.company.transporter_price,
         }
     }
 
@@ -881,6 +886,7 @@ impl ServicePrices {
             assembly_unit_price: 25.0,
             parking_ban_unit_price: 100.0,
             packing_unit_price: 30.0,
+            transporter_unit_price: 60.0,
         }
     }
 }
@@ -902,6 +908,7 @@ impl ServicePrices {
 /// - Montage (row 31, €50) — if `services.assembly`
 /// - Halteverbotszone (row 32, €100/zone) — 1–2 zones depending on flags
 /// - Umzugsmaterial (row 33, €30) — if `services.packing`
+/// - 3,5t Transporter m. Koffer (row ??, €60) — if `services.transporter`
 /// - Nürnbergerversicherung (always last, €0, `flat_total = 0.0`)
 ///
 /// Does NOT include Fahrkostenpauschale (computed separately in `build_offer_with_overrides`)
@@ -958,6 +965,16 @@ pub(crate) fn build_line_items(services: &Services, prices: &ServicePrices) -> V
             quantity: 1.0,
             unit_price: prices.packing_unit_price,
             remark: Some(format!("Stretchfolie, Decken, Gurte Einzelpreis {} €", format!("{:.2}", prices.packing_unit_price).replace('.', ","))),
+            ..Default::default()
+        });
+    }
+
+    // 3,5t Transporter m. Koffer
+    if services.transporter {
+        items.push(OfferLineItem {
+            description: "3,5t Transporter m. Koffer".to_string(),
+            quantity: 1.0,
+            unit_price: prices.transporter_unit_price,
             ..Default::default()
         });
     }
@@ -1377,9 +1394,15 @@ mod tests {
     }
 
     #[test]
-    fn no_transporter_item() {
-        let items = build_line_items(&Services::default(), &ServicePrices::defaults());
-        assert!(!items.iter().any(|i| i.description.contains("Transporter")), "Transporter must not appear");
+    fn no_transporter_item_when_disabled() {
+        let items = build_line_items(&Services { transporter: false, ..Default::default() }, &ServicePrices::defaults());
+        assert!(!items.iter().any(|i| i.description.contains("Transporter")), "Transporter must not appear when disabled");
+    }
+
+    #[test]
+    fn transporter_item_when_enabled() {
+        let items = build_line_items(&Services { transporter: true, ..Default::default() }, &ServicePrices::defaults());
+        assert!(items.iter().any(|i| i.description.contains("Transporter")), "Transporter should appear when enabled");
     }
 
     #[test]
@@ -1474,6 +1497,7 @@ mod tests {
             disposal: true,
             parking_ban_origin: true,
             parking_ban_destination: true,
+            transporter: true,
         });
         assert!(s.contains("Verpackungsservice"));
         assert!(s.contains("Montage"));
@@ -1645,11 +1669,13 @@ mod tests {
             disposal in proptest::bool::ANY,
             ban_origin in proptest::bool::ANY,
             ban_dest in proptest::bool::ANY,
+            transporter in proptest::bool::ANY,
         ) {
             let services = Services {
                 packing, assembly, disassembly, storage, disposal,
                 parking_ban_origin: ban_origin,
                 parking_ban_destination: ban_dest,
+                transporter,
             };
             let items = build_line_items(&services, &ServicePrices::defaults());
             // Must always end with Nürnbergerversicherung
@@ -1801,6 +1827,7 @@ mod tests {
             assembly_unit_price: 50.0,
             parking_ban_unit_price: 150.0,
             packing_unit_price: 40.0,
+            transporter_unit_price: 80.0,
         };
         let services = Services {
             disassembly: true,

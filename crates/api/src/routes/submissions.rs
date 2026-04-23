@@ -2008,6 +2008,8 @@ pub(crate) fn parse_services_string(
         disposal: s.contains("disposal") || s.contains("entsorgung"),
         parking_ban_origin: departure_parking_ban.unwrap_or(false),
         parking_ban_destination: arrival_parking_ban.unwrap_or(false),
+        // Default to true since the transporter is a standard offer position
+        transporter: !s.contains("no truck") && !s.contains("ohne transporter"),
     }
 }
 

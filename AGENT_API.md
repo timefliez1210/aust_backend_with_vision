@@ -9,7 +9,7 @@ updates after fixing an issue.
 ## Base URL
 
 ```
-https://aust-umzuege.de/api/v1/admin
+https://api.aufraeumhelden.com/api/v1/admin
 ```
 
 All endpoints require an `Authorization: Bearer <token>` header.
@@ -45,13 +45,20 @@ config section.
 
 ### Option A — Use the login endpoint
 
+Pre-configured agent credentials (from the `.env` in the project root):
+
+| Field    | Value                |
+|----------|----------------------|
+| `email`  | `agent@test.com`     |
+| `password` | `HelloAgent123!`   |
+
 ```http
 POST /api/v1/auth/login
 Content-Type: application/json
 
 {
-  "email":    "your-admin@aust-umzuege.de",
-  "password": "..."
+  "email":    "agent@test.com",
+  "password": "HelloAgent123!"
 }
 ```
 

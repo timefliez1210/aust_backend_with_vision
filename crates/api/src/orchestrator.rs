@@ -558,6 +558,7 @@ fn build_services(inquiry: &MovingInquiry) -> Services {
         disposal: inquiry.service_disposal,
         parking_ban_origin: inquiry.departure_parking_ban.unwrap_or(false),
         parking_ban_destination: inquiry.arrival_parking_ban.unwrap_or(false),
+        transporter: true,
     }
 }
 
@@ -671,7 +672,12 @@ mod tests {
     fn services_empty_inquiry() {
         let inquiry = minimal_inquiry();
         let services = build_services(&inquiry);
-        assert_eq!(services, Services::default());
+        // Transporter is always enabled; compare everything else against default
+        assert!(services.transporter);
+        assert_eq!(
+            Services { transporter: false, ..services.clone() },
+            Services::default()
+        );
     }
 
     #[test]
@@ -768,6 +774,11 @@ mod tests {
         let mut inquiry = minimal_inquiry();
         inquiry.notes = Some("Klavier im 1. OG".to_string());
         let services = build_services(&inquiry);
-        assert_eq!(services, Services::default());
+        // Transporter is always enabled; compare everything else against default
+        assert!(services.transporter);
+        assert_eq!(
+            Services { transporter: false, ..services.clone() },
+            Services::default()
+        );
     }
 }

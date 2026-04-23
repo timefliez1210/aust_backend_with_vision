@@ -284,6 +284,9 @@ pub struct CompanyConfig {
     /// Price for Umzugsmaterial (packing materials) in EUR. Default: 30.0 (= €30.00).
     #[serde(default = "default_packing_price")]
     pub packing_price: f64,
+    /// Price for 3,5t Transporter m. Koffer in EUR. Default: 60.0 (= €60.00).
+    #[serde(default = "default_transporter_price")]
+    pub transporter_price: f64,
     /// Saturday surcharge in cents. Default: 5000 (= €50.00).
     #[serde(default = "default_saturday_surcharge_cents")]
     pub saturday_surcharge_cents: i64,
@@ -293,6 +296,7 @@ fn default_rate_per_person_hour_cents() -> i64 { 3000 }
 fn default_assembly_price() -> f64 { 25.0 }
 fn default_parking_ban_price() -> f64 { 100.0 }
 fn default_packing_price() -> f64 { 30.0 }
+fn default_transporter_price() -> f64 { 60.0 }
 fn default_saturday_surcharge_cents() -> i64 { 5000 }
 
 impl Default for CompanyConfig {
@@ -304,6 +308,7 @@ impl Default for CompanyConfig {
             assembly_price: 25.0,
             parking_ban_price: 100.0,
             packing_price: 30.0,
+            transporter_price: 60.0,
             saturday_surcharge_cents: 5000,
         }
     }

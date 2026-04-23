@@ -22,6 +22,8 @@ pub struct Services {
     pub parking_ban_origin: bool,
     #[serde(default)]
     pub parking_ban_destination: bool,
+    #[serde(default)]
+    pub transporter: bool,
 }
 
 /// Canonical detail response for a single inquiry.
@@ -272,6 +274,7 @@ mod tests {
         assert!(!s.disposal);
         assert!(!s.parking_ban_origin);
         assert!(!s.parking_ban_destination);
+        assert!(!s.transporter);
     }
 
     #[test]
@@ -284,6 +287,7 @@ mod tests {
             disposal: false,
             parking_ban_origin: true,
             parking_ban_destination: false,
+            transporter: true,
         };
         let json = serde_json::to_string(&s).unwrap();
         let deserialized: Services = serde_json::from_str(&json).unwrap();
@@ -301,6 +305,7 @@ mod tests {
         assert!(!s.disposal);
         assert!(!s.parking_ban_origin);
         assert!(!s.parking_ban_destination);
+        assert!(!s.transporter);
     }
 
     #[test]

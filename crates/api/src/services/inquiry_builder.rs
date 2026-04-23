@@ -149,10 +149,14 @@ pub async fn build_inquiry_response(
                     .and_then(|r| r.get("packs_into_boxes")?.as_bool())
                     .unwrap_or(false);
 
+                let item_name = d.german_name.clone().unwrap_or_else(|| d.name.clone());
+                let (parsed_name, quantity, per_item_volume) =
+                    parse_quantity_prefix(&item_name, d.volume_m3);
+
                 ItemSnapshot {
-                    name: d.german_name.clone().unwrap_or_else(|| d.name.clone()),
-                    volume_m3: d.volume_m3,
-                    quantity: 1,
+                    name: parsed_name,
+                    volume_m3: per_item_volume,
+                    quantity,
                     confidence: d.confidence,
                     category,
                     dimensions,
@@ -379,6 +383,29 @@ pub async fn build_inquiry_list(
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// If an item name begins with a quantity prefix like `"4x "` or `"2x "`,
+/// extract the quantity, strip the prefix, and return the per-item volume.
+/// Otherwise return the original name with quantity = 1.
+///
+/// **Why**: Vision and inventory pipelines bake the quantity into the name
+/// (e.g. `"4x Einzelbett komplett"`) while `volume_m3` is the *total* volume.
+/// The frontend shows per-item volume and a separate ANZAHL column, so we
+/// need to split the data before sending it downstream.
+fn parse_quantity_prefix(name: &str, total_volume_m3: f64) -> (String, i64, f64) {
+    let trimmed = name.trim();
+    if let Some(pos) = trimmed.find('x') {
+        let before = trimmed[..pos].trim();
+        let after = trimmed[pos + 1..].trim();
+        if let Ok(n) = before.parse::<i64>() {
+            if n > 1 && !after.is_empty() {
+                let per_item = total_volume_m3 / n as f64;
+                return (after.to_string(), n, per_item);
+            }
+        }
+    }
+    (name.to_string(), 1, total_volume_m3)
+}
+
 /// Fetch an address row and convert to snapshot, if the ID is present.
 async fn fetch_address(
     pool: &PgPool,
@@ -523,5 +550,43 @@ fn extract_customer_message(notes: Option<&str>) -> Option<String> {
         None
     } else {
         Some(parts.join(", "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_quantity_prefix_extracts_and_divides() {
+        let (name, qty, vol) = parse_quantity_prefix("4x Einzelbett komplett", 4.0);
+        assert_eq!(name, "Einzelbett komplett");
+        assert_eq!(qty, 4);
+        assert!((vol - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn parse_quantity_prefix_no_prefix() {
+        let (name, qty, vol) = parse_quantity_prefix("Sofa", 2.5);
+        assert_eq!(name, "Sofa");
+        assert_eq!(qty, 1);
+        assert!((vol - 2.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn parse_quantity_prefix_single_x() {
+        // "1x Sofa" is treated as no meaningful prefix >1, so it is returned unchanged
+        let (name, qty, vol) = parse_quantity_prefix("1x Sofa", 2.0);
+        assert_eq!(name, "1x Sofa");
+        assert_eq!(qty, 1);
+        assert!((vol - 2.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn parse_quantity_prefix_with_decimal_volume() {
+        let (name, qty, vol) = parse_quantity_prefix("3x Schrank zerlegbar", 2.4);
+        assert_eq!(name, "Schrank zerlegbar");
+        assert_eq!(qty, 3);
+        assert!((vol - 0.8).abs() < 0.001);
     }
 }
