@@ -141,6 +141,25 @@ pub fn generate_travel_expense_xlsx(data: &TravelExpenseData) -> Result<Vec<u8>,
         "D29",
         &CellValue::Number(data.large_days as f64),
     );
+
+    // Row subtotals: overwrite G27/G29 text with formula showing day × rate
+    modified_sheet1 = set_cell_value(
+        &modified_sheet1,
+        "G27",
+        &CellValue::StyledFormula("D27*F27".into(), "25"),
+    );
+    modified_sheet1 = set_cell_value(
+        &modified_sheet1,
+        "G29",
+        &CellValue::StyledFormula("D29*F29".into(), "25"),
+    );
+
+    // Fix total formula: include meal deduction (D31) and reference subtotals
+    modified_sheet1 = modified_sheet1.replace(
+        "<f>D26+D27*F27+D29*F29+D32+D33-D30</f>",
+        "<f>D26+G27+G29+D32+D33-D30-D31</f>",
+    );
+
     modified_sheet1 = set_cell_value(
         &modified_sheet1,
         "D30",

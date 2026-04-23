@@ -748,6 +748,7 @@ pub(crate) struct EmployeeAssignmentSnapshotRow {
     pub transport_mode: Option<String>,
     pub travel_costs_cents: Option<i64>,
     pub accommodation_cents: Option<i64>,
+    pub misc_costs_cents: Option<i64>,
     pub meal_deduction: Option<String>,
 }
 
@@ -781,6 +782,7 @@ pub(crate) async fn fetch_employee_assignments_snapshot(
                ie.transport_mode,
                ie.travel_costs_cents,
                ie.accommodation_cents,
+               ie.misc_costs_cents,
                ie.meal_deduction
         FROM inquiry_employees ie
         JOIN employees e ON ie.employee_id = e.id

@@ -580,6 +580,7 @@ struct BulkItemEmployeeBody {
     transport_mode: Option<String>,
     travel_costs_cents: Option<i64>,
     accommodation_cents: Option<i64>,
+    misc_costs_cents: Option<i64>,
     meal_deduction: Option<String>,
 }
 
@@ -605,6 +606,7 @@ async fn put_item_employees(
             transport_mode: b.transport_mode,
             travel_costs_cents: b.travel_costs_cents,
             accommodation_cents: b.accommodation_cents,
+            misc_costs_cents: b.misc_costs_cents,
             meal_deduction: b.meal_deduction,
         }
     }).collect();

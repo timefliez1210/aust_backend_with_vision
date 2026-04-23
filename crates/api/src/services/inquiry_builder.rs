@@ -253,6 +253,7 @@ pub async fn build_inquiry_response(
             transport_mode: r.transport_mode,
             travel_costs_cents: r.travel_costs_cents,
             accommodation_cents: r.accommodation_cents,
+            misc_costs_cents: r.misc_costs_cents,
             meal_deduction: r.meal_deduction,
         })
         .collect();

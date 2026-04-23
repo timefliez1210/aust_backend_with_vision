@@ -681,6 +681,7 @@ async fn generate_travel_expenses(
     let first = &emp_rows[0];
     let travel_costs_eur = first.travel_costs_cents.map(|c| c as f64 / 100.0).unwrap_or(0.0);
     let accommodation_eur = first.accommodation_cents.map(|c| c as f64 / 100.0).unwrap_or(0.0);
+    let misc_costs_eur = first.misc_costs_cents.map(|c| c as f64 / 100.0).unwrap_or(0.0);
 
     // 6. Meal deductions (simplified)
     let mut breakfast_deduction = 0.0;
@@ -712,7 +713,7 @@ async fn generate_travel_expenses(
             breakfast_deduction_eur: breakfast_deduction,
             meal_deduction_eur: meal_deduction,
             accommodation_eur,
-            misc_costs_eur: 0.0,
+            misc_costs_eur,
         }
     )
     .map_err(|e| ApiError::Internal(format!("XLSX generation failed: {e}")))?;
@@ -747,6 +748,7 @@ struct BulkEmployeeAssignmentBody {
     transport_mode: Option<String>,
     travel_costs_cents: Option<i64>,
     accommodation_cents: Option<i64>,
+    misc_costs_cents: Option<i64>,
     meal_deduction: Option<String>,
 }
 
@@ -776,6 +778,7 @@ async fn put_inquiry_employees(
             transport_mode: b.transport_mode,
             travel_costs_cents: b.travel_costs_cents,
             accommodation_cents: b.accommodation_cents,
+            misc_costs_cents: b.misc_costs_cents,
             meal_deduction: b.meal_deduction,
         }
     }).collect();

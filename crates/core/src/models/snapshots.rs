@@ -269,6 +269,8 @@ pub struct EmployeeAssignmentSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub accommodation_cents: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub misc_costs_cents: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub meal_deduction: Option<String>,
 }
 
