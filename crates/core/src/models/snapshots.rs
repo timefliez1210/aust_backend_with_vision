@@ -88,6 +88,8 @@ pub struct InquiryResponse {
     pub end_date: Option<NaiveDate>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_multi_day: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub has_pauschale: bool,
 }
 
 /// Summary item for list endpoints.
@@ -258,6 +260,16 @@ pub struct EmployeeAssignmentSnapshot {
     pub employee_clock_out: Option<DateTime<Utc>>,
     pub employee_actual_hours: Option<f64>,
     pub notes: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_date: Option<NaiveDate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transport_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub travel_costs_cents: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accommodation_cents: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub meal_deduction: Option<String>,
 }
 
 #[cfg(test)]

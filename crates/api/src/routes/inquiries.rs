@@ -60,6 +60,7 @@ pub fn router() -> Router<Arc<AppState>> {
             axum::routing::patch(update_assignment)
                 .delete(remove_assignment),
         )
+        .route("/{id}/employees/{emp_id}/travel-expenses", get(generate_travel_expenses))
         .merge(super::invoices::router())
 }
 
@@ -143,6 +144,8 @@ struct UpdateInquiryRequest {
     end_date: Option<String>,
     /// Set to true to explicitly clear end_date (single-day inquiry).
     clear_end_date: Option<bool>,
+    /// Enable travel daily allowance (Verpflegungspauschale) for multi-day trips.
+    has_pauschale: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -454,6 +457,7 @@ async fn update_inquiry(
         request.custom_fields.as_ref(),
         request.employee_notes.as_deref(),
         end_date,
+        request.has_pauschale,
         now,
     )
     .await?;
@@ -605,6 +609,129 @@ async fn get_inquiry_emails(
     Ok(Json(threads))
 }
 
+/// `GET /api/v1/inquiries/{id}/employees/{emp_id}/travel-expenses` — Generate travel expense XLSX.
+///
+/// **Caller**: Admin dashboard download button on multi-day inquiries with has_pauschale=true.
+/// **Why**: Produces a Reisekostenabrechnung for one employee on this trip.
+async fn generate_travel_expenses(
+    State(state): State<Arc<AppState>>,
+    Extension(_claims): Extension<TokenClaims>,
+    Path((id, emp_id)): Path<(Uuid, Uuid)>,
+) -> Result<impl IntoResponse, ApiError> {
+    // 1. Fetch inquiry with end_date
+    let inquiry = inquiry_repo::fetch_by_id(&state.db, id).await?;
+    if !inquiry.has_pauschale {
+        return Err(ApiError::BadRequest(
+            "Verpflegungspauschale ist für diese Anfrage nicht aktiviert".into(),
+        ));
+    }
+    let Some(start_date) = inquiry.scheduled_date else {
+        return Err(ApiError::BadRequest("Kein Startdatum gesetzt".into()));
+    };
+    let end_date = inquiry.end_date.unwrap_or(start_date);
+    let total_days = (end_date - start_date).num_days() + 1;
+    if total_days < 2 {
+        return Err(ApiError::BadRequest(
+            "Verpflegungspauschale nur für mehrtägige Termine".into(),
+        ));
+    }
+
+    // 2. Fetch employee assignments for this inquiry + employee
+    let assignments = calendar_repo::fetch_inquiry_employees(&state.db, id).await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let emp_rows: Vec<_> = assignments.into_iter()
+        .filter(|a| a.employee_id == emp_id)
+        .collect();
+    if emp_rows.is_empty() {
+        return Err(ApiError::NotFound("Mitarbeiter nicht zugewiesen".into()));
+    }
+
+    // 3. Compute small / large days based on actual hours
+    let mut small_days = 0i32;
+    let mut large_days = 0i32;
+    for a in &emp_rows {
+        let is_first = a.job_date == start_date;
+        let is_last = a.job_date == end_date;
+        let hours = a.actual_hours.unwrap_or(a.planned_hours.unwrap_or(8.0));
+        if is_first || is_last {
+            // >8h on first/last day → large allowance; otherwise small
+            if hours > 8.0 {
+                large_days += 1;
+            } else {
+                small_days += 1;
+            }
+        } else {
+            large_days += 1;
+        }
+    }
+
+    // 4. Build destination / reason strings
+    let dest = if let Some(dest_addr_id) = inquiry.destination_address_id {
+        address_repo::fetch_by_id(&state.db, dest_addr_id).await
+            .ok()
+            .flatten()
+            .map(|a| format!("{}, {}", a.street, a.city))
+            .unwrap_or_else(|| "—".into())
+    } else {
+        "—".into()
+    };
+    let reason = inquiry.notes.clone().unwrap_or_else(|| "Umzug".into());
+
+    // 5. Aggregate per-employee travel fields (take from first row, they're the same across days)
+    let first = &emp_rows[0];
+    let travel_costs_eur = first.travel_costs_cents.map(|c| c as f64 / 100.0).unwrap_or(0.0);
+    let accommodation_eur = first.accommodation_cents.map(|c| c as f64 / 100.0).unwrap_or(0.0);
+
+    // 6. Meal deductions (simplified)
+    let mut breakfast_deduction = 0.0;
+    let mut meal_deduction = 0.0;
+    if let Some(ref md) = first.meal_deduction {
+        if md.contains("breakfast") {
+            breakfast_deduction = small_days as f64 * 14.0 * 0.20 + large_days as f64 * 28.0 * 0.20;
+        }
+        if md.contains("lunch") || md.contains("dinner") {
+            meal_deduction = small_days as f64 * 14.0 * 0.40 + large_days as f64 * 28.0 * 0.40;
+        }
+    }
+
+    // 7. Generate XLSX
+    let xlsx_bytes = aust_offer_generator::generate_travel_expense_xlsx(
+        &aust_offer_generator::TravelExpenseData {
+            employee_first_name: first.first_name.clone(),
+            employee_last_name: first.last_name.clone(),
+            start_date,
+            start_time: inquiry.start_time,
+            end_date,
+            end_time: inquiry.end_time,
+            destination: dest,
+            reason,
+            transport_mode: first.transport_mode.clone(),
+            travel_costs_eur,
+            small_days,
+            large_days,
+            breakfast_deduction_eur: breakfast_deduction,
+            meal_deduction_eur: meal_deduction,
+            accommodation_eur,
+            misc_costs_eur: 0.0,
+        }
+    )
+    .map_err(|e| ApiError::Internal(format!("XLSX generation failed: {e}")))?;
+
+    let filename = format!(
+        "Reisekosten_{}_{}.xlsx",
+        first.last_name, start_date
+    );
+
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet".to_string()),
+            (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{}\"", filename)),
+        ],
+        xlsx_bytes,
+    ))
+}
+
 #[derive(Debug, Deserialize)]
 struct BulkEmployeeAssignmentBody {
     employee_id: Uuid,
@@ -617,6 +744,10 @@ struct BulkEmployeeAssignmentBody {
     clock_out: Option<NaiveTime>,
     break_minutes: Option<i32>,
     actual_hours: Option<f64>,
+    transport_mode: Option<String>,
+    travel_costs_cents: Option<i64>,
+    accommodation_cents: Option<i64>,
+    meal_deduction: Option<String>,
 }
 
 /// `PUT /api/v1/inquiries/{id}/employees` — Full-replace all employee assignments.
@@ -642,6 +773,10 @@ async fn put_inquiry_employees(
             clock_out: b.clock_out,
             break_minutes: b.break_minutes.unwrap_or(0),
             actual_hours: b.actual_hours,
+            transport_mode: b.transport_mode,
+            travel_costs_cents: b.travel_costs_cents,
+            accommodation_cents: b.accommodation_cents,
+            meal_deduction: b.meal_deduction,
         }
     }).collect();
 

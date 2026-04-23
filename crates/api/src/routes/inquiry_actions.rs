@@ -743,6 +743,10 @@ pub(crate) async fn update_assignment(
         body.actual_hours,
         body.notes.as_deref(),
         body.day_date,
+        body.transport_mode.as_deref(),
+        body.travel_costs_cents,
+        body.accommodation_cents,
+        body.meal_deduction.as_deref(),
     )
     .await?;
 
@@ -763,6 +767,10 @@ pub(crate) async fn update_assignment(
         "break_minutes": row.break_minutes,
         "actual_hours": row.actual_hours,
         "notes": row.notes,
+        "transport_mode": row.transport_mode,
+        "travel_costs_cents": row.travel_costs_cents,
+        "accommodation_cents": row.accommodation_cents,
+        "meal_deduction": row.meal_deduction,
     })))
 }
 

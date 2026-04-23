@@ -84,4 +84,12 @@ pub struct UpdateAssignment {
     /// When set, scopes the update to the single day at this date (multi-day inquiries).
     /// When omitted, updates day_number = 1 and the flat table (legacy single-day path).
     pub day_date: Option<chrono::NaiveDate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transport_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub travel_costs_cents: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accommodation_cents: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub meal_deduction: Option<String>,
 }

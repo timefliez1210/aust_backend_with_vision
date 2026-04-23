@@ -249,6 +249,11 @@ pub async fn build_inquiry_response(
             employee_clock_out: r.employee_clock_out,
             employee_actual_hours: r.employee_actual_hours,
             notes: r.notes,
+            job_date: r.job_date,
+            transport_mode: r.transport_mode,
+            travel_costs_cents: r.travel_costs_cents,
+            accommodation_cents: r.accommodation_cents,
+            meal_deduction: r.meal_deduction,
         })
         .collect();
 
@@ -306,6 +311,7 @@ pub async fn build_inquiry_response(
         employees,
         end_date,
         is_multi_day,
+        has_pauschale: row.has_pauschale,
     })
 }
 

@@ -66,6 +66,10 @@ pub(crate) struct EmployeeAssignmentRow {
     pub clock_out: Option<NaiveTime>,
     pub break_minutes: i32,
     pub actual_hours: Option<f64>,
+    pub transport_mode: Option<String>,
+    pub travel_costs_cents: Option<i64>,
+    pub accommodation_cents: Option<i64>,
+    pub meal_deduction: Option<String>,
 }
 
 /// Input for one employee assignment (used by put_inquiry_employees / put_calendar_item_employees).
@@ -80,6 +84,10 @@ pub(crate) struct EmployeeAssignmentInput {
     pub clock_out: Option<NaiveTime>,
     pub break_minutes: i32,
     pub actual_hours: Option<f64>,
+    pub transport_mode: Option<String>,
+    pub travel_costs_cents: Option<i64>,
+    pub accommodation_cents: Option<i64>,
+    pub meal_deduction: Option<String>,
 }
 
 // ── Availability ──────────────────────────────────────────────────────────────
@@ -310,7 +318,11 @@ pub(crate) async fn fetch_inquiry_employees(
                ie.notes,
                ie.start_time, ie.end_time, ie.clock_in, ie.clock_out,
                COALESCE(ie.break_minutes, 0) AS break_minutes,
-               ie.actual_hours::float8 AS actual_hours
+               ie.actual_hours::float8 AS actual_hours,
+               ie.transport_mode,
+               ie.travel_costs_cents,
+               ie.accommodation_cents,
+               ie.meal_deduction
         FROM inquiry_employees ie
         JOIN employees e ON ie.employee_id = e.id
         WHERE ie.inquiry_id = $1
@@ -342,8 +354,9 @@ pub(crate) async fn put_inquiry_employees(
             r#"
             INSERT INTO inquiry_employees
                 (id, inquiry_id, employee_id, job_date, planned_hours, notes,
-                 start_time, end_time, clock_in, clock_out, break_minutes, actual_hours)
-            VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                 start_time, end_time, clock_in, clock_out, break_minutes, actual_hours,
+                 transport_mode, travel_costs_cents, accommodation_cents, meal_deduction)
+            VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
             "#,
         )
         .bind(inquiry_id)
@@ -357,6 +370,10 @@ pub(crate) async fn put_inquiry_employees(
         .bind(a.clock_out)
         .bind(a.break_minutes)
         .bind(a.actual_hours)
+        .bind(&a.transport_mode)
+        .bind(a.travel_costs_cents)
+        .bind(a.accommodation_cents)
+        .bind(&a.meal_deduction)
         .execute(&mut *tx)
         .await?;
     }
@@ -380,7 +397,11 @@ pub(crate) async fn fetch_calendar_item_employees(
                cie.notes,
                cie.start_time, cie.end_time, cie.clock_in, cie.clock_out,
                COALESCE(cie.break_minutes, 0) AS break_minutes,
-               cie.actual_hours::float8 AS actual_hours
+               cie.actual_hours::float8 AS actual_hours,
+               cie.transport_mode,
+               cie.travel_costs_cents,
+               cie.accommodation_cents,
+               cie.meal_deduction
         FROM calendar_item_employees cie
         JOIN employees e ON cie.employee_id = e.id
         WHERE cie.calendar_item_id = $1
@@ -412,8 +433,9 @@ pub(crate) async fn put_calendar_item_employees(
             r#"
             INSERT INTO calendar_item_employees
                 (id, calendar_item_id, employee_id, job_date, planned_hours,
-                 start_time, end_time, clock_in, clock_out, break_minutes, actual_hours)
-            VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                 start_time, end_time, clock_in, clock_out, break_minutes, actual_hours,
+                 transport_mode, travel_costs_cents, accommodation_cents, meal_deduction)
+            VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             "#,
         )
         .bind(calendar_item_id)
@@ -426,6 +448,10 @@ pub(crate) async fn put_calendar_item_employees(
         .bind(a.clock_out)
         .bind(a.break_minutes)
         .bind(a.actual_hours)
+        .bind(&a.transport_mode)
+        .bind(a.travel_costs_cents)
+        .bind(a.accommodation_cents)
+        .bind(&a.meal_deduction)
         .execute(&mut *tx)
         .await?;
     }

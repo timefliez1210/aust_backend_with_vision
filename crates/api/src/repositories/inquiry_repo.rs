@@ -45,6 +45,8 @@ pub(crate) struct InquiryDbRow {
     pub accepted_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    #[sqlx(default)]
+    pub has_pauschale: bool,
 }
 
 /// Readiness check projection for auto-offer generation.
@@ -82,7 +84,8 @@ pub(crate) async fn fetch_by_id(
                status, estimated_volume_m3, distance_km, preferred_date, scheduled_date,
                end_date, start_time, end_time, service_type, submission_mode, recipient_id,
                billing_address_id AS inquiry_billing_address_id, custom_fields, notes,
-               services, source, offer_sent_at, accepted_at, created_at, updated_at
+               services, source, offer_sent_at, accepted_at, created_at, updated_at,
+               has_pauschale
         FROM inquiries WHERE id = $1
         "#,
     )
@@ -328,6 +331,7 @@ pub(crate) async fn update_fields(
     employee_notes: Option<&str>,
     // Some(None) = explicitly clear end_date; Some(Some(d)) = set it; None = leave unchanged.
     end_date: Option<Option<NaiveDate>>,
+    has_pauschale: Option<bool>,
     now: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
@@ -350,6 +354,7 @@ pub(crate) async fn update_fields(
             custom_fields = COALESCE($16, custom_fields),
             employee_notes = COALESCE($17, employee_notes),
             end_date = CASE WHEN $19 THEN $20 ELSE end_date END,
+            has_pauschale = COALESCE($21, has_pauschale),
             updated_at = $18
         WHERE id = $1
         "#,
@@ -374,6 +379,7 @@ pub(crate) async fn update_fields(
     .bind(now)
     .bind(end_date.is_some())               // $19: update end_date?
     .bind(end_date.flatten())               // $20: value (None = NULL)
+    .bind(has_pauschale)                     // $21
     .execute(pool)
     .await?;
     Ok(())
@@ -589,6 +595,10 @@ pub(crate) async fn update_employee_assignment(
     actual_hours_override: Option<f64>,
     notes: Option<&str>,
     day_date: Option<chrono::NaiveDate>,
+    transport_mode: Option<&str>,
+    travel_costs_cents: Option<i64>,
+    accommodation_cents: Option<i64>,
+    meal_deduction: Option<&str>,
 ) -> Result<u64, sqlx::Error> {
     let break_min_f = break_minutes.unwrap_or(0) as f64;
     let computed_actual_hours: Option<f64> = if let Some(ah) = actual_hours_override {
@@ -615,7 +625,11 @@ pub(crate) async fn update_employee_assignment(
                 THEN (EXTRACT(EPOCH FROM (COALESCE($5, clock_out) - COALESCE($4, clock_in))) / 3600.0)
                 ELSE COALESCE($3, planned_hours)
             END,
-            notes = COALESCE($10, notes)
+            notes = COALESCE($10, notes),
+            transport_mode = COALESCE($12, transport_mode),
+            travel_costs_cents = COALESCE($13, travel_costs_cents),
+            accommodation_cents = COALESCE($14, accommodation_cents),
+            meal_deduction = COALESCE($15, meal_deduction)
         WHERE inquiry_id = $1
           AND employee_id = $2
           AND job_date = COALESCE($11, (SELECT scheduled_date FROM inquiries WHERE id = $1))
@@ -632,6 +646,10 @@ pub(crate) async fn update_employee_assignment(
     .bind(computed_actual_hours)
     .bind(notes)
     .bind(day_date)
+    .bind(transport_mode)
+    .bind(travel_costs_cents)
+    .bind(accommodation_cents)
+    .bind(meal_deduction)
     .execute(pool)
     .await?;
 
@@ -649,6 +667,10 @@ pub(crate) struct UpdatedAssignmentRow {
     pub break_minutes: i32,
     pub actual_hours: Option<f64>,
     pub notes: Option<String>,
+    pub transport_mode: Option<String>,
+    pub travel_costs_cents: Option<i64>,
+    pub accommodation_cents: Option<i64>,
+    pub meal_deduction: Option<String>,
 }
 
 /// Fetch an updated employee assignment (for response after PATCH).
@@ -671,7 +693,11 @@ pub(crate) async fn fetch_updated_assignment(
                SUM(CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
                          THEN (EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0)
                          ELSE NULL END)::float8 AS actual_hours,
-               STRING_AGG(ie.notes, '; ' ORDER BY ie.job_date) AS notes
+               STRING_AGG(ie.notes, '; ' ORDER BY ie.job_date) AS notes,
+               MAX(ie.transport_mode) AS transport_mode,
+               MAX(ie.travel_costs_cents) AS travel_costs_cents,
+               MAX(ie.accommodation_cents) AS accommodation_cents,
+               MAX(ie.meal_deduction) AS meal_deduction
         FROM inquiry_employees ie
         WHERE ie.inquiry_id = $1 AND ie.employee_id = $2
         GROUP BY ie.employee_id
@@ -718,6 +744,11 @@ pub(crate) struct EmployeeAssignmentSnapshotRow {
     pub employee_clock_out: Option<DateTime<Utc>>,
     pub employee_actual_hours: Option<f64>,
     pub notes: Option<String>,
+    pub job_date: Option<NaiveDate>,
+    pub transport_mode: Option<String>,
+    pub travel_costs_cents: Option<i64>,
+    pub accommodation_cents: Option<i64>,
+    pub meal_deduction: Option<String>,
 }
 
 /// Fetch employee assignments for an inquiry (inquiry builder projection with employee_ clock fields).
@@ -745,7 +776,12 @@ pub(crate) async fn fetch_employee_assignments_snapshot(
                CASE WHEN ie.employee_clock_out IS NOT NULL AND ie.employee_clock_in IS NOT NULL
                     THEN EXTRACT(EPOCH FROM (ie.employee_clock_out - ie.employee_clock_in)) / 3600.0
                     ELSE NULL END AS employee_actual_hours,
-               ie.notes
+               ie.notes,
+               ie.job_date,
+               ie.transport_mode,
+               ie.travel_costs_cents,
+               ie.accommodation_cents,
+               ie.meal_deduction
         FROM inquiry_employees ie
         JOIN employees e ON ie.employee_id = e.id
         WHERE ie.inquiry_id = $1

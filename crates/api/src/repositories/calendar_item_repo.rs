@@ -32,6 +32,10 @@ pub(crate) struct CalendarItemRow {
     pub company_name: Option<String>,
     #[sqlx(default)]
     pub employee_notes: Option<String>,
+    #[sqlx(default)]
+    pub end_date: Option<NaiveDate>,
+    #[sqlx(default)]
+    pub has_pauschale: bool,
 }
 
 /// Employee assignment record for a calendar item.
@@ -48,6 +52,10 @@ pub(crate) struct CalendarItemEmployee {
     pub break_minutes: i32,
     pub actual_hours: Option<f64>,
     pub notes: Option<String>,
+    pub transport_mode: Option<String>,
+    pub travel_costs_cents: Option<i64>,
+    pub accommodation_cents: Option<i64>,
+    pub meal_deduction: Option<String>,
 }
 
 /// Fetch a single calendar item row by id, LEFT JOINing the customer name.
@@ -66,7 +74,7 @@ pub(crate) async fn fetch_item_row(pool: &PgPool, id: Uuid) -> Result<CalendarIt
                ci.duration_hours::float8 AS duration_hours,
                ci.status, ci.created_at, ci.updated_at,
                ci.customer_id, c.name AS customer_name, c.customer_type, c.company_name,
-               ci.employee_notes
+               ci.employee_notes, ci.end_date, ci.has_pauschale
         FROM calendar_items ci
         LEFT JOIN customers c ON c.id = ci.customer_id
         WHERE ci.id = $1
@@ -94,7 +102,7 @@ pub(crate) async fn list_items_by_month(
                ci.duration_hours::float8 AS duration_hours,
                ci.status, ci.created_at, ci.updated_at,
                ci.customer_id, c.name AS customer_name, c.customer_type, c.company_name,
-               ci.employee_notes
+               ci.employee_notes, ci.end_date, ci.has_pauschale
         FROM calendar_items ci
         LEFT JOIN customers c ON c.id = ci.customer_id
         WHERE ci.scheduled_date >= $1 AND ci.scheduled_date < $2
@@ -119,7 +127,7 @@ pub(crate) async fn list_items_all(pool: &PgPool) -> Result<Vec<CalendarItemRow>
                ci.duration_hours::float8 AS duration_hours,
                ci.status, ci.created_at, ci.updated_at,
                ci.customer_id, c.name AS customer_name, c.customer_type, c.company_name,
-               ci.employee_notes
+               ci.employee_notes, ci.end_date, ci.has_pauschale
         FROM calendar_items ci
         LEFT JOIN customers c ON c.id = ci.customer_id
         ORDER BY ci.scheduled_date ASC NULLS LAST

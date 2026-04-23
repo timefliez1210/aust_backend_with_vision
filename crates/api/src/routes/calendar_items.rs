@@ -97,6 +97,8 @@ struct UpdateItemBody {
     employee_notes: Option<String>,
     /// Set end_date for multi-day items; send null to clear (single-day).
     end_date: Option<serde_json::Value>,
+    /// Enable travel daily allowance (Verpflegungspauschale) for multi-day trips.
+    has_pauschale: Option<bool>,
 }
 
 /// Body for assigning an employee to a calendar item.
@@ -336,6 +338,10 @@ async fn update_item(
         sets.push(format!("end_date = ${idx}"));
         idx += 1;
     }
+    if body.has_pauschale.is_some() {
+        sets.push(format!("has_pauschale = ${idx}"));
+        idx += 1;
+    }
 
     // Always update updated_at
     sets.push(format!("updated_at = ${idx}"));
@@ -395,6 +401,9 @@ async fn update_item(
             .and_then(|v| v.as_str())
             .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok());
         q = q.bind(end_date_val);
+    }
+    if let Some(v) = body.has_pauschale {
+        q = q.bind(v);
     }
     q = q.bind(Utc::now()); // updated_at
     q = q.bind(id);         // WHERE id
@@ -568,6 +577,10 @@ struct BulkItemEmployeeBody {
     clock_out: Option<NaiveTime>,
     break_minutes: Option<i32>,
     actual_hours: Option<f64>,
+    transport_mode: Option<String>,
+    travel_costs_cents: Option<i64>,
+    accommodation_cents: Option<i64>,
+    meal_deduction: Option<String>,
 }
 
 /// `PUT /api/v1/admin/calendar-items/{id}/employees` — Full-replace all employee assignments.
@@ -589,6 +602,10 @@ async fn put_item_employees(
             clock_out: b.clock_out,
             break_minutes: b.break_minutes.unwrap_or(0),
             actual_hours: b.actual_hours,
+            transport_mode: b.transport_mode,
+            travel_costs_cents: b.travel_costs_cents,
+            accommodation_cents: b.accommodation_cents,
+            meal_deduction: b.meal_deduction,
         }
     }).collect();
 

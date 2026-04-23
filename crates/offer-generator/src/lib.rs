@@ -4,6 +4,7 @@ mod invoice_xlsx;
 mod pdf_convert;
 mod pricing;
 mod timesheet_xlsx;
+mod travel_expense_xlsx;
 mod xlsx;
 
 pub use error::OfferError;
@@ -11,6 +12,7 @@ pub use invoice_xlsx::{generate_invoice_xlsx, ExtraService, InvoiceData, Invoice
 pub use pdf_convert::convert_xlsx_to_pdf;
 pub use pricing::{parse_floor, PricingEngine};
 pub use timesheet_xlsx::{generate_timesheet_xlsx, TimesheetData, TimesheetEntry};
+pub use travel_expense_xlsx::{generate_travel_expense_xlsx, TravelExpenseData};
 pub use xlsx::{
     generate_offer_xlsx, DetectedItemRow, OfferData, OfferLineItem,
     hide_row, unhide_row, set_cell_value as offer_set_cell_value,
