@@ -55,6 +55,7 @@ pub(crate) struct CalendarItemEmployee {
     pub transport_mode: Option<String>,
     pub travel_costs_cents: Option<i64>,
     pub accommodation_cents: Option<i64>,
+    pub misc_costs_cents: Option<i64>,
     pub meal_deduction: Option<String>,
 }
 
@@ -336,7 +337,12 @@ pub(crate) async fn fetch_item_employee(
                             CASE WHEN cie.clock_out IS NOT NULL AND cie.clock_in IS NOT NULL
                                  THEN (EXTRACT(EPOCH FROM (cie.clock_out - cie.clock_in)) / 3600.0)
                                  ELSE NULL END))::float8 AS actual_hours,
-               STRING_AGG(cie.notes, '; ' ORDER BY cie.job_date) AS notes
+               STRING_AGG(cie.notes, '; ' ORDER BY cie.job_date) AS notes,
+               MAX(cie.transport_mode)      AS transport_mode,
+               SUM(cie.travel_costs_cents)  AS travel_costs_cents,
+               SUM(cie.accommodation_cents) AS accommodation_cents,
+               SUM(cie.misc_costs_cents)    AS misc_costs_cents,
+               MAX(cie.meal_deduction)      AS meal_deduction
         FROM calendar_item_employees cie
         JOIN employees e ON e.id = cie.employee_id
         WHERE cie.calendar_item_id = $1 AND cie.employee_id = $2
@@ -397,7 +403,12 @@ pub(crate) async fn fetch_item_employees(
                             CASE WHEN cie.clock_out IS NOT NULL AND cie.clock_in IS NOT NULL
                                  THEN (EXTRACT(EPOCH FROM (cie.clock_out - cie.clock_in)) / 3600.0)
                                  ELSE NULL END))::float8 AS actual_hours,
-               STRING_AGG(cie.notes, '; ' ORDER BY cie.job_date) AS notes
+               STRING_AGG(cie.notes, '; ' ORDER BY cie.job_date) AS notes,
+               MAX(cie.transport_mode)      AS transport_mode,
+               SUM(cie.travel_costs_cents)  AS travel_costs_cents,
+               SUM(cie.accommodation_cents) AS accommodation_cents,
+               SUM(cie.misc_costs_cents)    AS misc_costs_cents,
+               MAX(cie.meal_deduction)      AS meal_deduction
         FROM calendar_item_employees cie
         JOIN employees e ON e.id = cie.employee_id
         WHERE cie.calendar_item_id = $1

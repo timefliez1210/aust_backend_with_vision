@@ -440,7 +440,7 @@ pub(crate) async fn put_calendar_item_employees(
                 (id, calendar_item_id, employee_id, job_date, planned_hours,
                  start_time, end_time, clock_in, clock_out, break_minutes, actual_hours,
                  transport_mode, travel_costs_cents, accommodation_cents, misc_costs_cents, meal_deduction)
-            VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+            VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
             "#,
         )
         .bind(calendar_item_id)

@@ -491,7 +491,7 @@ async fn assign_employee(
         .await
         .map_err(|e| {
             if let sqlx::Error::Database(ref db_err) = e {
-                if db_err.constraint() == Some("calendar_item_employees_calendar_item_id_employee_id_key") {
+                if db_err.constraint() == Some("calendar_item_employees_calendar_item_id_employee_id_job_date_key") {
                     return ApiError::Conflict("Mitarbeiter ist bereits zugewiesen".into());
                 }
             }

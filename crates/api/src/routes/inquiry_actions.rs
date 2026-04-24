@@ -698,7 +698,7 @@ pub(crate) async fn assign_employee(
     .await
     .map_err(|e| {
         if let sqlx::Error::Database(ref db_err) = e {
-            if db_err.constraint() == Some("inquiry_employees_inquiry_id_employee_id_key") {
+            if db_err.constraint() == Some("inquiry_employees_inquiry_id_employee_id_job_date_key") {
                 return ApiError::Conflict(
                     "Mitarbeiter ist bereits dieser Anfrage zugewiesen".into(),
                 );
