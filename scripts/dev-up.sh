@@ -3,7 +3,7 @@
 #
 # What it does:
 #   1. Ensures staging infra (postgres + minio + mailpit) is up
-#      — these three reuse the staging-up.sh stack, so the DB can hold a
+#      — these three reuse the staging.sh stack, so the DB can hold a
 #      production backup restored via scripts/restore-local.sh.
 #   2. Stops any running staging-backend/staging-frontend containers so
 #      port 8080 and 5173 are free and there is no version confusion.
@@ -21,7 +21,7 @@
 #   bash scripts/dev-up.sh --fresh            # pull+restore newest backup first
 #
 # Ctrl-C cleanly stops both processes; staging infra containers keep running
-# (stop them with `bash scripts/staging-up.sh --down` if wanted).
+# (stop them with `bash scripts/staging.sh down` if wanted).
 
 set -euo pipefail
 
@@ -167,7 +167,7 @@ cleanup() {
     [[ -n "${BACKEND_PID}"  ]] && kill "${BACKEND_PID}"  2>/dev/null || true
     [[ -n "${FRONTEND_PID}" ]] && kill "${FRONTEND_PID}" 2>/dev/null || true
     wait 2>/dev/null || true
-    ok "done (staging infra still running — stop with scripts/staging-up.sh --down)"
+    ok "done (staging infra still running — stop with scripts/staging.sh down)"
 }
 trap cleanup EXIT INT TERM
 
