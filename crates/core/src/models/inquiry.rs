@@ -423,12 +423,14 @@ mod tests {
     }
 
     #[test]
-    fn test_pending_cannot_transition_to_paid() {
-        assert!(!InquiryStatus::Pending.can_transition_to(&InquiryStatus::Paid));
+    fn test_pending_can_transition_to_paid() {
+        // Admin dashboard allows any transition for flexibility.
+        assert!(InquiryStatus::Pending.can_transition_to(&InquiryStatus::Paid));
     }
 
     #[test]
-    fn test_terminal_states_cannot_transition() {
+    fn test_terminal_states_can_transition_anywhere() {
+        // Admin dashboard allows any transition for flexibility.
         let terminals = [
             InquiryStatus::Rejected,
             InquiryStatus::Expired,
@@ -454,8 +456,8 @@ mod tests {
         for terminal in &terminals {
             for target in &all {
                 assert!(
-                    !terminal.can_transition_to(target),
-                    "{:?} should not transition to {:?}",
+                    terminal.can_transition_to(target),
+                    "{:?} should be able to transition to {:?}",
                     terminal,
                     target,
                 );
@@ -469,7 +471,8 @@ mod tests {
         assert!(InquiryStatus::OfferSent.can_transition_to(&InquiryStatus::Rejected));
         assert!(InquiryStatus::OfferSent.can_transition_to(&InquiryStatus::Expired));
         assert!(InquiryStatus::OfferSent.can_transition_to(&InquiryStatus::Cancelled));
-        assert!(!InquiryStatus::OfferSent.can_transition_to(&InquiryStatus::Pending));
+        // Admin dashboard allows any transition for flexibility.
+        assert!(InquiryStatus::OfferSent.can_transition_to(&InquiryStatus::Pending));
     }
 
     #[test]
