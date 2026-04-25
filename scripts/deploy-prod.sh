@@ -1,8 +1,17 @@
 #!/usr/bin/env bash
 # deploy-prod.sh — Build backend image locally, push to VPS, restart container
 #
-# Replaces deploy-binary.sh for the Docker-based production stack.
-# Run from your LOCAL machine:
+# Steps:
+#   1. Pre-flight checks
+#   2. Backup production DB + MinIO on VPS (before any changes)
+#   3. Build backend Docker image locally
+#   4. Tag existing VPS image as :previous (rollback anchor)
+#   5. Save + upload + load image on VPS
+#   6. Upload migrations
+#   7. Restart backend container (auto-migrates on startup)
+#   8. Health check
+#
+# Run from your LOCAL machine (must be on main, clean working tree):
 #   bash scripts/deploy-prod.sh
 
 set -euo pipefail
@@ -55,7 +64,14 @@ fi
 ok "docker-compose.yml present on VPS"
 
 # ---------------------------------------------------------------------------
-# 2. Build backend image locally
+# 2. Backup production DB + MinIO on VPS
+# ---------------------------------------------------------------------------
+step "Backing up production DB + MinIO on VPS"
+${SSH} 'bash /opt/aust/backup.sh'
+ok "Production backup complete"
+
+# ---------------------------------------------------------------------------
+# 3. Build backend image locally
 # ---------------------------------------------------------------------------
 step "Building backend Docker image (Debian 12 / bookworm)"
 docker build \
@@ -65,7 +81,7 @@ docker build \
 ok "Image built: ${IMAGE_NAME}:latest"
 
 # ---------------------------------------------------------------------------
-# 3. Tag existing image as :previous (for rollback), then save new image
+# 4. Tag existing image as :previous (for rollback), then save new image
 # ---------------------------------------------------------------------------
 step "Tagging previous image for rollback"
 if ${SSH} docker image inspect "${IMAGE_NAME}:latest" >/dev/null 2>&1; then

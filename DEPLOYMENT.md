@@ -196,14 +196,15 @@ bash scripts/deploy-prod.sh
 Pre-flight checks: working tree clean, on `main` branch, SSH reachable, `/opt/aust/docker-compose.yml` present.
 
 Steps:
-1. Build `aust_backend:latest` locally from `docker/Dockerfile.backend`.
-2. Tag existing VPS image as `aust_backend:previous` (rollback anchor).
-3. `docker save | gzip` → `/tmp/aust_backend.tar.gz`.
-4. `scp` tarball to VPS `/tmp/`.
-5. `docker load` on VPS, delete tarball.
-6. Upload `migrations/` to `/opt/aust/migrations/`.
-7. `docker compose up -d backend` on VPS.
-8. Health poll: 12 attempts × 5 s. Prints rollback command on failure.
+1. SSH to VPS and run `/opt/aust/backup.sh` — full postgres dump + MinIO snapshot before touching anything.
+2. Build `aust_backend:latest` locally from `docker/Dockerfile.backend`.
+3. Tag existing VPS image as `aust_backend:previous` (rollback anchor).
+4. `docker save | gzip` → `/tmp/aust_backend.tar.gz`.
+5. `scp` tarball to VPS `/tmp/`.
+6. `docker load` on VPS, delete tarball.
+7. Upload `migrations/` to `/opt/aust/migrations/`.
+8. `docker compose up -d backend` on VPS — container starts, `sqlx::migrate!()` applies any new migrations automatically.
+9. Health poll: 12 attempts × 5 s. Prints rollback command on failure.
 
 ### One-time systemd → container cutover
 
