@@ -264,6 +264,11 @@ pub(crate) async fn update_item_employee(
     actual_hours_override: Option<f64>,
     notes: Option<&str>,
     day_date: Option<chrono::NaiveDate>,
+    transport_mode: Option<&str>,
+    travel_costs_cents: Option<i64>,
+    accommodation_cents: Option<i64>,
+    misc_costs_cents: Option<i64>,
+    meal_deduction: Option<&str>,
 ) -> Result<u64, sqlx::Error> {
     let break_min_f = break_minutes.unwrap_or(0) as f64;
     let computed_actual_hours: Option<f64> = if let Some(ah) = actual_hours_override {
@@ -278,19 +283,24 @@ pub(crate) async fn update_item_employee(
     let result = sqlx::query(
         r#"
         UPDATE calendar_item_employees SET
-            clock_in      = COALESCE($4, clock_in),
-            clock_out     = COALESCE($5, clock_out),
-            start_time    = COALESCE($6, start_time),
-            end_time      = COALESCE($7, end_time),
-            break_minutes = COALESCE($8, break_minutes),
-            actual_hours  = $9,
-            planned_hours = CASE
+            clock_in            = COALESCE($4, clock_in),
+            clock_out           = COALESCE($5, clock_out),
+            start_time          = COALESCE($6, start_time),
+            end_time            = COALESCE($7, end_time),
+            break_minutes       = COALESCE($8, break_minutes),
+            actual_hours        = $9,
+            planned_hours       = CASE
                 WHEN $9 IS NOT NULL THEN $9
                 WHEN COALESCE($4, clock_in) IS NOT NULL AND COALESCE($5, clock_out) IS NOT NULL
                 THEN (EXTRACT(EPOCH FROM (COALESCE($5, clock_out) - COALESCE($4, clock_in))) / 3600.0)
                 ELSE COALESCE($3, planned_hours)
             END,
-            notes = COALESCE($10, notes)
+            notes               = COALESCE($10, notes),
+            transport_mode      = COALESCE($12, transport_mode),
+            travel_costs_cents  = COALESCE($13, travel_costs_cents),
+            accommodation_cents = COALESCE($14, accommodation_cents),
+            misc_costs_cents    = COALESCE($15, misc_costs_cents),
+            meal_deduction      = COALESCE($16, meal_deduction)
         WHERE calendar_item_id = $1
           AND employee_id = $2
           AND job_date = COALESCE($11, (SELECT COALESCE(scheduled_date, created_at::date) FROM calendar_items WHERE id = $1))
@@ -307,6 +317,11 @@ pub(crate) async fn update_item_employee(
     .bind(computed_actual_hours)
     .bind(notes)
     .bind(day_date)
+    .bind(transport_mode)
+    .bind(travel_costs_cents)
+    .bind(accommodation_cents)
+    .bind(misc_costs_cents)
+    .bind(meal_deduction)
     .execute(pool)
     .await?;
 

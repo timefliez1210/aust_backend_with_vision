@@ -770,6 +770,7 @@ pub(crate) async fn update_assignment(
         "transport_mode": row.transport_mode,
         "travel_costs_cents": row.travel_costs_cents,
         "accommodation_cents": row.accommodation_cents,
+        "misc_costs_cents": row.misc_costs_cents,
         "meal_deduction": row.meal_deduction,
     })))
 }

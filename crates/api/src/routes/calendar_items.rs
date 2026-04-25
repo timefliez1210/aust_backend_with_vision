@@ -124,6 +124,11 @@ struct UpdateEmployeeBody {
     /// When set, scopes the update to the single day at this date (multi-day items).
     /// When omitted, updates day_number = 1 and the flat table (legacy single-day path).
     day_date: Option<chrono::NaiveDate>,
+    transport_mode: Option<String>,
+    travel_costs_cents: Option<i64>,
+    accommodation_cents: Option<i64>,
+    misc_costs_cents: Option<i64>,
+    meal_deduction: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -531,6 +536,11 @@ async fn update_item_employee(
         body.actual_hours,
         body.notes.as_deref(),
         body.day_date,
+        body.transport_mode.as_deref(),
+        body.travel_costs_cents,
+        body.accommodation_cents,
+        body.misc_costs_cents,
+        body.meal_deduction.as_deref(),
     ).await?;
 
     if rows == 0 {

@@ -670,6 +670,7 @@ pub(crate) struct UpdatedAssignmentRow {
     pub transport_mode: Option<String>,
     pub travel_costs_cents: Option<i64>,
     pub accommodation_cents: Option<i64>,
+    pub misc_costs_cents: Option<i64>,
     pub meal_deduction: Option<String>,
 }
 
@@ -694,10 +695,11 @@ pub(crate) async fn fetch_updated_assignment(
                          THEN (EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0)
                          ELSE NULL END)::float8 AS actual_hours,
                STRING_AGG(ie.notes, '; ' ORDER BY ie.job_date) AS notes,
-               MAX(ie.transport_mode) AS transport_mode,
-               MAX(ie.travel_costs_cents) AS travel_costs_cents,
+               MAX(ie.transport_mode)      AS transport_mode,
+               MAX(ie.travel_costs_cents)  AS travel_costs_cents,
                MAX(ie.accommodation_cents) AS accommodation_cents,
-               MAX(ie.meal_deduction) AS meal_deduction
+               MAX(ie.misc_costs_cents)    AS misc_costs_cents,
+               MAX(ie.meal_deduction)      AS meal_deduction
         FROM inquiry_employees ie
         WHERE ie.inquiry_id = $1 AND ie.employee_id = $2
         GROUP BY ie.employee_id

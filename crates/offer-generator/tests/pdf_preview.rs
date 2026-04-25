@@ -30,7 +30,7 @@ fn preview_offer_pdf() {
         customer_street: "Goslarsche Landstr. 6".to_string(),
         customer_city: "31135 Hildesheim".to_string(),
         customer_phone: "01707335168".to_string(),
-        customer_email: "henning.rawohl@web.de".to_string(),
+        customer_email: Some("henning.rawohl@web.de".to_string()),
         company_name: None,
         attention_line: None,
         greeting: "Sehr geehrter Herr Rawohl,".to_string(),

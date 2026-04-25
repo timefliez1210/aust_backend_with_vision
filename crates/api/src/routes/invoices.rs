@@ -345,17 +345,20 @@ async fn create_invoice(
         let invoice_num = format!("{}-{:04}", today.format("%Y"), seqs[0]);
         let inv_id = Uuid::now_v7();
 
-        // Full invoice: offer line items (lump-sum for now, will be itemised in future)
-        let full_line_items = vec![InvoiceLineItem {
-            pos: 1,
-            description: format!(
-                "Umzugsdienstleistung gemäß Angebot Nr. {}",
-                invoice_context.offer.offer_number.as_deref().unwrap_or("")
-            ),
-            quantity: 1.0,
-            unit_price: offer_netto as f64 / 100.0,
-            remark: None,
-        }];
+        // Full invoice: KVA line items, falling back to a lump-sum if none stored
+        let kva_nr = invoice_context.offer.offer_number.as_deref().unwrap_or("");
+        let kva_items = kva_line_items_from_offer(&invoice_context, kva_nr);
+        let full_line_items = if kva_items.is_empty() {
+            vec![InvoiceLineItem {
+                pos: 1,
+                description: format!("Umzugsdienstleistung gemäß Angebot Nr. {kva_nr}"),
+                quantity: 1.0,
+                unit_price: offer_netto as f64 / 100.0,
+                remark: None,
+            }]
+        } else {
+            kva_items
+        };
         let data = build_invoice_data_from_items(
             &invoice_context,
             InvoiceType::Full,

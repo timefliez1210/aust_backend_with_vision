@@ -57,7 +57,7 @@ fn make_invoice_data(line_items: Vec<InvoiceLineItem>, invoice_type: InvoiceType
         invoice_date: NaiveDate::from_ymd_opt(2026, 4, 14).unwrap(),
         service_date: Some(NaiveDate::from_ymd_opt(2026, 4, 15).unwrap()),
         customer_name: "Herrn Horst Lindenthal".into(),
-        customer_email: "lindenthal@test.de".into(),
+        customer_email: Some("lindenthal@test.de".into()),
         company_name: None,
         attention_line: None,
         billing_street: "Goslarsche Landstr. 6".into(),
@@ -157,9 +157,9 @@ fn test_partial_final_with_deduction() {
 }
 
 #[test]
-fn test_16_line_items_fills_all_rows() {
-    // Test that all 16 line item slots can be filled
-    let items: Vec<InvoiceLineItem> = (1..=16)
+fn test_max_items_truncated() {
+    // Only 7 slots available (rows 31-37), excess items should be truncated
+    let items: Vec<InvoiceLineItem> = (1..=10)
         .map(|i| InvoiceLineItem {
             pos: i,
             description: format!("Service {i}"),
@@ -171,7 +171,7 @@ fn test_16_line_items_fills_all_rows() {
 
     let data = make_invoice_data(items, InvoiceType::Full);
     let result = generate_invoice_xlsx(&data);
-    assert!(result.is_ok(), "XLSX generation should succeed with 16 line items");
+    assert!(result.is_ok(), "XLSX generation should succeed with 10 line items (truncated to 7)");
 
     let bytes = result.unwrap();
     let reader = std::io::Cursor::new(bytes);
@@ -179,10 +179,13 @@ fn test_16_line_items_fills_all_rows() {
     let sheet = archive.by_name("xl/worksheets/sheet1.xml").expect("Should have sheet1.xml");
     let sheet_str = std::io::read_to_string(sheet).expect("Should read sheet1.xml");
 
-    // Verify all 16 items are present
-    for i in 1..=16 {
+    // Verify first 7 items are present
+    for i in 1..=7 {
         assert!(sheet_str.contains(&format!("Service {i}")), "Should contain 'Service {i}'");
     }
+    // Items 8 and beyond should be truncated
+    assert!(!sheet_str.contains("Service 8"), "Should NOT contain 'Service 8' (truncated)");
+    assert!(!sheet_str.contains("Service 10"), "Should NOT contain 'Service 10' (truncated)");
 }
 
 #[test]
@@ -196,7 +199,7 @@ fn test_legacy_path_base_netto_plus_extras() {
         invoice_date: NaiveDate::from_ymd_opt(2026, 4, 14).unwrap(),
         service_date: Some(NaiveDate::from_ymd_opt(2026, 4, 15).unwrap()),
         customer_name: "Test Customer".into(),
-        customer_email: "test@test.de".into(),
+        customer_email: Some("test@test.de".into()),
         company_name: None,
         attention_line: None,
         billing_street: String::new(),
@@ -248,10 +251,8 @@ fn test_row_hiding_with_few_items() {
     let sheet = archive.by_name("xl/worksheets/sheet1.xml").expect("Should have sheet1.xml");
     let sheet_str = std::io::read_to_string(sheet).expect("Should read sheet1.xml");
 
-    // Rows 34-46 should be hidden (used rows are 31-33)
-    for row in 34..=46 {
-        // Look for the row tag with the row number and hidden="true"
-        // (the offer generator uses hidden="true" not hidden="1")
+    // With 3 items, rows 34-37 should be hidden (only rows 31-33 are used)
+    for row in 34..=37 {
         let needle = format!("r=\"{}\"", row);
         assert!(
             sheet_str.contains(&needle)
