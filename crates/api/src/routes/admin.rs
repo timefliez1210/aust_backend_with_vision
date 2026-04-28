@@ -731,7 +731,6 @@ async fn employee_hours_export(
                 date,
                 clock_in: r.clock_in,
                 clock_out: r.clock_out,
-                break_minutes: r.break_minutes,
                 actual_hours: r.actual_hours,
             });
         }
@@ -742,7 +741,6 @@ async fn employee_hours_export(
                 date,
                 clock_in: r.clock_in,
                 clock_out: r.clock_out,
-                break_minutes: r.break_minutes,
                 actual_hours: r.actual_hours,
             });
         }
