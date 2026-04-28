@@ -188,23 +188,25 @@ cd "${PROJECT_DIR}"
 # ---------------------------------------------------------------------------
 step "Backend health check"
 sleep 5
+HEALTHY=0
 for i in $(seq 1 12); do
     if ${SSH} curl -sf http://localhost:8080/health >/dev/null 2>&1; then
         ok "Backend healthy (attempt ${i})"
+        HEALTHY=1
         break
-    fi
-    if [ "${i}" -eq 12 ]; then
-        echo -e "  ${RED}Health check failed — container logs:${RESET}"
-        ${SSH} 'docker logs aust_backend --tail 50'
-        echo ""
-        echo -e "  ${RED}Rollback command:${RESET}"
-        echo "  ssh -i ${SSH_KEY} ${VPS_USER}@${VPS_IP} \\"
-        echo "    'docker tag ${IMAGE_NAME}:previous ${IMAGE_NAME}:latest && cd /opt/aust && docker compose up -d backend'"
-        exit 1
     fi
     echo "  Attempt ${i}/12 — retrying in 5s..."
     sleep 5
 done
+if [ "${HEALTHY}" -eq 0 ]; then
+    echo -e "  ${RED}Health check failed after 12 attempts — container logs:${RESET}"
+    ${SSH} 'docker logs aust_backend --tail 50'
+    echo ""
+    echo -e "  ${RED}Rollback command:${RESET}"
+    echo "  ssh -i ${SSH_KEY} ${VPS_USER}@${VPS_IP} \\"
+    echo "    'docker tag ${IMAGE_NAME}:previous ${IMAGE_NAME}:latest && cd /opt/aust && docker compose up -d backend'"
+    exit 1
+fi
 
 rm -f "${TARBALL}"
 
