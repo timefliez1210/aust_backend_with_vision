@@ -721,14 +721,14 @@ pub(crate) fn detect_salutation_and_greeting(name: &str) -> (String, String) {
     // If the name contains "Frau" or "Herr" prefix, use that directly
     let name_trimmed = name.trim();
     if name_trimmed.starts_with("Frau ") {
-        let after = name_trimmed.strip_prefix("Frau ").unwrap().trim();
+        let after = &name_trimmed[5..];
         return (
             "Frau".to_string(),
             format!("Sehr geehrte Frau {after},"),
         );
     }
     if name_trimmed.starts_with("Herr ") {
-        let after = name_trimmed.strip_prefix("Herr ").unwrap().trim();
+        let after = &name_trimmed[5..];
         return (
             "Herrn".to_string(),
             format!("Sehr geehrter Herr {after},"),

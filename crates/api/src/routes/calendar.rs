@@ -105,8 +105,6 @@ pub struct EmployeeAssignmentResponse {
     pub last_name: String,
     pub job_date: NaiveDate,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub planned_hours: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub start_time: Option<NaiveTime>,
@@ -125,8 +123,6 @@ pub struct EmployeeAssignmentResponse {
 pub struct EmployeeAssignmentBody {
     pub employee_id: Uuid,
     pub job_date: NaiveDate,
-    #[serde(default)]
-    pub planned_hours: Option<f64>,
     #[serde(default)]
     pub notes: Option<String>,
     #[serde(default)]
@@ -211,7 +207,6 @@ fn row_to_assignment_response(r: calendar_repo::EmployeeAssignmentRow) -> Employ
         first_name: r.first_name,
         last_name: r.last_name,
         job_date: r.job_date,
-        planned_hours: r.planned_hours,
         notes: r.notes,
         start_time: r.start_time,
         end_time: r.end_time,

@@ -247,7 +247,6 @@ pub struct EmployeeAssignmentSnapshot {
     pub employee_id: Uuid,
     pub first_name: String,
     pub last_name: String,
-    pub planned_hours: f64,
     /// Admin-set clock times (TIME values)
     pub clock_in: Option<NaiveTime>,
     pub clock_out: Option<NaiveTime>,

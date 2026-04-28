@@ -7,10 +7,11 @@ use uuid::Uuid;
 /// Transitions: `Draft` → `Sent` → `Viewed` → `Accepted` | `Rejected` | `Expired`.
 /// Alex can also reject an offer before sending via the Telegram workflow, which
 /// sets the status directly to `Rejected`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum OfferStatus {
     /// Generated but not yet reviewed by Alex in Telegram.
+    #[default]
     Draft,
     /// Approved by Alex and emailed to the customer.
     Sent,
@@ -22,12 +23,6 @@ pub enum OfferStatus {
     Rejected,
     /// Offer validity period has passed without a response.
     Expired,
-}
-
-impl Default for OfferStatus {
-    fn default() -> Self {
-        Self::Draft
-    }
 }
 
 impl OfferStatus {

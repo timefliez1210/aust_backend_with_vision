@@ -60,7 +60,6 @@ pub struct UpdateEmployee {
 #[derive(Debug, Deserialize)]
 pub struct AssignEmployee {
     pub employee_id: Uuid,
-    pub planned_hours: f64,
     pub notes: Option<String>,
 }
 
@@ -73,7 +72,6 @@ pub struct AssignEmployee {
 /// it is derived as (clock_out − clock_in) in hours minus break_minutes/60.
 #[derive(Debug, Default, Deserialize)]
 pub struct UpdateAssignment {
-    pub planned_hours: Option<f64>,
     pub clock_in: Option<NaiveTime>,
     pub clock_out: Option<NaiveTime>,
     pub start_time: Option<NaiveTime>,

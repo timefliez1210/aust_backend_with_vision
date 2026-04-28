@@ -652,7 +652,7 @@ async fn generate_travel_expenses(
     for a in &emp_rows {
         let is_first = a.job_date == start_date;
         let is_last = a.job_date == end_date;
-        let hours = a.actual_hours.unwrap_or(a.planned_hours.unwrap_or(8.0));
+        let hours = a.actual_hours.unwrap_or(8.0);
         if is_first || is_last {
             // >8h on first/last day → large allowance; otherwise small
             if hours > 8.0 {
@@ -737,7 +737,6 @@ async fn generate_travel_expenses(
 struct BulkEmployeeAssignmentBody {
     employee_id: Uuid,
     job_date: chrono::NaiveDate,
-    planned_hours: Option<f64>,
     notes: Option<String>,
     start_time: Option<NaiveTime>,
     end_time: Option<NaiveTime>,
@@ -767,7 +766,6 @@ async fn put_inquiry_employees(
         calendar_repo::EmployeeAssignmentInput {
             employee_id: b.employee_id,
             job_date: b.job_date,
-            planned_hours: b.planned_hours,
             notes: b.notes,
             start_time: b.start_time,
             end_time: b.end_time,

@@ -178,7 +178,6 @@ pub(crate) struct ScheduleJobRow {
     pub estimated_volume_m3: Option<f64>,
     pub customer_name: Option<String>,
     pub customer_phone: Option<String>,
-    pub planned_hours: Option<f64>,
     pub actual_hours: Option<f64>,
     pub employee_notes: Option<String>,
 }
@@ -208,7 +207,6 @@ pub(crate) async fn fetch_schedule_jobs(
             i.estimated_volume_m3,
             COALESCE(c.first_name || ' ' || c.last_name, c.name) AS customer_name,
             c.phone AS customer_phone,
-            ie.planned_hours::float8 AS planned_hours,
             CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
                  THEN (EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0)::float8
                  ELSE NULL END AS actual_hours,
@@ -240,7 +238,6 @@ pub(crate) struct CalendarItemRow {
     pub category: String,
     pub scheduled_date: Option<NaiveDate>,
     pub status: String,
-    pub planned_hours: Option<f64>,
     pub actual_hours: Option<f64>,
     pub employee_notes: Option<String>,
 }
@@ -264,7 +261,6 @@ pub(crate) async fn fetch_schedule_items(
             ci.category,
             cie.job_date AS scheduled_date,
             ci.status,
-            cie.planned_hours::float8 AS planned_hours,
             CASE WHEN cie.clock_out IS NOT NULL AND cie.clock_in IS NOT NULL
                  THEN (EXTRACT(EPOCH FROM (cie.clock_out - cie.clock_in)) / 3600.0)::float8
                  ELSE NULL END AS actual_hours,
@@ -375,7 +371,6 @@ pub(crate) async fn fetch_item_colleague_names(
 /// Assignment row for job detail.
 #[derive(FromRow)]
 pub(crate) struct AssignmentRow {
-    pub planned_hours: Option<f64>,
     pub notes: Option<String>,
     pub employee_clock_in: Option<NaiveTime>,
     pub employee_clock_out: Option<NaiveTime>,
@@ -392,8 +387,7 @@ pub(crate) async fn fetch_assignment(
 ) -> Result<Option<AssignmentRow>, sqlx::Error> {
     sqlx::query_as(
         r#"
-        SELECT ie.planned_hours::float8,
-               ie.notes,
+        SELECT ie.notes,
                ie.clock_in AS employee_clock_in,
                ie.clock_out AS employee_clock_out
         FROM inquiry_employees ie
@@ -528,7 +522,6 @@ pub(crate) struct HoursRow {
     pub job_date: Option<NaiveDate>,
     pub origin_city: Option<String>,
     pub destination_city: Option<String>,
-    pub planned_hours: Option<f64>,
     pub actual_hours: Option<f64>,
     pub status: String,
 }
@@ -554,7 +547,6 @@ pub(crate) async fn fetch_hours_entries(
             ie.job_date                          AS job_date,
             oa.city                              AS origin_city,
             da.city                              AS destination_city,
-            ie.planned_hours::float8             AS planned_hours,
             CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
                  THEN (EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0)::float8
                  ELSE NULL END                   AS actual_hours,
@@ -578,7 +570,6 @@ pub(crate) async fn fetch_hours_entries(
             cie.job_date               AS job_date,
             NULL::text                 AS origin_city,
             NULL::text                 AS destination_city,
-            cie.planned_hours::float8  AS planned_hours,
             CASE WHEN cie.clock_out IS NOT NULL AND cie.clock_in IS NOT NULL
                  THEN (EXTRACT(EPOCH FROM (cie.clock_out - cie.clock_in)) / 3600.0)::float8
                  ELSE NULL END         AS actual_hours,
@@ -717,23 +708,21 @@ pub(crate) async fn fetch_month_hours(
     sqlx::query_as(
         r#"
         SELECT
-            COALESCE(SUM(planned_hours), 0.0)::float8 AS planned,
-            COALESCE(SUM(COALESCE(actual_hours, planned_hours)), 0.0)::float8 AS actual
+            0.0::float8 AS planned,
+            COALESCE(SUM(actual_hours), 0.0)::float8 AS actual
         FROM (
-            SELECT ie.planned_hours::float8,
-                   CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
+            SELECT CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
                         THEN (EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0)::float8
-                        ELSE NULL END AS actual_hours
+                        ELSE ie.actual_hours END AS actual_hours
             FROM inquiry_employees ie
             JOIN inquiries i ON ie.inquiry_id = i.id
             WHERE ie.employee_id = $1
               AND ie.job_date BETWEEN $2 AND $3
               AND i.status NOT IN ('cancelled', 'rejected', 'expired')
             UNION ALL
-            SELECT cie.planned_hours::float8,
-                   CASE WHEN cie.clock_out IS NOT NULL AND cie.clock_in IS NOT NULL
+            SELECT CASE WHEN cie.clock_out IS NOT NULL AND cie.clock_in IS NOT NULL
                         THEN (EXTRACT(EPOCH FROM (cie.clock_out - cie.clock_in)) / 3600.0)::float8
-                        ELSE NULL END AS actual_hours
+                        ELSE cie.actual_hours END AS actual_hours
             FROM calendar_item_employees cie
             JOIN calendar_items ci ON ci.id = cie.calendar_item_id
             WHERE cie.employee_id = $1
@@ -893,7 +882,6 @@ pub(crate) struct AdminAssignmentRow {
     pub origin_city: Option<String>,
     pub destination_city: Option<String>,
     pub booking_date: Option<NaiveDate>,
-    pub planned_hours: Option<f64>,
     pub actual_hours: Option<f64>,
     pub notes: Option<String>,
     pub inquiry_status: String,
@@ -914,10 +902,9 @@ pub(crate) async fn fetch_admin_assignments(
                oa.city AS origin_city,
                da.city AS destination_city,
                ie.job_date AS booking_date,
-               ie.planned_hours::float8 AS planned_hours,
                CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
                     THEN (EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0)::float8
-                    ELSE NULL END AS actual_hours,
+                    ELSE ie.actual_hours END AS actual_hours,
                ie.notes,
                i.status AS inquiry_status
         FROM inquiry_employees ie
@@ -944,13 +931,14 @@ pub(crate) struct AdminHoursRow {
     pub origin_city: Option<String>,
     pub destination_city: Option<String>,
     pub booking_date: Option<NaiveDate>,
-    pub planned_hours: f64,
     pub start_time: Option<NaiveTime>,
     pub end_time: Option<NaiveTime>,
     pub clock_in: Option<NaiveTime>,
     pub clock_out: Option<NaiveTime>,
     pub break_minutes: i32,
     pub actual_hours: Option<f64>,
+    pub employee_clock_in: Option<chrono::DateTime<chrono::Utc>>,
+    pub employee_clock_out: Option<chrono::DateTime<chrono::Utc>>,
     pub inquiry_status: String,
 }
 
@@ -971,7 +959,6 @@ pub(crate) async fn fetch_admin_hours(
                oa.city AS origin_city,
                da.city AS destination_city,
                ie.job_date AS booking_date,
-               COALESCE(ie.planned_hours, 0)::float8 AS planned_hours,
                ie.start_time,
                ie.end_time,
                ie.clock_in,
@@ -981,6 +968,8 @@ pub(crate) async fn fetch_admin_hours(
                     THEN (EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0
                           - COALESCE(ie.break_minutes, 0)::float8 / 60.0)::float8
                     ELSE ie.actual_hours END AS actual_hours,
+               ie.employee_clock_in,
+               ie.employee_clock_out,
                i.status AS inquiry_status
         FROM inquiry_employees ie
         JOIN inquiries i ON ie.inquiry_id = i.id
@@ -1008,13 +997,14 @@ pub(crate) struct AdminCalendarItemHoursRow {
     pub category: String,
     pub location: Option<String>,
     pub scheduled_date: Option<NaiveDate>,
-    pub planned_hours: f64,
     pub start_time: Option<NaiveTime>,
     pub end_time: Option<NaiveTime>,
     pub clock_in: Option<NaiveTime>,
     pub clock_out: Option<NaiveTime>,
     pub break_minutes: i32,
     pub actual_hours: Option<f64>,
+    pub employee_clock_in: Option<chrono::DateTime<chrono::Utc>>,
+    pub employee_clock_out: Option<chrono::DateTime<chrono::Utc>>,
     pub status: String,
 }
 
@@ -1035,7 +1025,6 @@ pub(crate) async fn fetch_admin_calendar_item_hours(
                ci.category,
                ci.location,
                cie.job_date AS scheduled_date,
-               COALESCE(cie.planned_hours, 0)::float8 AS planned_hours,
                cie.start_time,
                cie.end_time,
                cie.clock_in,
@@ -1045,6 +1034,8 @@ pub(crate) async fn fetch_admin_calendar_item_hours(
                     THEN (EXTRACT(EPOCH FROM (cie.clock_out - cie.clock_in)) / 3600.0
                           - COALESCE(cie.break_minutes, 0)::float8 / 60.0)::float8
                     ELSE cie.actual_hours END AS actual_hours,
+               cie.employee_clock_in,
+               cie.employee_clock_out,
                ci.status
         FROM calendar_item_employees cie
         JOIN calendar_items ci ON ci.id = cie.calendar_item_id

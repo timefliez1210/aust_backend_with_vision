@@ -106,14 +106,11 @@ struct UpdateItemBody {
 struct AssignEmployeeBody {
     /// UUID of the employee to assign.
     employee_id: Uuid,
-    /// Number of hours this employee is planned to work on the item.
-    planned_hours: f64,
 }
 
 /// Body for updating hours/notes on an existing employee assignment.
 #[derive(Debug, Deserialize)]
 struct UpdateEmployeeBody {
-    planned_hours: Option<f64>,
     clock_in: Option<NaiveTime>,
     clock_out: Option<NaiveTime>,
     start_time: Option<NaiveTime>,
@@ -211,6 +208,7 @@ async fn create_item(
     let category = body.category.unwrap_or_else(|| "intern".to_string());
     let duration_hours = body.duration_hours.unwrap_or(0.0);
 
+    let end_date = body.scheduled_date; // default end_date = scheduled_date (single-day)
     let new_id = calendar_item_repo::insert_item(
         &state.db,
         body.title.trim(),
@@ -222,6 +220,7 @@ async fn create_item(
         body.end_time,
         duration_hours,
         body.customer_id,
+        end_date,
     ).await?;
 
     let row = calendar_item_repo::fetch_item_row(&state.db, new_id).await?;
@@ -492,7 +491,7 @@ async fn assign_employee(
         return Err(ApiError::NotFound("Mitarbeiter nicht gefunden".into()));
     }
 
-    calendar_item_repo::insert_item_employee(&state.db, id, body.employee_id, body.planned_hours)
+    calendar_item_repo::insert_item_employee(&state.db, id, body.employee_id)
         .await
         .map_err(|e| {
             if let sqlx::Error::Database(ref db_err) = e {
@@ -527,7 +526,6 @@ async fn update_item_employee(
         &state.db,
         id,
         emp_id,
-        body.planned_hours,
         body.clock_in,
         body.clock_out,
         body.start_time,
@@ -579,7 +577,6 @@ async fn remove_item_employee(
 struct BulkItemEmployeeBody {
     employee_id: Uuid,
     job_date: NaiveDate,
-    planned_hours: Option<f64>,
     notes: Option<String>,
     start_time: Option<NaiveTime>,
     end_time: Option<NaiveTime>,
@@ -605,7 +602,6 @@ async fn put_item_employees(
         calendar_repo::EmployeeAssignmentInput {
             employee_id: b.employee_id,
             job_date: b.job_date,
-            planned_hours: b.planned_hours,
             notes: b.notes,
             start_time: b.start_time,
             end_time: b.end_time,

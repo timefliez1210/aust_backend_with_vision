@@ -8,22 +8,17 @@ use validator::Validate;
 /// Role-based access is not yet enforced by middleware (see TODO in CLAUDE.md),
 /// but the field is persisted and exposed so that future middleware can
 /// distinguish admins from operators.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum UserRole {
     /// Full access to all admin operations including user management and destructive actions.
     Admin,
     /// Office manager: can create/edit offers, assign employees, manage calendar.
     /// Cannot delete customers, employees, or perform other destructive operations.
+    #[default]
     Buerokraft,
     /// Legacy alias for Buerokraft — kept for backwards compatibility with existing tokens.
     Operator,
-}
-
-impl Default for UserRole {
-    fn default() -> Self {
-        Self::Buerokraft
-    }
 }
 
 impl UserRole {

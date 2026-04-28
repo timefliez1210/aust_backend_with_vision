@@ -248,7 +248,6 @@ struct ScheduleJob {
     estimated_volume_m3: Option<f64>,
     customer_name: Option<String>,
     customer_phone: Option<String>,
-    planned_hours: f64,
     actual_hours: Option<f64>,
     colleague_names: Vec<String>,
     employee_notes: Option<String>,
@@ -308,7 +307,6 @@ async fn get_schedule(
                 estimated_volume_m3: r.estimated_volume_m3,
                 customer_name: r.customer_name,
                 customer_phone: r.customer_phone,
-                planned_hours: r.planned_hours.unwrap_or(0.0),
                 actual_hours: r.actual_hours,
                 colleague_names: colleagues,
                 employee_notes: r.employee_notes,
@@ -350,7 +348,6 @@ async fn get_schedule(
             estimated_volume_m3: None,
             customer_name: None,
             customer_phone: None,
-            planned_hours: r.planned_hours.unwrap_or(0.0),
             actual_hours: r.actual_hours,
             colleague_names: colleagues,
             employee_notes: r.employee_notes,
@@ -396,7 +393,6 @@ struct JobDetail {
     customer_name: Option<String>,
     customer_phone: Option<String>,
     // Assignment
-    planned_hours: f64,
     notes: Option<String>,
     // Admin note visible to all employees on this job
     employee_notes: Option<String>,
@@ -475,7 +471,6 @@ async fn get_job_detail(
         items,
         customer_name: row.customer_name,
         customer_phone: row.customer_phone,
-        planned_hours: assign.planned_hours.unwrap_or(0.0),
         notes: assign.notes,
         employee_notes: row.employee_notes,
         employee_clock_in: assign.employee_clock_in,
@@ -552,7 +547,6 @@ async fn patch_employee_clock(
 struct HoursSummary {
     month: String,
     target_hours: f64,
-    planned_hours: f64,
     actual_hours: f64,
     assignment_count: usize,
     assignments: Vec<HoursEntry>,
@@ -569,7 +563,6 @@ struct HoursEntry {
     job_date: Option<NaiveDate>,
     origin_city: Option<String>,
     destination_city: Option<String>,
-    planned_hours: f64,
     actual_hours: Option<f64>,
     status: String,
 }
@@ -599,13 +592,11 @@ async fn get_hours(
 
     let rows = employee_repo::fetch_hours_entries(&state.db, claims.employee_id, from_date, to_date).await?;
 
-    let mut planned_sum = 0.0_f64;
     let mut actual_sum = 0.0_f64;
 
     let assignments: Vec<HoursEntry> = rows
         .into_iter()
         .map(|r| {
-            planned_sum += r.planned_hours.unwrap_or(0.0);
             if let Some(a) = r.actual_hours {
                 actual_sum += a;
             }
@@ -618,7 +609,6 @@ async fn get_hours(
                 job_date: r.job_date,
                 origin_city: r.origin_city,
                 destination_city: r.destination_city,
-                planned_hours: r.planned_hours.unwrap_or(0.0),
                 actual_hours: r.actual_hours,
                 status: r.status,
             }
@@ -628,7 +618,6 @@ async fn get_hours(
     Ok(Json(HoursSummary {
         month: month_str,
         target_hours,
-        planned_hours: planned_sum,
         actual_hours: actual_sum,
         assignment_count: assignments.len(),
         assignments,

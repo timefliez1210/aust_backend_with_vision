@@ -11,9 +11,10 @@ use super::snapshots::Services;
 /// Pre-sales: pending -> info_requested -> estimating -> estimated -> offer_ready -> offer_sent
 ///   -> accepted | rejected | expired | cancelled
 /// Operations: scheduled -> completed -> invoiced -> paid
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum InquiryStatus {
+    #[default]
     Pending,
     InfoRequested,
     Estimating,
@@ -28,12 +29,6 @@ pub enum InquiryStatus {
     Completed,
     Invoiced,
     Paid,
-}
-
-impl Default for InquiryStatus {
-    fn default() -> Self {
-        Self::Pending
-    }
 }
 
 impl InquiryStatus {

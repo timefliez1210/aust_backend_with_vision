@@ -539,33 +539,35 @@ pub(crate) async fn check_employee_active(
     Ok(row.map(|(active,)| active))
 }
 
-/// Insert an employee assignment for an inquiry on its scheduled_date.
+/// Insert employee assignment rows for an inquiry — one row per day in scheduled_date..=end_date.
 ///
 /// **Caller**: `assign_employee` handler
 pub(crate) async fn insert_employee_assignment(
     pool: &PgPool,
-    id: Uuid,
     inquiry_id: Uuid,
     employee_id: Uuid,
-    planned_hours: f64,
     notes: Option<&str>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
-        INSERT INTO inquiry_employees (id, inquiry_id, employee_id, job_date, planned_hours, notes, start_time, end_time)
-        SELECT $1, $2, $3,
-               COALESCE(scheduled_date, created_at::date),
-               $4, $5,
+        INSERT INTO inquiry_employees (id, inquiry_id, employee_id, job_date, notes, start_time, end_time)
+        SELECT gen_random_uuid(), $1, $2,
+               d::date,
+               $3,
                COALESCE(start_time, '08:00'::time),
                COALESCE(end_time,   '17:00'::time)
-        FROM inquiries WHERE id = $2
+        FROM inquiries,
+             generate_series(
+                 COALESCE(scheduled_date, created_at::date),
+                 COALESCE(end_date, scheduled_date, created_at::date),
+                 '1 day'::interval
+             ) AS d
+        WHERE id = $1
         ON CONFLICT (inquiry_id, employee_id, job_date) DO NOTHING
         "#,
     )
-    .bind(id)
     .bind(inquiry_id)
     .bind(employee_id)
-    .bind(planned_hours)
     .bind(notes)
     .execute(pool)
     .await?;
@@ -586,7 +588,6 @@ pub(crate) async fn update_employee_assignment(
     pool: &PgPool,
     inquiry_id: Uuid,
     employee_id: Uuid,
-    planned_hours: Option<f64>,
     clock_in: Option<chrono::NaiveTime>,
     clock_out: Option<chrono::NaiveTime>,
     start_time: Option<chrono::NaiveTime>,
@@ -613,31 +614,24 @@ pub(crate) async fn update_employee_assignment(
     let result = sqlx::query(
         r#"
         UPDATE inquiry_employees SET
-            clock_in      = COALESCE($4, clock_in),
-            clock_out     = COALESCE($5, clock_out),
-            start_time    = COALESCE($6, start_time),
-            end_time      = COALESCE($7, end_time),
-            break_minutes = COALESCE($8, break_minutes),
-            actual_hours  = $9,
-            planned_hours = CASE
-                WHEN $9 IS NOT NULL THEN $9
-                WHEN COALESCE($4, clock_in) IS NOT NULL AND COALESCE($5, clock_out) IS NOT NULL
-                THEN (EXTRACT(EPOCH FROM (COALESCE($5, clock_out) - COALESCE($4, clock_in))) / 3600.0)
-                ELSE COALESCE($3, planned_hours)
-            END,
-            notes = COALESCE($10, notes),
-            transport_mode = COALESCE($12, transport_mode),
-            travel_costs_cents = COALESCE($13, travel_costs_cents),
-            accommodation_cents = COALESCE($14, accommodation_cents),
-            meal_deduction = COALESCE($15, meal_deduction)
+            clock_in      = COALESCE($3, clock_in),
+            clock_out     = COALESCE($4, clock_out),
+            start_time    = COALESCE($5, start_time),
+            end_time      = COALESCE($6, end_time),
+            break_minutes = COALESCE($7, break_minutes),
+            actual_hours  = $8,
+            notes = COALESCE($9, notes),
+            transport_mode = COALESCE($11, transport_mode),
+            travel_costs_cents = COALESCE($12, travel_costs_cents),
+            accommodation_cents = COALESCE($13, accommodation_cents),
+            meal_deduction = COALESCE($14, meal_deduction)
         WHERE inquiry_id = $1
           AND employee_id = $2
-          AND job_date = COALESCE($11, (SELECT scheduled_date FROM inquiries WHERE id = $1))
+          AND job_date = COALESCE($10, (SELECT scheduled_date FROM inquiries WHERE id = $1))
         "#,
     )
     .bind(inquiry_id)
     .bind(employee_id)
-    .bind(planned_hours)
     .bind(clock_in)
     .bind(clock_out)
     .bind(start_time)
@@ -659,7 +653,6 @@ pub(crate) async fn update_employee_assignment(
 /// Updated assignment row projection (after update).
 #[derive(Debug, sqlx::FromRow)]
 pub(crate) struct UpdatedAssignmentRow {
-    pub planned_hours: Option<f64>,
     pub clock_in: Option<chrono::NaiveTime>,
     pub clock_out: Option<chrono::NaiveTime>,
     pub start_time: Option<chrono::NaiveTime>,
@@ -685,8 +678,7 @@ pub(crate) async fn fetch_updated_assignment(
 ) -> Result<UpdatedAssignmentRow, sqlx::Error> {
     sqlx::query_as(
         r#"
-        SELECT SUM(ie.planned_hours)::float8 AS planned_hours,
-               MIN(ie.clock_in)  AS clock_in,
+        SELECT MIN(ie.clock_in)  AS clock_in,
                MAX(ie.clock_out) AS clock_out,
                MIN(ie.start_time) AS start_time,
                MAX(ie.end_time)   AS end_time,
@@ -735,7 +727,6 @@ pub(crate) struct EmployeeAssignmentSnapshotRow {
     pub employee_id: Uuid,
     pub first_name: String,
     pub last_name: String,
-    pub planned_hours: f64,
     pub clock_in: Option<chrono::NaiveTime>,
     pub clock_out: Option<chrono::NaiveTime>,
     pub start_time: Option<chrono::NaiveTime>,
@@ -765,7 +756,6 @@ pub(crate) async fn fetch_employee_assignments_snapshot(
     sqlx::query_as(
         r#"
         SELECT ie.employee_id, e.first_name, e.last_name,
-               ie.planned_hours::float8 AS planned_hours,
                ie.clock_in,
                ie.clock_out,
                ie.start_time,
@@ -940,10 +930,10 @@ pub(crate) async fn create_minimal(
     sqlx::query(
         r#"
         INSERT INTO inquiries (id, customer_id, origin_address_id, destination_address_id,
-                           stop_address_id, status, scheduled_date, notes, services, source,
+                           stop_address_id, status, scheduled_date, end_date, notes, services, source,
                            service_type, submission_mode, recipient_id, billing_address_id, custom_fields,
                            created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $16)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $17)
         "#,
     )
     .bind(id)
@@ -953,6 +943,7 @@ pub(crate) async fn create_minimal(
     .bind(stop_id)
     .bind(status)
     .bind(scheduled_date)
+    .bind(scheduled_date) // end_date defaults to scheduled_date
     .bind(notes)
     .bind(services)
     .bind(source)

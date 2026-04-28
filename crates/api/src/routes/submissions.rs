@@ -1113,8 +1113,7 @@ async fn manual_inquiry(
         .or(form.volume_m3.as_deref())
         .and_then(|s| s.trim().parse::<f64>().ok());
 
-    if manual_volume.is_some() {
-        let volume = manual_volume.unwrap();
+    if let Some(volume) = manual_volume {
         let now_update = chrono::Utc::now();
         inquiry_repo::update_volume_and_status(&state.db, inquiry_id, volume, "estimated", now_update).await
             .map_err(|e| ApiError::Internal(format!("Volumen konnte nicht gespeichert werden: {e}")))?;
@@ -1575,16 +1574,16 @@ pub(crate) async fn handle_submission(
         (customer_id, inquiry_id)
     };
 
-    tracing::info!(customer_id = %customer_id, email = %email, inquiry_id = %inquiry_id, "Submission committed");
+    tracing::info!(customer_id = %customer_id, inquiry_id = %inquiry_id, "Submission committed");
 
     // 7. Check for manual volume (manuell mode) — skip vision pipeline if provided.
     let manual_volume: Option<f64> = form.volumen.as_deref()
         .or(form.volume_m3.as_deref())
         .and_then(|s| s.trim().parse::<f64>().ok());
 
-    if manual_volume.is_some() && form.images.is_empty() {
-        // Fast path: customer provided volume directly, no vision pipeline needed.
-        let volume = manual_volume.unwrap();
+    if let Some(volume) = manual_volume {
+        if form.images.is_empty() {
+            // Fast path: customer provided volume directly, no vision pipeline needed.
         let now_update = chrono::Utc::now();
         inquiry_repo::update_volume_and_status(&state.db, inquiry_id, volume, "estimated", now_update).await
             .map_err(|e| ApiError::Internal(format!("Volumen konnte nicht gespeichert werden: {e}")))?;
@@ -1640,6 +1639,7 @@ pub(crate) async fn handle_submission(
                 message: "Anfrage erhalten. Angebot wird erstellt.".to_string(),
             }),
         ));
+        }
     }
 
     // 8. Vision pipeline path: pre-create estimation row and upload images to S3.

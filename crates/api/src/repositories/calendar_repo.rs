@@ -58,7 +58,6 @@ pub(crate) struct EmployeeAssignmentRow {
     pub first_name: String,
     pub last_name: String,
     pub job_date: NaiveDate,
-    pub planned_hours: Option<f64>,
     pub notes: Option<String>,
     pub start_time: Option<NaiveTime>,
     pub end_time: Option<NaiveTime>,
@@ -77,7 +76,6 @@ pub(crate) struct EmployeeAssignmentRow {
 pub(crate) struct EmployeeAssignmentInput {
     pub employee_id: Uuid,
     pub job_date: NaiveDate,
-    pub planned_hours: Option<f64>,
     pub notes: Option<String>,
     pub start_time: Option<NaiveTime>,
     pub end_time: Option<NaiveTime>,
@@ -316,7 +314,6 @@ pub(crate) async fn fetch_inquiry_employees(
         r#"
         SELECT ie.employee_id, e.first_name, e.last_name,
                ie.job_date,
-               ie.planned_hours::float8 AS planned_hours,
                ie.notes,
                ie.start_time, ie.end_time, ie.clock_in, ie.clock_out,
                COALESCE(ie.break_minutes, 0) AS break_minutes,
@@ -356,16 +353,15 @@ pub(crate) async fn put_inquiry_employees(
         sqlx::query(
             r#"
             INSERT INTO inquiry_employees
-                (id, inquiry_id, employee_id, job_date, planned_hours, notes,
+                (id, inquiry_id, employee_id, job_date, notes,
                  start_time, end_time, clock_in, clock_out, break_minutes, actual_hours,
                  transport_mode, travel_costs_cents, accommodation_cents, misc_costs_cents, meal_deduction)
-            VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+            VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
             "#,
         )
         .bind(inquiry_id)
         .bind(a.employee_id)
         .bind(a.job_date)
-        .bind(a.planned_hours)
         .bind(&a.notes)
         .bind(a.start_time)
         .bind(a.end_time)
@@ -397,7 +393,6 @@ pub(crate) async fn fetch_calendar_item_employees(
         r#"
         SELECT cie.employee_id, e.first_name, e.last_name,
                cie.job_date,
-               cie.planned_hours::float8 AS planned_hours,
                cie.notes,
                cie.start_time, cie.end_time, cie.clock_in, cie.clock_out,
                COALESCE(cie.break_minutes, 0) AS break_minutes,
@@ -437,16 +432,15 @@ pub(crate) async fn put_calendar_item_employees(
         sqlx::query(
             r#"
             INSERT INTO calendar_item_employees
-                (id, calendar_item_id, employee_id, job_date, planned_hours,
+                (id, calendar_item_id, employee_id, job_date,
                  start_time, end_time, clock_in, clock_out, break_minutes, actual_hours,
                  transport_mode, travel_costs_cents, accommodation_cents, misc_costs_cents, meal_deduction)
-            VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+            VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             "#,
         )
         .bind(calendar_item_id)
         .bind(a.employee_id)
         .bind(a.job_date)
-        .bind(a.planned_hours)
         .bind(a.start_time)
         .bind(a.end_time)
         .bind(a.clock_in)

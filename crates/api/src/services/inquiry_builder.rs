@@ -238,7 +238,6 @@ pub async fn build_inquiry_response(
             employee_id: r.employee_id,
             first_name: r.first_name,
             last_name: r.last_name,
-            planned_hours: r.planned_hours,
             clock_in: r.clock_in,
             clock_out: r.clock_out,
             start_time: r.start_time,
@@ -259,7 +258,7 @@ pub async fn build_inquiry_response(
         .collect();
 
     let end_date = row.end_date;
-    let is_multi_day = end_date.is_some();
+    let is_multi_day = end_date.map_or(false, |ed| row.scheduled_date.map_or(false, |sd| ed > sd));
 
     // 7. Extract customer message from notes
     let customer_message = extract_customer_message(row.notes.as_deref());

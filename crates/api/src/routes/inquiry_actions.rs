@@ -689,10 +689,8 @@ pub(crate) async fn assign_employee(
 
     inquiry_repo::insert_employee_assignment(
         &state.db,
-        Uuid::now_v7(),
         id,
         body.employee_id,
-        body.planned_hours,
         body.notes.as_deref(),
     )
     .await
@@ -712,7 +710,6 @@ pub(crate) async fn assign_employee(
         Json(serde_json::json!({
             "employee_id": body.employee_id,
             "inquiry_id": id,
-            "planned_hours": body.planned_hours,
             "notes": body.notes,
         })),
     ))
@@ -734,7 +731,6 @@ pub(crate) async fn update_assignment(
         &state.db,
         id,
         emp_id,
-        body.planned_hours,
         body.clock_in,
         body.clock_out,
         body.start_time,
@@ -759,7 +755,6 @@ pub(crate) async fn update_assignment(
     Ok(Json(serde_json::json!({
         "employee_id": emp_id,
         "inquiry_id": id,
-        "planned_hours": row.planned_hours.unwrap_or(0.0),
         "clock_in": row.clock_in,
         "clock_out": row.clock_out,
         "start_time": row.start_time,

@@ -44,7 +44,6 @@ pub(crate) struct CalendarItemEmployee {
     pub employee_id: Uuid,
     pub first_name: String,
     pub last_name: String,
-    pub planned_hours: Option<f64>,
     pub clock_in: Option<NaiveTime>,
     pub clock_out: Option<NaiveTime>,
     pub start_time: Option<NaiveTime>,
@@ -153,11 +152,12 @@ pub(crate) async fn insert_item(
     end_time: Option<NaiveTime>,
     duration_hours: f64,
     customer_id: Option<Uuid>,
+    end_date: Option<NaiveDate>,
 ) -> Result<Uuid, sqlx::Error> {
     let (new_id,): (Uuid,) = sqlx::query_as(
         r#"
-        INSERT INTO calendar_items (title, description, category, location, scheduled_date, start_time, end_time, duration_hours, customer_id)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        INSERT INTO calendar_items (title, description, category, location, scheduled_date, start_time, end_time, duration_hours, customer_id, end_date)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         RETURNING id
         "#,
     )
@@ -170,6 +170,7 @@ pub(crate) async fn insert_item(
     .bind(end_time)
     .bind(duration_hours)
     .bind(customer_id)
+    .bind(end_date)
     .fetch_one(pool)
     .await?;
     Ok(new_id)
@@ -214,31 +215,34 @@ pub(crate) async fn employee_exists(pool: &PgPool, id: Uuid) -> Result<bool, sql
     Ok(row.is_some())
 }
 
-/// Insert a calendar item employee assignment.
+/// Insert calendar item employee assignment rows — one row per day in scheduled_date..=end_date.
 ///
 /// **Caller**: `assign_employee` handler
-/// **Why**: Links an employee to an internal work item on its scheduled_date.
+/// **Why**: Links an employee to an internal work item for every day of its date range.
 pub(crate) async fn insert_item_employee(
     pool: &PgPool,
     calendar_item_id: Uuid,
     employee_id: Uuid,
-    planned_hours: f64,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
-        INSERT INTO calendar_item_employees (id, calendar_item_id, employee_id, job_date, planned_hours, start_time, end_time)
+        INSERT INTO calendar_item_employees (id, calendar_item_id, employee_id, job_date, start_time, end_time)
         SELECT gen_random_uuid(), $1, $2,
-               COALESCE(scheduled_date, created_at::date),
-               $3,
+               d::date,
                COALESCE(start_time, '08:00'::time),
                COALESCE(end_time,   '17:00'::time)
-        FROM calendar_items WHERE id = $1
+        FROM calendar_items,
+             generate_series(
+                 COALESCE(scheduled_date, created_at::date),
+                 COALESCE(end_date, scheduled_date, created_at::date),
+                 '1 day'::interval
+             ) AS d
+        WHERE id = $1
         ON CONFLICT (calendar_item_id, employee_id, job_date) DO NOTHING
         "#,
     )
     .bind(calendar_item_id)
     .bind(employee_id)
-    .bind(planned_hours)
     .execute(pool)
     .await?;
     Ok(())
@@ -255,7 +259,6 @@ pub(crate) async fn update_item_employee(
     pool: &PgPool,
     calendar_item_id: Uuid,
     employee_id: Uuid,
-    planned_hours: Option<f64>,
     clock_in: Option<NaiveTime>,
     clock_out: Option<NaiveTime>,
     start_time: Option<NaiveTime>,
@@ -283,32 +286,25 @@ pub(crate) async fn update_item_employee(
     let result = sqlx::query(
         r#"
         UPDATE calendar_item_employees SET
-            clock_in            = COALESCE($4, clock_in),
-            clock_out           = COALESCE($5, clock_out),
-            start_time          = COALESCE($6, start_time),
-            end_time            = COALESCE($7, end_time),
-            break_minutes       = COALESCE($8, break_minutes),
-            actual_hours        = $9,
-            planned_hours       = CASE
-                WHEN $9 IS NOT NULL THEN $9
-                WHEN COALESCE($4, clock_in) IS NOT NULL AND COALESCE($5, clock_out) IS NOT NULL
-                THEN (EXTRACT(EPOCH FROM (COALESCE($5, clock_out) - COALESCE($4, clock_in))) / 3600.0)
-                ELSE COALESCE($3, planned_hours)
-            END,
-            notes               = COALESCE($10, notes),
-            transport_mode      = COALESCE($12, transport_mode),
-            travel_costs_cents  = COALESCE($13, travel_costs_cents),
-            accommodation_cents = COALESCE($14, accommodation_cents),
-            misc_costs_cents    = COALESCE($15, misc_costs_cents),
-            meal_deduction      = COALESCE($16, meal_deduction)
+            clock_in            = COALESCE($3, clock_in),
+            clock_out           = COALESCE($4, clock_out),
+            start_time          = COALESCE($5, start_time),
+            end_time            = COALESCE($6, end_time),
+            break_minutes       = COALESCE($7, break_minutes),
+            actual_hours        = $8,
+            notes               = COALESCE($9, notes),
+            transport_mode      = COALESCE($11, transport_mode),
+            travel_costs_cents  = COALESCE($12, travel_costs_cents),
+            accommodation_cents = COALESCE($13, accommodation_cents),
+            misc_costs_cents    = COALESCE($14, misc_costs_cents),
+            meal_deduction      = COALESCE($15, meal_deduction)
         WHERE calendar_item_id = $1
           AND employee_id = $2
-          AND job_date = COALESCE($11, (SELECT COALESCE(scheduled_date, created_at::date) FROM calendar_items WHERE id = $1))
+          AND job_date = COALESCE($10, (SELECT COALESCE(scheduled_date, created_at::date) FROM calendar_items WHERE id = $1))
         "#,
     )
     .bind(calendar_item_id)
     .bind(employee_id)
-    .bind(planned_hours)
     .bind(clock_in)
     .bind(clock_out)
     .bind(start_time)
@@ -342,7 +338,6 @@ pub(crate) async fn fetch_item_employee(
         SELECT cie.employee_id,
                e.first_name,
                e.last_name,
-               SUM(cie.planned_hours)::float8 AS planned_hours,
                MIN(cie.clock_in)  AS clock_in,
                MAX(cie.clock_out) AS clock_out,
                MIN(cie.start_time) AS start_time,
@@ -408,7 +403,6 @@ pub(crate) async fn fetch_item_employees(
         SELECT cie.employee_id,
                e.first_name,
                e.last_name,
-               SUM(cie.planned_hours)::float8 AS planned_hours,
                MIN(cie.clock_in)  AS clock_in,
                MAX(cie.clock_out) AS clock_out,
                MIN(cie.start_time) AS start_time,

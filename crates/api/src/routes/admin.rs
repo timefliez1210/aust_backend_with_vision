@@ -382,7 +382,6 @@ struct EmployeeListItem {
     phone: Option<String>,
     monthly_hours_target: f64,
     active: bool,
-    planned_hours_month: Option<f64>,
     actual_hours_month: Option<f64>,
     created_at: DateTime<Utc>,
 }
@@ -439,7 +438,6 @@ async fn list_employees(
             phone: row.phone,
             monthly_hours_target: row.monthly_hours_target,
             active: row.active,
-            planned_hours_month: planned,
             actual_hours_month: actual,
             created_at: row.created_at,
         });
@@ -507,7 +505,6 @@ async fn get_employee(
                 "origin_city": a.origin_city,
                 "destination_city": a.destination_city,
                 "booking_date": a.booking_date,
-                "planned_hours": a.planned_hours.unwrap_or(0.0),
                 "actual_hours": a.actual_hours,
                 "notes": a.notes,
                 "status": a.inquiry_status,
@@ -625,13 +622,11 @@ async fn employee_hours_summary(
     // Also fetch calendar item assignments for this employee in the same month.
     let item_rows = employee_repo::fetch_admin_calendar_item_hours(&state.db, id, from_date, to_date).await?;
 
-    let mut planned_sum = 0.0_f64;
     let mut actual_sum = 0.0_f64;
 
     let assignments: Vec<serde_json::Value> = rows
         .into_iter()
         .map(|r| {
-            planned_sum += r.planned_hours;
             if let Some(av) = r.actual_hours {
                 actual_sum += av;
             }
@@ -641,13 +636,14 @@ async fn employee_hours_summary(
                 "origin_city": r.origin_city,
                 "destination_city": r.destination_city,
                 "booking_date": r.booking_date,
-                "planned_hours": r.planned_hours,
                 "start_time": r.start_time,
                 "end_time": r.end_time,
                 "clock_in": r.clock_in,
                 "clock_out": r.clock_out,
                 "break_minutes": r.break_minutes,
                 "actual_hours": r.actual_hours,
+                "employee_clock_in": r.employee_clock_in,
+                "employee_clock_out": r.employee_clock_out,
                 "status": r.inquiry_status,
             })
         })
@@ -656,7 +652,6 @@ async fn employee_hours_summary(
     let calendar_items: Vec<serde_json::Value> = item_rows
         .into_iter()
         .map(|r| {
-            planned_sum += r.planned_hours;
             if let Some(av) = r.actual_hours {
                 actual_sum += av;
             }
@@ -666,13 +661,14 @@ async fn employee_hours_summary(
                 "category": r.category,
                 "location": r.location,
                 "scheduled_date": r.scheduled_date,
-                "planned_hours": r.planned_hours,
                 "start_time": r.start_time,
                 "end_time": r.end_time,
                 "clock_in": r.clock_in,
                 "clock_out": r.clock_out,
                 "break_minutes": r.break_minutes,
                 "actual_hours": r.actual_hours,
+                "employee_clock_in": r.employee_clock_in,
+                "employee_clock_out": r.employee_clock_out,
                 "status": r.status,
             })
         })
@@ -682,7 +678,6 @@ async fn employee_hours_summary(
         "from": from_date.to_string(),
         "to": to_date.to_string(),
         "target_hours": target,
-        "planned_hours": planned_sum,
         "actual_hours": actual_sum,
         "assignment_count": assignments.len() + calendar_items.len(),
         "assignments": assignments,
