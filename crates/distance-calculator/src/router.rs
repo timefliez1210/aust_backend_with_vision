@@ -2,6 +2,7 @@ use crate::DistanceError;
 use aust_core::models::{DistanceResult, GeoLocation};
 use reqwest::Client;
 use serde::Deserialize;
+use std::time::Duration;
 use tracing::debug;
 
 pub struct DistanceRouter {
@@ -12,7 +13,10 @@ pub struct DistanceRouter {
 impl DistanceRouter {
     pub fn new(api_key: String) -> Self {
         Self {
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .expect("reqwest client with timeout"),
             api_key,
         }
     }

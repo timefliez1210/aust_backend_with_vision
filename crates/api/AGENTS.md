@@ -1,6 +1,6 @@
 # crates/api — REST API, Repos, Services
 
-The main backend crate. Axum HTTP server with JWT middleware, 18 route files, 13 repository modules, 9 service modules.
+The main backend crate. Axum HTTP server with JWT middleware, 18 route files, 16 repository modules, 8 service modules.
 
 ## File Map
 
@@ -8,16 +8,16 @@ The main backend crate. Axum HTTP server with JWT middleware, 18 route files, 13
 
 | File | Purpose | Size |
 |------|---------|------|
-| `submissions.rs` | Public form submissions (photo, mobile, AR, video, manual) | 84KB |
-| `admin.rs` | Dashboard, employees, notes, feedback, timesheets | 51KB |
-| `invoices.rs` | Invoice CRUD + XLSX generation | 32KB |
-| `inquiry_actions.rs` | Estimation triggers, offer generation, employee assignments | 28KB |
-| `inquiries.rs` | Inquiry CRUD, status transitions, PDF download, delete | 20KB |
-| `calendar.rs` | Calendar schedule, availability, bookings | 25KB |
-| `calendar_items.rs` | Calendar item CRUD (non-inquiry work blocks) | 18KB |
+| `submissions.rs` | Public form submissions (photo, mobile, AR, video, manual) | 92KB |
+| `admin.rs` | Dashboard, employees, notes, feedback, timesheets | 67KB |
+| `invoices.rs` | Invoice CRUD + XLSX generation | 47KB |
+| `inquiry_actions.rs` | Estimation triggers, offer generation, employee assignments | 29KB |
+| `inquiries.rs` | Inquiry CRUD, status transitions, PDF download, delete | 29KB |
+| `calendar.rs` | Calendar schedule, availability, bookings | 13KB |
+| `calendar_items.rs` | Calendar item CRUD (non-inquiry work blocks) | 22KB |
 | `customer.rs` | Customer-facing endpoints (OTP auth, inquiry list) | 19KB |
-| `employee.rs` | Employee CRUD, document upload/download, hours | 25KB |
-| `admin_customers.rs` | Admin customer CRUD, address update | 14KB |
+| `employee.rs` | Employee CRUD, document upload/download, hours | 26KB |
+| `admin_customers.rs` | Admin customer CRUD, address update | 17KB |
 | `admin_emails.rs` | Email thread CRUD, drafts, send | 17KB |
 | `auth.rs` | JWT login/refresh | 17KB |
 | `estimates.rs` | Volume estimation CRUD + image serving | 36KB |
@@ -37,6 +37,10 @@ The main backend crate. Axum HTTP server with JWT middleware, 18 route files, 13
 | `address_repo.rs` | `addresses` | |
 | `customer_auth_repo.rs` | `customer_sessions`, OTP | |
 | `email_repo.rs` | `email_threads`, `email_messages` | |
+| `auth_repo.rs` | `users` (login/role lookups) | |
+| `feedback_repo.rs` | `feedback_reports` | Admin customer feedback |
+| `invoice_reminder_repo.rs` | `invoice_reminders` | |
+| `review_repo.rs` | `reviews` | |
 
 ### Services (`src/services/`)
 

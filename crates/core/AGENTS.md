@@ -22,7 +22,7 @@ pending → info_requested → estimating → estimated → offer_ready → offe
   → scheduled → completed → invoiced → paid
 ```
 
-- `can_transition_to(&self, target)` — enforces valid transitions
+- `can_transition_to(&self, target)` — currently returns `true` for all transitions (admin dashboard has full flexibility; the state machine is informational only)
 - `is_locked_for_modifications(&self)` — returns true for `offer_ready` through `paid` (prevents volume/address changes after offer)
 
 ## CompanyConfig Pricing Constants
@@ -50,6 +50,6 @@ All configurable via `config/*.toml` with `serde(default)`:
 | If you change... | ...also verify |
 |---|---|
 | `InquiryStatus` enum | `can_transition_to()`, `is_locked_for_modifications()`, admin frontend `INQUIRY_STATUS_LABELS`, inquiry PATCH handler status gate |
-| `CompanyConfig` struct | `PricingEngine::with_rate()` calls, `ServicePrices::from_config()`, offer generator, all unit tests using `PricingEngine::new()` |
+| `CompanyConfig` struct | `PricingEngine::with_rate()` calls, `ServicePrices::from_config()` (in `crates/api/src/services/offer_builder.rs`), offer generator, all unit tests using `PricingEngine::new()` |
 | `Services` struct | `build_line_items()` in offer builder, XLSX line items, foto-angebot form, admin service toggles |
 | `EstimationMethod` enum | `volume.rs` string conversion, 5 submission handlers, DB CHECK constraint, offer builder `parse_detected_items()`, vision service |

@@ -2,6 +2,7 @@ use crate::DistanceError;
 use aust_core::models::GeoLocation;
 use reqwest::Client;
 use serde::Deserialize;
+use std::time::Duration;
 use tracing::debug;
 
 /// Converts free-text German address strings to WGS-84 coordinates using the
@@ -23,7 +24,10 @@ impl Geocoder {
     /// - `api_key` — ORS API key passed as `?api_key=` query parameter.
     pub fn new(api_key: String) -> Self {
         Self {
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .expect("reqwest client with timeout"),
             api_key,
         }
     }
