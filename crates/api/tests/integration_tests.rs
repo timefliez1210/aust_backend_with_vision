@@ -144,22 +144,25 @@ async fn employee_clock_times_stored_in_day_table(pool: PgPool) {
         &pool, customer_id, origin_id, dest_id, "estimated", "foto", Some("privatumzug"),
     ).await;
 
-    let day_id = test_helpers::insert_test_inquiry_day(
-        &pool, inquiry_id, 1, chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
-    ).await;
     let emp_id = test_helpers::insert_test_employee(&pool, "Max", "Mustermann").await;
-    test_helpers::insert_test_day_employee(&pool, day_id, emp_id, 8.0).await;
+    test_helpers::insert_test_inquiry_employee(
+        &pool,
+        inquiry_id,
+        emp_id,
+        chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
+        8.0,
+    ).await;
 
-    // Write clock-in/out to the day table
+    // Write clock-in/out to the flat table
     let clock_in = chrono::Utc::now() - chrono::Duration::hours(4);
     let clock_out = chrono::Utc::now();
     sqlx::query(
-        "UPDATE inquiry_day_employees SET clock_in = $1, clock_out = $2
-         WHERE inquiry_day_id = $3 AND employee_id = $4",
+        "UPDATE inquiry_employees SET employee_clock_in = $1, employee_clock_out = $2
+         WHERE inquiry_id = $3 AND employee_id = $4",
     )
     .bind(clock_in)
     .bind(clock_out)
-    .bind(day_id)
+    .bind(inquiry_id)
     .bind(emp_id)
     .execute(&pool)
     .await
@@ -167,22 +170,22 @@ async fn employee_clock_times_stored_in_day_table(pool: PgPool) {
 
     // Read back — must NOT be NULL
     let row: (Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>) = sqlx::query_as(
-        "SELECT ide.clock_in, ide.clock_out
-         FROM inquiry_day_employees ide
-         WHERE ide.inquiry_day_id = $1 AND ide.employee_id = $2",
+        "SELECT employee_clock_in, employee_clock_out
+         FROM inquiry_employees
+         WHERE inquiry_id = $1 AND employee_id = $2",
     )
-    .bind(day_id)
+    .bind(inquiry_id)
     .bind(emp_id)
     .fetch_one(&pool)
     .await
     .expect("fetch clock times");
 
-    assert!(row.0.is_some(), "clock_in must be stored in inquiry_day_employees");
-    assert!(row.1.is_some(), "clock_out must be stored in inquiry_day_employees");
+    assert!(row.0.is_some(), "employee_clock_in must be stored in inquiry_employees");
+    assert!(row.1.is_some(), "employee_clock_out must be stored in inquiry_employees");
 }
 
 // ============================================================================
-// BUG-M3: update_clock_times must target day_number=1 only
+// BUG-M3: update_clock_times must target first job_date only
 // ============================================================================
 #[sqlx::test(migrations = "../../migrations")]
 async fn clock_times_target_day_one_only(pool: PgPool) {
@@ -196,64 +199,75 @@ async fn clock_times_target_day_one_only(pool: PgPool) {
         &pool, customer_id, origin_id, dest_id, "estimated", "foto", Some("privatumzug"),
     ).await;
 
-    // Create 3 days for a multi-day move
-    let day1_id = test_helpers::insert_test_inquiry_day(
-        &pool, inquiry_id, 1, chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
-    ).await;
-    let day2_id = test_helpers::insert_test_inquiry_day(
-        &pool, inquiry_id, 2, chrono::NaiveDate::from_ymd_opt(2026, 6, 2).unwrap(),
-    ).await;
-    let _day3_id = test_helpers::insert_test_inquiry_day(
-        &pool, inquiry_id, 3, chrono::NaiveDate::from_ymd_opt(2026, 6, 3).unwrap(),
-    ).await;
-
+    // Create 3 job-date rows for a multi-day move (same employee on 3 dates)
     let emp_id = test_helpers::insert_test_employee(&pool, "Anna", "Schmidt").await;
-    test_helpers::insert_test_day_employee(&pool, day1_id, emp_id, 8.0).await;
-    test_helpers::insert_test_day_employee(&pool, day2_id, emp_id, 8.0).await;
+    test_helpers::insert_test_inquiry_employee(
+        &pool,
+        inquiry_id,
+        emp_id,
+        chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
+        8.0,
+    )
+    .await;
+    test_helpers::insert_test_inquiry_employee(
+        &pool,
+        inquiry_id,
+        emp_id,
+        chrono::NaiveDate::from_ymd_opt(2026, 6, 2).unwrap(),
+        8.0,
+    )
+    .await;
+    test_helpers::insert_test_inquiry_employee(
+        &pool,
+        inquiry_id,
+        emp_id,
+        chrono::NaiveDate::from_ymd_opt(2026, 6, 3).unwrap(),
+        8.0,
+    )
+    .await;
 
-    // Simulate update_clock_times: UPDATE day_employees WHERE day_number = 1
+    // Simulate update_clock_times: UPDATE only first job_date
     let clock_in = chrono::Utc::now() - chrono::Duration::hours(4);
     let result = sqlx::query(
-        "UPDATE inquiry_day_employees ide SET clock_in = $1
-         FROM inquiry_days iday
-         WHERE ide.inquiry_day_id = iday.id
-           AND iday.inquiry_id = $2 AND iday.day_number = 1 AND ide.employee_id = $3",
+        "UPDATE inquiry_employees SET employee_clock_in = $1
+         WHERE inquiry_id = $2 AND job_date = $3 AND employee_id = $4",
     )
     .bind(clock_in)
     .bind(inquiry_id)
+    .bind(chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap())
     .bind(emp_id)
     .execute(&pool)
     .await
-    .expect("update clock_in for day 1");
+    .expect("update clock_in for 2026-06-01");
 
-    // Only 1 row should be affected (day 1 only)
-    assert_eq!(result.rows_affected(), 1, "clock update must only affect day_number=1");
+    // Only 1 row should be affected (first job_date)
+    assert_eq!(result.rows_affected(), 1, "clock update must only affect first job_date");
 
-    // Verify day 1 has clock_in set
+    // Verify first job_date has employee_clock_in set
     let day1_clock: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
-        "SELECT ide.clock_in FROM inquiry_day_employees ide
-         JOIN inquiry_days iday ON ide.inquiry_day_id = iday.id
-         WHERE iday.inquiry_id = $1 AND iday.day_number = 1 AND ide.employee_id = $2",
+        "SELECT employee_clock_in FROM inquiry_employees
+         WHERE inquiry_id = $1 AND job_date = $2 AND employee_id = $3",
     )
     .bind(inquiry_id)
+    .bind(chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap())
     .bind(emp_id)
     .fetch_one(&pool)
     .await
     .expect("day1 clock_in");
-    assert!(day1_clock.is_some(), "day 1 must have clock_in set");
+    assert!(day1_clock.is_some(), "day 1 must have employee_clock_in set");
 
-    // Verify day 2 does NOT have clock_in set
+    // Verify second job_date does NOT have employee_clock_in set
     let day2_clock: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
-        "SELECT ide.clock_in FROM inquiry_day_employees ide
-         JOIN inquiry_days iday ON ide.inquiry_day_id = iday.id
-         WHERE iday.inquiry_id = $1 AND iday.day_number = 2 AND ide.employee_id = $2",
+        "SELECT employee_clock_in FROM inquiry_employees
+         WHERE inquiry_id = $1 AND job_date = $2 AND employee_id = $3",
     )
     .bind(inquiry_id)
+    .bind(chrono::NaiveDate::from_ymd_opt(2026, 6, 2).unwrap())
     .bind(emp_id)
     .fetch_one(&pool)
     .await
     .expect("day2 clock_in");
-    assert!(day2_clock.is_none(), "day 2 must NOT have clock_in set");
+    assert!(day2_clock.is_none(), "day 2 must NOT have employee_clock_in set");
 }
 
 // ============================================================================
@@ -271,23 +285,27 @@ async fn delete_inquiry_with_bookings_prevented(pool: PgPool) {
         &pool, customer_id, origin_id, dest_id, "estimated", "foto", Some("privatumzug"),
     ).await;
 
-    // Create a day and employee assignment
-    let day_id = test_helpers::insert_test_inquiry_day(
-        &pool, inquiry_id, 1, chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
-    ).await;
+    // Create employee assignments via the flat table
     let emp_id = test_helpers::insert_test_employee(&pool, "Max", "Müller").await;
-    test_helpers::insert_test_day_employee(&pool, day_id, emp_id, 8.0).await;
+    test_helpers::insert_test_inquiry_employee(
+        &pool,
+        inquiry_id,
+        emp_id,
+        chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
+        8.0,
+    )
+    .await;
 
-    // Try to check for active bookings before deleting
-    let day_count: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM inquiry_days WHERE inquiry_id = $1",
+    // Check for active employee assignments before soft-delete attempt
+    let emp_count: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM inquiry_employees WHERE inquiry_id = $1",
     )
     .bind(inquiry_id)
     .fetch_one(&pool)
     .await
-    .expect("count days");
+    .expect("count inquiry_employees");
 
-    assert_eq!(day_count.0, 1, "inquiry must have 1 day before deletion attempt");
+    assert_eq!(emp_count.0, 1, "inquiry must have 1 employee assignment before deletion attempt");
 }
 
 // ============================================================================
@@ -506,7 +524,7 @@ async fn calendar_item_customer_fields(pool: PgPool) {
 }
 
 // ============================================================================
-// Inquiry day employees read correctly (single-day branch)
+// Inquiry employees read correctly (single-day branch via flat table)
 // ============================================================================
 #[sqlx::test(migrations = "../../migrations")]
 async fn single_day_inquiry_employee_count_from_day_table(pool: PgPool) {
@@ -520,28 +538,38 @@ async fn single_day_inquiry_employee_count_from_day_table(pool: PgPool) {
         &pool, customer_id, origin_id, dest_id, "estimated", "foto", Some("privatumzug"),
     ).await;
 
-    // Create day and assign 2 employees
-    let day_id = test_helpers::insert_test_inquiry_day(
-        &pool, inquiry_id, 1, chrono::NaiveDate::from_ymd_opt(2026, 6, 15).unwrap(),
-    ).await;
+    // Assign 2 employees via the flat table for a single day
     let emp1 = test_helpers::insert_test_employee(&pool, "Anna", "Arbeiterin").await;
     let emp2 = test_helpers::insert_test_employee(&pool, "Ben", "Bauarbeiter").await;
-    test_helpers::insert_test_day_employee(&pool, day_id, emp1, 8.0).await;
-    test_helpers::insert_test_day_employee(&pool, day_id, emp2, 4.0).await;
+    test_helpers::insert_test_inquiry_employee(
+        &pool,
+        inquiry_id,
+        emp1,
+        chrono::NaiveDate::from_ymd_opt(2026, 6, 15).unwrap(),
+        8.0,
+    )
+    .await;
+    test_helpers::insert_test_inquiry_employee(
+        &pool,
+        inquiry_id,
+        emp2,
+        chrono::NaiveDate::from_ymd_opt(2026, 6, 15).unwrap(),
+        4.0,
+    )
+    .await;
 
-    // Count employees via day-employees table (single-day branch pattern)
+    // Count employees via the flat table
     let count: (i64,) = sqlx::query_as(
-        "SELECT COUNT(DISTINCT ide.employee_id)::bigint
-         FROM inquiry_day_employees ide
-         JOIN inquiry_days iday ON ide.inquiry_day_id = iday.id
-         WHERE iday.inquiry_id = $1",
+        "SELECT COUNT(DISTINCT employee_id)::bigint
+         FROM inquiry_employees
+         WHERE inquiry_id = $1",
     )
     .bind(inquiry_id)
     .fetch_one(&pool)
     .await
-    .expect("count day employees");
+    .expect("count inquiry_employees");
 
-    assert_eq!(count.0, 2, "must count 2 employees from day table");
+    assert_eq!(count.0, 2, "must count 2 employees from inquiry_employees table");
 }
 
 // ============================================================================

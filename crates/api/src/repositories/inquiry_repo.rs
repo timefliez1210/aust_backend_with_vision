@@ -933,7 +933,7 @@ pub(crate) async fn create_minimal(
                            stop_address_id, status, scheduled_date, end_date, notes, services, source,
                            service_type, submission_mode, recipient_id, billing_address_id, custom_fields,
                            created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $17)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, COALESCE($16, '{}'::jsonb), $17, $17)
         "#,
     )
     .bind(id)
@@ -951,7 +951,7 @@ pub(crate) async fn create_minimal(
     .bind(submission_mode)
     .bind(recipient_id)
     .bind(billing_address_id)
-    .bind(custom_fields)
+    .bind(custom_fields.unwrap_or(&serde_json::json!({})).clone())
     .bind(now)
     .execute(executor)
     .await?;

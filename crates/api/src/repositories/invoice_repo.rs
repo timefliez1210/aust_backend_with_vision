@@ -25,6 +25,32 @@ pub(crate) struct InvoiceRow {
     pub deposit_percent: Option<i16>,
     /// FK to the sibling `partial_first` invoice, stored on `partial_final`; NULL otherwise.
     pub deposit_invoice_id: Option<Uuid>,
+    pub payment_method: Option<String>,
+    pub notes: Option<String>,
+    pub due_date: Option<chrono::NaiveDate>,
+}
+
+/// Flat projection for Rechnungsausgangsbuch — one row per invoice with
+/// customer name, service date, and offer amounts.
+#[derive(Debug, FromRow)]
+pub(crate) struct RechnungsausgangRow {
+    pub id: Uuid,
+    pub invoice_number: String,
+    pub invoice_type: String,
+    pub status: String,
+    pub sent_at: Option<DateTime<Utc>>,
+    pub paid_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub payment_method: Option<String>,
+    pub notes: Option<String>,
+    pub due_date: Option<chrono::NaiveDate>,
+    pub extra_services: serde_json::Value,
+    /// Netto amount from the active offer in cents.
+    pub offer_netto_cents: Option<i64>,
+    /// Brutto = netto * 1.19
+    pub offer_brutto_cents: Option<i64>,
+    pub customer_name: Option<String>,
+    pub scheduled_date: Option<chrono::NaiveDate>,
 }
 
 /// Minimal offer projection for invoice amount calculation.
@@ -49,7 +75,8 @@ pub(crate) async fn list_by_inquiry(
     sqlx::query_as(
         "SELECT id, inquiry_id, invoice_number, invoice_type, partial_group_id,
                 partial_percent, status, extra_services, pdf_s3_key, sent_at, paid_at, created_at,
-                deposit_percent, deposit_invoice_id
+                deposit_percent, deposit_invoice_id,
+                payment_method, notes, due_date
          FROM invoices WHERE inquiry_id = $1 ORDER BY created_at",
     )
     .bind(inquiry_id)
@@ -267,7 +294,8 @@ pub(crate) async fn fetch_by_id(
     sqlx::query_as(
         "SELECT id, inquiry_id, invoice_number, invoice_type, partial_group_id,
                 partial_percent, status, extra_services, pdf_s3_key, sent_at, paid_at, created_at,
-                deposit_percent, deposit_invoice_id
+                deposit_percent, deposit_invoice_id,
+                payment_method, notes, due_date
          FROM invoices WHERE id = $1",
     )
     .bind(inv_id)
@@ -287,7 +315,8 @@ pub(crate) async fn fetch_by_id_and_inquiry(
     sqlx::query_as(
         "SELECT id, inquiry_id, invoice_number, invoice_type, partial_group_id,
                 partial_percent, status, extra_services, pdf_s3_key, sent_at, paid_at, created_at,
-                deposit_percent, deposit_invoice_id
+                deposit_percent, deposit_invoice_id,
+                payment_method, notes, due_date
          FROM invoices WHERE id = $1 AND inquiry_id = $2",
     )
     .bind(inv_id)
@@ -510,4 +539,41 @@ pub(crate) async fn fetch_offer_netto(
             .fetch_optional(pool)
             .await?;
     Ok(row.map(|(c,)| c).unwrap_or(0))
+}
+
+/// List all invoices with customer name and offer amounts for Rechnungsausgangsbuch.
+///
+/// **Caller**: `admin`
+/// **Why**: Flat list of all invoices regardless of inquiry, with computed amounts.
+pub(crate) async fn list_for_rechnungsausgangsbuch(
+    pool: &PgPool,
+) -> Result<Vec<RechnungsausgangRow>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT
+            inv.id,
+            inv.invoice_number,
+            inv.invoice_type,
+            inv.status,
+            inv.sent_at,
+            inv.paid_at,
+            inv.created_at,
+            inv.payment_method,
+            inv.notes,
+            inv.due_date,
+            inv.extra_services,
+            off.price_cents AS offer_netto_cents,
+            (off.price_cents * 119 / 100) AS offer_brutto_cents,
+            c.name AS customer_name,
+            i.scheduled_date
+         FROM invoices inv
+         JOIN inquiries i ON i.id = inv.inquiry_id
+         JOIN customers c ON c.id = i.customer_id
+         LEFT JOIN offers off ON off.inquiry_id = inv.inquiry_id
+             AND off.id = (SELECT o2.id FROM offers o2
+                           WHERE o2.inquiry_id = inv.inquiry_id
+                           ORDER BY o2.created_at DESC LIMIT 1)
+         ORDER BY inv.invoice_number DESC",
+    )
+    .fetch_all(pool)
+    .await
 }

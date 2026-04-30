@@ -330,8 +330,6 @@ pub async fn clean_test_data(pool: &PgPool) {
     for table in &[
         "volume_estimations",
         "offers",
-        "inquiry_day_employees",
-        "inquiry_days",
         "inquiry_employees",
         "inquiries",
         "addresses",
@@ -362,45 +360,25 @@ pub async fn insert_test_employee(pool: &PgPool, first_name: &str, last_name: &s
     id
 }
 
-/// Insert an inquiry day and return the day ID.
-pub async fn insert_test_inquiry_day(
+/// Insert an inquiry employee assignment into the flat table.
+pub async fn insert_test_inquiry_employee(
     pool: &PgPool,
     inquiry_id: uuid::Uuid,
-    day_number: i16,
-    day_date: chrono::NaiveDate,
-) -> uuid::Uuid {
-    let id = uuid::Uuid::now_v7();
-    sqlx::query(
-        "INSERT INTO inquiry_days (id, inquiry_id, day_date, day_number, start_time, end_time)
-         VALUES ($1, $2, $3, $4, '08:00'::time, '17:00'::time)",
-    )
-    .bind(id)
-    .bind(inquiry_id)
-    .bind(day_date)
-    .bind(day_number)
-    .execute(pool)
-    .await
-    .expect("insert test inquiry_day");
-    id
-}
-
-/// Insert a day-employee assignment and return the assignment ID.
-pub async fn insert_test_day_employee(
-    pool: &PgPool,
-    inquiry_day_id: uuid::Uuid,
     employee_id: uuid::Uuid,
+    job_date: chrono::NaiveDate,
     planned_hours: f64,
 ) {
     sqlx::query(
-        "INSERT INTO inquiry_day_employees (inquiry_day_id, employee_id, planned_hours)
-         VALUES ($1, $2, $3)",
+        "INSERT INTO inquiry_employees (inquiry_id, employee_id, job_date, planned_hours, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, NOW(), NOW())",
     )
-    .bind(inquiry_day_id)
+    .bind(inquiry_id)
     .bind(employee_id)
+    .bind(job_date)
     .bind(planned_hours)
     .execute(pool)
     .await
-    .expect("insert test day_employee");
+    .expect("insert test inquiry_employee");
 }
 
 /// Insert a test customer with a specific customer_type and return its ID.

@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use aust_core::models::TokenClaims;
 use aust_offer_generator::{convert_xlsx_to_pdf, generate_timesheet_xlsx, TimesheetData, TimesheetEntry};
-use crate::repositories::{admin_repo, employee_repo, feedback_repo, review_repo, invoice_reminder_repo};
+use crate::repositories::{admin_repo, employee_repo, feedback_repo, review_repo, invoice_reminder_repo, invoice_repo};
 use crate::{ApiError, AppState};
 
 use super::admin_customers;
@@ -64,6 +64,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/morning-workflow", get(morning_workflow))
         .route("/invoice-reminders", get(list_invoice_reminders))
         .route("/invoice-reminders/{id}/action", post(invoice_reminder_action))
+        .route("/rechnungsausgangsbuch", get(rechnungsausgangsbuch))
 }
 
 // --- Dashboard ---
@@ -1753,6 +1754,73 @@ async fn list_review_reminders(
             customer_email: r.customer_email,
         })
         .collect();
+    Ok(Json(items))
+}
+
+// ---------------------------------------------------------------------------
+// --- Rechnungsausgangsbuch ---
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+struct RechnungsausgangItem {
+    id: Uuid,
+    invoice_number: String,
+    customer_name: Option<String>,
+    scheduled_date: Option<NaiveDate>,
+    netto_cents: Option<i64>,
+    mwst_cents: Option<i64>,
+    brutto_cents: Option<i64>,
+    sent_at: Option<DateTime<Utc>>,
+    due_date: Option<NaiveDate>,
+    paid_at: Option<DateTime<Utc>>,
+    offene_zahlungen_cents: Option<i64>,
+    payment_method: Option<String>,
+    notes: Option<String>,
+}
+
+/// `GET /api/v1/admin/rechnungsausgangsbuch` — Flat list of all invoices with computed amounts.
+///
+/// **Caller**: Admin Rechnungsausgangsbuch page
+/// **Why**: Provides a single flat query for the invoice ledger view.
+async fn rechnungsausgangsbuch(
+    State(state): State<Arc<AppState>>,
+    Extension(_claims): Extension<TokenClaims>,
+) -> Result<Json<Vec<RechnungsausgangItem>>, ApiError> {
+    let rows = invoice_repo::list_for_rechnungsausgangsbuch(&state.db).await?;
+
+    let items: Vec<RechnungsausgangItem> = rows
+        .into_iter()
+        .map(|r| {
+            let netto_cents = r.offer_netto_cents;
+            let brutto_cents = r.offer_brutto_cents;
+            let mwst_cents = brutto_cents
+                .zip(netto_cents)
+                .map(|(b, n)| b - n);
+
+            let offen = if r.paid_at.is_some() {
+                Some(0i64)
+            } else {
+                brutto_cents
+            };
+
+            RechnungsausgangItem {
+                id: r.id,
+                invoice_number: r.invoice_number,
+                customer_name: r.customer_name,
+                scheduled_date: r.scheduled_date,
+                netto_cents,
+                mwst_cents,
+                brutto_cents,
+                sent_at: r.sent_at,
+                due_date: r.due_date,
+                paid_at: r.paid_at,
+                offene_zahlungen_cents: offen,
+                payment_method: r.payment_method,
+                notes: r.notes,
+            }
+        })
+        .collect();
+
     Ok(Json(items))
 }
 
