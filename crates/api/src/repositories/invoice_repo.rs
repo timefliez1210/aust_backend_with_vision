@@ -572,7 +572,7 @@ pub(crate) async fn list_for_rechnungsausgangsbuch(
              AND off.id = (SELECT o2.id FROM offers o2
                            WHERE o2.inquiry_id = inv.inquiry_id
                            ORDER BY o2.created_at DESC LIMIT 1)
-         ORDER BY inv.invoice_number DESC",
+         ORDER BY COALESCE(inv.sent_at, inv.created_at) ASC",
     )
     .fetch_all(pool)
     .await
