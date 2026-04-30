@@ -566,7 +566,7 @@ pub(crate) async fn list_for_rechnungsausgangsbuch(
             c.name AS customer_name,
             i.scheduled_date
          FROM invoices inv
-         JOIN inquiries i ON i.id = inv.inquiry_id
+         JOIN inquiries i ON i.id = inv.inquiry_id AND i.status IN ('completed', 'invoiced', 'paid')
          JOIN customers c ON c.id = i.customer_id
          LEFT JOIN offers off ON off.inquiry_id = inv.inquiry_id
              AND off.id = (SELECT o2.id FROM offers o2
