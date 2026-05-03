@@ -128,6 +128,22 @@ async fn main() -> Result<()> {
     });
     tracing::info!("Stuck estimation cleanup task started");
 
+    // Periodic flash-contact reminders: notify Alex when the requested callback window begins.
+    let reminder_db = state.db.clone();
+    let reminder_tg = state.config.telegram.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(120)); // every 2 min
+        loop {
+            interval.tick().await;
+            if let Err(e) = aust_api::services::flash_contact_service::run_reminder_check(
+                &reminder_db, &reminder_tg,
+            ).await {
+                tracing::warn!("Flash contact reminder check failed: {e}");
+            }
+        }
+    });
+    tracing::info!("Flash contact reminder task started");
+
     // Create router and start server
     let app = create_router(state);
 

@@ -85,6 +85,17 @@ impl IntoResponse for ApiError {
     }
 }
 
+impl From<aust_flash_contact::FlashContactError> for ApiError {
+    fn from(err: aust_flash_contact::FlashContactError) -> Self {
+        match err {
+            aust_flash_contact::FlashContactError::Database(e) => ApiError::Database(e),
+            aust_flash_contact::FlashContactError::UnknownTimePreference(msg) => {
+                ApiError::Internal(format!("flash contact bad time preference: {msg}"))
+            }
+        }
+    }
+}
+
 impl From<aust_core::Error> for ApiError {
     fn from(err: aust_core::Error) -> Self {
         match err {

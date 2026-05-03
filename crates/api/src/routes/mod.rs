@@ -8,6 +8,7 @@ pub mod customer;
 pub mod distance;
 pub mod employee;
 pub mod estimates;
+pub mod flash_contact;
 pub mod health;
 pub mod inquiries;
 pub mod inquiry_actions;
@@ -44,6 +45,7 @@ pub fn public_api_router() -> Router<Arc<AppState>> {
         .nest("/estimates", estimates::public_router())
         .nest("/media", estimates::public_router())
         .route("/distance/calculate", post(distance::calculate))
+        .merge(flash_contact::router())
 }
 
 /// Protected API routes (require admin JWT).

@@ -186,16 +186,18 @@ async fn handle_ar_submission(
     let now = chrono::Utc::now();
 
     // Pre-compute pure values before acquiring the transaction
-    let (dep_street, dep_city, dep_postal) = merge_address_parts(
+    let (dep_street_full, dep_city, dep_postal) = merge_address_parts(
         services::vision::parse_address(&departure_address),
         form.departure_city.as_deref(),
         form.departure_postal.as_deref(),
     );
-    let (arr_street, arr_city, arr_postal) = merge_address_parts(
+    let (dep_street, dep_hn) = split_street_house_number(&dep_street_full);
+    let (arr_street_full, arr_city, arr_postal) = merge_address_parts(
         services::vision::parse_address(&arrival_address),
         form.arrival_city.as_deref(),
         form.arrival_postal.as_deref(),
     );
+    let (arr_street, arr_hn) = split_street_house_number(&arr_street_full);
     let scheduled_date_naive = form
         .scheduled_date
         .as_deref()
@@ -241,7 +243,7 @@ async fn handle_ar_submission(
             Some(dep_postal.as_str()).filter(|s| !s.is_empty()),
             form.departure_floor.as_deref(),
             form.departure_elevator,
-            None,
+            dep_hn.as_deref(),
             form.departure_parking_ban,
         )
         .await
@@ -254,7 +256,7 @@ async fn handle_ar_submission(
             Some(arr_postal.as_str()).filter(|s| !s.is_empty()),
             form.arrival_floor.as_deref(),
             form.arrival_elevator,
-            None,
+            arr_hn.as_deref(),
             form.arrival_parking_ban,
         )
         .await
@@ -723,19 +725,25 @@ async fn video_inquiry(
     let now = chrono::Utc::now();
 
     // Pre-compute pure values before acquiring the transaction
-    let (dep_street, dep_city, dep_postal) = merge_address_parts(
+    let (dep_street_full, dep_city, dep_postal) = merge_address_parts(
         services::vision::parse_address(&departure_address),
         departure_city.as_deref(),
         departure_postal.as_deref(),
     );
-    let (arr_street, arr_city, arr_postal) = merge_address_parts(
+    let (dep_street, dep_hn) = split_street_house_number(&dep_street_full);
+    let (arr_street_full, arr_city, arr_postal) = merge_address_parts(
         services::vision::parse_address(&arrival_address),
         arrival_city.as_deref(),
         arrival_postal.as_deref(),
     );
+    let (arr_street, arr_hn) = split_street_house_number(&arr_street_full);
     let stop_parsed = stop_address.as_deref()
         .filter(|s| !s.trim().is_empty())
-        .map(|a| services::vision::parse_address(a));
+        .map(|a| {
+            let (street, city, postal) = services::vision::parse_address(a);
+            let (street_clean, hn) = split_street_house_number(&street);
+            (street_clean, hn, city, postal)
+        });
     let scheduled_date_naive = scheduled_date.as_deref()
         .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok());
     let notes = build_notes(services_text.as_deref(), departure_parking_ban, arrival_parking_ban, message.as_deref());
@@ -770,7 +778,7 @@ async fn video_inquiry(
             Some(dep_postal.as_str()).filter(|s| !s.is_empty()),
             departure_floor.as_deref(),
             departure_elevator,
-            None,
+            dep_hn.as_deref(),
             departure_parking_ban,
         )
         .await
@@ -783,7 +791,7 @@ async fn video_inquiry(
             Some(arr_postal.as_str()).filter(|s| !s.is_empty()),
             arrival_floor.as_deref(),
             arrival_elevator,
-            None,
+            arr_hn.as_deref(),
             arrival_parking_ban,
         )
         .await
@@ -824,7 +832,7 @@ async fn video_inquiry(
             None
         };
 
-        let stop_id: Option<Uuid> = if let Some((stop_street, stop_city, stop_postal)) = stop_parsed {
+        let stop_id: Option<Uuid> = if let Some((stop_street, stop_hn, stop_city, stop_postal)) = stop_parsed {
             Some(
                 address_repo::create(
                     &mut *tx,
@@ -833,7 +841,7 @@ async fn video_inquiry(
                     Some(stop_postal.as_str()).filter(|s| !s.is_empty()),
                     stop_floor.as_deref(),
                     stop_elevator,
-                    None,
+                    stop_hn.as_deref(),
                     stop_parking_ban,
                 )
                 .await
@@ -978,16 +986,18 @@ async fn manual_inquiry(
     let now = chrono::Utc::now();
 
     // Pre-compute pure values before acquiring the transaction
-    let (dep_street, dep_city, dep_postal) = merge_address_parts(
+    let (dep_street_full, dep_city, dep_postal) = merge_address_parts(
         services::vision::parse_address(departure_address),
         form.departure_city.as_deref(),
         form.departure_postal.as_deref(),
     );
-    let (arr_street, arr_city, arr_postal) = merge_address_parts(
+    let (dep_street, dep_hn) = split_street_house_number(&dep_street_full);
+    let (arr_street_full, arr_city, arr_postal) = merge_address_parts(
         services::vision::parse_address(arrival_address),
         form.arrival_city.as_deref(),
         form.arrival_postal.as_deref(),
     );
+    let (arr_street, arr_hn) = split_street_house_number(&arr_street_full);
     let scheduled_date_naive = form
         .scheduled_date
         .as_deref()
@@ -1024,7 +1034,7 @@ async fn manual_inquiry(
             Some(dep_postal.as_str()).filter(|s| !s.is_empty()),
             form.departure_floor.as_deref(),
             form.departure_elevator,
-            None,
+            dep_hn.as_deref(),
             form.departure_parking_ban,
         )
         .await
@@ -1037,7 +1047,7 @@ async fn manual_inquiry(
             Some(arr_postal.as_str()).filter(|s| !s.is_empty()),
             form.arrival_floor.as_deref(),
             form.arrival_elevator,
-            None,
+            arr_hn.as_deref(),
             form.arrival_parking_ban,
         )
         .await
@@ -1388,6 +1398,27 @@ pub(crate) fn merge_address_parts(
     (street, parsed_city, parsed_postal)
 }
 
+/// @notice Legacy data (pre-2026-05) has house numbers concatenated into the
+///         street field (e.g. "Musterstr. 1") with `house_number` = NULL
+///         because all submission handlers passed `None` for house_number.
+///         The admin frontend (AddressEditor.svelte) also duplicates this logic
+///         for display. When touching the addresses table, consider backfilling
+///         with a migration to clean up legacy rows.
+///
+/// @dev Split a street like "Musterstr. 1" into ("Musterstr.", Some("1")).
+///      Returns the original string unchanged if no house number is detected.
+pub(crate) fn split_street_house_number(street: &str) -> (String, Option<String>) {
+    let trimmed = street.trim();
+    if let Some(last_space) = trimmed.rfind(' ') {
+        let candidate = trimmed[last_space + 1..].trim();
+        if candidate.chars().next().map_or(false, |c| c.is_ascii_digit()) {
+            let street_part = trimmed[..last_space].trim().to_string();
+            return (street_part, Some(candidate.to_string()));
+        }
+    }
+    (trimmed.to_string(), None)
+}
+
 pub(crate) fn parse_bool_field(value: &str) -> bool {
     matches!(
         value.trim().to_lowercase().as_str(),
@@ -1424,19 +1455,25 @@ pub(crate) async fn handle_submission(
     let now = chrono::Utc::now();
 
     // Pre-compute pure values before acquiring the transaction
-    let (dep_street, dep_city, dep_postal) = merge_address_parts(
+    let (dep_street_full, dep_city, dep_postal) = merge_address_parts(
         services::vision::parse_address(&departure_address),
         form.departure_city.as_deref(),
         form.departure_postal.as_deref(),
     );
-    let (arr_street, arr_city, arr_postal) = merge_address_parts(
+    let (dep_street, dep_hn) = split_street_house_number(&dep_street_full);
+    let (arr_street_full, arr_city, arr_postal) = merge_address_parts(
         services::vision::parse_address(&arrival_address),
         form.arrival_city.as_deref(),
         form.arrival_postal.as_deref(),
     );
+    let (arr_street, arr_hn) = split_street_house_number(&arr_street_full);
     let stop_parsed = form.stop_address.as_deref()
         .filter(|s| !s.trim().is_empty())
-        .map(|a| services::vision::parse_address(a));
+        .map(|a| {
+            let (street, city, postal) = services::vision::parse_address(a);
+            let (street_clean, hn) = split_street_house_number(&street);
+            (street_clean, hn, city, postal)
+        });
     let scheduled_date_naive = form
         .scheduled_date
         .as_deref()
@@ -1473,7 +1510,7 @@ pub(crate) async fn handle_submission(
             Some(dep_postal.as_str()).filter(|s| !s.is_empty()),
             form.departure_floor.as_deref(),
             form.departure_elevator,
-            None,
+            dep_hn.as_deref(),
             form.departure_parking_ban,
         )
         .await
@@ -1486,7 +1523,7 @@ pub(crate) async fn handle_submission(
             Some(arr_postal.as_str()).filter(|s| !s.is_empty()),
             form.arrival_floor.as_deref(),
             form.arrival_elevator,
-            None,
+            arr_hn.as_deref(),
             form.arrival_parking_ban,
         )
         .await
@@ -1513,7 +1550,7 @@ pub(crate) async fn handle_submission(
             None
         };
 
-        let stop_id: Option<Uuid> = if let Some((stop_street, stop_city, stop_postal)) = stop_parsed {
+        let stop_id: Option<Uuid> = if let Some((stop_street, stop_hn, stop_city, stop_postal)) = stop_parsed {
             Some(
                 address_repo::create(
                     &mut *tx,
@@ -1522,7 +1559,7 @@ pub(crate) async fn handle_submission(
                     Some(stop_postal.as_str()).filter(|s| !s.is_empty()),
                     form.stop_floor.as_deref(),
                     form.stop_elevator,
-                    None,
+                    stop_hn.as_deref(),
                     form.stop_parking_ban,
                 )
                 .await
@@ -2106,6 +2143,43 @@ mod tests {
         assert_eq!(result.0, "Berlinstr. 5");
         assert_eq!(result.1, "Berlin");
         assert_eq!(result.2, "10115");
+    }
+
+    // ── split_street_house_number ───────────────────────────────────────
+
+    #[test]
+    fn split_extracts_house_number() {
+        let (street, hn) = split_street_house_number("Musterstr. 1");
+        assert_eq!(street, "Musterstr.");
+        assert_eq!(hn.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn split_handles_letter_suffix() {
+        let (street, hn) = split_street_house_number("Hauptstraße 123a");
+        assert_eq!(street, "Hauptstraße");
+        assert_eq!(hn.as_deref(), Some("123a"));
+    }
+
+    #[test]
+    fn split_handles_range() {
+        let (street, hn) = split_street_house_number("Am Markt 5-7");
+        assert_eq!(street, "Am Markt");
+        assert_eq!(hn.as_deref(), Some("5-7"));
+    }
+
+    #[test]
+    fn split_no_number_returns_original() {
+        let (street, hn) = split_street_house_number("Am Markt");
+        assert_eq!(street, "Am Markt");
+        assert_eq!(hn, None);
+    }
+
+    #[test]
+    fn split_empty_string() {
+        let (street, hn) = split_street_house_number("");
+        assert_eq!(street, "");
+        assert_eq!(hn, None);
     }
 
     // ── parse_bool_field ────────────────────────────────────────────────────

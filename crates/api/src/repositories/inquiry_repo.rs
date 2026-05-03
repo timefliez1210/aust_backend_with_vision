@@ -323,6 +323,8 @@ pub(crate) async fn update_fields(
     origin_address_id: Option<Uuid>,
     scheduled_date: Option<NaiveDate>,
     destination_address_id: Option<Uuid>,
+    // Some(None) = explicitly clear stop_address_id; Some(Some(id)) = set; None = leave unchanged.
+    stop_address_id: Option<Option<Uuid>>,
     service_type: Option<&str>,
     submission_mode: Option<&str>,
     recipient_id: Option<Uuid>,
@@ -347,15 +349,16 @@ pub(crate) async fn update_fields(
             end_time = COALESCE($9, end_time),
             origin_address_id = COALESCE($10, origin_address_id),
             destination_address_id = COALESCE($11, destination_address_id),
-            service_type = COALESCE($12, service_type),
-            submission_mode = COALESCE($13, submission_mode),
-            recipient_id = COALESCE($14, recipient_id),
-            billing_address_id = COALESCE($15, billing_address_id),
-            custom_fields = COALESCE($16, custom_fields),
-            employee_notes = COALESCE($17, employee_notes),
-            end_date = CASE WHEN $19 THEN $20 ELSE end_date END,
-            has_pauschale = COALESCE($21, has_pauschale),
-            updated_at = $18
+            stop_address_id = CASE WHEN $23 THEN $12 ELSE stop_address_id END,
+            service_type = COALESCE($13, service_type),
+            submission_mode = COALESCE($14, submission_mode),
+            recipient_id = COALESCE($15, recipient_id),
+            billing_address_id = COALESCE($16, billing_address_id),
+            custom_fields = COALESCE($17, custom_fields),
+            employee_notes = COALESCE($18, employee_notes),
+            end_date = CASE WHEN $20 THEN $21 ELSE end_date END,
+            has_pauschale = COALESCE($22, has_pauschale),
+            updated_at = $19
         WHERE id = $1
         "#,
     )
@@ -370,6 +373,7 @@ pub(crate) async fn update_fields(
     .bind(end_time)
     .bind(origin_address_id)
     .bind(destination_address_id)
+    .bind(stop_address_id.flatten())          // $12: value (None = NULL)
     .bind(service_type)
     .bind(submission_mode)
     .bind(recipient_id)
@@ -377,9 +381,10 @@ pub(crate) async fn update_fields(
     .bind(custom_fields)
     .bind(employee_notes)
     .bind(now)
-    .bind(end_date.is_some())               // $19: update end_date?
-    .bind(end_date.flatten())               // $20: value (None = NULL)
-    .bind(has_pauschale)                     // $21
+    .bind(end_date.is_some())               // $20: update end_date?
+    .bind(end_date.flatten())               // $21: value (None = NULL)
+    .bind(has_pauschale)                     // $22
+    .bind(stop_address_id.is_some())        // $23: update stop_address_id?
     .execute(pool)
     .await?;
     Ok(())

@@ -75,6 +75,10 @@ pub(crate) struct AddressInput {
     pub(crate) postal_code: Option<String>,
     pub(crate) floor: Option<String>,
     pub(crate) elevator: Option<bool>,
+    /// @notice Legacy data (pre-2026-05) may have house numbers embedded in
+    ///         `street` (e.g. "Musterstr. 1") with `house_number` = NULL.
+    ///         The admin frontend (AddressEditor.svelte) extracts the number
+    ///         for display. See `split_street_house_number()` in submissions.rs.
     pub(crate) house_number: Option<String>,
     pub(crate) parking_ban: Option<bool>,
 }
@@ -84,6 +88,8 @@ struct CreateInquiryRequest {
     customer_id: Uuid,
     origin: Option<AddressInput>,
     destination: Option<AddressInput>,
+    /// Inline stop address — if provided, creates an address record and sets stop_address_id.
+    stop: Option<AddressInput>,
     services: Option<Services>,
     notes: Option<String>,
     scheduled_date: Option<String>,
@@ -146,6 +152,12 @@ struct UpdateInquiryRequest {
     clear_end_date: Option<bool>,
     /// Enable travel daily allowance (Verpflegungspauschale) for multi-day trips.
     has_pauschale: Option<bool>,
+    /// Inline stop address — if provided, creates an address record and sets stop_address_id.
+    stop_address: Option<AddressInput>,
+    /// Link to an existing stop address by UUID.
+    stop_address_id: Option<Uuid>,
+    /// Set to `true` to explicitly clear the stop address.
+    clear_stop_address: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -216,6 +228,30 @@ async fn create_inquiry(
         None
     };
 
+    // Create stop address if provided inline
+    let stop_id = if let Some(ref addr) = request.stop {
+        let street = addr.street.as_deref().unwrap_or("").trim().to_string();
+        let city = addr.city.as_deref().unwrap_or("").trim().to_string();
+        if !street.is_empty() || !city.is_empty() {
+            let id = address_repo::create(
+                &state.db,
+                &street,
+                &city,
+                addr.postal_code.as_deref(),
+                addr.floor.as_deref(),
+                addr.elevator,
+                addr.house_number.as_deref(),
+                addr.parking_ban,
+            )
+            .await?;
+            Some(id)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     // Create billing address if provided inline
     let billing_address_id = if let Some(ref addr) = request.billing_address {
         let street = addr.street.as_deref().unwrap_or("").trim().to_string();
@@ -261,7 +297,7 @@ async fn create_inquiry(
         request.customer_id,
         origin_id,
         dest_id,
-        None,
+        stop_id,
         initial_status.as_str(),
         request.estimated_volume_m3,
         request.distance_km,
@@ -368,7 +404,10 @@ async fn update_inquiry(
             || request.services.is_some()
             || request.distance_km.is_some()
             || request.origin_address_id.is_some()
-            || request.destination_address_id.is_some();
+            || request.destination_address_id.is_some()
+            || request.stop_address_id.is_some()
+            || request.stop_address.is_some()
+            || request.clear_stop_address.unwrap_or(false);
         if locked_fields_modified {
             return Err(ApiError::Validation(
                 "Inquiry mit vorhandenem Angebot kann nicht mehr inhaltlich geändert werden (Volumen, Services, Entfernung, Adressen). Bitte Angebot neu erstellen.".into(),
@@ -425,6 +464,33 @@ async fn update_inquiry(
         resolved_billing_address_id
     };
 
+    // Resolve stop address.
+    // None = leave unchanged; Some(None) = clear; Some(Some(id)) = set.
+    let stop_address_id: Option<Option<Uuid>> = if request.clear_stop_address.unwrap_or(false) {
+        Some(None)
+    } else if let Some(ref addr) = request.stop_address {
+        let street = addr.street.as_deref().unwrap_or("").trim().to_string();
+        let city = addr.city.as_deref().unwrap_or("").trim().to_string();
+        if !street.is_empty() || !city.is_empty() {
+            let id = address_repo::create(
+                &state.db,
+                &street,
+                &city,
+                addr.postal_code.as_deref(),
+                addr.floor.as_deref(),
+                addr.elevator,
+                addr.house_number.as_deref(),
+                addr.parking_ban,
+            )
+            .await?;
+            Some(Some(id))
+        } else {
+            request.stop_address_id.map(Some)
+        }
+    } else {
+        request.stop_address_id.map(Some)
+    };
+
     let scheduled_date = request.scheduled_date.as_deref().and_then(|s| {
         chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
     });
@@ -450,6 +516,7 @@ async fn update_inquiry(
         request.origin_address_id,
         scheduled_date,
         request.destination_address_id,
+        stop_address_id,
         request.service_type.as_deref(),
         request.submission_mode.as_deref(),
         request.recipient_id,
