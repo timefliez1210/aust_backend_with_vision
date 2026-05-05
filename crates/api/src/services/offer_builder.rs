@@ -244,19 +244,18 @@ pub(crate) async fn build_offer_with_overrides(
     }
 
     // 7. Build line items.
-    //    Fahrkostenpauschale resolution order (first match wins):
-    //    a) overrides.fahrt_flat_total is Some  → admin explicitly set it (persisted to DB)
-    //    b) overrides.line_items contains entry → admin set it via line_items (also persisted)
-    //    c) neither                             → re-compute from ORS (NOT persisted as override)
+    //    Frontend sends a fully ordered list (line_items=Some). Backend trusts the order
+    //    and only resolves special items in-place: labor (filled with persons/hours/rate),
+    //    Fahrkostenpauschale (admin override or ORS), Nürnbergerversicherung (canonical
+    //    coverage line). If insurance is absent from the list, it is omitted from the offer
+    //    (= admin removed it). Custom items with quantity=0 are filtered out (skeleton
+    //    placeholders the admin left blank).
+    //
+    //    When line_items is None (auto-gen / Telegram path): compose default order matching
+    //    the admin UI's preferred sequence.
     let inquiry_services = inquiry.services.clone().unwrap_or_default();
 
     // Resolved fahrt value: Some(euros) if admin-set (or previously admin-set), None if ORS should calculate.
-    // Resolution order (first match wins):
-    //   1. fahrt_reset=true              → None (force ORS, clear any stored override)
-    //   2. explicit fahrt_flat_total     → use it directly (new admin value)
-    //   3. line_items has Fahrkostenpauschale → extract from line item (admin-edited line items)
-    //   4. existing_offer_id is set      → load stored fahrt_override_cents from DB (admin set it before)
-    //   5. none of the above             → None (first generation — ORS will calculate)
     let admin_fahrt_euros: Option<f64> = if overrides.fahrt_reset {
         None
     } else if let Some(v) = overrides.fahrt_flat_total {
@@ -265,9 +264,13 @@ pub(crate) async fn build_offer_with_overrides(
         items
             .iter()
             .find(|li| li.description == "Fahrkostenpauschale")
-            .map(|li| li.flat_total.unwrap_or(li.quantity * li.unit_price))
+            .and_then(|li| {
+                li.flat_total.or_else(|| {
+                    let q = li.quantity * li.unit_price;
+                    if q > 0.0 { Some(q) } else { None }
+                })
+            })
     } else if let Some(existing_id) = overrides.existing_offer_id {
-        // Admin override was set before — carry it forward unconditionally.
         offer_repo::fetch_fahrt_override(db, existing_id)
             .await?
             .map(|c| c as f64 / 100.0)
@@ -275,7 +278,22 @@ pub(crate) async fn build_offer_with_overrides(
         None
     };
 
-    let fahrt_item = if let Some(total) = admin_fahrt_euros {
+    let make_labor = |rate: f64| OfferLineItem {
+        description: format!("{} Umzugshelfer", pricing_result.estimated_helpers),
+        quantity: pricing_result.estimated_hours,
+        unit_price: rate,
+        is_labor: true,
+        ..Default::default()
+    };
+    let make_insurance = || OfferLineItem {
+        description: "Nürnbergerversicherung".to_string(),
+        quantity: 1.0,
+        unit_price: 0.0,
+        flat_total: Some(0.0),
+        remark: Some("Deckungssumme: 620,00 Euro / m³".to_string()),
+        ..Default::default()
+    };
+    let resolved_fahrt_item = if let Some(total) = admin_fahrt_euros {
         OfferLineItem {
             description: "Fahrkostenpauschale".to_string(),
             quantity: 0.0,
@@ -288,29 +306,46 @@ pub(crate) async fn build_offer_with_overrides(
         build_fahrt_item(config, origin.as_ref(), destination.as_ref(), stop_address.as_ref(), distance).await
     };
 
-    let line_items = if let Some(ref items) = overrides.line_items {
-        let mut result = vec![fahrt_item];
-        result.extend(
-            items
-                .iter()
-                .filter(|li| li.description != "Fahrkostenpauschale" && li.description != "Nürnbergerversicherung")
-                .cloned(),
-        );
-        // Always append Nürnbergerversicherung last — non-editable fixed item
-        result.push(OfferLineItem {
-            description: "Nürnbergerversicherung".to_string(),
-            quantity: 1.0,
-            unit_price: 0.0,
-            flat_total: Some(0.0),
-            remark: Some("Deckungssumme: 620,00 Euro / m³".to_string()),
-            ..Default::default()
-        });
+    let line_items: Vec<OfferLineItem> = if let Some(ref items) = overrides.line_items {
+        // Admin sent an authoritative ordered list. Resolve special items in-place,
+        // filter qty=0 placeholders, preserve order.
+        let mut result = Vec::with_capacity(items.len());
+        for li in items {
+            let is_labor_item = li.is_labor || li.description.ends_with("Umzugshelfer");
+            let is_fahrt = li.description == "Fahrkostenpauschale";
+            let is_insurance = li.description == "Nürnbergerversicherung";
+
+            if is_labor_item {
+                // Unit price filled in after rate resolution below
+                result.push(make_labor(0.0));
+            } else if is_fahrt {
+                result.push(resolved_fahrt_item.clone());
+            } else if is_insurance {
+                result.push(make_insurance());
+            } else if li.quantity > 0.0 {
+                result.push(li.clone());
+            }
+            // qty=0 custom items: dropped (skeleton placeholders)
+        }
         result
     } else {
-        let mut items = vec![fahrt_item];
+        // Auto-gen / Telegram path: labor first, then service items, then fahrt, insurance last.
         let service_prices = ServicePrices::from_config(config);
-        items.extend(build_line_items(&inquiry_services, &service_prices));
-        items
+        let auto = build_line_items(&inquiry_services, &service_prices);
+        let mut services_items: Vec<OfferLineItem> = Vec::new();
+        let mut insurance: Option<OfferLineItem> = None;
+        for item in auto {
+            match item.description.as_str() {
+                "Nürnbergerversicherung" => insurance = Some(item),
+                _ => services_items.push(item),
+            }
+        }
+        let mut composed: Vec<OfferLineItem> = Vec::new();
+        composed.push(make_labor(0.0));
+        composed.extend(services_items);
+        composed.push(resolved_fahrt_item.clone());
+        if let Some(i) = insurance { composed.push(i); }
+        composed
     };
 
     let rate_override = calculate_rate_override(
@@ -320,6 +355,17 @@ pub(crate) async fn build_offer_with_overrides(
         pricing_result.estimated_hours,
         &line_items,
     );
+
+    // Fill labor unit_price now that rate is resolved.
+    let line_items: Vec<OfferLineItem> = line_items
+        .into_iter()
+        .map(|mut li| {
+            if li.is_labor {
+                li.unit_price = rate_override;
+            }
+            li
+        })
+        .collect();
 
     // 8. Build OfferData
     let now = chrono::Utc::now();
@@ -401,15 +447,8 @@ pub(crate) async fn build_offer_with_overrides(
     let valid_until_date =
         valid_days.map(|days| (now + chrono::Duration::days(days)).date_naive());
 
-    // Labor is always the first line item
-    let mut all_items = vec![OfferLineItem {
-        description: format!("{} Umzugshelfer", pricing_result.estimated_helpers),
-        quantity: pricing_result.estimated_hours,
-        unit_price: rate_override,
-        is_labor: true,
-        ..Default::default()
-    }];
-    all_items.extend(line_items);
+    // line_items is already the full ordered list (labor / fahrt / insurance resolved in place).
+    let all_items = line_items;
 
     let offer_data = OfferData {
         offer_number: offer_number.clone(),

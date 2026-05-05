@@ -141,7 +141,17 @@ export AUST__TELEGRAM__ADMIN_CHAT_ID=0
 
 export AUST__AUTH__JWT_SECRET="dev-jwt-secret-do-not-use-in-production-min32chars"
 
-export AUST__VISION_SERVICE__ENABLED=false
+# Vision Service — disabled by default in dev to avoid accidentally consuming
+# Modal GPU credits. Set AUST_DEV_VISION=1 before running dev-up.sh to
+# enable real Modal calls against the deployed endpoints (URLs pulled from
+# .env / config). This is useful for end-to-end vision pipeline testing.
+if [[ -n "${AUST_DEV_VISION:-}" ]]; then
+    export AUST__VISION_SERVICE__ENABLED=true
+    echo "  Vision service ENABLED → real Modal calls active"
+else
+    export AUST__VISION_SERVICE__ENABLED=false
+    echo "  Vision service DISABLED → set AUST_DEV_VISION=1 to enable real Modal"
+fi
 
 export AUST__COMPANY__DEPOT_ADDRESS="Borsigstr 6 31135 Hildesheim"
 export AUST__COMPANY__FAHRT_RATE_PER_KM=1.00

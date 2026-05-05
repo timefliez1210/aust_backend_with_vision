@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::repositories::{calendar_repo, email_repo, estimation_repo, inquiry_repo, offer_repo};
+use crate::repositories::{address_repo, calendar_repo, email_repo, estimation_repo, inquiry_repo, offer_repo};
 use crate::routes::offers::{build_offer_with_overrides, OfferOverrides};
 use crate::routes::submissions::{
     parse_inquiry_form, process_submission_background, process_video_background,
@@ -135,11 +135,34 @@ pub(crate) async fn update_inquiry_items(
     Path(inquiry_id): Path<Uuid>,
     Json(request): Json<UpdateEstimationItemsRequest>,
 ) -> Result<Json<EstimationDetail>, ApiError> {
-    // Get latest estimation for this inquiry
+    // Get latest estimation for this inquiry (or create one if none exists)
     let (estimation_id, estimation_method, est_source_data) =
-        estimation_repo::fetch_latest_for_inquiry(&state.db, inquiry_id)
-            .await?
-            .ok_or_else(|| ApiError::NotFound("Keine Schaetzung fuer diese Anfrage".into()))?;
+        match estimation_repo::fetch_latest_for_inquiry(&state.db, inquiry_id).await? {
+            Some(row) => row,
+            None => {
+                // Manually created inquiries (e.g. "termin" mode) have no estimation.
+                // Auto-create one so the admin can add items via the dashboard.
+                let new_id = Uuid::now_v7();
+                let now = chrono::Utc::now();
+                let source_data = serde_json::json!({
+                    "origin": "admin_inventory_edit",
+                    "created_at": now.to_rfc3339(),
+                });
+                estimation_repo::upsert(
+                    &state.db,
+                    new_id,
+                    inquiry_id,
+                    "inventory",
+                    &source_data,
+                    None,
+                    0.0,
+                    0.0,
+                    now,
+                )
+                .await?;
+                (new_id, "inventory".to_string(), Some(source_data))
+            }
+        };
 
     // Calculate new total volume
     let total_volume: f64 = request
@@ -768,6 +791,266 @@ pub(crate) async fn update_assignment(
         "misc_costs_cents": row.misc_costs_cents,
         "meal_deduction": row.meal_deduction,
     })))
+}
+
+/// POST /api/v1/inquiries/{id}/estimations/{estimation_id}/retry — Retry a failed estimation.
+///
+/// **Caller**: Admin dashboard "Retry" button on failed estimations.
+/// **Why**: When a vision estimation fails (Modal timeout, OOM, etc.) the admin needs
+///          a one-click retry that reuses the original images/video from S3 without
+///          re-uploading from the browser.
+///
+/// # What it does
+/// 1. Fetches the failed estimation row.
+/// 2. Reads `source_data.s3_keys` or `source_data.video_s3_key`.
+/// 3. Downloads the original media from S3.
+/// 4. Creates a **new** `volume_estimations` row so the failure history is preserved.
+/// 5. Spawns the same background pipeline as a fresh submission.
+///
+/// # Returns
+/// `202 Accepted` with the new `estimation_id` for polling.
+///
+/// # Errors
+/// - `404` if inquiry or estimation not found.
+/// - `400` if estimation status is not `failed`.
+/// - `400` if no S3 keys were stored in `source_data`.
+/// - `500` if S3 download fails.
+pub(crate) async fn retry_estimation(
+    State(state): State<Arc<AppState>>,
+    Path((inquiry_id, estimation_id)): Path<(Uuid, Uuid)>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    // 1. Verify inquiry exists
+    let inquiry = inquiry_repo::fetch_by_id(&state.db, inquiry_id).await?;
+
+    // 2. Fetch the failed estimation
+    let existing = estimation_repo::fetch_by_id(&state.db, estimation_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Estimation nicht gefunden".into()))?;
+
+    if existing.inquiry_id != inquiry_id {
+        return Err(ApiError::BadRequest(
+            "Estimation gehört nicht zur Anfrage".into(),
+        ));
+    }
+
+    if existing.status != "failed" {
+        return Err(ApiError::BadRequest(format!(
+            "Estimation muss 'failed' sein zum Wiederholen (aktuell: {})",
+            existing.status
+        )));
+    }
+
+    // 3. Build address strings from the inquiry's origin/destination
+    let origin = if let Some(id) = inquiry.origin_address_id {
+        address_repo::fetch_by_id(&state.db, id).await? // returns Option<AddressRow>
+    } else {
+        None
+    };
+    let destination = if let Some(id) = inquiry.destination_address_id {
+        address_repo::fetch_by_id(&state.db, id).await?
+    } else {
+        None
+    };
+
+    let departure_address = origin.map_or_else(String::new, |a| {
+        let hn = a.house_number.as_deref().unwrap_or("");
+        let p = a.postal_code.as_deref().unwrap_or("");
+        let city = a.city.as_str();
+        let base = if !hn.is_empty() {
+            format!("{} {}", a.street, hn)
+        } else {
+            a.street
+        };
+        if !p.is_empty() {
+            format!("{}, {} {}", base, p, city)
+        } else {
+            format!("{}, {}", base, city)
+        }
+    });
+
+    let arrival_address = destination.map_or_else(String::new, |a| {
+        let hn = a.house_number.as_deref().unwrap_or("");
+        let p = a.postal_code.as_deref().unwrap_or("");
+        let city = a.city;
+        let base = if !hn.is_empty() {
+            format!("{} {}", a.street, hn)
+        } else {
+            a.street
+        };
+        if !p.is_empty() {
+            format!("{}, {} {}", base, p, city)
+        } else {
+            format!("{}, {}", base, city)
+        }
+    });
+
+    // 4. Read S3 keys from the original estimation's source_data
+    let s3_keys: Vec<String> = existing
+        .source_data
+        .get("s3_keys")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let video_key = existing
+        .source_data
+        .get("video_s3_key")
+        .and_then(|v| v.as_str().map(String::from));
+
+    let video_mime: String = existing
+        .source_data
+        .get("video_mime")
+        .and_then(|v| v.as_str().map(String::from))
+        .unwrap_or_else(|| "video/mp4".to_string());
+
+    // 5. Create a new estimation row (preserve history — don't overwrite the failed one)
+    let new_estimation_id = Uuid::now_v7();
+    let now = chrono::Utc::now();
+
+    // Normalise method: legacy admin uploads use "depth_sensor" but the actual pipeline
+    // runs as "vision" (Grounding DINO + SAM2 + depth).
+    let method = match existing.method.as_str() {
+        "depth_sensor" => "vision",
+        m => m,
+    };
+
+    estimation_repo::create_processing(&state.db, new_estimation_id, inquiry_id, method).await?;
+
+    if !s3_keys.is_empty() {
+        // ── Photo / vision retry ──────────────────────────────────────────────
+        let mut new_source_data = existing.source_data.clone();
+        if let Some(obj) = new_source_data.as_object_mut() {
+            obj.insert(
+                "retry_of".to_string(),
+                serde_json::Value::String(estimation_id.to_string()),
+            );
+            obj.insert(
+                "retry_at".to_string(),
+                serde_json::Value::String(now.to_rfc3339()),
+            );
+        }
+        estimation_repo::update_source_data(&state.db, new_estimation_id, &new_source_data)
+            .await?;
+
+        // Download images from S3
+        let mut images: Vec<(Vec<u8>, String)> = Vec::with_capacity(s3_keys.len());
+        for key in &s3_keys {
+            let bytes = state
+                .storage
+                .download(key)
+                .await
+                .map_err(|e| ApiError::Internal(format!("Konnte Bild nicht von S3 laden ({key}): {e}")))?;
+            let mime = if key.ends_with(".png") {
+                "image/png"
+            } else {
+                "image/jpeg"
+            };
+            images.push((bytes.to_vec(), mime.to_string()));
+        }
+
+        tracing::info!(
+            inquiry_id = %inquiry_id,
+            old_estimation_id = %estimation_id,
+            new_estimation_id = %new_estimation_id,
+            image_count = images.len(),
+            "Spawning retry background processing for photos"
+        );
+
+        let state_bg = Arc::clone(&state);
+        let dep_addr = departure_address;
+        let arr_addr = arrival_address;
+        let s3_keys_bg = s3_keys;
+        tokio::spawn(async move {
+            if let Err(e) = process_submission_background(
+                Arc::clone(&state_bg),
+                inquiry_id,
+                new_estimation_id,
+                images,
+                Vec::new(),           // depth_maps (not available on retry)
+                None,                 // ar_metadata
+                dep_addr,
+                arr_addr,
+                s3_keys_bg,
+                now,
+            )
+            .await
+            {
+                tracing::error!(
+                    estimation_id = %new_estimation_id,
+                    error = %e,
+                    "Retry background processing failed"
+                );
+                let _ = estimation_repo::mark_failed(&state_bg.db, new_estimation_id).await;
+            }
+        });
+    } else if let Some(vk) = video_key {
+        // ── Video retry ──────────────────────────────────────────────────────
+        let mut new_source_data = existing.source_data.clone();
+        if let Some(obj) = new_source_data.as_object_mut() {
+            obj.insert(
+                "retry_of".to_string(),
+                serde_json::Value::String(estimation_id.to_string()),
+            );
+        }
+        estimation_repo::update_source_data(&state.db, new_estimation_id, &new_source_data)
+            .await?;
+
+        let bytes = state
+            .storage
+            .download(&vk)
+            .await
+            .map_err(|e| ApiError::Internal(format!("Konnte Video nicht von S3 laden ({vk}): {e}")))?;
+        let video_bytes = bytes.to_vec();
+        let mime = video_mime;
+        let s3_key = vk;
+
+        tracing::info!(
+            inquiry_id = %inquiry_id,
+            old_estimation_id = %estimation_id,
+            new_estimation_id = %new_estimation_id,
+            video_bytes = video_bytes.len(),
+            "Spawning retry background processing for video"
+        );
+
+        let state_bg = Arc::clone(&state);
+        tokio::spawn(async move {
+            if let Err(e) = process_video_background(
+                Arc::clone(&state_bg),
+                inquiry_id,
+                new_estimation_id,
+                video_bytes,
+                mime,
+                s3_key,
+            )
+            .await
+            {
+                tracing::error!(
+                    estimation_id = %new_estimation_id,
+                    error = %e,
+                    "Retry video background processing failed"
+                );
+                let _ = estimation_repo::mark_failed(&state_bg.db, new_estimation_id).await;
+            }
+        });
+    } else {
+        return Err(ApiError::BadRequest(
+            "Keine S3-Medien in der Estimation gefunden — Retry nicht möglich".into(),
+        ));
+    }
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "estimation_id": new_estimation_id,
+            "inquiry_id": inquiry_id,
+            "status": "processing",
+            "message": "Analyse wird wiederholt — neuer Estimation-Eintrag erstellt."
+        })),
+    ))
 }
 
 /// `DELETE /api/v1/inquiries/{id}/employees/{emp_id}` — Remove employee from inquiry.

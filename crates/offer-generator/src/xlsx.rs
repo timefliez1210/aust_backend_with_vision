@@ -406,27 +406,27 @@ fn build_cell_modifications(
     const STYLES_F_LABOR: [&str; 2] = ["86", "85"];   // column F labor (€/Stunde)
     const STYLES_G: [&str; 2] = ["84", "83"];          // column G (right-aligned €)
 
-    // 1. Hide ALL template rows 31-42 and clear their content
-    let mut hidden_rows: Vec<u32> = (31..=42).collect();
+    // 1. Hide ALL template rows 31-50 and clear their content
+    let mut hidden_rows: Vec<u32> = (31..=50).collect();
     let mut unhidden_rows: Vec<u32> = Vec::new();
 
-    for row in 31..=42u32 {
+    for row in 31..=50u32 {
         mods.push((format!("E{row}"), CellValue::Number(0.0)));
         mods.push((format!("F{row}"), CellValue::Number(0.0)));
     }
 
     // 2. Write items sequentially starting at row 31
     // L1: warn when line items exceed template capacity
-    if data.line_items.len() > 12 {
+    if data.line_items.len() > 20 {
         tracing::warn!(
             offer_number = %data.offer_number,
             total_items = data.line_items.len(),
-            max_items = 12,
-            "Offer has {} line items but template only has 12 slots (rows 31-42). Excess items will be truncated in PDF.",
+            max_items = 20,
+            "Offer has {} line items but template only has 20 slots (rows 31-50). Excess items will be truncated in PDF.",
             data.line_items.len()
         );
     }
-    let max_items = 12.min(data.line_items.len()); // template has 12 slots (31-42)
+    let max_items = 20.min(data.line_items.len()); // template has 20 slots (31-50)
     for (i, item) in data.line_items.iter().take(max_items).enumerate() {
         let row = 31 + i as u32;
         let color = 1 - i % 2; // 1 = blue (first row), 0 = white
@@ -481,8 +481,8 @@ fn build_cell_modifications(
 
             // Write formula to G with right-aligned € style
             if item.is_labor {
-                mods.push(("J50".into(), CellValue::Number(data.persons as f64)));
-                let formula = format!("IF(E{row}=\"\", 0, F{row}*E{row}*J50)");
+                mods.push(("J58".into(), CellValue::Number(data.persons as f64)));
+                let formula = format!("IF(E{row}=\"\", 0, F{row}*E{row}*J58)");
                 mods.push((format!("G{row}"), CellValue::StyledFormula(formula, STYLES_G[color])));
             } else {
                 let formula = format!("IF(E{row}=\"\", 0, F{row}*E{row})");
@@ -494,8 +494,9 @@ fn build_cell_modifications(
     // Remove unhidden rows from hidden list
     hidden_rows.retain(|r| !unhidden_rows.contains(r));
 
-    // Rewrite G44 formula: SUM instead of individual row references (keep € right-aligned style)
-    mods.push(("G44".into(), CellValue::StyledFormula("SUM(G31:G42)".into(), "72")));
+    // Rewrite the totals SUM formula. After template extension, the G44 cell is now G52
+    // (rows 43+ were shifted down by 8 to make room for 8 extra line-item slots).
+    mods.push(("G52".into(), CellValue::StyledFormula("SUM(G31:G50)".into(), "72")));
 
     (mods, hidden_rows, unhidden_rows)
 }
@@ -1684,10 +1685,10 @@ mod tests {
     }
 
     #[test]
-    fn j50_contains_persons_count() {
+    fn j58_contains_persons_count() {
         let mut data = minimal_offer_data();
         data.persons = 4;
-        // Need a labor line item to trigger J50 write
+        // Need a labor line item to trigger J58 write (was J50 before template extension to 20 rows).
         data.line_items = vec![OfferLineItem {
             description: "4 Umzugshelfer".to_string(),
             quantity: 5.0,
@@ -1698,9 +1699,8 @@ mod tests {
         }];
         let bytes = generate_offer_xlsx(&data).expect("generate should succeed");
         let xml = read_xlsx_sheet1(&bytes);
-        // J50 should be present with value 4
-        assert!(xml.contains(r#"r="J50""#), "J50 cell should exist in XML");
-        assert!(xml.contains("<v>4</v>"), "J50 should contain value 4");
+        assert!(xml.contains(r#"r="J58""#), "J58 cell should exist in XML");
+        assert!(xml.contains("<v>4</v>"), "J58 should contain value 4");
     }
 
     #[test]

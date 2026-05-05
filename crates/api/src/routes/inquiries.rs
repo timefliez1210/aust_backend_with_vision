@@ -19,8 +19,8 @@ use crate::repositories::{address_repo, calendar_repo, customer_repo, estimation
 use crate::routes::estimates::collect_estimation_s3_keys;
 use crate::routes::inquiry_actions::{
     assign_employee, generate_inquiry_offer, list_inquiry_employees, remove_assignment,
-    trigger_estimate, trigger_estimate_upload, trigger_video_upload, update_assignment,
-    update_inquiry_items,
+    retry_estimation, trigger_estimate, trigger_estimate_upload, trigger_video_upload,
+    update_assignment, update_inquiry_items,
 };
 use crate::services::inquiry_builder;
 use crate::{ApiError, AppState};
@@ -45,6 +45,7 @@ pub fn router() -> Router<Arc<AppState>> {
             get(get_inquiry).patch(update_inquiry).delete(delete_inquiry),
         )
         .route("/{id}/pdf", get(get_inquiry_pdf))
+        .route("/{id}/estimations/{estimation_id}/retry", post(retry_estimation))
         .route("/{id}/items", put(update_inquiry_items))
         .route("/{id}/estimate/depth", post(trigger_estimate_upload))
         .route("/{id}/estimate/video", post(trigger_video_upload))
