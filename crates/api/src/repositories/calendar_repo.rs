@@ -48,6 +48,7 @@ pub(crate) struct ScheduleCalendarItemRow {
     pub day_number: i32,
     pub total_days: i32,
     pub scheduled_date: NaiveDate,
+    pub description: Option<String>,
 }
 
 /// One employee assignment row returned by `fetch_inquiry_employees` /
@@ -271,6 +272,7 @@ pub(crate) async fn fetch_schedule_calendar_items(
             ci.title,
             ci.category,
             ci.location,
+            ci.description,
             COALESCE(ci.start_time, '08:00'::time)                     AS start_time,
             ci.end_time,
             COUNT(cie.employee_id)                                      AS employees_assigned,

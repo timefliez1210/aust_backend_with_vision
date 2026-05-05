@@ -79,6 +79,7 @@ struct ScheduleCalendarItem {
     day_number: i32,
     total_days: i32,
     scheduled_date: NaiveDate,
+    description: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -338,6 +339,7 @@ async fn get_schedule(
             day_number: r.day_number,
             total_days: r.total_days,
             scheduled_date: r.scheduled_date,
+            description: r.description,
         });
     }
 
