@@ -242,20 +242,26 @@ pub fn generate_offer_xlsx(data: &OfferData) -> Result<Vec<u8>, OfferError> {
     // Remove hyperlinks section — we want plain text, not clickable links
     modified_sheet1 = strip_hyperlinks(&modified_sheet1);
 
+    // Keep fitToPage="true" + fitToWidth="1" so columns are scaled to one page wide,
+    // but set fitToHeight="0" so vertical pagination is *not* squeezed into N pages —
+    // the template's manual rowBreak above row 70 (where the conditions textbox is
+    // anchored) is then honoured, and the textbox lands cleanly on page 2 instead of
+    // splitting across pages.
+    modified_sheet1 = modified_sheet1.replace(
+        r#"fitToWidth="1" fitToHeight="2""#,
+        r#"fitToWidth="1" fitToHeight="0""#,
+    );
+
     // Read and fix workbook.xml (print area + possibly add items sheet reference)
     let workbook_xml = read_zip_entry(&mut template_zip, "xl/workbook.xml")?;
     let workbook_str = String::from_utf8(workbook_xml)
         .map_err(|e| OfferError::Template(format!("workbook.xml is not valid UTF-8: {e}")))?;
 
-    let has_items = !data.detected_items.is_empty();
+    // Items sheet (page 3 in PDF) intentionally suppressed for now per product decision.
+    let has_items = false;
     let modified_workbook = modify_workbook(&workbook_str, has_items);
 
-    // Build items sheet if needed
-    let items_sheet_xml = if has_items {
-        Some(build_items_sheet_xml(&data.detected_items))
-    } else {
-        None
-    };
+    let items_sheet_xml: Option<String> = None;
 
     // Read and modify Content_Types and rels if we're adding items sheet
     let content_types_xml = read_zip_entry(&mut template_zip, "[Content_Types].xml")?;
@@ -1092,6 +1098,7 @@ fn add_items_sheet_to_workbook(xml: &str) -> String {
 ///
 /// # Returns
 /// A complete `xl/worksheets/sheet2.xml` content string ready to write into the output ZIP.
+#[allow(dead_code)]
 fn build_items_sheet_xml(items: &[DetectedItemRow]) -> String {
     let mut xml = String::with_capacity(8192);
 
@@ -1797,6 +1804,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "items sheet (page 3) intentionally suppressed for now"]
     fn generate_with_detected_items_creates_second_sheet() {
         let mut data = minimal_offer_data();
         data.detected_items = vec![DetectedItemRow {
