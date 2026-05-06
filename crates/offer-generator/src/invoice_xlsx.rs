@@ -46,18 +46,18 @@ use zip::{ZipArchive, ZipWriter};
 
 /// The invoice template XLSX — embedded at compile time.
 ///
-/// `Rechnung_Vorlage_v3.xlsx` is a clean invoice layout derived from the
-/// `2025- Luttert.xlsx` template. It uses columns A–E with proper formulas
-/// pre-baked for line-item totals and the Netto/MwSt/Brutto block.
-const TEMPLATE_BYTES: &[u8] = include_bytes!("../../../templates/Rechnung_Vorlage_v3.xlsx");
+/// `Rechnung_Vorlage_v4.xlsx` is the canonical Aust Rechnung layout
+/// (sourced from `01 Rechnungen.xlsx`). Columns A–E, logo top-right,
+/// info@/www in column E beside the customer block, formulas pre-baked.
+const TEMPLATE_BYTES: &[u8] = include_bytes!("../../../templates/Rechnung_Vorlage_v4.xlsx");
 
 /// First row used for line items in the invoice template.
 const LINE_ITEM_START_ROW: u32 = 31;
-/// Last row used for line items (rows 31–37 = 7 slots).
-/// The totals block (rows 38–41) sits immediately after and must NOT be hidden.
-const LINE_ITEM_END_ROW: u32 = 37;
+/// Last row used for line items (rows 31–50 = 20 slots).
+/// The totals block (rows 51–54) sits immediately after and must NOT be hidden.
+const LINE_ITEM_END_ROW: u32 = 50;
 /// Maximum number of line item rows.
-const MAX_LINE_ITEMS: usize = 7;
+const MAX_LINE_ITEMS: usize = 20;
 
 // ---------------------------------------------------------------------------
 // Public data types
@@ -302,34 +302,25 @@ fn build_cell_modifications(
     };
 
     // ── Address block (A8–A11) ────────────────────────────────────────────
-    // For business customers: A8 = company name, A9 = attention line
-    // For private customers:  A8 = customer name, A9 = email (or blank)
-    if let Some(ref company) = data.company_name {
-        mods.push(("A8".into(), CellValue::Text(company.clone())));
+    // A8 reserved for the company name (blank on private invoices) so the
+    // contact name in A9 sits in the same line whether or not it's a business.
+    // Email is intentionally NOT written to the invoice (data privacy).
+    let (a8, a9) = if let Some(ref company) = data.company_name {
         let attn = data
             .attention_line
             .clone()
             .filter(|s| !s.is_empty())
-            .or_else(|| data.customer_email.clone())
-            .unwrap_or_default();
-        mods.push(("A9".into(), CellValue::Text(attn)));
+            .unwrap_or_else(|| data.customer_name.clone());
+        (company.clone(), attn)
     } else {
-        mods.push(("A8".into(), CellValue::Text(data.customer_name.clone())));
-        mods.push((
-            "A9".into(),
-            CellValue::Text(data.customer_email.clone().unwrap_or_default()),
-        ));
-    }
+        (String::new(), data.customer_name.clone())
+    };
+    mods.push(("A8".into(), CellValue::Text(a8)));
+    mods.push(("A9".into(), CellValue::Text(a9)));
     mods.push(("A10".into(), CellValue::Text(billing_street.clone())));
     mods.push(("A11".into(), CellValue::Text(billing_city.clone())));
-
-    // ── Contact info (A12): phone + email ─────────────────────────────────
-    let contact = if let Some(ref email) = data.customer_email {
-        format!("E-Mail: {email}")
-    } else {
-        String::new()
-    };
-    mods.push(("A12".into(), CellValue::Text(contact)));
+    // A12 historically held an "E-Mail: …" line; cleared for privacy.
+    mods.push(("A12".into(), CellValue::Text(String::new())));
 
     // ── Dates (C18–C19, E18–E19) ─────────────────────────────────────────
     let service_date_str = data
@@ -353,18 +344,18 @@ fn build_cell_modifications(
     // ── Salutation / greeting (A24) ────────────────────────────────────────
     mods.push(("A24".into(), CellValue::Text(data.salutation.clone())));
 
-    // ── Auftragsort (A26) ──────────────────────────────────────────────────
+    // ── Intro text (A26) ──────────────────────────────────────────────────
     mods.push((
         "A26".into(),
-        CellValue::Text(format!("Auftragsort: {}, {}", billing_street, billing_city)),
-    ));
-
-    // ── Intro text (A27) ──────────────────────────────────────────────────
-    mods.push((
-        "A27".into(),
         CellValue::Text(
             "wir bedanken uns für Ihr Vertrauen und stellen Ihnen vereinbarungsgemäß folgendes in Rechnung.".into(),
         ),
+    ));
+
+    // ── Auftragsort (A27) ──────────────────────────────────────────────────
+    mods.push((
+        "A27".into(),
+        CellValue::Text(format!("Auftragsort: {}, {}", billing_street, billing_city)),
     ));
 
     // ── Line items (rows 31–37, columns A-D) ──────────────────────────────
@@ -510,11 +501,11 @@ fn build_legacy_line_items(data: &InvoiceData) -> Vec<InvoiceLineItem> {
 
 /// Patch `workbook.xml`: fix print area to A:E and ensure fullCalcOnLoad.
 ///
-/// The template's print area already covers A1:E49 — we verify it's set correctly.
+/// The v4 template's print area covers A1:E69 (20 line item rows + totals + footer).
 fn modify_invoice_workbook(xml: &str) -> String {
     let mut result = xml.to_string();
 
-    // Fix print area to A:E
+    // Fix print area to A:E covering line items + totals + footer
     if let Some(start) = result.find("_xlnm.Print_Area") {
         if let Some(content_start) = result[start..].find('>') {
             let abs_content_start = start + content_start + 1;
@@ -522,7 +513,7 @@ fn modify_invoice_workbook(xml: &str) -> String {
                 let abs_end = abs_content_start + end_tag;
                 let mut patched = String::with_capacity(result.len());
                 patched.push_str(&result[..abs_content_start]);
-                patched.push_str("Tabelle1!$A$1:$E$49");
+                patched.push_str("Tabelle1!$A$1:$E$69");
                 patched.push_str(&result[abs_end..]);
                 result = patched;
             }

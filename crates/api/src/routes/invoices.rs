@@ -758,7 +758,7 @@ async fn load_invoice_context(
                     "Kein Angebot vorhanden — bitte erst ein Angebot erstellen oder einen Betrag angeben".into(),
                 )
             })?;
-            ActiveOfferRow { price_cents: cents, offer_number: None, line_items_json: None }
+            ActiveOfferRow { price_cents: cents, offer_number: None, line_items_json: None, persons: None }
         }
     };
 
@@ -862,17 +862,24 @@ fn kva_line_items_from_offer(ctx: &InvoiceContext, _kva_nr: &str) -> Vec<Invoice
         Ok(v) => v,
         Err(_) => return vec![],
     };
+    // Nürnbergerversicherung is included on the KVA for transparency but is a
+    // free service — suppress it on the invoice to keep the line list focused
+    // on billable positions.
     offer_items
         .into_iter()
+        .filter(|item| !item.description.trim().to_lowercase().starts_with("nürnberger"))
         .enumerate()
         .map(|(i, item)| {
             // Compute netto unit price in EUR for the invoice line.
             // OfferLineItem stores unit_price per hour/unit in EUR.
-            // For labor items the total is unit_price × quantity × persons,
-            // but we flatten to a single line item: quantity=1, unit_price=total.
-            // For flat_total items we use the flat value directly.
+            // For labor items the offer formula is hours × rate × persons (J50);
+            // for flat_total items we use the flat value directly; otherwise quantity × unit_price.
+            // We flatten to a single invoice line: quantity=1, unit_price=total.
+            let persons = ctx.offer.persons.unwrap_or(1).max(1) as f64;
             let unit_price_eur = if let Some(flat) = item.flat_total {
                 flat
+            } else if item.is_labor {
+                item.unit_price * item.quantity * persons
             } else {
                 item.unit_price * item.quantity
             };

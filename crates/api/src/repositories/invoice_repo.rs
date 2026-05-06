@@ -60,6 +60,9 @@ pub(crate) struct ActiveOfferRow {
     pub offer_number: Option<String>,
     /// KVA line items stored as JSONB; NULL when no offer exists or for pre-migration offers.
     pub line_items_json: Option<serde_json::Value>,
+    /// Number of workers (J50 in the offer formula) — needed to recompute labor line totals
+    /// on the invoice (`hours × rate × persons`).
+    pub persons: Option<i32>,
 }
 
 // ── Queries ──────────────────────────────────────────────────────────────────
@@ -93,7 +96,7 @@ pub(crate) async fn fetch_active_offer(
     inquiry_id: Uuid,
 ) -> Result<Option<ActiveOfferRow>, sqlx::Error> {
     sqlx::query_as(
-        "SELECT price_cents, offer_number, line_items_json FROM offers WHERE inquiry_id = $1
+        "SELECT price_cents, offer_number, line_items_json, persons FROM offers WHERE inquiry_id = $1
          ORDER BY created_at DESC LIMIT 1",
     )
     .bind(inquiry_id)
