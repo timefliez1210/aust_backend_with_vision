@@ -188,7 +188,7 @@ async fn vision_estimate(
     )
     .await?;
 
-    inquiry_repo::update_volume_and_status(&state.db, request.inquiry_id, total_volume, "volume_estimated", now).await?;
+    inquiry_repo::update_volume_and_status(&state.db, request.inquiry_id, total_volume, "estimated", now).await?;
 
     // Auto-generate offer in background
     let state_clone = state.clone();
@@ -302,7 +302,7 @@ async fn depth_sensor_estimate(
     )
     .await?;
 
-    inquiry_repo::update_volume_and_status(&state.db, inquiry_id, total_volume, "volume_estimated", now).await?;
+    inquiry_repo::update_volume_and_status(&state.db, inquiry_id, total_volume, "estimated", now).await?;
 
     // Auto-generate offer in background
     let state_clone = state.clone();
@@ -619,7 +619,7 @@ async fn process_video_background(
         .unwrap_or(0.0);
 
     // Update quote with combined estimated volume
-    let _ = inquiry_repo::update_volume_and_status(&state.db, inquiry_id, combined_volume, "volume_estimated", now).await;
+    let _ = inquiry_repo::update_volume_and_status(&state.db, inquiry_id, combined_volume, "estimated", now).await;
 
     tracing::info!(%inquiry_id, %estimation_id, combined_volume, "Background: all video estimations completed, triggering offer generation");
 
@@ -677,7 +677,7 @@ async fn inventory_estimate(
     )
     .await?;
 
-    inquiry_repo::update_volume_and_status(&state.db, request.inquiry_id, total_volume, "volume_estimated", now).await?;
+    inquiry_repo::update_volume_and_status(&state.db, request.inquiry_id, total_volume, "estimated", now).await?;
 
     // Auto-generate offer in background
     let state_clone = state.clone();
@@ -765,7 +765,7 @@ pub fn collect_estimation_s3_keys(
 /// **Why**: Deleting an estimation must also remove its S3 files (video, images, crop
 /// thumbnails) to avoid orphaned objects. After deletion, the quote's volume is
 /// recalculated from the remaining completed estimations, and its status is reset to
-/// "new" if no estimations remain.
+/// "pending" if no estimations remain.
 ///
 /// # Parameters
 /// - `state` — shared AppState (DB pool, storage)
@@ -804,8 +804,8 @@ async fn delete_estimate(
         .unwrap_or(0.0);
     let now = chrono::Utc::now();
 
-    // Only update volume/status if there are still estimations; otherwise reset to new
-    let new_status = if combined_volume > 0.0 { "volume_estimated" } else { "new" };
+    // Only update volume/status if there are still estimations; otherwise reset to pending
+    let new_status = if combined_volume > 0.0 { "estimated" } else { "pending" };
     estimation_repo::update_inquiry_volume_status(&state.db, inquiry_id, combined_volume, new_status, now).await?;
 
     Ok(StatusCode::NO_CONTENT)

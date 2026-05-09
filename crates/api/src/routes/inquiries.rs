@@ -397,26 +397,7 @@ async fn update_inquiry(
     let current_status: InquiryStatus = current_inquiry.status.parse()
         .map_err(|_| ApiError::Internal(format!("Invalid status in DB: {}", current_inquiry.status)))?;
 
-    // M3: Gate mutable fields on current status
-    // Once an inquiry has an offer (offer_ready or beyond), volume, services,
-    // distance, and addresses are locked — changing them would break the accepted offer.
-    if current_status.is_locked_for_modifications() {
-        let locked_fields_modified = request.estimated_volume_m3.is_some()
-            || request.services.is_some()
-            || request.distance_km.is_some()
-            || request.origin_address_id.is_some()
-            || request.destination_address_id.is_some()
-            || request.stop_address_id.is_some()
-            || request.stop_address.is_some()
-            || request.clear_stop_address.unwrap_or(false);
-        if locked_fields_modified {
-            return Err(ApiError::Validation(
-                "Inquiry mit vorhandenem Angebot kann nicht mehr inhaltlich geändert werden (Volumen, Services, Entfernung, Adressen). Bitte Angebot neu erstellen.".into(),
-            ));
-        }
-    }
-
-    // Validate status transition if status is being changed
+// Validate status transition if status is being changed
     if let Some(ref new_status) = request.status {
         let target_status: InquiryStatus = new_status.parse()
             .map_err(|e| ApiError::Validation(format!("Ungueltiger Status: {e}")))?;

@@ -395,7 +395,7 @@ pub(crate) async fn update_inquiry_processing(
     inquiry_id: Uuid,
     now: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE inquiries SET status = 'processing', updated_at = $1 WHERE id = $2")
+    sqlx::query("UPDATE inquiries SET status = 'estimating', updated_at = $1 WHERE id = $2")
         .bind(now)
         .bind(inquiry_id)
         .execute(pool)

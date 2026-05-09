@@ -1024,7 +1024,7 @@ mod _disabled_integration_tests {
         // This test verifies the "offer already exists" guard: calling try_auto_generate_offer
         // on a quote that already has an active offer must not create a second one.
         let (_, pool) = setup().await;
-        let inquiry_id = insert_test_quote_with_status(&pool, "volume_estimated").await;
+        let inquiry_id = insert_test_quote_with_status(&pool, "estimated").await;
         insert_test_offer(&pool, inquiry_id, "draft").await;
 
         let state = std::sync::Arc::new(test_app_state_with_pool(pool.clone()).await);
@@ -1101,7 +1101,7 @@ mod _disabled_integration_tests {
     #[tokio::test]
     async fn unique_active_offer_constraint_rejects_second_draft() {
         let (_, pool) = setup().await;
-        let inquiry_id = insert_test_quote_with_status(&pool, "volume_estimated").await;
+        let inquiry_id = insert_test_quote_with_status(&pool, "estimated").await;
         insert_test_offer(&pool, inquiry_id, "draft").await;
 
         let id2 = uuid::Uuid::now_v7();
@@ -1122,7 +1122,7 @@ mod _disabled_integration_tests {
     #[tokio::test]
     async fn unique_constraint_allows_second_offer_after_rejection() {
         let (_, pool) = setup().await;
-        let inquiry_id = insert_test_quote_with_status(&pool, "volume_estimated").await;
+        let inquiry_id = insert_test_quote_with_status(&pool, "estimated").await;
         insert_test_offer(&pool, inquiry_id, "rejected").await;
 
         let id2 = uuid::Uuid::now_v7();
