@@ -83,6 +83,23 @@ services:
       retries: 5
       start_period: 30s
 
+  # Telegram sidecar — handles fc_reached / fc_snooze / fc_dismiss callback buttons.
+  # NOTE: only one process may poll a bot token at a time. If the email-agent is ever
+  # deployed to prod, provision a dedicated bot token for flash contacts and set
+  # AUST__TELEGRAM__BOT_TOKEN here to that separate token.
+  flash-contact-bot:
+    image: aust_flash_contact_bot:latest
+    container_name: aust_flash_contact_bot
+    restart: always
+    env_file:
+      - path: /opt/aust/.env
+        required: true
+    environment:
+      AUST__DATABASE__URL: postgres://aust:aust_dev_password@postgres:5432/aust_backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+
 volumes:
   postgres_data:
     external: true

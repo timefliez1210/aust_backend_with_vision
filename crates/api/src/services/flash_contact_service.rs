@@ -14,6 +14,15 @@ use tracing::{info, warn};
 /// Queries all pending flash contacts, computes whether their requested
 /// time window has started, and sends a Telegram ping to Alex if so.
 pub async fn run_reminder_check(db: &PgPool, tg_config: &TelegramConfig) -> anyhow::Result<()> {
+    run_reminder_check_with_base(db, tg_config, "https://api.telegram.org").await
+}
+
+/// Inner implementation that accepts a configurable Telegram base URL for testing.
+pub async fn run_reminder_check_with_base(
+    db: &PgPool,
+    tg_config: &TelegramConfig,
+    tg_base_url: &str,
+) -> anyhow::Result<()> {
     let contacts = fetch_pending_reminders(db).await?;
     let now = chrono::Utc::now();
     let client = Client::new();
@@ -23,12 +32,21 @@ pub async fn run_reminder_check(db: &PgPool, tg_config: &TelegramConfig) -> anyh
             if now >= remind_at {
                 let message = format_reminder_message(&contact);
                 let api_url = format!(
-                    "https://api.telegram.org/bot{}/sendMessage",
-                    tg_config.bot_token
+                    "{}/bot{}/sendMessage",
+                    tg_base_url, tg_config.bot_token
                 );
+
+                let inline_keyboard = serde_json::json!({
+                    "inline_keyboard": [[
+                        { "text": "✅ Erreicht",          "callback_data": format!("fc_reached:{}", contact.id) },
+                        { "text": "🔁 Nochmal erinnern", "callback_data": format!("fc_snooze:{}", contact.id) },
+                        { "text": "🗑 Verwerfen",         "callback_data": format!("fc_dismiss:{}", contact.id) }
+                    ]]
+                });
                 let payload = serde_json::json!({
                     "chat_id": tg_config.admin_chat_id,
                     "text": message,
+                    "reply_markup": inline_keyboard,
                 });
 
                 match client.post(&api_url).json(&payload).send().await {
@@ -50,4 +68,137 @@ pub async fn run_reminder_check(db: &PgPool, tg_config: &TelegramConfig) -> anyh
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aust_core::config::TelegramConfig;
+    use aust_flash_contact::{CreateFlashContact, TimePreference};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    fn test_db_url() -> String {
+        std::env::var("AUST__DATABASE__URL")
+            .unwrap_or_else(|_| "postgres://aust:aust_dev_password@localhost/aust_backend".into())
+    }
+
+    fn test_tg_config() -> TelegramConfig {
+        TelegramConfig {
+            bot_token: "TEST_BOT_TOKEN".into(),
+            admin_chat_id: 0,
+        }
+    }
+
+    /// Spins up a tiny HTTP server that returns 200 OK for any request and
+    /// counts how many times it was called.
+    async fn mock_telegram_server() -> (String, Arc<AtomicUsize>) {
+        use tokio::net::TcpListener;
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_clone = counter.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    counter_clone.fetch_add(1, Ordering::SeqCst);
+                    use tokio::io::AsyncWriteExt;
+                    let response = b"HTTP/1.1 200 OK\r\nContent-Length: 15\r\n\r\n{\"ok\":true}\r\n\r\n";
+                    let _ = stream.write_all(response).await;
+                }
+            }
+        });
+        (format!("http://127.0.0.1:{}", addr.port()), counter)
+    }
+
+    #[tokio::test]
+    async fn reminder_check_fires_for_active_window_contact() {
+        let pool = sqlx::PgPool::connect(&test_db_url()).await.unwrap();
+        let (mock_url, call_count) = mock_telegram_server().await;
+
+        // Insert a contact for the 08-10 window (currently open at 9am Berlin).
+        // After the bug fix, `reminder_time` returns Some(window_start) when inside
+        // the window, so the cron correctly fires.
+        let input = CreateFlashContact {
+            name: "Cron Test".into(),
+            phone: "01234-test".into(),
+            time_preference: TimePreference::Vormittag,
+        };
+        let contact = aust_flash_contact::insert(&pool, &input).await.unwrap();
+
+        let tg = test_tg_config();
+        run_reminder_check_with_base(&pool, &tg, &mock_url).await.unwrap();
+
+        // Verify the row is now marked as reminded.
+        let row = sqlx::query(
+            "SELECT reminder_sent_at FROM flash_contacts WHERE id = $1",
+        )
+        .bind(contact.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        use sqlx::Row;
+        let reminded_at: Option<chrono::DateTime<chrono::Utc>> = row.try_get("reminder_sent_at").unwrap();
+        assert!(reminded_at.is_some(), "reminder_sent_at should be set after cron fires");
+
+        // Telegram mock should have received exactly one call.
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+
+        // Clean up.
+        sqlx::query("DELETE FROM flash_contacts WHERE id = $1")
+            .bind(contact.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reminder_check_skips_already_handled() {
+        let pool = sqlx::PgPool::connect(&test_db_url()).await.unwrap();
+        let (mock_url, call_count) = mock_telegram_server().await;
+
+        let input = CreateFlashContact {
+            name: "Handled Test".into(),
+            phone: "01234-handled".into(),
+            time_preference: TimePreference::Vormittag,
+        };
+        let contact = aust_flash_contact::insert(&pool, &input).await.unwrap();
+        aust_flash_contact::mark_handled(&pool, contact.id).await.unwrap();
+
+        let tg = test_tg_config();
+        run_reminder_check_with_base(&pool, &tg, &mock_url).await.unwrap();
+
+        // Telegram should NOT have been called.
+        assert_eq!(call_count.load(Ordering::SeqCst), 0);
+
+        sqlx::query("DELETE FROM flash_contacts WHERE id = $1")
+            .bind(contact.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reminder_check_skips_any_time() {
+        let pool = sqlx::PgPool::connect(&test_db_url()).await.unwrap();
+        let (mock_url, call_count) = mock_telegram_server().await;
+
+        let input = CreateFlashContact {
+            name: "AnyTime Test".into(),
+            phone: "01234-anytime".into(),
+            time_preference: TimePreference::Gleich,
+        };
+        let contact = aust_flash_contact::insert(&pool, &input).await.unwrap();
+
+        let tg = test_tg_config();
+        run_reminder_check_with_base(&pool, &tg, &mock_url).await.unwrap();
+
+        assert_eq!(call_count.load(Ordering::SeqCst), 0, "gleich contacts never get a scheduled reminder");
+
+        sqlx::query("DELETE FROM flash_contacts WHERE id = $1")
+            .bind(contact.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
 }

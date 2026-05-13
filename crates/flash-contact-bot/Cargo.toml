@@ -1,0 +1,23 @@
+[package]
+name = "flash-contact-bot"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "flash_contact_bot"
+path = "src/main.rs"
+
+[dependencies]
+aust-flash-contact = { path = "../flash-contact" }
+
+tokio = { workspace = true }
+sqlx = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = "0.10"
+uuid = { workspace = true }

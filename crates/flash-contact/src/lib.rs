@@ -26,51 +26,44 @@ pub type Result<T> = std::result::Result<T, FlashContactError>;
 
 // ── Model ───────────────────────────────────────────────────────────────────
 
-/// Preferred callback time window chosen by the customer.
+/// Preferred callback time chosen by the customer — matches the UI labels exactly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TimePreference {
-    #[serde(rename = "any_time")]
-    AnyTime,
-    #[serde(rename = "08-10")]
-    MorningEarly,
-    #[serde(rename = "10-12")]
-    MorningLate,
-    #[serde(rename = "14-16")]
-    AfternoonEarly,
-    #[serde(rename = "16-18")]
-    AfternoonLate,
+    /// Call as soon as possible — no scheduled reminder.
+    #[serde(rename = "gleich")]
+    Gleich,
+    /// Morning slot — reminder fires at 09:00 Europe/Berlin.
+    #[serde(rename = "vormittag")]
+    Vormittag,
+    /// Afternoon slot — reminder fires at 13:00 Europe/Berlin.
+    #[serde(rename = "nachmittag")]
+    Nachmittag,
 }
 
 impl TimePreference {
-    /// Returns `(start_hour, end_hour)` or `None` for `AnyTime`.
-    pub fn window(&self) -> Option<(u32, u32)> {
+    /// Returns the reminder hour in Europe/Berlin, or `None` for `Gleich`.
+    pub fn reminder_hour(&self) -> Option<u32> {
         match self {
-            TimePreference::AnyTime => None,
-            TimePreference::MorningEarly => Some((8, 10)),
-            TimePreference::MorningLate => Some((10, 12)),
-            TimePreference::AfternoonEarly => Some((14, 16)),
-            TimePreference::AfternoonLate => Some((16, 18)),
+            TimePreference::Gleich => None,
+            TimePreference::Vormittag => Some(9),
+            TimePreference::Nachmittag => Some(13),
         }
     }
 
-    /// German display label.
+    /// German display label shown in Telegram.
     pub fn label(&self) -> &'static str {
         match self {
-            TimePreference::AnyTime => "Jederzeit",
-            TimePreference::MorningEarly => "08:00 – 10:00",
-            TimePreference::MorningLate => "10:00 – 12:00",
-            TimePreference::AfternoonEarly => "14:00 – 16:00",
-            TimePreference::AfternoonLate => "16:00 – 18:00",
+            TimePreference::Gleich => "Jetzt gleich",
+            TimePreference::Vormittag => "Vormittag",
+            TimePreference::Nachmittag => "Nachmittag",
         }
     }
 
     fn as_str(&self) -> &'static str {
         match self {
-            TimePreference::AnyTime => "any_time",
-            TimePreference::MorningEarly => "08-10",
-            TimePreference::MorningLate => "10-12",
-            TimePreference::AfternoonEarly => "14-16",
-            TimePreference::AfternoonLate => "16-18",
+            TimePreference::Gleich => "gleich",
+            TimePreference::Vormittag => "vormittag",
+            TimePreference::Nachmittag => "nachmittag",
         }
     }
 }
@@ -80,11 +73,9 @@ impl FromStr for TimePreference {
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s {
-            "any_time" => Ok(TimePreference::AnyTime),
-            "08-10" => Ok(TimePreference::MorningEarly),
-            "10-12" => Ok(TimePreference::MorningLate),
-            "14-16" => Ok(TimePreference::AfternoonEarly),
-            "16-18" => Ok(TimePreference::AfternoonLate),
+            "gleich" => Ok(TimePreference::Gleich),
+            "vormittag" => Ok(TimePreference::Vormittag),
+            "nachmittag" => Ok(TimePreference::Nachmittag),
             _ => Err(format!("unknown time_preference: {s}")),
         }
     }
@@ -100,6 +91,10 @@ pub struct FlashContact {
     pub created_at: DateTime<Utc>,
     pub reminder_sent_at: Option<DateTime<Utc>>,
     pub handled_at: Option<DateTime<Utc>>,
+    /// Overrides the default reminder schedule when set by the bot after "Nochmal erinnern".
+    pub next_remind_at: Option<DateTime<Utc>>,
+    /// Set when Alex taps "Verwerfen" — contact is closed without a successful callback.
+    pub dismissed_at: Option<DateTime<Utc>>,
 }
 
 /// Input used to create a flash contact.
@@ -112,51 +107,66 @@ pub struct CreateFlashContact {
 
 // ── Repository ─────────────────────────────────────────────────────────────
 
+const SELECT_COLS: &str =
+    "id, name, phone, time_preference, created_at, reminder_sent_at, handled_at, next_remind_at, dismissed_at";
+
 /// Insert a new flash contact.
 pub async fn insert(db: &PgPool, input: &CreateFlashContact) -> Result<FlashContact> {
     let id = Uuid::now_v7();
     let now = Utc::now();
-
-    let row = sqlx::query(
-        r#"
-        INSERT INTO flash_contacts (id, name, phone, time_preference, created_at)
-        VALUES ($1, $2, $3, $4, $5)
-        RETURNING id, name, phone, time_preference, created_at, reminder_sent_at, handled_at
-        "#
-    )
-    .bind(id)
-    .bind(&input.name)
-    .bind(&input.phone)
-    .bind(input.time_preference.as_str())
-    .bind(now)
-    .fetch_one(db)
-    .await?;
-
+    let sql = format!(
+        "INSERT INTO flash_contacts (id, name, phone, time_preference, created_at)
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING {SELECT_COLS}"
+    );
+    let row = sqlx::query(&sql)
+        .bind(id)
+        .bind(&input.name)
+        .bind(&input.phone)
+        .bind(input.time_preference.as_str())
+        .bind(now)
+        .fetch_one(db)
+        .await?;
     Ok(map_row(row)?)
 }
 
-/// Fetch all flash contacts that still need a reminder check.
+/// Fetch all contacts that need a reminder right now.
+///
+/// Two cases:
+/// 1. First-time reminder: `reminder_sent_at IS NULL`, time_preference != 'gleich'
+/// 2. Snoozed reminder: `next_remind_at` is set and has arrived
 pub async fn fetch_pending_reminders(db: &PgPool) -> Result<Vec<FlashContact>> {
-    let rows = sqlx::query(
-        r#"
-        SELECT id, name, phone, time_preference, created_at, reminder_sent_at, handled_at
-        FROM flash_contacts
-        WHERE handled_at IS NULL
-          AND reminder_sent_at IS NULL
-          AND time_preference != 'any_time'
-        ORDER BY created_at ASC
-        "#
-    )
-    .fetch_all(db)
-    .await?;
-
+    let now = Utc::now();
+    let sql = format!(
+        "SELECT {SELECT_COLS} FROM flash_contacts
+         WHERE handled_at IS NULL AND dismissed_at IS NULL
+           AND (
+             (reminder_sent_at IS NULL AND next_remind_at IS NULL AND time_preference != 'gleich')
+             OR (next_remind_at IS NOT NULL AND next_remind_at <= $1)
+           )
+         ORDER BY created_at ASC"
+    );
+    let rows = sqlx::query(&sql).bind(now).fetch_all(db).await?;
     rows.into_iter().map(map_row).collect()
 }
 
-/// Mark reminder as sent.
+/// Mark the initial reminder as sent (clears next_remind_at).
 pub async fn mark_reminder_sent(db: &PgPool, id: Uuid) -> Result<()> {
     let now = Utc::now();
-    sqlx::query("UPDATE flash_contacts SET reminder_sent_at = $1 WHERE id = $2")
+    sqlx::query(
+        "UPDATE flash_contacts SET reminder_sent_at = $1, next_remind_at = NULL WHERE id = $2",
+    )
+    .bind(now)
+    .bind(id)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// Mark contact as handled — Alex successfully reached the customer.
+pub async fn mark_handled(db: &PgPool, id: Uuid) -> Result<()> {
+    let now = Utc::now();
+    sqlx::query("UPDATE flash_contacts SET handled_at = $1, next_remind_at = NULL WHERE id = $2")
         .bind(now)
         .bind(id)
         .execute(db)
@@ -164,14 +174,28 @@ pub async fn mark_reminder_sent(db: &PgPool, id: Uuid) -> Result<()> {
     Ok(())
 }
 
-/// Mark contact as handled (e.g. Alex called back).
-pub async fn mark_handled(db: &PgPool, id: Uuid) -> Result<()> {
+/// Mark contact as dismissed — Alex gives up without reaching the customer.
+pub async fn mark_dismissed(db: &PgPool, id: Uuid) -> Result<()> {
     let now = Utc::now();
-    sqlx::query("UPDATE flash_contacts SET handled_at = $1 WHERE id = $2")
-        .bind(now)
-        .bind(id)
-        .execute(db)
-        .await?;
+    sqlx::query(
+        "UPDATE flash_contacts SET dismissed_at = $1, next_remind_at = NULL WHERE id = $2",
+    )
+    .bind(now)
+    .bind(id)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// Schedule the next snooze reminder and clear the sent flag so the cron fires again.
+pub async fn schedule_snooze(db: &PgPool, id: Uuid, next_remind_at: DateTime<Utc>) -> Result<()> {
+    sqlx::query(
+        "UPDATE flash_contacts SET next_remind_at = $1, reminder_sent_at = NULL WHERE id = $2",
+    )
+    .bind(next_remind_at)
+    .bind(id)
+    .execute(db)
+    .await?;
     Ok(())
 }
 
@@ -180,7 +204,6 @@ fn map_row(row: sqlx::postgres::PgRow) -> Result<FlashContact> {
     let time_preference = time_pref_str
         .parse()
         .map_err(|_| FlashContactError::UnknownTimePreference(time_pref_str))?;
-
     Ok(FlashContact {
         id: row.try_get("id")?,
         name: row.try_get("name")?,
@@ -189,7 +212,46 @@ fn map_row(row: sqlx::postgres::PgRow) -> Result<FlashContact> {
         created_at: row.try_get("created_at")?,
         reminder_sent_at: row.try_get("reminder_sent_at")?,
         handled_at: row.try_get("handled_at")?,
+        next_remind_at: row.try_get("next_remind_at")?,
+        dismissed_at: row.try_get("dismissed_at")?,
     })
+}
+
+// ── Snooze schedule ──────────────────────────────────────────────────────────
+
+/// Compute the next snooze timestamp after Alex taps "Nochmal erinnern".
+///
+/// Escalation sequences (wall-clock hours in Europe/Berlin):
+/// - Vormittag: 08 → 11 → 08(+1d) → 11(+1d) → …
+/// - Nachmittag: 13 → 16 → 13(+1d) → 16(+1d) → …
+///
+/// Picks the next slot strictly after `now`.
+pub fn next_snooze(pref: TimePreference, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let slots: &[u32] = match pref {
+        TimePreference::Gleich => return None,
+        TimePreference::Vormittag => &[8, 11],
+        TimePreference::Nachmittag => &[13, 16],
+    };
+    let now_local = now.with_timezone(&Berlin);
+    let today = now_local.date_naive();
+
+    // Try each slot today, then tomorrow.
+    for day_offset in 0u64..=1 {
+        let day = today + chrono::Duration::days(day_offset as i64);
+        for &hour in slots {
+            let t = NaiveTime::from_hms_opt(hour, 0, 0)?;
+            let local = Berlin.from_local_datetime(&day.and_time(t)).single()?;
+            let utc = local.with_timezone(&Utc);
+            if utc > now {
+                return Some(utc);
+            }
+        }
+    }
+    // Fallback: 08:00 two days from now (shouldn't normally be reached).
+    let fallback_day = today + chrono::Duration::days(2);
+    let t = NaiveTime::from_hms_opt(slots[0], 0, 0)?;
+    let local = Berlin.from_local_datetime(&fallback_day.and_time(t)).single()?;
+    Some(local.with_timezone(&Utc))
 }
 
 // ── Time window logic ────────────────────────────────────────────────────────
@@ -197,47 +259,47 @@ fn map_row(row: sqlx::postgres::PgRow) -> Result<FlashContact> {
 /// Compute the next reminder DateTime for a flash contact.
 ///
 /// Returns `None` when:
-/// - the preference is `AnyTime`
-/// - the contact is already handled or reminded
-/// - the current time is already inside the selected window
+/// - the preference is `Gleich` (call immediately, no scheduled reminder)
+/// - the contact is already handled or already reminded
+///
+/// Otherwise returns the next wall-clock reminder time in Europe/Berlin:
+/// - if the reminder hour hasn't passed today → today at that hour
+/// - if it has already passed today → tomorrow at that hour
+///
+/// When we are past the reminder hour but the cron hasn't fired yet,
+/// `Some(today_remind_utc)` is still returned so that `now >= remind_at`
+/// is true and the reminder fires on the next cron tick.
 pub fn reminder_time(contact: &FlashContact, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-    if contact.handled_at.is_some() || contact.reminder_sent_at.is_some() {
+    if contact.handled_at.is_some() || contact.dismissed_at.is_some() || contact.reminder_sent_at.is_some() {
         return None;
     }
 
-    let (start_hour, end_hour) = contact.time_preference.window()?;
-    // Time windows are wall-clock hours in Alex's timezone (Europe/Berlin),
-    // not UTC — DST handling matters.
+    // Snoozed contact: use the explicit next_remind_at timestamp.
+    if let Some(next) = contact.next_remind_at {
+        return Some(next);
+    }
+
+    // Reminder hour is a wall-clock hour in Europe/Berlin (DST-aware).
+    let remind_hour = contact.time_preference.reminder_hour()?;
     let now_local = now.with_timezone(&Berlin);
     let today = now_local.date_naive();
-    let start_time = NaiveTime::from_hms_opt(start_hour, 0, 0)?;
-    let end_time = NaiveTime::from_hms_opt(end_hour, 0, 0)?;
+    let remind_time = NaiveTime::from_hms_opt(remind_hour, 0, 0)?;
 
-    let today_start_local = Berlin
-        .from_local_datetime(&today.and_time(start_time))
+    let today_remind_local = Berlin
+        .from_local_datetime(&today.and_time(remind_time))
         .single()?;
-    let today_start_utc = today_start_local.with_timezone(&Utc);
+    let today_remind_utc = today_remind_local.with_timezone(&Utc);
 
-    if now < today_start_utc {
-        return Some(today_start_utc);
+    if now < today_remind_utc {
+        // Reminder hour hasn't arrived yet today.
+        return Some(today_remind_utc);
     }
 
-    let today_end_local = Berlin
-        .from_local_datetime(&today.and_time(end_time))
-        .single()?;
-    let today_end_utc = today_end_local.with_timezone(&Utc);
-
-    if now <= today_end_utc {
-        // Inside the window — immediate notification was enough.
-        return None;
-    }
-
-    // Window already closed for today → next occurrence is tomorrow at start hour.
-    let tomorrow = today.succ_opt()?;
-    let tomorrow_start_local = Berlin
-        .from_local_datetime(&tomorrow.and_time(start_time))
-        .single()?;
-    Some(tomorrow_start_local.with_timezone(&Utc))
+    // We are at or past today's reminder hour — either fire now (cron missed the
+    // exact tick) or roll to tomorrow if the reminder was already sent.
+    // Since `reminder_sent_at` is checked above, reaching here means it hasn't
+    // been sent yet, so return today's time so `now >= remind_at` fires.
+    Some(today_remind_utc)
 }
 
 // ── Telegram formatting ────────────────────────────────────────────────────
@@ -282,6 +344,8 @@ mod tests {
             created_at: Utc::now(),
             reminder_sent_at: None,
             handled_at: None,
+            next_remind_at: None,
+            dismissed_at: None,
         }
     }
 
@@ -295,41 +359,44 @@ mod tests {
     }
 
     #[test]
-    fn reminder_before_window_starts_today() {
-        let c = make_contact(TimePreference::MorningEarly);
+    fn reminder_before_hour_returns_that_hour_today() {
+        // Vormittag reminds at 09:00. At 07:00 → remind_at = 09:00 today.
+        let c = make_contact(TimePreference::Vormittag);
         let day = NaiveDate::from_ymd_opt(2026, 6, 15).unwrap();
-        let now = berlin(day, 6, 0);
-        let rt = reminder_time(&c, now).expect("should remind today");
-        assert_eq!(rt, berlin(day, 8, 0));
+        let rt = reminder_time(&c, berlin(day, 7, 0)).expect("should schedule reminder");
+        assert_eq!(rt, berlin(day, 9, 0));
     }
 
     #[test]
-    fn reminder_inside_window_returns_none() {
-        let c = make_contact(TimePreference::MorningEarly);
+    fn reminder_at_or_after_hour_fires_immediately() {
+        // At 09:30 the cron tick may have missed 09:00 — still returns today's remind_at
+        // so `now >= remind_at` is true and the reminder fires on the next tick.
+        let c = make_contact(TimePreference::Vormittag);
         let day = NaiveDate::from_ymd_opt(2026, 6, 15).unwrap();
-        assert!(reminder_time(&c, berlin(day, 9, 0)).is_none());
+        let rt = reminder_time(&c, berlin(day, 9, 30)).expect("should still remind");
+        assert_eq!(rt, berlin(day, 9, 0));
     }
 
     #[test]
-    fn reminder_after_window_rolls_to_tomorrow() {
-        let c = make_contact(TimePreference::MorningEarly);
+    fn reminder_nachmittag_before_hour() {
+        // Nachmittag reminds at 13:00.
+        let c = make_contact(TimePreference::Nachmittag);
         let day = NaiveDate::from_ymd_opt(2026, 6, 15).unwrap();
-        let tomorrow = day.succ_opt().unwrap();
-        let rt = reminder_time(&c, berlin(day, 11, 0)).expect("should remind tomorrow");
-        assert_eq!(rt, berlin(tomorrow, 8, 0));
+        let rt = reminder_time(&c, berlin(day, 11, 0)).expect("should schedule reminder");
+        assert_eq!(rt, berlin(day, 13, 0));
     }
 
     #[test]
-    fn reminder_any_time_is_none() {
-        let c = make_contact(TimePreference::AnyTime);
+    fn reminder_gleich_is_none() {
+        let c = make_contact(TimePreference::Gleich);
         assert!(reminder_time(&c, Utc::now()).is_none());
     }
 
     #[test]
     fn reminder_handled_is_none() {
-        let mut c = make_contact(TimePreference::MorningEarly);
+        let mut c = make_contact(TimePreference::Vormittag);
         c.handled_at = Some(Utc::now());
         let day = NaiveDate::from_ymd_opt(2026, 6, 15).unwrap();
-        assert!(reminder_time(&c, berlin(day, 6, 0)).is_none());
+        assert!(reminder_time(&c, berlin(day, 7, 0)).is_none());
     }
 }

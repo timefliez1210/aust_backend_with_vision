@@ -6,7 +6,7 @@ authors = ["AUST Team"]
 license = "MIT"
 
 [workspace]
-members = ["crates/api", "crates/core", "crates/email-agent", "crates/distance-calculator", "crates/llm-providers", "crates/offer-generator", "crates/storage", "crates/volume-estimator", "crates/flash-contact"]
+members = ["crates/api", "crates/core", "crates/email-agent", "crates/distance-calculator", "crates/llm-providers", "crates/offer-generator", "crates/storage", "crates/volume-estimator", "crates/flash-contact", "crates/flash-contact-bot"]
 
 [workspace.package]
 version = "0.1.0"

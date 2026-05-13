@@ -15,6 +15,7 @@ use uuid::Uuid;
 use aust_core::models::TokenClaims;
 use aust_offer_generator::{convert_xlsx_to_pdf, generate_timesheet_xlsx, TimesheetData, TimesheetEntry};
 use crate::repositories::{admin_repo, employee_repo, feedback_repo, review_repo, invoice_reminder_repo, invoice_repo};
+use aust_flash_contact;
 use crate::{ApiError, AppState};
 
 use super::admin_customers;
@@ -65,6 +66,8 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/invoice-reminders", get(list_invoice_reminders))
         .route("/invoice-reminders/{id}/action", post(invoice_reminder_action))
         .route("/rechnungsausgangsbuch", get(rechnungsausgangsbuch))
+        .route("/flash-contacts", get(list_flash_contacts))
+        .route("/flash-contacts/{id}/handle", post(handle_flash_contact))
 }
 
 // --- Dashboard ---
@@ -1824,6 +1827,67 @@ async fn rechnungsausgangsbuch(
         .collect();
 
     Ok(Json(items))
+}
+
+// ── Flash contacts (admin) ─────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+struct FlashContactItem {
+    id: Uuid,
+    name: String,
+    phone: String,
+    time_preference: String,
+    created_at: DateTime<Utc>,
+    reminder_sent_at: Option<DateTime<Utc>>,
+    handled_at: Option<DateTime<Utc>>,
+    next_remind_at: Option<DateTime<Utc>>,
+    dismissed_at: Option<DateTime<Utc>>,
+}
+
+async fn list_flash_contacts(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<FlashContactItem>>, ApiError> {
+    use sqlx::Row;
+
+    let rows = sqlx::query(
+        r#"
+        SELECT id, name, phone, time_preference, created_at, reminder_sent_at, handled_at,
+               next_remind_at, dismissed_at
+        FROM flash_contacts
+        ORDER BY created_at DESC
+        LIMIT 200
+        "#,
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(ApiError::from)?;
+
+    let mut items = Vec::with_capacity(rows.len());
+    for r in rows {
+        items.push(FlashContactItem {
+            id: r.try_get("id").map_err(ApiError::from)?,
+            name: r.try_get("name").map_err(ApiError::from)?,
+            phone: r.try_get("phone").map_err(ApiError::from)?,
+            time_preference: r.try_get("time_preference").map_err(ApiError::from)?,
+            created_at: r.try_get("created_at").map_err(ApiError::from)?,
+            reminder_sent_at: r.try_get("reminder_sent_at").map_err(ApiError::from)?,
+            handled_at: r.try_get("handled_at").map_err(ApiError::from)?,
+            next_remind_at: r.try_get("next_remind_at").map_err(ApiError::from)?,
+            dismissed_at: r.try_get("dismissed_at").map_err(ApiError::from)?,
+        });
+    }
+
+    Ok(Json(items))
+}
+
+async fn handle_flash_contact(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+) -> Result<impl axum::response::IntoResponse, ApiError> {
+    aust_flash_contact::mark_handled(&state.db, id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok((axum::http::StatusCode::NO_CONTENT, ()))
 }
 
 #[cfg(test)]
