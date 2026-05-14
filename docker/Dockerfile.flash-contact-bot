@@ -15,7 +15,7 @@ COPY migrations ./migrations
 COPY templates ./templates
 COPY config ./config
 
-RUN cargo build --release --bin flash_contact_bot
+RUN cargo build --release -p flash-contact-bot --bin flash_contact_bot
 
 # ---- Runtime stage ----
 FROM debian:bookworm-slim
