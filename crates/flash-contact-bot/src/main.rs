@@ -6,9 +6,9 @@
 //!   fc_snooze:<id>   → schedule_snooze (remind again at next slot)
 //!   fc_dismiss:<id>  → mark_dismissed  (give up)
 //!
-//! NOTE: Only one process may poll a given bot token at a time. If the email-agent
-//! is ever deployed to prod it must move to a webhook so this sidecar can keep polling,
-//! or a dedicated bot token must be provisioned for flash contacts.
+//! Uses a dedicated bot token (`AUST__TELEGRAM__FLASH_CONTACT_BOT_TOKEN`),
+//! separate from the main email-agent bot, so the two pollers don't fight
+//! over `getUpdates` (Telegram allows only one long-poller per token).
 
 mod bot;
 
@@ -28,8 +28,8 @@ async fn main() -> Result<()> {
         .or_else(|_| std::env::var("DATABASE_URL"))
         .expect("AUST__DATABASE__URL must be set");
 
-    let bot_token = std::env::var("AUST__TELEGRAM__BOT_TOKEN")
-        .expect("AUST__TELEGRAM__BOT_TOKEN must be set");
+    let bot_token = std::env::var("AUST__TELEGRAM__FLASH_CONTACT_BOT_TOKEN")
+        .expect("AUST__TELEGRAM__FLASH_CONTACT_BOT_TOKEN must be set");
 
     let admin_chat_id: i64 = std::env::var("AUST__TELEGRAM__ADMIN_CHAT_ID")
         .expect("AUST__TELEGRAM__ADMIN_CHAT_ID must be set")

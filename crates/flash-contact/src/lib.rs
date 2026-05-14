@@ -164,13 +164,17 @@ pub async fn mark_reminder_sent(db: &PgPool, id: Uuid) -> Result<()> {
 }
 
 /// Mark contact as handled — Alex successfully reached the customer.
+/// Idempotent: re-clicking the button leaves the original `handled_at` intact.
 pub async fn mark_handled(db: &PgPool, id: Uuid) -> Result<()> {
     let now = Utc::now();
-    sqlx::query("UPDATE flash_contacts SET handled_at = $1, next_remind_at = NULL WHERE id = $2")
-        .bind(now)
-        .bind(id)
-        .execute(db)
-        .await?;
+    sqlx::query(
+        "UPDATE flash_contacts SET handled_at = $1, next_remind_at = NULL \
+         WHERE id = $2 AND handled_at IS NULL",
+    )
+    .bind(now)
+    .bind(id)
+    .execute(db)
+    .await?;
     Ok(())
 }
 
@@ -178,7 +182,8 @@ pub async fn mark_handled(db: &PgPool, id: Uuid) -> Result<()> {
 pub async fn mark_dismissed(db: &PgPool, id: Uuid) -> Result<()> {
     let now = Utc::now();
     sqlx::query(
-        "UPDATE flash_contacts SET dismissed_at = $1, next_remind_at = NULL WHERE id = $2",
+        "UPDATE flash_contacts SET dismissed_at = $1, next_remind_at = NULL \
+         WHERE id = $2 AND dismissed_at IS NULL",
     )
     .bind(now)
     .bind(id)

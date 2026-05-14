@@ -33,7 +33,7 @@ pub async fn run_reminder_check_with_base(
                 let message = format_reminder_message(&contact);
                 let api_url = format!(
                     "{}/bot{}/sendMessage",
-                    tg_base_url, tg_config.bot_token
+                    tg_base_url, tg_config.flash_contact_bot_token
                 );
 
                 let inline_keyboard = serde_json::json!({
@@ -87,6 +87,7 @@ mod tests {
         TelegramConfig {
             bot_token: "TEST_BOT_TOKEN".into(),
             admin_chat_id: 0,
+            flash_contact_bot_token: "TEST_FLASH_BOT_TOKEN".into(),
         }
     }
 
@@ -116,15 +117,21 @@ mod tests {
         let pool = sqlx::PgPool::connect(&test_db_url()).await.unwrap();
         let (mock_url, call_count) = mock_telegram_server().await;
 
-        // Insert a contact for the 08-10 window (currently open at 9am Berlin).
-        // After the bug fix, `reminder_time` returns Some(window_start) when inside
-        // the window, so the cron correctly fires.
+        // Insert a contact, then force `next_remind_at` into the past so the
+        // cron fires regardless of wall-clock time of day (test must be
+        // deterministic — earlier version assumed it ran during Vormittag).
         let input = CreateFlashContact {
             name: "Cron Test".into(),
             phone: "01234-test".into(),
             time_preference: TimePreference::Vormittag,
         };
         let contact = aust_flash_contact::insert(&pool, &input).await.unwrap();
+        sqlx::query("UPDATE flash_contacts SET next_remind_at = $1 WHERE id = $2")
+            .bind(chrono::Utc::now() - chrono::Duration::minutes(5))
+            .bind(contact.id)
+            .execute(&pool)
+            .await
+            .unwrap();
 
         let tg = test_tg_config();
         run_reminder_check_with_base(&pool, &tg, &mock_url).await.unwrap();

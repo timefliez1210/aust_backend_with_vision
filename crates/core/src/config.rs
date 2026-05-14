@@ -156,10 +156,16 @@ pub struct MapsConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct TelegramConfig {
     /// Telegram Bot API token (`123456:ABCDEF...`) obtained from BotFather.
+    /// Used by the email-agent for offer-approval messages.
     pub bot_token: String,
     /// Numeric chat ID of the admin (Alex); messages and approval buttons are
     /// sent only to this chat.
     pub admin_chat_id: i64,
+    /// Dedicated bot token for flash-contact reminders + callback polling.
+    /// Must be a different bot from `bot_token` — Telegram allows only one
+    /// long-poller per token, so flash-contact gets its own bot to avoid
+    /// fighting the email-agent for callback_query updates.
+    pub flash_contact_bot_token: String,
 }
 
 /// JWT authentication settings for the admin REST API.

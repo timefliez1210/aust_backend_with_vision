@@ -84,9 +84,8 @@ services:
       start_period: 30s
 
   # Telegram sidecar — handles fc_reached / fc_snooze / fc_dismiss callback buttons.
-  # NOTE: only one process may poll a bot token at a time. If the email-agent is ever
-  # deployed to prod, provision a dedicated bot token for flash contacts and set
-  # AUST__TELEGRAM__BOT_TOKEN here to that separate token.
+  # Uses its own dedicated bot token (AUST__TELEGRAM__FLASH_CONTACT_BOT_TOKEN, set in
+  # /opt/aust/.env) so it does not fight the email-agent over getUpdates polling.
   flash-contact-bot:
     image: aust_flash_contact_bot:latest
     container_name: aust_flash_contact_bot

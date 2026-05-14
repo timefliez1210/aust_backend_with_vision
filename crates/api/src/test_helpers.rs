@@ -65,6 +65,7 @@ pub fn test_config() -> Config {
         telegram: TelegramConfig {
             bot_token: "test-bot-token".to_string(),
             admin_chat_id: 0,
+            flash_contact_bot_token: "test-flash-contact-bot-token".to_string(),
         },
         auth: AuthConfig {
             jwt_secret: "test-jwt-secret-that-is-long-enough-for-validation".to_string(),

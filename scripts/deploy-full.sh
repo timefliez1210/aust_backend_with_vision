@@ -34,7 +34,9 @@ SCP="scp -i ${SSH_KEY} -o StrictHostKeyChecking=no"
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 FRONTEND_DIR="${PROJECT_DIR}/frontend"
 IMAGE_NAME="aust_backend"
+FLASH_BOT_IMAGE="aust_flash_contact_bot"
 TARBALL="/tmp/aust_backend.tar.gz"
+FLASH_BOT_TARBALL="/tmp/aust_flash_contact_bot.tar.gz"
 
 GREEN="\033[0;32m"; RED="\033[0;31m"; BOLD="\033[1m"; RESET="\033[0m"
 ok()   { echo -e "  ${GREEN}OK${RESET}  ${1}"; }
@@ -101,6 +103,12 @@ ok "FTP_PASS available"
 # ---------------------------------------------------------------------------
 # 2. Backup production DB + MinIO on VPS
 # ---------------------------------------------------------------------------
+step "Verifying flash-contact bot token on VPS"
+if ! ${SSH} 'grep -q "^AUST__TELEGRAM__FLASH_CONTACT_BOT_TOKEN=" /opt/aust/.env'; then
+    fail "AUST__TELEGRAM__FLASH_CONTACT_BOT_TOKEN missing from /opt/aust/.env on VPS — flash-contact-bot will crash-loop."
+fi
+ok "Flash-contact bot token present"
+
 step "Backing up production DB + MinIO on VPS"
 ${SSH} 'bash /opt/aust/backup.sh'
 ok "Production backup complete"
@@ -114,6 +122,13 @@ docker build \
     -t "${IMAGE_NAME}:latest" \
     "${PROJECT_DIR}"
 ok "Image built: ${IMAGE_NAME}:latest"
+
+step "Building flash-contact-bot Docker image"
+docker build \
+    -f "${PROJECT_DIR}/docker/Dockerfile.flash-contact-bot" \
+    -t "${FLASH_BOT_IMAGE}:latest" \
+    "${PROJECT_DIR}"
+ok "Image built: ${FLASH_BOT_IMAGE}:latest"
 
 # ---------------------------------------------------------------------------
 # 4. Build frontend (bun build + inline CSS)
@@ -140,10 +155,23 @@ else
     echo "  No existing image found — skipping rollback tag"
 fi
 
+step "Tagging previous flash-contact-bot image for rollback"
+if ${SSH} docker image inspect "${FLASH_BOT_IMAGE}:latest" >/dev/null 2>&1; then
+    ${SSH} "docker tag ${FLASH_BOT_IMAGE}:latest ${FLASH_BOT_IMAGE}:previous"
+    ok "Tagged existing image as :previous"
+else
+    echo "  No existing image found — skipping rollback tag"
+fi
+
 step "Saving backend image to tarball"
 docker save "${IMAGE_NAME}:latest" | gzip > "${TARBALL}"
 TARBALL_SIZE=$(du -sh "${TARBALL}" | cut -f1)
 ok "Tarball: ${TARBALL} (${TARBALL_SIZE})"
+
+step "Saving flash-contact-bot image to tarball"
+docker save "${FLASH_BOT_IMAGE}:latest" | gzip > "${FLASH_BOT_TARBALL}"
+FLASH_BOT_TARBALL_SIZE=$(du -sh "${FLASH_BOT_TARBALL}" | cut -f1)
+ok "Tarball: ${FLASH_BOT_TARBALL} (${FLASH_BOT_TARBALL_SIZE})"
 
 # ---------------------------------------------------------------------------
 # 6. Upload image tarball to VPS
@@ -152,11 +180,19 @@ step "Uploading backend image to VPS"
 ${SCP} "${TARBALL}" "${VPS_USER}@${VPS_IP}:/tmp/aust_backend.tar.gz"
 ok "Tarball uploaded"
 
+step "Uploading flash-contact-bot image to VPS"
+${SCP} "${FLASH_BOT_TARBALL}" "${VPS_USER}@${VPS_IP}:/tmp/aust_flash_contact_bot.tar.gz"
+ok "Tarball uploaded"
+
 # ---------------------------------------------------------------------------
 # 7. Load image on VPS
 # ---------------------------------------------------------------------------
 step "Loading backend image on VPS"
 ${SSH} 'docker load < /tmp/aust_backend.tar.gz && rm /tmp/aust_backend.tar.gz'
+ok "Image loaded on VPS"
+
+step "Loading flash-contact-bot image on VPS"
+${SSH} 'docker load < /tmp/aust_flash_contact_bot.tar.gz && rm /tmp/aust_flash_contact_bot.tar.gz'
 ok "Image loaded on VPS"
 
 # ---------------------------------------------------------------------------
@@ -173,6 +209,10 @@ ok "Migrations uploaded"
 step "Restarting backend container"
 ${SSH} 'cd /opt/aust && docker compose up -d backend'
 ok "docker compose up -d backend"
+
+step "Restarting flash-contact-bot container"
+${SSH} 'cd /opt/aust && docker compose up -d flash-contact-bot'
+ok "docker compose up -d flash-contact-bot"
 
 # ---------------------------------------------------------------------------
 # 10. Deploy frontend to KAS via FTP

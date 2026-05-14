@@ -132,6 +132,7 @@ services:
       # Replace in .env.staging if you want a real staging Telegram bot.
       AUST__TELEGRAM__BOT_TOKEN: "0000000000:AAAAAAAAAAaaaaaaaaaaaaaaaaaaaaaaaaaa"
       AUST__TELEGRAM__ADMIN_CHAT_ID: "0"
+      AUST__TELEGRAM__FLASH_CONTACT_BOT_TOKEN: "0000000001:AAAAAAAAAAaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
       # Auth
       AUST__AUTH__JWT_SECRET: staging-jwt-secret-do-not-use-in-production-min32chars
