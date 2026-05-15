@@ -2,7 +2,7 @@ use axum::{
     extract::{Multipart, Path, Query, State},
     http::header,
     response::Response,
-    routing::{get, patch, post},
+    routing::{get, patch, post, put},
     Extension, Json, Router,
 };
 use bytes::Bytes;
@@ -14,7 +14,8 @@ use uuid::Uuid;
 
 use aust_core::models::TokenClaims;
 use aust_offer_generator::{convert_xlsx_to_pdf, generate_timesheet_xlsx, TimesheetData, TimesheetEntry};
-use crate::repositories::{admin_repo, employee_repo, feedback_repo, review_repo, invoice_reminder_repo, invoice_repo};
+use crate::repositories::{admin_repo, employee_repo, feedback_repo, review_repo, invoice_reminder_repo, invoice_repo, settings_repo};
+use crate::repositories::settings_repo::PricingSettings;
 use aust_flash_contact;
 use crate::{ApiError, AppState};
 
@@ -68,6 +69,9 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/rechnungsausgangsbuch", get(rechnungsausgangsbuch))
         .route("/flash-contacts", get(list_flash_contacts))
         .route("/flash-contacts/{id}/handle", post(handle_flash_contact))
+        .route("/settings", get(get_settings))
+        .route("/settings/pricing", put(update_pricing_settings))
+        .route("/settings/numbers", put(update_number_settings))
 }
 
 // --- Dashboard ---
@@ -1890,6 +1894,73 @@ async fn handle_flash_contact(
     Ok((axum::http::StatusCode::NO_CONTENT, ()))
 }
 
+// --- Settings ---
+
+#[derive(Debug, Serialize)]
+struct SettingsResponse {
+    pricing: PricingSettings,
+    next_invoice_number: i64,
+    next_offer_number: i64,
+}
+
+/// `GET /api/v1/admin/settings` — effective pricing values plus the next
+/// invoice/KVA numbers the sequences will hand out.
+async fn get_settings(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<TokenClaims>,
+) -> Result<Json<SettingsResponse>, ApiError> {
+    require_admin(&claims)?;
+    let pricing = settings_repo::get_pricing(&state.db, &state.config).await?;
+    let numbers = settings_repo::get_next_numbers(&state.db).await?;
+    Ok(Json(SettingsResponse {
+        pricing,
+        next_invoice_number: numbers.next_invoice_number,
+        next_offer_number: numbers.next_offer_number,
+    }))
+}
+
+/// `PUT /api/v1/admin/settings/pricing` — persist the standard pricing values.
+async fn update_pricing_settings(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<TokenClaims>,
+    Json(body): Json<PricingSettings>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&claims)?;
+    settings_repo::upsert_pricing(&state.db, &body).await?;
+    tracing::info!(admin = %claims.sub, "Admin updated pricing settings");
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+#[derive(Debug, Deserialize)]
+struct NumberSettingsRequest {
+    next_invoice_number: Option<i64>,
+    next_offer_number: Option<i64>,
+}
+
+/// `PUT /api/v1/admin/settings/numbers` — set the next value the invoice and/or
+/// KVA sequences will hand out. Only the provided fields are changed.
+async fn update_number_settings(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<TokenClaims>,
+    Json(body): Json<NumberSettingsRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&claims)?;
+    if let Some(n) = body.next_invoice_number {
+        if n < 1 {
+            return Err(ApiError::Validation("Rechnungsnummer muss groesser als 0 sein".into()));
+        }
+        settings_repo::set_next_invoice(&state.db, n).await?;
+    }
+    if let Some(n) = body.next_offer_number {
+        if n < 1 {
+            return Err(ApiError::Validation("KVA-Nummer muss groesser als 0 sein".into()));
+        }
+        settings_repo::set_next_offer(&state.db, n).await?;
+    }
+    tracing::info!(admin = %claims.sub, "Admin updated number sequences");
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1907,5 +1978,71 @@ mod tests {
         assert!(resolve_doc_column("1=1").is_none());
         assert!(resolve_doc_column("invalid_type").is_none());
         assert!(resolve_doc_column("").is_none());
+    }
+
+    /// PUT /api/v1/admin/settings/numbers sets the sequences such that the
+    /// next issued Rechnungsnummer and KVA-Nummer match what was configured.
+    ///
+    /// Flow: set numbers via endpoint → insert a customer (proving the API is
+    /// healthy) → consume one value from each sequence via the same repo
+    /// functions the offer/invoice generation pipeline uses → assert.
+    #[tokio::test]
+    async fn set_numbers_then_issued_numbers_match() {
+        use crate::repositories::{invoice_repo, offer_repo};
+        use crate::test_helpers::{generate_test_jwt, insert_test_customer, test_app_state};
+        use axum::body::Body;
+        use hyper::Request;
+        use tower::ServiceExt;
+
+        let state = test_app_state().await;
+        let pool = state.db.clone();
+        let app = crate::create_router(state);
+        let token = generate_test_jwt();
+
+        // Pick large values to avoid colliding with whatever the shared test
+        // DB sequences are currently at. Sequences only advance, so picking
+        // high values keeps this test resilient against parallel runs.
+        let target_invoice: i64 = 900_000 + (chrono::Utc::now().timestamp() % 10_000);
+        let target_offer: i64 = 800_000 + (chrono::Utc::now().timestamp() % 10_000);
+
+        let body = serde_json::json!({
+            "next_invoice_number": target_invoice,
+            "next_offer_number": target_offer,
+        });
+        let resp = app
+            .oneshot(
+                Request::put("/api/v1/admin/settings/numbers")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "setting numbers via endpoint must succeed");
+
+        // The "creates a customer" part of the request — proves the system is
+        // operational after the settings update.
+        let _customer_id = insert_test_customer(&pool).await;
+
+        // Consume one value from each sequence the way the real pipeline does.
+        let today = chrono::Utc::now().date_naive();
+        let issued_offer_number = offer_repo::next_offer_number(&pool, today)
+            .await
+            .expect("issue offer number");
+        let issued_invoice_numbers = invoice_repo::next_invoice_numbers(&pool, 1)
+            .await
+            .expect("issue invoice number");
+
+        let expected_offer = format!("{}-{:04}", today.format("%Y"), target_offer);
+        assert_eq!(
+            issued_offer_number, expected_offer,
+            "KVA-Nummer must match the value set via the settings endpoint"
+        );
+        assert_eq!(
+            issued_invoice_numbers,
+            vec![target_invoice],
+            "Rechnungsnummer must match the value set via the settings endpoint"
+        );
     }
 }

@@ -3,7 +3,8 @@ use uuid::Uuid;
 
 use crate::ApiError;
 use crate::repositories::{AddressRow, CustomerRow};
-use crate::repositories::{address_repo, customer_repo, offer_repo};
+use crate::repositories::{address_repo, customer_repo, offer_repo, settings_repo};
+use crate::repositories::settings_repo::PricingSettings;
 use crate::types::resolve_billing_address_id;
 use crate::types::InquiryRow;
 use aust_core::config::Config;
@@ -229,7 +230,10 @@ pub(crate) async fn build_offer_with_overrides(
         has_elevator_stop: stop_address.as_ref().and_then(|a| a.elevator),
     };
 
-    let pricing_engine = PricingEngine::with_rate(config.company.rate_per_person_hour_cents, config.company.saturday_surcharge_cents);
+    // Standard pricing: DB-backed settings override the config/env defaults.
+    let pricing = settings_repo::get_pricing(db, config).await?;
+
+    let pricing_engine = PricingEngine::with_rate(pricing.rate_per_person_hour_cents, pricing.saturday_surcharge_cents);
     let mut pricing_result = pricing_engine.calculate(&pricing_input);
 
     // Apply overrides
@@ -303,7 +307,7 @@ pub(crate) async fn build_offer_with_overrides(
             remark: None,
         }
     } else {
-        build_fahrt_item(config, origin.as_ref(), destination.as_ref(), stop_address.as_ref(), distance).await
+        build_fahrt_item(config, pricing.fahrt_rate_per_km, origin.as_ref(), destination.as_ref(), stop_address.as_ref(), distance).await
     };
 
     let line_items: Vec<OfferLineItem> = if let Some(ref items) = overrides.line_items {
@@ -330,7 +334,7 @@ pub(crate) async fn build_offer_with_overrides(
         result
     } else {
         // Auto-gen / Telegram path: labor first, then service items, then fahrt, insurance last.
-        let service_prices = ServicePrices::from_config(config);
+        let service_prices = ServicePrices::from_pricing(&pricing);
         let auto = build_line_items(&inquiry_services, &service_prices);
         let mut services_items: Vec<OfferLineItem> = Vec::new();
         let mut insurance: Option<OfferLineItem> = None;
@@ -853,13 +857,13 @@ pub(crate) fn detect_salutation_and_greeting(name: &str) -> (String, String) {
 /// Fallback: `flat_total = distance_km × 2.0 × fahrt_rate_per_km`
 async fn build_fahrt_item(
     config: &Config,
+    rate: f64,
     origin: Option<&AddressRow>,
     destination: Option<&AddressRow>,
     stop: Option<&AddressRow>,
     distance_km: f64,
 ) -> OfferLineItem {
     let depot = config.company.depot_address.clone();
-    let rate = config.company.fahrt_rate_per_km;
 
     let format_addr = |a: &AddressRow| -> String {
         match &a.postal_code {
@@ -908,13 +912,13 @@ pub(crate) struct ServicePrices {
 }
 
 impl ServicePrices {
-    /// Build from the application config.
-    pub fn from_config(config: &Config) -> Self {
+    /// Build from the effective (DB-backed, config-fallback) pricing settings.
+    pub fn from_pricing(p: &PricingSettings) -> Self {
         Self {
-            assembly_unit_price: config.company.assembly_price,
-            parking_ban_unit_price: config.company.parking_ban_price,
-            packing_unit_price: config.company.packing_price,
-            transporter_unit_price: config.company.transporter_price,
+            assembly_unit_price: p.assembly_price,
+            parking_ban_unit_price: p.parking_ban_price,
+            packing_unit_price: p.packing_price,
+            transporter_unit_price: p.transporter_price,
         }
     }
 
