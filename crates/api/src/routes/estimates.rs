@@ -560,30 +560,26 @@ async fn process_video_background(
 
     if let Some(items_arr) = items_value.as_array_mut() {
         for (idx, item_val) in items_arr.iter_mut().enumerate() {
-            if let Some(crop_b64) = item_val.get("crop_base64").and_then(|v| v.as_str()) {
-                if !crop_b64.is_empty() {
+            if let Some(crop_b64) = item_val.get("crop_base64").and_then(|v| v.as_str())
+                && !crop_b64.is_empty() {
                     let name = item_val.get("name").and_then(|v| v.as_str()).unwrap_or("item");
                     let safe_name = name.replace(' ', "_").to_lowercase();
                     let key = format!("estimates/{inquiry_id}/{estimation_id}/crops/{safe_name}_{idx}.jpg");
                     if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(crop_b64)
-                    {
-                        if state
+                        && state
                             .storage
                             .upload(&key, Bytes::from(decoded), "image/jpeg")
                             .await
                             .is_ok()
+                        && let Some(obj) = item_val.as_object_mut()
                         {
-                            item_val.as_object_mut().map(|obj| {
-                                obj.remove("crop_base64");
-                                obj.insert(
-                                    "crop_s3_key".to_string(),
-                                    serde_json::Value::String(key),
-                                );
-                            });
+                            obj.remove("crop_base64");
+                            obj.insert(
+                                "crop_s3_key".to_string(),
+                                serde_json::Value::String(key),
+                            );
                         }
-                    }
                 }
-            }
         }
     }
 

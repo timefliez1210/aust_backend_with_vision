@@ -1,6 +1,6 @@
 # crates/api — REST API, Repos, Services
 
-The main backend crate. Axum HTTP server with JWT middleware, 18 route files, 16 repository modules, 8 service modules.
+The main backend crate. Axum HTTP server with JWT middleware, 19 route files, 18 repository modules, 10 service modules.
 
 ## File Map
 
@@ -21,6 +21,11 @@ The main backend crate. Axum HTTP server with JWT middleware, 18 route files, 16
 | `admin_emails.rs` | Email thread CRUD, drafts, send | 17KB |
 | `auth.rs` | JWT login/refresh | 17KB |
 | `estimates.rs` | Volume estimation CRUD + image serving | 36KB |
+| `distance.rs` | ORS distance calculation endpoint | 2KB |
+| `flash_contact.rs` | Flash contact form submission | 2KB |
+| `health.rs` | Health/readiness checks | 1KB |
+| `shared.rs` | Shared route utilities | 2KB |
+| `offers.rs` | Minimal offer route stub | 0.4KB |
 
 ### Repositories (`src/repositories/`)
 
@@ -41,6 +46,7 @@ The main backend crate. Axum HTTP server with JWT middleware, 18 route files, 16
 | `feedback_repo.rs` | `feedback_reports` | Admin customer feedback |
 | `invoice_reminder_repo.rs` | `invoice_reminders` | |
 | `review_repo.rs` | `reviews` | |
+| `settings_repo.rs` | `settings` (invoices, reminders, review config) | |
 
 ### Services (`src/services/`)
 
@@ -54,6 +60,7 @@ The main backend crate. Axum HTTP server with JWT middleware, 18 route files, 16
 | `email.rs` | Email formatting helpers |
 | `otp_service.rs` | OTP generation + verification |
 | `vision.rs` | Vision service client (photo, depth, video) |
+| `flash_contact_service.rs` | Flash contact form processing |
 
 ## Critical Patterns
 
@@ -74,8 +81,6 @@ The old `inquiry_days`, `inquiry_day_employees`, `calendar_item_days`, `calendar
 
 **`day_number` and `total_days`** are computed on the fly: `(job_date - scheduled_date + 1)` and `(end_date - scheduled_date + 1)`.
 
-### Status Gate (M3)
-`InquiryStatus::is_locked_for_modifications()` returns true for `offer_ready` through `paid`. When locked, PATCH `/inquiries/{id}` rejects changes to `estimated_volume_m3`, `services`, `distance_km`, `origin_address_id`, `destination_address_id`.
 
 ### Offer Race Condition (M1)
 `offers_inquiry_active_unique` partial unique index prevents duplicate active offers. `offer_builder.rs::insert_returning()` catches constraint violations and falls back to updating the existing offer.
@@ -89,14 +94,14 @@ All pricing constants are in `CompanyConfig`:
 - `saturday_surcharge_cents` (default 5000 = €50)
 - `fahrt_rate_per_km` (default 1.0)
 
-`PricingEngine::with_rate(rate, surcharge)` and `ServicePrices::from_config(config)` replace `PricingEngine::new()` in non-test code.
+`PricingEngine::with_rate(rate, surcharge)` and `ServicePrices::from_pricing()` replaces `PricingEngine::new()` in non-test code.
 
 ### Submission Handlers
 5 handlers in `submissions.rs`: photo, mobile (via `handle_submission`), AR, video, manual. All create billing addresses from parsed fields via `merge_address_parts()`. Manual mode has volume fast-path (skip vision pipeline).
 
 ## Test Infrastructure
 
-- `src/test_helpers.rs` — DB pool factory, JWT generator, insert factories (customer, address, inquiry, employee, day, day-employee, estimation)
+- `src/test_helpers.rs` — DB pool factory, JWT generator, insert factories (customer, address, inquiry, employee, estimation)
 - `tests/integration_tests.rs` — 20 DB-level integration tests requiring `DATABASE_URL`
 - Unit tests in `#[cfg(test)] mod tests` blocks within source files (repos, routes, services)
 
@@ -112,8 +117,8 @@ All pricing constants are in `CompanyConfig`:
 
 | If you change... | ...also verify |
 |---|---|
-| Inquiry status machine | `can_transition_to()`, `is_locked_for_modifications()`, admin frontend status labels (`INQUIRY_STATUS_LABELS`), `inquiry_repo.rs` status query |
-| `CompanyConfig` pricing | `PricingEngine::with_rate()`, `ServicePrices::from_config()`, offer XLSX template pricing cells, unit tests |
+| Inquiry status machine | `can_transition_to()`, admin frontend status labels (`INQUIRY_STATUS_LABELS`), `inquiry_repo.rs` status query, `inquiries.rs` PATCH handler status validation |
+| `CompanyConfig` pricing | `PricingEngine::with_rate()`, `ServicePrices::from_pricing()`, offer XLSX template pricing cells, unit tests |
 | `Services` struct flags | `build_line_items()` in offer_builder, XLSX rows 31–42, foto-angebot form, frontend service toggles |
 | `inquiry_employees` schema (add/remove columns) | `calendar_item_employees` mirror, `calendar_repo` schedule queries, `employee_repo` hours queries, admin employee panel |
 | `offers` unique constraint | `offer_pipeline.rs` race guard, `offer_builder.rs` insert catch block, `offer_repo.rs` fetch_active_id |

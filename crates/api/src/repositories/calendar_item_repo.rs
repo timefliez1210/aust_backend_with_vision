@@ -141,6 +141,8 @@ pub(crate) async fn list_items_all(pool: &PgPool) -> Result<Vec<CalendarItemRow>
 ///
 /// **Caller**: `create_item` handler
 /// **Why**: Creates a new internal event record.
+// repository fn — args mirror DB columns
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn insert_item(
     pool: &PgPool,
     title: &str,
@@ -255,6 +257,8 @@ pub(crate) async fn insert_item_employee(
 ///
 /// Updates the row matching (calendar_item_id, employee_id, job_date). When job_date
 /// is None, falls back to the item's scheduled_date.
+// repository fn — args mirror DB columns
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn update_item_employee(
     pool: &PgPool,
     calendar_item_id: Uuid,

@@ -215,6 +215,8 @@ impl EmailProcessor {
     }
 
     /// Store an inbound email message in the database.
+    // repository fn — args mirror DB columns for inbound_emails table
+    #[allow(clippy::too_many_arguments)]
     async fn store_inbound_email(
         &self,
         thread_id: Uuid,
@@ -424,8 +426,8 @@ impl EmailProcessor {
             .await;
         }
 
-        if let Some(ref avail) = availability {
-            if !avail.requested_date_available {
+        if let Some(ref avail) = availability
+            && !avail.requested_date_available {
                 info!(
                     "Date {} is fully booked, sending capacity question to Telegram",
                     avail.requested_date
@@ -436,7 +438,6 @@ impl EmailProcessor {
                 )
                 .await;
             }
-        }
 
         // If inquiry has enough data, forward to offer pipeline
         if inquiry_snapshot.is_complete() {
@@ -445,7 +446,7 @@ impl EmailProcessor {
                 inquiry_snapshot.id
             );
             if let Some(tx) = &self.offer_tx {
-                let _ = tx.send(ApprovalDecision::InquiryComplete(inquiry_snapshot.clone()));
+                let _ = tx.send(ApprovalDecision::InquiryComplete(Box::new(inquiry_snapshot.clone())));
             }
             // Remove from HashMap so a future submission from the same customer
             // (e.g. a new inquiry months later) starts fresh rather than merging
@@ -483,11 +484,10 @@ impl EmailProcessor {
         }
 
         // Mark as read
-        if !email.message_id.is_empty() {
-            if let Err(e) = self.imap.mark_as_read(&email.message_id).await {
+        if !email.message_id.is_empty()
+            && let Err(e) = self.imap.mark_as_read(&email.message_id).await {
                 warn!("Failed to mark email as read: {e}");
             }
-        }
     }
 
     /// Send a draft response to Telegram for approval.
@@ -1290,6 +1290,6 @@ fn merge_inquiry(target: &mut MovingInquiry, source: &MovingInquiry) {
         }
     }
     if matches!(target.source, aust_core::models::InquirySource::DirectEmail) {
-        target.source = source.source.clone();
+        target.source = source.source;
     }
 }

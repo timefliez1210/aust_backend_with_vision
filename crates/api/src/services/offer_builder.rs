@@ -387,7 +387,7 @@ pub(crate) async fn build_offer_with_overrides(
     let origin_street = origin.as_ref().map(|a| a.street.clone()).unwrap_or_default();
     let origin_city = origin
         .as_ref()
-        .map(|a| format_city(a))
+        .map(format_city)
         .unwrap_or_default();
     let origin_floor_info = origin
         .as_ref()
@@ -401,7 +401,7 @@ pub(crate) async fn build_offer_with_overrides(
         .unwrap_or_default();
     let dest_city = destination
         .as_ref()
-        .map(|a| format_city(a))
+        .map(format_city)
         .unwrap_or_default();
     let dest_floor_info = destination
         .as_ref()
@@ -429,7 +429,7 @@ pub(crate) async fn build_offer_with_overrides(
         .unwrap_or_else(|| origin_street.clone());
     let billing_city = billing_addr
         .as_ref()
-        .map(|a| format_city(a))
+        .map(format_city)
         .unwrap_or_else(|| origin_city.clone());
 
     // Get or generate offer ID and number (UPDATE-in-place when existing_offer_id is set)
@@ -440,7 +440,7 @@ pub(crate) async fn build_offer_with_overrides(
         (existing_id, offer_number)
     } else {
         let offer_number = offer_repo::next_offer_number(db, today).await
-            .map_err(|e| ApiError::Database(e))?;
+            .map_err(ApiError::Database)?;
         (Uuid::now_v7(), offer_number)
     };
 
@@ -629,7 +629,7 @@ pub(crate) async fn build_offer_with_overrides(
     // Update inquiry status
     crate::repositories::inquiry_repo::update_status(db, inquiry_id, "offer_ready", now)
         .await
-        .map_err(|e| ApiError::Database(e))?;
+        .map_err(ApiError::Database)?;
 
     // Build full address strings for Telegram summary
     let origin_full = if origin_street.is_empty() {
@@ -763,15 +763,13 @@ pub(crate) fn format_city(addr: &AddressRow) -> String {
 pub(crate) fn detect_salutation_and_greeting(name: &str) -> (String, String) {
     // If the name contains "Frau" or "Herr" prefix, use that directly
     let name_trimmed = name.trim();
-    if name_trimmed.starts_with("Frau ") {
-        let after = &name_trimmed[5..];
+    if let Some(after) = name_trimmed.strip_prefix("Frau ") {
         return (
             "Frau".to_string(),
             format!("Sehr geehrte Frau {after},"),
         );
     }
-    if name_trimmed.starts_with("Herr ") {
-        let after = &name_trimmed[5..];
+    if let Some(after) = name_trimmed.strip_prefix("Herr ") {
         return (
             "Herrn".to_string(),
             format!("Sehr geehrter Herr {after},"),

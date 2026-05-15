@@ -55,7 +55,7 @@ pub enum ApprovalDecision {
     /// Free-text edit instructions for an offer (routed when no email draft is being edited)
     OfferEditText(String),
     /// A complete inquiry is ready to become a quote + offer
-    InquiryComplete(aust_core::models::MovingInquiry),
+    InquiryComplete(Box<aust_core::models::MovingInquiry>),
 }
 
 /// Calendar commands from Telegram.
@@ -211,18 +211,16 @@ impl TelegramBot {
             self.last_update_id = Some(update.update_id);
 
             // Handle inline keyboard callback (Approve/Edit/Deny button press)
-            if let Some(callback) = &update.callback_query {
-                if let Some(data) = &callback.data {
-                    if let Some(resp) = self.handle_callback(data, callback).await {
+            if let Some(callback) = &update.callback_query
+                && let Some(data) = &callback.data
+                    && let Some(resp) = self.handle_callback(data, callback).await {
                         responses.push(resp);
                     }
-                }
-            }
 
             // Handle text message (edit instructions or calendar commands from admin)
-            if let Some(message) = &update.message {
-                if message.chat.id == self.admin_chat_id {
-                    if let Some(text) = &message.text {
+            if let Some(message) = &update.message
+                && message.chat.id == self.admin_chat_id
+                    && let Some(text) = &message.text {
                         if let Some(cmd) = Self::parse_calendar_command(text) {
                             responses.push(ApprovalResponse {
                                 draft_id: "calendar_command".to_string(),
@@ -241,8 +239,6 @@ impl TelegramBot {
                             });
                         }
                     }
-                }
-            }
         }
 
         Ok(responses)
@@ -498,12 +494,11 @@ impl TelegramBot {
             return Some(CalendarCommand::ShowUpcoming);
         }
         if let Some(args) = text.strip_prefix("/kapazitaet ") {
-            let parts: Vec<&str> = args.trim().split_whitespace().collect();
-            if parts.len() == 2 {
-                if let Ok(cap) = parts[1].parse::<i32>() {
+            let parts: Vec<&str> = args.split_whitespace().collect();
+            if parts.len() == 2
+                && let Ok(cap) = parts[1].parse::<i32>() {
                     return Some(CalendarCommand::SetCapacity(parts[0].to_string(), cap));
                 }
-            }
         }
 
         None

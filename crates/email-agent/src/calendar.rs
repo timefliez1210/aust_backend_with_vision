@@ -177,6 +177,8 @@ pub async fn get_schedule(
     default_capacity: i32,
 ) -> Result<Vec<ScheduleEntry>, sqlx::Error> {
     // Fetch all active inquiries in range
+    // sqlx tuple — mirrors the SELECT column order exactly
+    #[allow(clippy::type_complexity)]
     let rows: Vec<(NaiveDate, Uuid, Option<String>, Option<String>, Option<String>, Option<f64>)> =
         sqlx::query_as(
             r#"

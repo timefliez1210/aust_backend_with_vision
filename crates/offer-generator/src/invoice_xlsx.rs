@@ -18,11 +18,11 @@
 //! - **Intro text**:   A27
 //! - **Table header**: Row 30 (Pos., Beschreibung, Menge, Einzelpreis, Gesamtpreis)
 //! - **Line items**:   rows 31–37 (A=pos, B=desc, C=qty, D=unit_price, E=formula D*C)
-//! - **Totals**:       Row 38 Nettosumme (E38=SUM(E31:E37))
-//!                     Row 39 zzgl. 19% MwSt. (E39=E38*19%)
-//!                     Row 41 Rechnungsbetrag (E41=E38+E39)
+//! - **Totals**:       Row 38 Nettosumme (E38=SUM(E31:E37)),
+//!   Row 39 zzgl. 19% MwSt. (E39=E38*19%),
+//!   Row 41 Rechnungsbetrag (E41=E38+E39)
 //! - **Footer**:       Row 44 payment instruction, Row 47 "Mit freundlichen Grüßen",
-//!                     Row 49 "Aust Umzüge & Haushaltsauflösungen"
+//!   Row 49 "Aust Umzüge & Haushaltsauflösungen"
 //!
 //! Formulas for line-item totals and the sums are pre-baked in the template.
 //! The code only writes data cells (A, B, C, D) for items; the E-column formulas
@@ -506,8 +506,8 @@ fn modify_invoice_workbook(xml: &str) -> String {
     let mut result = xml.to_string();
 
     // Fix print area to A:E covering line items + totals + footer
-    if let Some(start) = result.find("_xlnm.Print_Area") {
-        if let Some(content_start) = result[start..].find('>') {
+    if let Some(start) = result.find("_xlnm.Print_Area")
+        && let Some(content_start) = result[start..].find('>') {
             let abs_content_start = start + content_start + 1;
             if let Some(end_tag) = result[abs_content_start..].find("</definedName>") {
                 let abs_end = abs_content_start + end_tag;
@@ -518,19 +518,16 @@ fn modify_invoice_workbook(xml: &str) -> String {
                 result = patched;
             }
         }
-    }
 
     // Ensure fullCalcOnLoad is set
     if result.contains(r#"fullCalcOnLoad="false""#) {
         result = result.replace(r#"fullCalcOnLoad="false""#, r#"fullCalcOnLoad="true""#);
-    } else if !result.contains("fullCalcOnLoad=") {
-        if let Some(pos) = result.find("<calcPr") {
-            if let Some(gt) = result[pos..].find("/>") {
+    } else if !result.contains("fullCalcOnLoad=")
+        && let Some(pos) = result.find("<calcPr")
+            && let Some(gt) = result[pos..].find("/>") {
                 let insert_at = pos + gt;
                 result.insert_str(insert_at, r#" fullCalcOnLoad="true""#);
             }
-        }
-    }
 
     result
 }
@@ -553,14 +550,13 @@ fn strip_rechnung_drawing(xml: &str) -> String {
 /// Remove the `<hyperlinks>` block from `sheet1.xml` so email addresses render
 /// as plain text rather than clickable hyperlinks.
 fn strip_hyperlinks(xml: &str) -> String {
-    if let Some(start) = xml.find("<hyperlinks>") {
-        if let Some(end) = xml.find("</hyperlinks>") {
+    if let Some(start) = xml.find("<hyperlinks>")
+        && let Some(end) = xml.find("</hyperlinks>") {
             let mut result = String::with_capacity(xml.len());
             result.push_str(&xml[..start]);
             result.push_str(&xml[end + "</hyperlinks>".len()..]);
             return result;
         }
-    }
     xml.to_string()
 }
 

@@ -18,6 +18,7 @@ pub(crate) struct InquiryDbRow {
     pub status: String,
     pub estimated_volume_m3: Option<f64>,
     pub distance_km: Option<f64>,
+    #[allow(dead_code)]
     pub preferred_date: Option<DateTime<Utc>>, // retired — kept for DB compat
     pub scheduled_date: Option<chrono::NaiveDate>,
     #[sqlx(default)]
@@ -33,6 +34,7 @@ pub(crate) struct InquiryDbRow {
     #[sqlx(default)]
     pub inquiry_billing_address_id: Option<Uuid>,
     #[sqlx(default)]
+    #[allow(dead_code)]
     pub custom_fields: serde_json::Value,
     pub notes: Option<String>,
     #[sqlx(default)]
@@ -474,57 +476,6 @@ pub(crate) async fn fetch_email_threads(
     .await
 }
 
-/// Employee assignment row for inquiry detail (includes email field).
-#[derive(Debug, serde::Serialize, sqlx::FromRow)]
-pub(crate) struct EmployeeAssignmentRow {
-    pub employee_id: Uuid,
-    pub first_name: String,
-    pub last_name: String,
-    pub email: String,
-    pub planned_hours: f64,
-    pub clock_in: Option<chrono::NaiveTime>,
-    pub clock_out: Option<chrono::NaiveTime>,
-    pub start_time: Option<chrono::NaiveTime>,
-    pub end_time: Option<chrono::NaiveTime>,
-    pub break_minutes: i32,
-    pub actual_hours: Option<f64>,
-    pub notes: Option<String>,
-}
-
-/// Fetch employee assignments for an inquiry (with email).
-///
-/// **Caller**: `list_inquiry_employees` handler
-/// **Why**: Shows assigned employees for a job. Reads from day-level table,
-///          aggregating per-employee across all days.
-pub(crate) async fn list_employee_assignments(
-    pool: &PgPool,
-    inquiry_id: Uuid,
-) -> Result<Vec<EmployeeAssignmentRow>, sqlx::Error> {
-    sqlx::query_as(
-        r#"
-        SELECT ie.employee_id, e.first_name, e.last_name, e.email,
-               SUM(ie.planned_hours)::float8 AS planned_hours,
-               MIN(ie.clock_in)  AS clock_in,
-               MAX(ie.clock_out) AS clock_out,
-               MIN(ie.start_time) AS start_time,
-               MAX(ie.end_time)   AS end_time,
-               COALESCE(MAX(ie.break_minutes), 0)::int AS break_minutes,
-               SUM(CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
-                         THEN (EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0)
-                         ELSE NULL END)::float8 AS actual_hours,
-               STRING_AGG(ie.notes, '; ' ORDER BY ie.job_date) AS notes
-        FROM inquiry_employees ie
-        JOIN employees e ON ie.employee_id = e.id
-        WHERE ie.inquiry_id = $1
-        GROUP BY ie.employee_id, e.first_name, e.last_name, e.email
-        ORDER BY e.last_name, e.first_name
-        "#,
-    )
-    .bind(inquiry_id)
-    .fetch_all(pool)
-    .await
-}
-
 /// Check whether an employee exists and is active.
 ///
 /// **Caller**: `assign_employee` handler
@@ -589,6 +540,8 @@ pub(crate) async fn insert_employee_assignment(
 ///
 /// # Returns
 /// Number of rows affected (0 if not found).
+// repository fn — args mirror DB columns
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn update_employee_assignment(
     pool: &PgPool,
     inquiry_id: Uuid,
@@ -913,6 +866,8 @@ pub(crate) async fn count_items(
 ///
 /// **Caller**: `handle_submission`, `video_inquiry`
 /// **Why**: Public form submissions create inquiries without volume/distance initially.
+// repository fn — args mirror DB columns
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn create_minimal(
     executor: impl sqlx::Executor<'_, Database = sqlx::Postgres>,
     id: Uuid,

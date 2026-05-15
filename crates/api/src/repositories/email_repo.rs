@@ -87,6 +87,8 @@ pub(crate) async fn create_thread(
 ///
 /// **Caller**: `generate_offer_email_draft`, `handle_offer_approval`
 /// **Why**: Centralises email message creation across offer approval and draft generation.
+// repository fn — args mirror DB columns
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn insert_message(
     pool: &PgPool,
     id: Uuid,

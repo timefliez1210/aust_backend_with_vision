@@ -291,55 +291,45 @@ Antworte NUR mit dem JSON-Objekt, ohne Erklärungen. Setze fehlende Felder auf n
         let mut updated = inquiry.clone();
 
         if let Ok(extracted) = serde_json::from_str::<serde_json::Value>(&response) {
-            if let Some(name) = extracted.get("name").and_then(|v| v.as_str()) {
-                if updated.name.is_none() && !name.is_empty() {
+            if let Some(name) = extracted.get("name").and_then(|v| v.as_str())
+                && updated.name.is_none() && !name.is_empty() {
                     updated.name = Some(name.to_string());
                 }
-            }
-            if let Some(phone) = extracted.get("phone").and_then(|v| v.as_str()) {
-                if updated.phone.is_none() && !phone.is_empty() {
+            if let Some(phone) = extracted.get("phone").and_then(|v| v.as_str())
+                && updated.phone.is_none() && !phone.is_empty() {
                     updated.phone = Some(phone.to_string());
                 }
-            }
-            if let Some(date_str) = extracted.get("scheduled_date").and_then(|v| v.as_str()) {
-                if updated.scheduled_date.is_none() {
-                    if let Ok(date) = NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
+            if let Some(date_str) = extracted.get("scheduled_date").and_then(|v| v.as_str())
+                && updated.scheduled_date.is_none()
+                    && let Ok(date) = NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
                         updated.scheduled_date = Some(date);
                     }
-                }
-            }
-            if let Some(addr) = extracted.get("departure_address").and_then(|v| v.as_str()) {
-                if updated.departure_address.is_none() && !addr.is_empty() {
+            if let Some(addr) = extracted.get("departure_address").and_then(|v| v.as_str())
+                && updated.departure_address.is_none() && !addr.is_empty() {
                     updated.departure_address = Some(addr.to_string());
                 }
-            }
-            if let Some(floor) = extracted.get("departure_floor").and_then(|v| v.as_str()) {
-                if updated.departure_floor.is_none() && !floor.is_empty() {
+            if let Some(floor) = extracted.get("departure_floor").and_then(|v| v.as_str())
+                && updated.departure_floor.is_none() && !floor.is_empty() {
                     updated.departure_floor = Some(floor.to_string());
                 }
-            }
-            if let Some(addr) = extracted.get("arrival_address").and_then(|v| v.as_str()) {
-                if updated.arrival_address.is_none() && !addr.is_empty() {
+            if let Some(addr) = extracted.get("arrival_address").and_then(|v| v.as_str())
+                && updated.arrival_address.is_none() && !addr.is_empty() {
                     updated.arrival_address = Some(addr.to_string());
                 }
-            }
-            if let Some(floor) = extracted.get("arrival_floor").and_then(|v| v.as_str()) {
-                if updated.arrival_floor.is_none() && !floor.is_empty() {
+            if let Some(floor) = extracted.get("arrival_floor").and_then(|v| v.as_str())
+                && updated.arrival_floor.is_none() && !floor.is_empty() {
                     updated.arrival_floor = Some(floor.to_string());
                 }
-            }
-            if let Some(vol) = extracted.get("volume_m3").and_then(|v| v.as_f64()) {
-                if updated.volume_m3.is_none() {
+            if let Some(vol) = extracted.get("volume_m3").and_then(|v| v.as_f64())
+                && updated.volume_m3.is_none() {
                     updated.volume_m3 = Some(vol);
                 }
-            }
-            if let Some(items) = extracted.get("items_description").and_then(|v| v.as_str()) {
-                if updated.items_list.is_none() && !items.is_empty() {
+            if let Some(items) = extracted.get("items_description").and_then(|v| v.as_str())
+                && updated.items_list.is_none() && !items.is_empty() {
                     updated.items_list = Some(items.to_string());
                 }
-            }
-            if let Some(notes) = extracted.get("notes").and_then(|v| v.as_str()) {
-                if !notes.is_empty() {
+            if let Some(notes) = extracted.get("notes").and_then(|v| v.as_str())
+                && !notes.is_empty() {
                     let existing = updated.notes.clone().unwrap_or_default();
                     if !existing.contains(notes) {
                         updated.notes = Some(if existing.is_empty() {
@@ -349,7 +339,6 @@ Antworte NUR mit dem JSON-Objekt, ohne Erklärungen. Setze fehlende Felder auf n
                         });
                     }
                 }
-            }
         }
 
         Ok(updated)

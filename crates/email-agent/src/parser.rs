@@ -189,7 +189,7 @@ impl EmailParser {
         let scheduled_date = form
             .wunschtermin
             .as_deref()
-            .and_then(|d| parse_date(d));
+            .and_then(parse_date);
 
         let volume_m3 = form
             .umzugsvolumen_m3
@@ -561,8 +561,8 @@ fn extract_section_field(body: &str, section: &str, key: &str) -> Option<String>
             break;
         }
 
-        if in_section {
-            if let Some(rest) = lower.strip_prefix(&key_lower) {
+        if in_section
+            && let Some(rest) = lower.strip_prefix(&key_lower) {
                 let rest_trimmed = rest.trim_start_matches(':').trim_start_matches(' ').trim();
                 if !rest_trimmed.is_empty() && rest_trimmed != "-" && rest_trimmed != "keine" {
                     // Return the original (non-lowered) value
@@ -570,7 +570,6 @@ fn extract_section_field(body: &str, section: &str, key: &str) -> Option<String>
                     return Some(orig_rest.to_string());
                 }
             }
-        }
     }
     None
 }
@@ -603,11 +602,11 @@ fn extract_section_bool(body: &str, section: &str, key: &str) -> Option<bool> {
 /// # Parameters
 /// - `key` — The field name that starts the block (e.g., `"Gegenstände"`).
 fn extract_multiline_field(body: &str, key: &str) -> Option<String> {
-    let mut lines_iter = body.lines().peekable();
+    let lines_iter = body.lines().peekable();
     let mut result_lines = Vec::new();
     let mut found = false;
 
-    while let Some(line) = lines_iter.next() {
+    for line in lines_iter {
         let trimmed = line.trim();
 
         if !found {

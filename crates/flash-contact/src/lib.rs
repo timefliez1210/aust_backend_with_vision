@@ -127,7 +127,7 @@ pub async fn insert(db: &PgPool, input: &CreateFlashContact) -> Result<FlashCont
         .bind(now)
         .fetch_one(db)
         .await?;
-    Ok(map_row(row)?)
+    map_row(row)
 }
 
 /// Fetch all contacts that need a reminder right now.

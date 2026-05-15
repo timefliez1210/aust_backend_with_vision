@@ -241,8 +241,9 @@ async fn list_orders(
 
     // Filter by specific sub-status within orders, or show all order statuses
     let status_filter = query.status.as_deref();
+    #[allow(clippy::match_like_matches_macro)]
     let statuses: &[&str] = match status_filter {
-        Some(s) if matches!(s, "accepted" | "scheduled" | "completed" | "invoiced" | "paid") => &[],
+        Some("accepted" | "scheduled" | "completed" | "invoiced" | "paid") => &[],
         _ => &["accepted", "scheduled", "completed", "invoiced", "paid"],
     };
 
@@ -431,7 +432,7 @@ async fn list_employees(
 
     let mut employees = Vec::with_capacity(repo_rows.len());
     for row in repo_rows {
-        let (planned, actual) = if let Some((from, to)) = &month_range {
+        let (_planned, actual) = if let Some((from, to)) = &month_range {
             fetch_employee_month_hours(&state.db, row.id, *from, *to).await?
         } else {
             (None, None)
@@ -476,11 +477,10 @@ async fn create_employee(
     )
     .await
     .map_err(|e| {
-        if let sqlx::Error::Database(ref db_err) = e {
-            if db_err.constraint() == Some("employees_email_key") {
+        if let sqlx::Error::Database(ref db_err) = e
+            && db_err.constraint() == Some("employees_email_key") {
                 return ApiError::Conflict("Ein Mitarbeiter mit dieser E-Mail existiert bereits.".into());
             }
-        }
         ApiError::from(e)
     })?;
 
@@ -544,11 +544,10 @@ async fn update_employee(
         return Err(ApiError::NotFound("Mitarbeiter nicht gefunden".into()));
     }
 
-    if let Some(ref sal) = body.salutation {
-        if !["Herr", "Frau", "D"].contains(&sal.as_str()) {
+    if let Some(ref sal) = body.salutation
+        && !["Herr", "Frau", "D"].contains(&sal.as_str()) {
             return Err(ApiError::BadRequest("Ungueltige Anrede".into()));
         }
-    }
 
     employee_repo::update(
         &state.db, id,
@@ -595,6 +594,7 @@ async fn delete_employee(
 /// # Query Parameters
 /// - `from` + `to` (YYYY-MM-DD): explicit date range (used for 7-day view)
 /// - `month` (YYYY-MM): calendar month; used when `from`/`to` are absent
+///
 /// If none are provided, defaults to the current calendar month.
 ///
 /// # Returns
@@ -922,11 +922,10 @@ async fn upload_employee_document(
     })? {
         if field.name() == Some("file") {
             // Derive extension from original filename
-            if let Some(fname) = field.file_name() {
-                if let Some(ext) = fname.rsplit('.').next().filter(|e| !e.is_empty()) {
+            if let Some(fname) = field.file_name()
+                && let Some(ext) = fname.rsplit('.').next().filter(|e| !e.is_empty()) {
                     file_ext = ext.to_lowercase();
                 }
-            }
             if let Some(ct) = field.content_type() {
                 content_type_str = ct.to_string();
             }
@@ -1333,13 +1332,12 @@ async fn patch_feedback(
         return Err(ApiError::BadRequest("Mindestens status oder agent_notes muss gesetzt sein.".into()));
     }
     let valid = ["open", "in_progress", "resolved", "needs_clarification"];
-    if let Some(ref s) = body.status {
-        if !valid.contains(&s.as_str()) {
+    if let Some(ref s) = body.status
+        && !valid.contains(&s.as_str()) {
             return Err(ApiError::BadRequest(
                 format!("Ungültiger Status '{s}'. Erlaubt: open, in_progress, resolved, needs_clarification."),
             ));
         }
-    }
     let report = feedback_repo::update_report(
         &state.db,
         id,
@@ -1483,7 +1481,7 @@ struct InvoiceReminderActionBody {
 ///
 /// # Actions
 /// - `"send"` — sends the appropriate dunning email (Zahlungserinnerung / 1. Mahnung /
-///              2. Mahnung); advances to the next level 7 days from now, or closes after level 3
+///   2. Mahnung); advances to the next level 7 days from now, or closes after level 3
 /// - `"later"` — postpones the reminder by `snooze_days` (default 7)
 /// - `"paid"` — marks the invoice as paid and closes the reminder
 ///
@@ -1617,7 +1615,7 @@ async fn morning_workflow(
         admin_repo::fetch_morning_inquiries(&state.db),
         admin_repo::fetch_morning_calendar_items(&state.db),
     )
-    .map_err(|e| ApiError::Database(e))?;
+    .map_err(ApiError::Database)?;
 
     let inquiries = inq_rows.into_iter().map(|r| MorningInquiryItem {
         id: r.id,

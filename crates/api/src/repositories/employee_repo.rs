@@ -742,6 +742,8 @@ pub(crate) async fn fetch_month_hours(
 ///
 /// **Caller**: `admin::create_employee`
 /// **Why**: Registers a new employee for assignment tracking.
+// repository fn — args mirror DB columns
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn create(
     pool: &PgPool,
     id: Uuid,
@@ -808,6 +810,8 @@ pub(crate) async fn exists(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error>
 ///
 /// **Caller**: `admin::update_employee`
 /// **Why**: COALESCE-based partial update of profile fields.
+// repository fn — args mirror DB columns
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn update(
     pool: &PgPool,
     id: Uuid,
@@ -1115,7 +1119,7 @@ pub(crate) async fn clear_document_key(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    
 
     /// Verify that fetch_document_key does NOT append _key to the column name.
     /// The bug was a double _key suffix (arbeitsvertrag_key_key) that made all

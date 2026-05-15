@@ -23,6 +23,8 @@ pub(crate) struct EstimationRow {
 /// **Caller**: `create_inquiry`, `trigger_estimate`, `handle_complete_inquiry`
 /// **Why**: Creates estimation for manual/inventory methods where the caller doesn't need
 ///          the returned row.
+// repository fn — args mirror DB columns
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn insert_no_return(
     pool: &PgPool,
     id: Uuid,

@@ -13,7 +13,6 @@ src/main.rs
     │       ├── crates/core              ← domain models, config, errors (no deps)
     │       ├── crates/llm-providers     ← LLM abstraction (Claude / OpenAI / Ollama)
     │       ├── crates/storage           ← S3/local file storage abstraction
-    │       ├── crates/calendar          ← booking + capacity management
     │       ├── crates/distance-calculator ← ORS geocoding + routing
     │       ├── crates/offer-generator   ← pricing engine, XLSX gen, PDF via LibreOffice
     │       └── crates/volume-estimator  ← LLM vision + ML service client
@@ -168,7 +167,7 @@ The assign-employee modal defaults `planned_hours` to `0` — the admin fills it
 
 ## Offer XLSX Template Layout
 
-Template file: `templates/Angebot_Vorlage.xlsx` (embedded at compile time in `offer-generator`).
+Template file: `templates/offer_template.xlsx` (embedded at compile time in `offer-generator`).
 
 ```
 Sheet "Tabelle1":

@@ -97,7 +97,7 @@ async fn submission_mode_invalid_rejected(pool: PgPool) {
 async fn calendar_item_with_business_customer(pool: PgPool) {
     let customer_id = test_helpers::insert_test_customer_with_type(&pool, "business", Some("Acme GmbH"))
         .await;
-    let origin_id =
+    let _origin_id =
         test_helpers::insert_test_address(&pool, "Musterstr. 1", "Berlin", "10115", None, None).await;
 
     // Create a calendar item with a business customer
@@ -634,7 +634,7 @@ async fn duplicate_active_offer_rejected_by_unique_constraint(pool: PgPool) {
 
     // Insert first active offer — must succeed
     let offer1_id = Uuid::now_v7();
-    let result1 = sqlx::query(
+    let _result1 = sqlx::query(
         "INSERT INTO offers (id, inquiry_id, price_cents, currency, status, created_at)
          VALUES ($1, $2, 50000, 'EUR', 'draft', NOW())",
     )

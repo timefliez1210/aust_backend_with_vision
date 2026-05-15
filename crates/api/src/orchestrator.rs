@@ -7,7 +7,6 @@
 //! - `services::email_dispatch`   — SMTP sending + email thread management
 
 use crate::repositories::{address_repo, customer_repo, estimation_repo, inquiry_repo, offer_repo};
-use crate::services;
 use crate::services::telegram_service::{
     handle_offer_approval, handle_offer_denial, handle_offer_edit, send_telegram_message,
 };
@@ -58,7 +57,10 @@ pub async fn run_offer_event_handler(
     state: Arc<AppState>,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<ApprovalDecision>,
 ) {
-    let client = Client::new();
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("reqwest client builder");
     let bot_token = &state.config.telegram.bot_token;
     let chat_id = state.config.telegram.admin_chat_id;
     let mut editing: Option<EditingOffer> = None;
@@ -106,7 +108,7 @@ pub async fn run_offer_event_handler(
                 }
             }
             ApprovalDecision::InquiryComplete(inquiry) => {
-                handle_complete_inquiry(&state, &client, bot_token, chat_id, inquiry).await;
+                handle_complete_inquiry(&state, &client, bot_token, chat_id, *inquiry).await;
             }
             ApprovalDecision::OfferEditText(text) => {
                 let Some(edit_state) = editing.take() else {
@@ -215,11 +217,10 @@ async fn handle_complete_inquiry(
     {
         let calculator = RouteCalculator::new(state.config.maps.api_key.clone());
         let mut route_addresses = vec![dep.clone()];
-        if inquiry.has_intermediate_stop {
-            if let Some(stop_addr) = &inquiry.intermediate_address {
+        if inquiry.has_intermediate_stop
+            && let Some(stop_addr) = &inquiry.intermediate_address {
                 route_addresses.push(stop_addr.clone());
             }
-        }
         route_addresses.push(arr.clone());
         match calculator
             .calculate(&RouteRequest {
@@ -273,7 +274,7 @@ async fn handle_complete_inquiry(
     let inquiry_services = build_services(&inquiry);
     let services_json = serde_json::to_value(&inquiry_services).unwrap_or_default();
     let notes = inquiry.notes.clone();
-    let source = serde_json::to_value(&inquiry.source)
+    let source = serde_json::to_value(inquiry.source)
         .ok()
         .and_then(|v| v.as_str().map(String::from))
         .unwrap_or_else(|| "direct_email".to_string());
@@ -372,11 +373,10 @@ async fn handle_complete_inquiry(
     let result_data = inquiry
         .items_list
         .as_deref()
-        .map(|text| {
+        .and_then(|text| {
             let items = parse_items_list_text(text);
             serde_json::to_value(&items).ok()
-        })
-        .flatten();
+        });
 
     if let Err(e) = estimation_repo::insert_no_return(
         &state.db,
@@ -491,8 +491,8 @@ pub fn parse_items_list_text(text: &str) -> Vec<ParsedInventoryItem> {
 
         // Try to extract quantity: "2x " or "2 x " at the start
         let digits: String = item_str.chars().take_while(|c| c.is_ascii_digit()).collect();
-        if !digits.is_empty() {
-            if let Ok(qty) = digits.parse::<u32>() {
+        if !digits.is_empty()
+            && let Ok(qty) = digits.parse::<u32>() {
                 let after_digits = &item_str[digits.len()..];
                 if after_digits.starts_with('x') || after_digits.starts_with(" x") {
                     quantity = qty;
@@ -505,11 +505,10 @@ pub fn parse_items_list_text(text: &str) -> Vec<ParsedInventoryItem> {
                         .to_string();
                 }
             }
-        }
 
         // Try to extract volume from parenthesized notation: "(0.80 m³)" or "(0,80 m³)"
-        if let Some(paren_start) = name.rfind('(') {
-            if let Some(paren_end) = name[paren_start..].find(')') {
+        if let Some(paren_start) = name.rfind('(')
+            && let Some(paren_end) = name[paren_start..].find(')') {
                 let inside = &name[paren_start + 1..paren_start + paren_end];
                 let vol_str = inside
                     .replace("m³", "")
@@ -522,7 +521,6 @@ pub fn parse_items_list_text(text: &str) -> Vec<ParsedInventoryItem> {
                     name = name[..paren_start].trim().to_string();
                 }
             }
-        }
 
         if !name.is_empty() {
             items.push(ParsedInventoryItem {

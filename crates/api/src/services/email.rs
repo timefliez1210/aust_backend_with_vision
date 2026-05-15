@@ -25,6 +25,8 @@ pub fn build_plain_email(
 }
 
 /// Build an email message with a PDF attachment.
+// service fn — args are distinct email fields
+#[allow(clippy::too_many_arguments)]
 pub fn build_email_with_attachment(
     from_address: &str,
     from_name: &str,

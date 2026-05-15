@@ -150,7 +150,7 @@ async fn login(
         .verify_password(request.password.as_bytes(), &parsed_hash)
         .map_err(|_| ApiError::Unauthorized("Ungültige E-Mail oder Passwort".into()))?;
 
-    let role = UserRole::from_str(&user.role);
+    let role = UserRole::from_db_str(&user.role);
 
     let token = create_tokens(
         user.id,

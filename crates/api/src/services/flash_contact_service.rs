@@ -25,11 +25,14 @@ pub async fn run_reminder_check_with_base(
 ) -> anyhow::Result<()> {
     let contacts = fetch_pending_reminders(db).await?;
     let now = chrono::Utc::now();
-    let client = Client::new();
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("reqwest client builder");
 
     for contact in contacts {
-        if let Some(remind_at) = reminder_time(&contact, now) {
-            if now >= remind_at {
+        if let Some(remind_at) = reminder_time(&contact, now)
+            && now >= remind_at {
                 let message = format_reminder_message(&contact);
                 let api_url = format!(
                     "{}/bot{}/sendMessage",
@@ -64,7 +67,6 @@ pub async fn run_reminder_check_with_base(
                     }
                 }
             }
-        }
     }
 
     Ok(())

@@ -119,12 +119,11 @@ When working on a specific area, read the corresponding AGENTS.md for focused co
 ## Status State Machine
 
 ```
-pending → estimating → estimated → offer_ready → offer_sent → accepted → scheduled → completed → invoiced → paid
+pending → info_requested → estimating → estimated → offer_ready → offer_sent → accepted → scheduled → completed → invoiced → paid
                                                                                                   ↘ cancelled
 ```
 
 Informational only — `can_transition_to()` returns `true` for all transitions (admin dashboard has full flexibility).
-Once `offer_ready` or beyond, core fields (volume, services, distance, addresses) are locked — see `is_locked_for_modifications()`.
 
 ## Key Data Flow: Submission → Offer
 
@@ -138,7 +137,7 @@ Once `offer_ready` or beyond, core fields (volume, services, distance, addresses
 
 ## Testing
 
-- **Unit tests**: `cargo test --lib --workspace` (219 tests, zero DB dependency)
+- **Unit tests**: `cargo test --lib --workspace` (242 tests, zero DB dependency)
 - **Integration tests**: `DATABASE_URL=... cargo test -p aust-api --test integration_tests` (20 tests, needs Postgres)
 - **Test helpers**: `crates/api/src/test_helpers.rs` — DB pool, factories for customer/address/inquiry/employee
 
@@ -148,16 +147,16 @@ When you modify something in column A, verify or update everything in column B. 
 
 | If you change... | ...also check/verify | ...because |
 |---|---|---|
-| `InquiryStatus` enum or state machine | `can_transition_to()`, `is_locked_for_modifications()`, integration tests, admin frontend status labels | Status is enforced in 3 places (model, API handler, frontend) |
-| `CompanyConfig` pricing fields | `PricingEngine::with_rate()`, `ServicePrices::from_config()`, offer XLSX template, unit tests | Price constants flow through 4 layers |
+| `InquiryStatus` enum or state machine | `can_transition_to()`, integration tests, admin frontend status labels | Status is enforced in 3 places (model, API handler, frontend) |
+| `CompanyConfig` pricing fields | `PricingEngine::with_rate()`, `ServicePrices::from_pricing()`, offer XLSX template, unit tests | Price constants flow through 4 layers |
 | `Services` struct (flags like `packing`, `assembly`) | `build_line_items()`, `format_services_display()`, XLSX rows 31–42, foto-angebot form | Adding a service flag touches submission, offer, and PDF |
 | `PricingInput` / `PricingResult` | `build_offer_with_overrides()`, `ServicePrices`, XLSX `persons` cell (J50), Telegram edit flow | Pricing inputs flow into offer generation and Telegram editing |
 | `inquiry_employees` / `calendar_item_employees` schema | `calendar_repo` schedule queries, `employee_repo` hours/schedule queries, admin employee panel, `inquiry_builder` snapshot | One row per (entity, employee, job_date) — all reads go through this single flat table |
 | `offers` table or unique constraint | `offer_pipeline.rs` (race guard), `offer_builder.rs` (insert_returning catch), `offer_repo.rs` | Unique partial index prevents duplicates, insert path must handle constraint violation |
-| DB migration | `test_helpers.rs` (factory functions), integration tests, `deploy.sh` (manual migrate) | Migrations are one-way; test factories must match new columns |
+| DB migration | `test_helpers.rs` (factory functions), integration tests, `deploy-prod.sh` (manual migrate) | Migrations are one-way; test factories must match new columns |
 | Frontend `api.svelte.ts` | All admin pages that call the API | Adding/removing endpoints requires updating both API routes and fetch functions |
 | `EstimationMethod` enum | `volume.rs`, `submissions.rs` (4 handlers), `offer_builder.rs` (parse_detected_items), vision service | New estimation methods need handler + parsing + DB CHECK constraint update |
-| `build_line_items()` / service prices | XLSX template rows, foto-angebot form, `ServicePrices.from_config()`, unit tests | Line item order and max (12) must match template slots |
+| `build_line_items()` / service prices | XLSX template rows, foto-angebot form, `ServicePrices.from_pricing()`, unit tests | Line item order and max (12) must match template slots |
 | `Scheduled_date` / date fields | Calendar queries, offer PDF date, XLSX cell B17, Telegram summary | Date changes propagate to calendar, offer, PDF, Telegram |
 | `address_repo` or address fields | `merge_address_parts()` in all 5 submission handlers, offer PDF address block, XLSX cells A8-A11 | Address format changes must match both submission parsing and PDF rendering |
 | `deploy-prod.sh` / deployment | Frontend submodule version, DB migration order, `migrations/` | Migrations auto-run on startup; upload new ones before deploy |

@@ -76,21 +76,18 @@ impl PricingEngine {
 
         // Find the highest floor without elevator (origin, destination, intermediate stop)
         let mut floors_without_elevator: Vec<u32> = Vec::new();
-        if !input.has_elevator_origin.unwrap_or(false) {
-            if let Some(f) = input.floor_origin {
+        if !input.has_elevator_origin.unwrap_or(false)
+            && let Some(f) = input.floor_origin {
                 floors_without_elevator.push(f);
             }
-        }
-        if !input.has_elevator_destination.unwrap_or(false) {
-            if let Some(f) = input.floor_destination {
+        if !input.has_elevator_destination.unwrap_or(false)
+            && let Some(f) = input.floor_destination {
                 floors_without_elevator.push(f);
             }
-        }
-        if !input.has_elevator_stop.unwrap_or(false) {
-            if let Some(f) = input.floor_stop {
+        if !input.has_elevator_stop.unwrap_or(false)
+            && let Some(f) = input.floor_stop {
                 floors_without_elevator.push(f);
             }
-        }
 
         let highest_floor = floors_without_elevator.into_iter().max().unwrap_or(0);
         // Extra workers for floors above 1st: floor 1 = 0 extra, floor 2 = 1 extra, etc.
@@ -135,11 +132,10 @@ impl PricingEngine {
     /// # Returns
     /// `saturday_surcharge_cents` if the scheduled date falls on a Saturday, `0` otherwise.
     fn calculate_date_adjustment(&self, input: &PricingInput) -> i64 {
-        if let Some(date) = input.scheduled_date {
-            if date.weekday() == chrono::Weekday::Sat {
+        if let Some(date) = input.scheduled_date
+            && date.weekday() == chrono::Weekday::Sat {
                 return self.saturday_surcharge_cents;
             }
-        }
         0
     }
 }
@@ -196,7 +192,7 @@ impl Default for PricingEngine {
 mod tests {
     use super::*;
     use aust_core::models::PricingInput;
-    use chrono::TimeZone;
+    
 
     fn base_input() -> PricingInput {
         PricingInput {

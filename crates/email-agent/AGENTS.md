@@ -30,7 +30,7 @@ The kostenloses-angebot web form sends JSON attached to the email. Key field map
 | `name` | name |
 | `email` | email (NOT IMAP sender — that's the company inbox) |
 | `phone` | phone |
-| `wunschtermin` | preferred_date |
+| `wunschtermin` | scheduled_date |
 | `auszugsadresse`, `etage-auszug`, `halteverbot-auszug` | departure address/floor/parking ban |
 | `einzugsadresse`, `etage-einzug`, `halteverbot-einzug` | arrival address/floor/parking ban |
 | `umzugsvolumen-m3` | volume_m3 |
@@ -40,7 +40,7 @@ The kostenloses-angebot web form sends JSON attached to the email. Key field map
 
 ## Customer Email Fix
 
-IMAP sender for form submissions is always the company inbox (`umzug@example.com`). After parsing, the processor uses the email from the JSON form data instead — ensures correct customer record.
+IMAP sender for form submissions is always the company inbox (`<company-inbox>`). After parsing, the processor uses the email from the JSON form data instead — ensures correct customer record.
 
 ## State Management
 

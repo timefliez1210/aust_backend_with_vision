@@ -162,7 +162,7 @@ All variables follow the pattern `AUST__SECTION__KEY` (double underscore as sepa
 | `aust-offer-generator` | Pricing engine, XLSX template rendering, LibreOffice PDF conversion |
 | `aust-llm-providers` | Pluggable LLM abstraction (Claude, OpenAI, Ollama) behind a common trait |
 | `aust-storage` | Pluggable file storage abstraction (S3-compatible, local filesystem) |
-| `aust-calendar` | Moving date booking management, capacity tracking, availability queries |
+| `aust-calendar` | *(calendar logic lives in `aust-api` — no separate crate)* |
 
 ## Database
 
@@ -178,13 +178,13 @@ Migration files are in `migrations/`. Key tables:
 |---|---|
 | `customers` | Customer contact information |
 | `addresses` | Origin, destination, and stop addresses with geocoordinates |
-| `quotes` | Moving quote requests, status tracking, volume and distance |
+| `inquiries` | Moving inquiries, status tracking, volume and distance |
 | `volume_estimations` | Estimation results (method: vision / inventory / depth_sensor / video) |
 | `offers` | Generated offers with pricing, PDF storage key, line items |
+| `inquiry_employees` | Employee assignments per inquiry per day |
+| `calendar_items` | Non-inquiry calendar work items |
+| `users` | Admin users (email + password hash + role) |
 | `email_threads` / `email_messages` | Full email conversation history |
-| `calendar_bookings` | Moving date bookings |
-| `calendar_capacity_overrides` | Per-date capacity overrides |
-| `users` | Admin users (email + Argon2 password hash + role) |
 
 ## API Reference
 
@@ -196,7 +196,7 @@ See [docs/API.md](docs/API.md) for the full API reference with request/response 
 |---|---|
 | Health | `/health`, `/ready` |
 | Auth | `/api/v1/auth/` |
-| Quotes | `/api/v1/quotes/` |
+| Inquiries | `/api/v1/inquiries/` |
 | Volume Estimation | `/api/v1/estimates/` |
 | Offers | `/api/v1/offers/` |
 | Calendar | `/api/v1/calendar/` |
@@ -211,7 +211,7 @@ The backend runs as a systemd service (`aust-backend.service`) built from a rele
 
 ```bash
 # Backup DB → git pull → cargo build --release → restart service → health check
-./scripts/deploy.sh
+./scripts/deploy-prod.sh
 ```
 
 ### Manual restart
@@ -225,7 +225,7 @@ journalctl -u aust-backend -f
 
 ```bash
 # Manual backup (stored in backups/db/ as gzipped pg_dump, 30-backup rotation)
-./scripts/backup-db.sh
+./scripts/backup.sh
 
 # Install daily backup timer (runs at 03:00)
 sudo cp scripts/aust-backup.service scripts/aust-backup.timer /etc/systemd/system/
@@ -251,10 +251,10 @@ cargo test --lib --workspace
 
 ```bash
 # Check compilation without building
-cargo check --workspace
+cargo check -p aust-api
 
 # Clippy lints
-cargo clippy --workspace
+cargo clippy -p aust-api
 
 # Format
 cargo fmt --all

@@ -401,6 +401,8 @@ pub async fn insert_test_customer_with_type(pool: &PgPool, customer_type: &str, 
 }
 
 /// Insert a test address with parking_ban and return its ID.
+// test helper — args mirror test fixture fields
+#[allow(clippy::too_many_arguments)]
 pub async fn insert_test_address_full(
     pool: &PgPool,
     street: &str,

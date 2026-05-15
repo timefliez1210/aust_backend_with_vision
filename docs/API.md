@@ -207,7 +207,7 @@ An inquiry represents a single moving request from initial contact through to co
 
 `InquiryStatus` values: `pending` | `info_requested` | `estimating` | `estimated` | `offer_ready` | `offer_sent` | `accepted` | `rejected` | `expired` | `cancelled` | `scheduled` | `completed` | `invoiced` | `paid`
 
-Status transitions are validated server-side by `InquiryStatus::can_transition_to()`.
+Status transitions are validated server-side by `can_transition_to()`.
 
 ### InquiryResponse type
 
@@ -219,7 +219,7 @@ Status transitions are validated server-side by `InquiryStatus::can_transition_t
   services: Services;   // { packing, assembly, disassembly, storage, disposal, parking_ban_origin, parking_ban_destination }
   volume_m3: number | null;
   distance_km: number | null;
-  preferred_date: string | null;
+  scheduled_date: string | null;
   notes: string | null;
   customer_message: string | null;
   created_at: string;
@@ -355,7 +355,7 @@ Create a new inquiry. Automatically creates or upserts the customer (by email) a
   destination_elevator?: boolean;
   services?: Services;                    // defaults to all false
   notes?: string;
-  preferred_date?: string;                // ISO 8601, e.g. "2026-03-15T09:00:00Z"
+  scheduled_date?: string;                // ISO 8601, e.g. "2026-03-15T09:00:00Z"
 }
 ```
 
@@ -384,7 +384,7 @@ curl -X POST http://localhost:8080/api/v1/inquiries \
     "destination_floor": "EG",
     "destination_elevator": true,
     "services": { "packing": true, "disassembly": true, "assembly": true, "parking_ban_origin": true },
-    "preferred_date": "2026-04-01T08:00:00Z",
+    "scheduled_date": "2026-04-01T08:00:00Z",
     "notes": "Sehr schweres Klavier im Wohnzimmer"
   }'
 ```
@@ -462,7 +462,7 @@ Partially update an inquiry. All fields are optional; only provided fields are u
   services?: Services;
   estimated_volume_m3?: number;
   distance_km?: number;
-  preferred_date?: string;
+  scheduled_date?: string;
   origin_address_id?: string;
   destination_address_id?: string;
 }
@@ -748,7 +748,7 @@ Upload photos from the photo webapp for volume estimation. Creates an inquiry wi
 | `phone` | text | No | Customer phone |
 | `origin_address` | text | No | Origin address (free text) |
 | `destination_address` | text | No | Destination address (free text) |
-| `preferred_date` | text | No | ISO 8601 date |
+| `scheduled_date` | text | No | ISO 8601 date |
 | `notes` | text | No | Additional notes |
 | `<any name>` | file | Yes | One or more image files (JPEG, PNG) |
 
@@ -800,7 +800,7 @@ Upload photos and optional depth maps from the mobile app. Creates an inquiry wi
 | `phone` | text | No | Customer phone |
 | `origin_address` | text | No | Origin address (free text) |
 | `destination_address` | text | No | Destination address (free text) |
-| `preferred_date` | text | No | ISO 8601 date |
+| `scheduled_date` | text | No | ISO 8601 date |
 | `notes` | text | No | Additional notes |
 | `<any name>` | file | Yes | Image files and/or depth map files |
 
@@ -855,7 +855,7 @@ Upload AR per-item capture data from the mobile app. Creates an inquiry with `so
 | `departure_address` | text | No | Origin address |
 | `arrival_address` | text | No | Destination address |
 | `services` | text | No | Comma-separated service codes (e.g. `assembly,disassembly`) |
-| `preferred_date` | text | No | ISO 8601 date |
+| `scheduled_date` | text | No | ISO 8601 date |
 | `message` | text | No | Additional notes |
 | `item_manifest` | text | Yes | JSON array — `[{label: string, frame_count: number}, ...]` |
 | `intrinsics` | text | No | JSON object — `{fx, fy, cx, cy, width, height}` from ARKit |

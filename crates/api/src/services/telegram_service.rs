@@ -70,7 +70,10 @@ pub(crate) fn format_address_line(address: &str, floor: &str, elevator: Option<b
 /// - `config` — Telegram bot config (token + admin chat ID)
 /// - `generated` — offer data including the rendered PDF bytes and offer summary
 pub(crate) async fn send_offer_to_telegram(config: &TelegramConfig, generated: &GeneratedOffer) {
-    let client = Client::new();
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("reqwest client builder");
     let api_url = format!(
         "https://api.telegram.org/bot{}/sendDocument",
         config.bot_token
@@ -199,7 +202,10 @@ pub(crate) async fn send_offer_to_telegram(config: &TelegramConfig, generated: &
 /// - `config` — Telegram bot config (token + admin chat ID)
 /// - `message` — German-language error description to display
 pub(crate) async fn notify_telegram_error(config: &TelegramConfig, message: &str) {
-    let client = Client::new();
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("reqwest client builder");
     let api_url = format!(
         "https://api.telegram.org/bot{}/sendMessage",
         config.bot_token
@@ -606,8 +612,8 @@ pub(crate) fn parse_edit_instructions(text: &str) -> EditOverrides {
         // Price: "preis auf 800", "800 euro", "800€", "preis: 800", "350 brutto"
         // Bare prices ("800 euro", "800€", "preis 800") are always treated as brutto — consistent with LLM path.
         // Only explicit "netto" keeps the value as-is.
-        if segment.contains("preis") || segment.contains('€') || segment.contains("euro") || segment.contains("brutto") || segment.contains("netto") {
-            if let Some(num) = extract_number(segment) {
+        if (segment.contains("preis") || segment.contains('€') || segment.contains("euro") || segment.contains("brutto") || segment.contains("netto"))
+            && let Some(num) = extract_number(segment) {
                 let cents = if segment.contains("netto") {
                     (num * 100.0) as i64
                 } else {
@@ -616,37 +622,31 @@ pub(crate) fn parse_edit_instructions(text: &str) -> EditOverrides {
                 };
                 overrides.price_cents = Some(cents);
             }
-        }
 
         // Persons: "4 helfer", "helfer: 4", "4 mann"
-        if segment.contains("helfer") || segment.contains("mann") || segment.contains("person") {
-            if let Some(num) = extract_number(segment) {
+        if (segment.contains("helfer") || segment.contains("mann") || segment.contains("person"))
+            && let Some(num) = extract_number(segment) {
                 overrides.persons = Some(num as u32);
             }
-        }
 
         // Hours: "6 stunden", "stunden: 6"
-        if segment.contains("stunde") {
-            if let Some(num) = extract_number(segment) {
-                if !segment.contains("satz") && !segment.contains("rate") {
+        if segment.contains("stunde")
+            && let Some(num) = extract_number(segment)
+                && !segment.contains("satz") && !segment.contains("rate") {
                     overrides.hours = Some(num);
                 }
-            }
-        }
 
         // Rate: "stundensatz 35", "rate: 35"
-        if segment.contains("stundensatz") || segment.contains("rate") {
-            if let Some(num) = extract_number(segment) {
+        if (segment.contains("stundensatz") || segment.contains("rate"))
+            && let Some(num) = extract_number(segment) {
                 overrides.rate = Some(num);
             }
-        }
 
         // Volume: "volumen 15", "15 m³", "15 kubikmeter"
-        if segment.contains("volumen") || segment.contains("m³") || segment.contains("kubik") {
-            if let Some(num) = extract_number(segment) {
+        if (segment.contains("volumen") || segment.contains("m³") || segment.contains("kubik"))
+            && let Some(num) = extract_number(segment) {
                 overrides.volume_m3 = Some(num);
             }
-        }
     }
 
     overrides

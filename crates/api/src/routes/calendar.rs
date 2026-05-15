@@ -202,6 +202,7 @@ async fn find_nearest_available(
     Ok(results)
 }
 
+#[allow(dead_code)]
 fn row_to_assignment_response(r: calendar_repo::EmployeeAssignmentRow) -> EmployeeAssignmentResponse {
     EmployeeAssignmentResponse {
         employee_id: r.employee_id,

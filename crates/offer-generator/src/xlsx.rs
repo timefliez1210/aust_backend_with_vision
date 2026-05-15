@@ -929,14 +929,13 @@ pub fn strip_formula_cached_values(xml: &str) -> String {
 /// The cell fragment with the `<v>` element removed. Returns the original string
 /// unchanged if no `<v>` element is found.
 fn strip_v_element(cell: &str) -> String {
-    if let Some(v_start) = cell.find("<v>") {
-        if let Some(v_end) = cell[v_start..].find("</v>") {
+    if let Some(v_start) = cell.find("<v>")
+        && let Some(v_end) = cell[v_start..].find("</v>") {
             let mut result = String::with_capacity(cell.len());
             result.push_str(&cell[..v_start]);
             result.push_str(&cell[v_start + v_end + 4..]);
             return result;
         }
-    }
     // Also handle <v/> (empty cached value)
     if let Some(v_start) = cell.find("<v/>") {
         let mut result = String::with_capacity(cell.len());
@@ -996,8 +995,8 @@ fn modify_workbook(xml: &str, add_items_sheet: bool) -> String {
 /// Modified string with `fullCalcOnLoad="true"` injected into `<calcPr>`.
 /// Returns the original if `<calcPr>` is not found.
 fn force_recalc(xml: &str) -> String {
-    if let Some(pos) = xml.find("<calcPr") {
-        if let Some(gt) = xml[pos..].find("/>") {
+    if let Some(pos) = xml.find("<calcPr")
+        && let Some(gt) = xml[pos..].find("/>") {
             let tag_end = pos + gt;
             // Insert fullCalcOnLoad before the closing />
             let mut result = String::with_capacity(xml.len() + 25);
@@ -1006,7 +1005,6 @@ fn force_recalc(xml: &str) -> String {
             result.push_str(&xml[tag_end..]);
             return result;
         }
-    }
     xml.to_string()
 }
 
@@ -1025,8 +1023,8 @@ fn force_recalc(xml: &str) -> String {
 /// Modified string with the print area limited to columns A-H.
 /// Returns the original if `_xlnm.Print_Area` is not found.
 fn fix_print_area(xml: &str) -> String {
-    if let Some(start) = xml.find("_xlnm.Print_Area") {
-        if let Some(content_start) = xml[start..].find('>') {
+    if let Some(start) = xml.find("_xlnm.Print_Area")
+        && let Some(content_start) = xml[start..].find('>') {
             let abs_content_start = start + content_start + 1;
             if let Some(end_tag) = xml[abs_content_start..].find("</definedName>") {
                 let abs_end = abs_content_start + end_tag;
@@ -1037,7 +1035,6 @@ fn fix_print_area(xml: &str) -> String {
                 return result;
             }
         }
-    }
     xml.to_string()
 }
 
@@ -1279,15 +1276,14 @@ fn add_sheet2_relationship(xml: &str) -> String {
 /// Modified string with the entire `<hyperlinks>…</hyperlinks>` block removed.
 /// Returns the original if the block is not found.
 fn strip_hyperlinks(xml: &str) -> String {
-    if let Some(start) = xml.find("<hyperlinks>") {
-        if let Some(end_tag) = xml[start..].find("</hyperlinks>") {
+    if let Some(start) = xml.find("<hyperlinks>")
+        && let Some(end_tag) = xml[start..].find("</hyperlinks>") {
             let abs_end = start + end_tag + "</hyperlinks>".len();
             let mut result = String::with_capacity(xml.len());
             result.push_str(&xml[..start]);
             result.push_str(&xml[abs_end..]);
             return result;
         }
-    }
     xml.to_string()
 }
 
@@ -1360,6 +1356,8 @@ fn strip_hyperlink_rels(xml: &str) -> String {
 /// # Errors
 /// - `OfferError::Template` if any template ZIP entry cannot be read
 /// - `OfferError::Template` if writing to the output ZIP fails
+// repository fn — args mirror the XLSX ZIP parts that must be individually replaced
+#[allow(clippy::too_many_arguments)]
 fn assemble_xlsx(
     template_zip: &mut ZipArchive<Cursor<&[u8]>>,
     sheet1_xml: &str,
@@ -1685,7 +1683,7 @@ mod tests {
     fn generate_returns_valid_zip() {
         let data = minimal_offer_data();
         let bytes = generate_offer_xlsx(&data).expect("generate should succeed");
-        assert!(bytes.len() > 0);
+        assert!(!bytes.is_empty());
         // ZIP magic bytes: PK (0x50, 0x4B)
         assert_eq!(bytes[0], 0x50);
         assert_eq!(bytes[1], 0x4B);

@@ -33,7 +33,7 @@ impl UserRole {
 
     /// Parses a role from its database string representation.
     /// Unknown strings default to `Buerokraft`.
-    pub fn from_str(s: &str) -> Self {
+    pub fn from_db_str(s: &str) -> Self {
         match s {
             "admin" => Self::Admin,
             "buerokraft" => Self::Buerokraft,

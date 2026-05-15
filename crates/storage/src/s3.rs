@@ -28,11 +28,11 @@ impl S3Storage {
                 .force_path_style(true);
         }
 
-        if let Ok(access_key) = std::env::var("AWS_ACCESS_KEY_ID") {
-            if let Ok(secret_key) = std::env::var("AWS_SECRET_ACCESS_KEY") {
-                let credentials = Credentials::new(access_key, secret_key, None, None, "env");
-                s3_config_builder = s3_config_builder.credentials_provider(credentials);
-            }
+        if let Ok(access_key) = std::env::var("AWS_ACCESS_KEY_ID")
+            && let Ok(secret_key) = std::env::var("AWS_SECRET_ACCESS_KEY")
+        {
+            let credentials = Credentials::new(access_key, secret_key, None, None, "env");
+            s3_config_builder = s3_config_builder.credentials_provider(credentials);
         }
 
         let s3_config = s3_config_builder.build();

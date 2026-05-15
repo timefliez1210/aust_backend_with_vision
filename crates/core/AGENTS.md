@@ -7,11 +7,11 @@ The shared foundation. Every other crate depends on this. No DB, no HTTP, no I/O
 | File | What | Key Types |
 |------|------|-----------|
 | `src/config.rs` | Application configuration | `Config`, `CompanyConfig` (pricing rates), `CalendarConfig`, `VisionServiceConfig` |
-| `src/models/inquiry.rs` | Inquiry lifecycle | `InquiryStatus` state machine with `can_transition_to()` + `is_locked_for_modifications()` |
+| `src/models/inquiry.rs` | Inquiry lifecycle | `InquiryStatus` state machine with `can_transition_to()` |
 | `src/models/offer.rs` | Offer state | `OfferStatus`, `PricingBreakdown`, `PricingInput`, `PricingResult` |
 | `src/models/snapshots.rs` | Structured services | `Services` (packing, assembly, disassembly, storage, disposal, parking_ban_origin/destination) |
 | `src/models/volume.rs` | Estimation methods | `EstimationMethod` enum (Vision, Inventory, DepthSensor, Ar, Video, Manual) |
-| `src/models/user.rs` | Auth | `TokenClaims`, `UserRole` (Admin, Buerokraft, Employee) |
+| `src/models/user.rs` | Auth | `TokenClaims`, `UserRole` (Admin, Operator, Buerokraft) |
 | `src/error.rs` | Shared errors | |
 
 ## InquiryStatus State Machine
@@ -23,7 +23,6 @@ pending → info_requested → estimating → estimated → offer_ready → offe
 ```
 
 - `can_transition_to(&self, target)` — currently returns `true` for all transitions (admin dashboard has full flexibility; the state machine is informational only)
-- `is_locked_for_modifications(&self)` — returns true for `offer_ready` through `paid` (prevents volume/address changes after offer)
 
 ## CompanyConfig Pricing Constants
 
@@ -49,7 +48,7 @@ All configurable via `config/*.toml` with `serde(default)`:
 
 | If you change... | ...also verify |
 |---|---|
-| `InquiryStatus` enum | `can_transition_to()`, `is_locked_for_modifications()`, admin frontend `INQUIRY_STATUS_LABELS`, inquiry PATCH handler status gate |
-| `CompanyConfig` struct | `PricingEngine::with_rate()` calls, `ServicePrices::from_config()` (in `crates/api/src/services/offer_builder.rs`), offer generator, all unit tests using `PricingEngine::new()` |
+| `InquiryStatus` enum | `can_transition_to()`, admin frontend `INQUIRY_STATUS_LABELS`, `inquiries.rs` PATCH handler status validation |
+| `CompanyConfig` struct | `PricingEngine::with_rate()` calls, `ServicePrices::from_pricing()` (in `crates/api/src/services/offer_builder.rs`), offer generator, all unit tests using `PricingEngine::new()` |
 | `Services` struct | `build_line_items()` in offer builder, XLSX line items, foto-angebot form, admin service toggles |
 | `EstimationMethod` enum | `volume.rs` string conversion, 5 submission handlers, DB CHECK constraint, offer builder `parse_detected_items()`, vision service |

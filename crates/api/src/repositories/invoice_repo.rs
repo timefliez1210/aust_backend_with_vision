@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 /// Full projection of an invoice row.
 #[derive(Debug, FromRow)]
+#[allow(dead_code)]
 pub(crate) struct InvoiceRow {
     pub id: Uuid,
     pub inquiry_id: Uuid,
@@ -33,6 +34,7 @@ pub(crate) struct InvoiceRow {
 /// Flat projection for Rechnungsausgangsbuch — one row per invoice with
 /// customer name, service date, and offer amounts.
 #[derive(Debug, FromRow)]
+#[allow(dead_code)]
 pub(crate) struct RechnungsausgangRow {
     pub id: Uuid,
     pub invoice_number: String,
@@ -163,6 +165,8 @@ pub(crate) async fn next_invoice_numbers(
 /// **Caller**: `invoices::create_invoice` (partial flow)
 /// **Why**: Creates the Anzahlung invoice with status `ready`. Also persists
 /// `deposit_percent` so the final invoice can reference it without a sibling lookup.
+// repository fn — args mirror DB columns
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn insert_partial_first(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     id: Uuid,
@@ -196,6 +200,8 @@ pub(crate) async fn insert_partial_first(
 /// **Why**: Creates the Schlussrechnung with status `draft`. Stores `deposit_invoice_id`
 /// (FK to the sibling `partial_first`) so the deduction line can reference the exact
 /// Anzahlung invoice number without another DB round-trip.
+// repository fn — args mirror DB columns
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn insert_partial_final(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     id: Uuid,

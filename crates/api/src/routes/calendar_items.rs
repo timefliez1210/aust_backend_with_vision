@@ -328,7 +328,7 @@ async fn update_item(
         idx += 1;
     }
     if body.remove_customer {
-        sets.push(format!("customer_id = NULL"));
+        sets.push("customer_id = NULL".to_string());
     } else if body.customer_id.is_some() {
         sets.push(format!("customer_id = ${idx}"));
         idx += 1;
@@ -390,11 +390,10 @@ async fn update_item(
     if let Some(v) = body.status {
         q = q.bind(v);
     }
-    if !body.remove_customer {
-        if let Some(v) = body.customer_id {
+    if !body.remove_customer
+        && let Some(v) = body.customer_id {
             q = q.bind(v);
         }
-    }
     if let Some(v) = body.employee_notes {
         q = q.bind(v);
     }
@@ -494,11 +493,10 @@ async fn assign_employee(
     calendar_item_repo::insert_item_employee(&state.db, id, body.employee_id)
         .await
         .map_err(|e| {
-            if let sqlx::Error::Database(ref db_err) = e {
-                if db_err.constraint() == Some("calendar_item_employees_calendar_item_id_employee_id_job_date_key") {
+            if let sqlx::Error::Database(ref db_err) = e
+                && db_err.constraint() == Some("calendar_item_employees_calendar_item_id_employee_id_job_date_key") {
                     return ApiError::Conflict("Mitarbeiter ist bereits zugewiesen".into());
                 }
-            }
             ApiError::from(e)
         })?;
 

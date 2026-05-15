@@ -59,8 +59,8 @@ pub async fn try_auto_generate_offer(state: Arc<AppState>, inquiry_id: Uuid) {
     };
 
     // Auto-calculate distance if both addresses are present and distance is still 0/missing
-    if q.distance_km.unwrap_or(0.0) == 0.0 {
-        if let (Some(origin_id), Some(dest_id)) = (q.origin_address_id, q.destination_address_id) {
+    if q.distance_km.unwrap_or(0.0) == 0.0
+        && let (Some(origin_id), Some(dest_id)) = (q.origin_address_id, q.destination_address_id) {
             let fmt_addr = |a: &address_repo::AddressStrRow| format!(
                 "{}, {}{}",
                 a.street,
@@ -73,11 +73,10 @@ pub async fn try_auto_generate_offer(state: Arc<AppState>, inquiry_id: Uuid) {
 
             if let (Some(origin), Some(dest)) = (origin, dest) {
                 let mut route_addresses = vec![fmt_addr(&origin)];
-                if let Some(stop_id) = q.stop_address_id {
-                    if let Some(stop) = address_repo::fetch_street_city(&state.db, stop_id).await.ok().flatten() {
+                if let Some(stop_id) = q.stop_address_id
+                    && let Some(stop) = address_repo::fetch_street_city(&state.db, stop_id).await.ok().flatten() {
                         route_addresses.push(fmt_addr(&stop));
                     }
-                }
                 route_addresses.push(fmt_addr(&dest));
 
                 let calculator = RouteCalculator::new(state.config.maps.api_key.clone());
@@ -90,7 +89,6 @@ pub async fn try_auto_generate_offer(state: Arc<AppState>, inquiry_id: Uuid) {
                 }
             }
         }
-    }
 
     info!("Auto-generating offer for quote {inquiry_id}");
 

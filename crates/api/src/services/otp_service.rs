@@ -174,7 +174,7 @@ pub(crate) async fn handle_request_otp(
                 ApiError::Internal("E-Mail konnte nicht gesendet werden".into())
             })?;
 
-        tracing::info!(email = %email, label = backend.user_label(), "OTP sent");
+        tracing::info!(label = backend.user_label(), "OTP sent");
     }
 
     Ok(OtpResponse {

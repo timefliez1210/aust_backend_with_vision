@@ -327,6 +327,8 @@ pub(crate) async fn fetch_customer_termine(
 }
 
 /// Update customer fields (partial update).
+// repository fn — args mirror DB columns
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn update_customer(
     pool: &PgPool,
     id: Uuid,
@@ -392,6 +394,8 @@ pub(crate) async fn update_customer(
 ///
 /// `email` is optional — when `None`, the customer is created without an email
 /// address (useful for walk-in or phone customers who don't have email).
+// repository fn — args mirror DB columns
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn create_customer(
     pool: &PgPool,
     id: Uuid,
@@ -597,6 +601,8 @@ pub(crate) struct AddressResponse {
 }
 
 /// Update an address (partial update).
+// repository fn — args mirror DB columns
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn update_address(
     pool: &PgPool,
     id: Uuid,
@@ -913,6 +919,8 @@ pub(crate) async fn fetch_thread_for_reply(
 }
 
 /// Insert a draft reply message.
+// repository fn — args mirror DB columns
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn insert_reply_draft(
     pool: &PgPool,
     id: Uuid,
@@ -984,6 +992,8 @@ pub(crate) async fn create_compose_thread(
 }
 
 /// Insert a compose draft message.
+// repository fn — args mirror DB columns
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn insert_compose_draft(
     pool: &PgPool,
     id: Uuid,

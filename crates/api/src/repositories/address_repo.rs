@@ -18,6 +18,7 @@ pub(crate) struct AddressRow {
     pub floor: Option<String>,
     pub elevator: Option<bool>,
     #[sqlx(default)]
+    #[allow(dead_code)]
     pub parking_ban: bool,
 }
 
@@ -119,6 +120,8 @@ pub(crate) async fn fetch_full(
 ///
 /// **Caller**: `create_inquiry`, `handle_submission`, `handle_complete_inquiry`
 /// **Why**: Multiple entry points create addresses; centralises the INSERT.
+// repository fn — args mirror DB columns
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn create(
     executor: impl sqlx::Executor<'_, Database = sqlx::Postgres>,
     street: &str,

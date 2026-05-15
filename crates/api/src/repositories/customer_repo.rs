@@ -58,13 +58,11 @@ impl CustomerRow {
     /// For business customers, returns the company name instead of a personal salutation.
     pub fn address_salutation(&self) -> String {
         // Business → company name goes in the salutation slot
-        if self.customer_type.as_deref() == Some("business") {
-            if let Some(ref cn) = self.company_name {
-                if !cn.is_empty() {
+        if self.customer_type.as_deref() == Some("business")
+            && let Some(ref cn) = self.company_name
+                && !cn.is_empty() {
                     return cn.clone();
                 }
-            }
-        }
         match self.salutation.as_deref() {
             Some("Herr") => "Herrn".to_string(),
             Some("Frau") => "Frau".to_string(),
@@ -83,7 +81,8 @@ impl CustomerRow {
             return String::new();
         }
         // Business with known Ansprechpartner
-        let name = match (self.salutation.as_deref(), self.first_name.as_deref(), self.last_name.as_deref()) {
+        
+        match (self.salutation.as_deref(), self.first_name.as_deref(), self.last_name.as_deref()) {
             (Some("Herr"), Some(f), Some(l)) => format!("z.Hd. Herrn {f} {l}"),
             (Some("Frau"), Some(f), Some(l)) => format!("z.Hd. Frau {f} {l}"),
             (Some("D"), Some(f), Some(l)) => format!("z.Hd. {f} {l}"),
@@ -91,8 +90,7 @@ impl CustomerRow {
             (Some("Frau"), None, Some(l)) => format!("z.Hd. Frau {l}"),
             (_, Some(f), Some(l)) => format!("z.Hd. {f} {l}"),
             _ => String::new(),
-        };
-        name
+        }
     }
 
     /// Full display name: first + last, or the legacy `name` field, or email.
@@ -145,6 +143,8 @@ pub(crate) async fn fetch_by_email(
 ///
 /// # Returns
 /// The customer's UUID (either newly created or existing).
+// repository fn — args mirror DB columns
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn upsert(
     executor: impl sqlx::Executor<'_, Database = sqlx::Postgres>,
     email: &str,
@@ -254,8 +254,8 @@ pub(crate) async fn create_recipient(
 
     let id = uuid::Uuid::now_v7();
     let name = format!("{} {}",
-        first_name.as_deref().unwrap_or(""),
-        last.as_deref().unwrap_or(""
+        first_name.unwrap_or(""),
+        last.unwrap_or(""
     )).trim().to_string();
 
     sqlx::query_as(

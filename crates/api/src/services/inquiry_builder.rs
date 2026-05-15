@@ -258,7 +258,7 @@ pub async fn build_inquiry_response(
         .collect();
 
     let end_date = row.end_date;
-    let is_multi_day = end_date.map_or(false, |ed| row.scheduled_date.map_or(false, |sd| ed > sd));
+    let is_multi_day = end_date.is_some_and(|ed| row.scheduled_date.is_some_and(|sd| ed > sd));
 
     // 7. Extract customer message from notes
     let customer_message = extract_customer_message(row.notes.as_deref());
@@ -402,12 +402,11 @@ fn parse_quantity_prefix(name: &str, total_volume_m3: f64) -> (String, i64, f64)
     if let Some(pos) = trimmed.find('x') {
         let before = trimmed[..pos].trim();
         let after = trimmed[pos + 1..].trim();
-        if let Ok(n) = before.parse::<i64>() {
-            if n > 1 && !after.is_empty() {
+        if let Ok(n) = before.parse::<i64>()
+            && n > 1 && !after.is_empty() {
                 let per_item = total_volume_m3 / n as f64;
                 return (after.to_string(), n, per_item);
             }
-        }
     }
     (name.to_string(), 1, total_volume_m3)
 }

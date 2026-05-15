@@ -262,7 +262,7 @@ async fn handle_ar_submission(
         .await
         .map_err(|e| ApiError::Internal(format!("Einzugsadresse konnte nicht erstellt werden: {e}")))?;
 
-        let recipient_id = if form.recipient_last_name.as_deref().map_or(false, |s| !s.trim().is_empty()) {
+        let recipient_id = if form.recipient_last_name.as_deref().is_some_and(|s| !s.trim().is_empty()) {
             Some(customer_repo::create_recipient(
                 &mut *tx,
                 form.recipient_salutation.as_deref(),
@@ -437,6 +437,8 @@ async fn handle_ar_submission(
 ///
 /// # Errors
 /// Returns `Err(String)` on any fatal failure; caller marks the estimation 'failed'.
+// handler fn — args are distinct request components
+#[allow(clippy::too_many_arguments)]
 async fn process_ar_submission_background(
     state: Arc<AppState>,
     inquiry_id: Uuid,
@@ -749,6 +751,25 @@ async fn video_inquiry(
     let notes = build_notes(services_text.as_deref(), departure_parking_ban, arrival_parking_ban, message.as_deref());
     let services_struct = parse_services_string(services_text.as_deref(), departure_parking_ban, arrival_parking_ban);
     let services_json = serde_json::to_value(&services_struct).unwrap_or(serde_json::json!({}));
+    // submission_mode: use frontend-supplied value (e.g. "video", "ar") or fall back to "video"
+    let resolved_submission_mode: String = submission_mode
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("video")
+        .to_string();
+    // volumen + umzugsgut: customer-stated volume (m³) and item list stored in custom_fields.
+    // create_minimal has no dedicated volume column; we persist both in the JSONB custom_fields
+    // so the data is available to the estimator and admin UI without a schema change.
+    let custom_fields_json = {
+        let mut m = serde_json::Map::new();
+        if let Some(v) = volumen.as_deref().filter(|s| !s.trim().is_empty()) {
+            m.insert("customer_volume_m3".to_string(), serde_json::Value::String(v.to_string()));
+        }
+        if let Some(items) = umzugsgut.as_deref().filter(|s| !s.trim().is_empty()) {
+            m.insert("umzugsgut".to_string(), serde_json::Value::String(items.to_string()));
+        }
+        serde_json::Value::Object(m)
+    };
     let inquiry_id = Uuid::now_v7();
 
     // Wrap all DB writes in a single transaction so a mid-flight failure leaves no orphans
@@ -797,7 +818,7 @@ async fn video_inquiry(
         .await
         .map_err(|e| ApiError::Internal(format!("Einzugsadresse konnte nicht erstellt werden: {e}")))?;
 
-        let recipient_id = if recipient_last_name.as_deref().map_or(false, |s| !s.trim().is_empty()) {
+        let recipient_id = if recipient_last_name.as_deref().is_some_and(|s| !s.trim().is_empty()) {
             Some(customer_repo::create_recipient(
                 &mut *tx,
                 recipient_salutation.as_deref(),
@@ -864,10 +885,10 @@ async fn video_inquiry(
             Some(&services_json),
             "video_webapp",
             service_type.as_deref(),
-            Some("video"),
+            Some(resolved_submission_mode.as_str()),
             recipient_id,
             billing_address_id,
-            None,
+            Some(&custom_fields_json),
             now,
         )
         .await
@@ -1074,7 +1095,7 @@ async fn manual_inquiry(
             None
         };
 
-        let recipient_id = if form.recipient_last_name.as_deref().map_or(false, |s| !s.trim().is_empty()) {
+        let recipient_id = if form.recipient_last_name.as_deref().is_some_and(|s| !s.trim().is_empty()) {
             Some(customer_repo::create_recipient(
                 &mut *tx,
                 form.recipient_salutation.as_deref(),
@@ -1411,7 +1432,7 @@ pub(crate) fn split_street_house_number(street: &str) -> (String, Option<String>
     let trimmed = street.trim();
     if let Some(last_space) = trimmed.rfind(' ') {
         let candidate = trimmed[last_space + 1..].trim();
-        if candidate.chars().next().map_or(false, |c| c.is_ascii_digit()) {
+        if candidate.chars().next().is_some_and(|c| c.is_ascii_digit()) {
             let street_part = trimmed[..last_space].trim().to_string();
             return (street_part, Some(candidate.to_string()));
         }
@@ -1569,7 +1590,7 @@ pub(crate) async fn handle_submission(
             None
         };
 
-        let recipient_id = if form.recipient_last_name.as_deref().map_or(false, |s| !s.trim().is_empty()) {
+        let recipient_id = if form.recipient_last_name.as_deref().is_some_and(|s| !s.trim().is_empty()) {
             Some(customer_repo::create_recipient(
                 &mut *tx,
                 form.recipient_salutation.as_deref(),
@@ -1618,8 +1639,8 @@ pub(crate) async fn handle_submission(
         .or(form.volume_m3.as_deref())
         .and_then(|s| s.trim().parse::<f64>().ok());
 
-    if let Some(volume) = manual_volume {
-        if form.images.is_empty() {
+    if let Some(volume) = manual_volume
+        && form.images.is_empty() {
             // Fast path: customer provided volume directly, no vision pipeline needed.
         let now_update = chrono::Utc::now();
         inquiry_repo::update_volume_and_status(&state.db, inquiry_id, volume, "estimated", now_update).await
@@ -1677,7 +1698,6 @@ pub(crate) async fn handle_submission(
             }),
         ));
         }
-    }
 
     // 8. Vision pipeline path: pre-create estimation row and upload images to S3.
     let estimation_id = Uuid::now_v7();
@@ -1770,6 +1790,8 @@ pub(crate) async fn handle_submission(
 ///
 /// # Errors
 /// Returns `Err(String)` on any fatal failure; the caller marks the estimation 'failed'.
+// handler fn — args are distinct request components
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_submission_background(
     state: Arc<AppState>,
     inquiry_id: Uuid,
@@ -1807,13 +1829,12 @@ pub(crate) async fn process_submission_background(
     }
 
     // 1. Upload depth maps if present (images are already in S3 from the caller)
-    if !depth_maps.is_empty() {
-        if let Err(e) =
+    if !depth_maps.is_empty()
+        && let Err(e) =
             upload_depth_maps_to_s3(&*state.storage, inquiry_id, estimation_id, &depth_maps).await
         {
             tracing::warn!("Failed to upload depth maps: {e}");
         }
-    }
 
     // 2. Acquire the vision semaphore so only one job runs on Modal at a time.
     //    Other workers will queue here until the current GPU job completes.
@@ -2089,11 +2110,10 @@ pub(crate) fn build_notes(
         parts.push("Halteverbot Einzug".to_string());
     }
 
-    if let Some(msg) = message {
-        if !msg.trim().is_empty() {
+    if let Some(msg) = message
+        && !msg.trim().is_empty() {
             parts.push(msg.trim().to_string());
         }
-    }
 
     parts.join(", ")
 }

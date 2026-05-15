@@ -148,7 +148,7 @@ async fn verify_otp(
     let expires_at = now + chrono::Duration::days(30);
     customer_auth_repo::create_session(&state.db, customer.0, &token, expires_at).await?;
 
-    tracing::info!(customer_id = %customer.0, email = %email, "Customer authenticated via OTP");
+    tracing::info!(customer_id = %customer.0, "Customer authenticated via OTP");
 
     Ok(Json(VerifyResponse {
         token,
@@ -393,7 +393,7 @@ fn parse_estimation_items(result_data: Option<serde_json::Value>) -> Vec<Estimat
 
     items_array
         .iter()
-        .filter_map(|item| {
+        .map(|item| {
             let name = item
                 .get("name")
                 .or_else(|| item.get("german_name"))
@@ -410,11 +410,11 @@ fn parse_estimation_items(result_data: Option<serde_json::Value>) -> Vec<Estimat
                 .and_then(|v| v.as_i64())
                 .unwrap_or(1) as i32;
 
-            Some(EstimationItem {
+            EstimationItem {
                 name,
                 volume_m3,
                 quantity,
-            })
+            }
         })
         .collect()
 }
@@ -588,7 +588,10 @@ async fn download_inquiry_pdf(
 
 /// Send a notification to the admin via Telegram.
 async fn notify_admin_telegram(config: &aust_core::config::TelegramConfig, text: &str) {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("reqwest client builder");
     let api_url = format!(
         "https://api.telegram.org/bot{}/sendMessage",
         config.bot_token

@@ -369,11 +369,10 @@ pub(super) async fn create_customer(
     )
     .await
     .map_err(|e| {
-        if let sqlx::Error::Database(ref db_err) = e {
-            if db_err.constraint() == Some("customers_email_key") {
+        if let sqlx::Error::Database(ref db_err) = e
+            && db_err.constraint() == Some("customers_email_key") {
                 return ApiError::Validation("E-Mail-Adresse existiert bereits".into());
             }
-        }
         ApiError::Database(e)
     })?;
 

@@ -199,7 +199,9 @@ impl VisionServiceClient {
 
         // Hard outer timeout as safety net (tokio-level, cannot be defeated by
         // stuck HTTP connections unlike reqwest's internal timeout)
-        let result = tokio::time::timeout(
+        
+
+        tokio::time::timeout(
             Duration::from_secs(660),
             self.send_video_request(&video_client, &url, form),
         )
@@ -209,9 +211,7 @@ impl VisionServiceClient {
             VolumeError::ExternalService(
                 "Vision service video request timed out after 660s".to_string(),
             )
-        })?;
-
-        result
+        })?
     }
 
     async fn send_video_request(
@@ -633,6 +633,8 @@ impl VisionServiceClient {
     ///
     /// # Errors
     /// Same conditions as `estimate_upload_async`.
+    // vision service fn — args mirror the multipart video upload fields
+    #[allow(clippy::too_many_arguments)]
     pub async fn estimate_video_async(
         &self,
         job_id: &str,
@@ -912,6 +914,8 @@ impl VisionServiceClient {
     /// - `intrinsics` — optional JSON string
     /// - `poses` — optional JSON string
     /// - `poll_interval` / `max_polls` / `max_retries` — from `vision_service` config
+    // vision service fn — args mirror the multipart AR upload fields
+    #[allow(clippy::too_many_arguments)]
     pub async fn estimate_ar_async(
         &self,
         job_id: &str,

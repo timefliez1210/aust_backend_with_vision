@@ -290,13 +290,23 @@ async fn create_invoice(
         let first_pdf = generate_pdf_bytes(&first_xlsx).await;
 
         // PartialFinal: KVA line items + "Abzgl. Anzahlung" deduction line
-        let final_line_items = build_final_line_items(
+        let mut final_line_items = build_final_line_items(
             &state.db,
             &invoice_context,
             first_netto,
             &first_num,
             None, // no extras at creation time
         ).await?;
+        // Guarantee first + final == offer_netto exactly (German VAT compliance).
+        // The XLSX SUM formula derives netto from line items; rounding via f64 can
+        // produce ±1 cent drift. We correct the deduction line so the sheet total
+        // equals final_netto to the cent.
+        adjust_final_deduction_for_rounding(&mut final_line_items, final_netto);
+        debug_assert_eq!(
+            line_items_netto_cents(&final_line_items),
+            final_netto,
+            "PartialFinal netto must match offer_netto - first_netto after rounding adjustment"
+        );
         let final_data = build_invoice_data_from_items(
             &invoice_context,
             InvoiceType::PartialFinal,
@@ -444,7 +454,7 @@ async fn get_invoice_pdf(
             header::CONTENT_DISPOSITION,
             format!("attachment; filename=\"{filename}\""),
         )
-        .body(axum::body::Body::from(bytes::Bytes::from(bytes)))
+        .body(axum::body::Body::from(bytes))
         .map_err(|e| ApiError::Internal(format!("Response build error: {e}")))?;
 
     Ok(response)
@@ -473,8 +483,8 @@ async fn update_invoice(
     let now = Utc::now();
 
     // Handle status update
-    if let Some(ref new_status) = req.status {
-        if new_status == "paid" {
+    if let Some(ref new_status) = req.status
+        && new_status == "paid" {
             invoice_repo::mark_paid(&state.db, inv_id, now).await?;
 
             // Auto-transition inquiry to 'paid' when all invoices are paid
@@ -483,7 +493,6 @@ async fn update_invoice(
                 invoice_repo::transition_inquiry_to_paid(&state.db, inquiry_id, now).await?;
             }
         }
-    }
 
     // Handle extra services update + PDF regeneration
     if let Some(ref extras) = req.extra_services {
@@ -956,20 +965,44 @@ async fn build_final_line_items(
     Ok(items)
 }
 
+/// Sum the netto total of `items` in cents, rounding each line to the nearest cent.
+///
+/// Mirrors the arithmetic the XLSX SUM formula performs after rounding each D*C cell.
+fn line_items_netto_cents(items: &[InvoiceLineItem]) -> i64 {
+    items
+        .iter()
+        .map(|it| (it.unit_price * it.quantity * 100.0).round() as i64)
+        .sum()
+}
+
+/// Adjust the last line item (the Anzahlung deduction) so that the sum of all
+/// items equals `target_netto_cents` exactly.
+///
+/// The deduction line is always last and has a negative `unit_price`. A ±1 cent
+/// drift caused by f64 rounding is corrected here so the XLSX SUM formula
+/// prints the legally required total without rounding error.
+fn adjust_final_deduction_for_rounding(items: &mut [InvoiceLineItem], target_netto_cents: i64) {
+    let actual = line_items_netto_cents(items);
+    let drift = actual - target_netto_cents; // positive → we over-counted, deduction must increase
+    if drift != 0
+        && let Some(last) = items.last_mut() {
+            // Deduction line has quantity=1, so adjusting unit_price by drift/100 EUR suffices.
+            last.unit_price -= drift as f64 / 100.0;
+        }
+}
+
 /// Resolve the deposit (Anzahlung) invoice number for a partial_final row.
 ///
 /// Priority: `deposit_invoice_id` column → `partial_group_id` sibling lookup → empty string.
 async fn resolve_deposit_number(db: &sqlx::PgPool, row: &InvoiceRow) -> String {
-    if let Some(dep_id) = row.deposit_invoice_id {
-        if let Ok(Some(n)) = invoice_repo::fetch_deposit_invoice_number(db, dep_id).await {
+    if let Some(dep_id) = row.deposit_invoice_id
+        && let Ok(Some(n)) = invoice_repo::fetch_deposit_invoice_number(db, dep_id).await {
             return n;
         }
-    }
-    if let Some(gid) = row.partial_group_id {
-        if let Ok(Some(n)) = invoice_repo::fetch_deposit_number_by_group(db, gid).await {
+    if let Some(gid) = row.partial_group_id
+        && let Ok(Some(n)) = invoice_repo::fetch_deposit_number_by_group(db, gid).await {
             return n;
         }
-    }
     String::new()
 }
 

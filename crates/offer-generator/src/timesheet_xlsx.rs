@@ -79,7 +79,7 @@ pub fn generate_timesheet_xlsx(data: &TimesheetData) -> Result<Vec<u8>, OfferErr
     // Pre-compute totals
     let total_hours: f64 = entries
         .iter()
-        .filter_map(|e| effective_hours(e))
+        .filter_map(effective_hours)
         .sum();
     let regular_hours = total_hours.min(data.target_hours);
     let overtime = (total_hours - data.target_hours).max(0.0);
