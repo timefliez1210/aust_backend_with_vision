@@ -150,8 +150,22 @@ pub async fn build_inquiry_response(
                     .unwrap_or(false);
 
                 let item_name = d.german_name.clone().unwrap_or_else(|| d.name.clone());
-                let (parsed_name, quantity, per_item_volume) =
+                let (prefix_name, prefix_qty, prefix_per_item_volume) =
                     parse_quantity_prefix(&item_name, d.volume_m3);
+                // Admin edits (PUT /items) store an explicit `quantity` field with a
+                // prefix-free name and a per-item `volume_m3`. Vision/inventory
+                // pipelines instead bake the count into the name ("2x Sofa") with no
+                // quantity field. Prefer the explicit field; only fall back to the
+                // name prefix when the name actually carries one.
+                let stored_qty = raw
+                    .and_then(|r| r.get("quantity"))
+                    .and_then(|q| q.as_u64());
+                let (parsed_name, quantity, per_item_volume) = match stored_qty {
+                    Some(q) if prefix_qty == 1 && q >= 1 => {
+                        (prefix_name, q as i64, d.volume_m3)
+                    }
+                    _ => (prefix_name, prefix_qty, prefix_per_item_volume),
+                };
 
                 ItemSnapshot {
                     name: parsed_name,
