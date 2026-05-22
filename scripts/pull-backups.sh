@@ -6,7 +6,7 @@
 
 set -euo pipefail
 
-VPS_IP="72.62.89.179"
+VPS_IP="${VPS_IP:-187.124.161.90}"
 VPS_USER="root"
 SSH_KEY="$HOME/.ssh/id_ed25519"
 SSH="ssh -i ${SSH_KEY} -o StrictHostKeyChecking=no ${VPS_USER}@${VPS_IP}"

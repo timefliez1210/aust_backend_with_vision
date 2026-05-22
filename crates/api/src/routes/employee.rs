@@ -176,7 +176,7 @@ async fn verify_otp(
     let expires_at = now + chrono::Duration::days(30);
     employee_repo::create_session(&state.db, emp_id, &token, expires_at).await?;
 
-    tracing::info!(employee_id = %emp_id, email = %email, "Employee authenticated via OTP");
+    tracing::info!(employee_id = %emp_id, "Employee authenticated via OTP");
 
     Ok(Json(VerifyResponse {
         token,
