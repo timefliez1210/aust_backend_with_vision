@@ -19,11 +19,16 @@ src/main.rs
     │
     └── crates/email-agent  ← IMAP poller, email parser, Telegram approval loop
             ├── crates/core
-            ├── crates/llm-providers
-            └── crates/calendar          ← checks availability before drafting reply
+            └── crates/llm-providers
 ```
 
+There is **no `crates/calendar`** — calendar logic lives in `aust-api`
+(`calendar_repo.rs`, `calendar_item_repo.rs`) and in `aust-email-agent`
+(`calendar.rs`, used to check availability before drafting a reply).
+
 `crates/core` is the only crate with zero internal dependencies. Every other crate depends on it.
+The `aust-flash-contact` crate (callback-form capture) and the `flash-contact-bot` binary sit
+alongside these and also depend only on `crates/core`.
 
 ---
 
@@ -44,7 +49,7 @@ flowchart TD
         MERGE[MovingInquiry\nmerge parsed data]
         COMPLETE{is_complete?}
         LLM_ENRICH[LLM enrichment\nextract structured data\nfrom free text]
-        CAL[Calendar check\npreferred_date availability]
+        CAL[Calendar check\nscheduled_date availability]
         DRAFT[LLM draft email\nGerman follow-up]
         TG_DRAFT[Telegram\nApprove / Edit / Deny]
         SMTP_DRAFT[SMTP\nsend draft to customer]
@@ -101,7 +106,7 @@ flowchart TD
 | `EmployeeAssignmentSnapshot` | core/models/snapshots.rs | Employee assignment embedded in InquiryResponse |
 | `PricingInput` / `PricingResult` | offer-generator/pricing.rs | Pricing calculation I/O |
 | `OfferLineItem` | api/services/offer_builder.rs | One row in the XLSX offer (re-exported via routes/offers.rs) |
-| `DateAvailability` | calendar/models.rs | Availability + alternatives for a date |
+| `DateAvailability` | email-agent/calendar.rs | Availability + alternatives for a date |
 | `RouteResult` | distance-calculator/route.rs | Geocoded route with km + duration |
 
 ---

@@ -164,7 +164,8 @@ When you modify something in column A, verify or update everything in column B. 
 ## Deployment
 
 ```bash
-bash scripts/deploy-prod.sh          # Deploy: backup VPS → build image → push → restart → health check
+bash scripts/deploy-prod.sh          # Deploy backend + flash-bot: backup VPS → build image → push → restart → health check
+bash scripts/deploy-full.sh          # Same as above, plus build + FTP-deploy the frontend to KAS hosting
 bash scripts/staging-up.sh           # Start full staging stack (Docker) on ports 8099/5435/4173
 bash scripts/staging-up.sh --rebuild # Force rebuild of staging images
 bash scripts/dev-up.sh               # Local dev with hot reload (cargo watch + Vite) on 8080/5173

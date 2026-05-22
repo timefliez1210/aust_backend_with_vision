@@ -50,11 +50,11 @@ A modular Rust backend that automates the quote-to-offer pipeline for a moving c
 
 ## Prerequisites
 
-| Requirement | Minimum version | Notes |
+| Requirement | Version | Notes |
 |---|---|---|
-| Rust | 1.82 (stable) | `rustup update stable` |
+| Rust | 1.88 | Pinned via `rust-toolchain.toml` — `rustup` installs it automatically |
 | PostgreSQL | 16 | Any 16.x release |
-| Docker + Compose | Docker 24+ | For local dev infrastructure |
+| Docker + Compose | Docker 24+ | For local dev infrastructure and production |
 | LibreOffice | 7.x | Required for XLSX-to-PDF conversion (`soffice` must be on PATH) |
 
 ## Quick Start
@@ -69,8 +69,7 @@ A modular Rust backend that automates the quote-to-offer pipeline for a moving c
 2. **Start infrastructure** (PostgreSQL 16, MinIO)
 
    ```bash
-   cd docker && docker-compose up -d
-   cd ..
+   docker compose -f docker/docker-compose.yml up -d
    ```
 
 3. **Configure environment**
@@ -122,9 +121,9 @@ All variables follow the pattern `AUST__SECTION__KEY` (double underscore as sepa
 | `AUST__STORAGE__REGION` | S3 region | `us-east-1` |
 | `AWS_ACCESS_KEY_ID` | S3 access key | `minioadmin` |
 | `AWS_SECRET_ACCESS_KEY` | S3 secret key | `minioadmin` |
-| `AUST__LLM__DEFAULT_PROVIDER` | LLM provider: `claude`, `openai`, or `ollama` | `claude` |
+| `AUST__LLM__DEFAULT_PROVIDER` | LLM provider: `claude`, `openai`, or `ollama` | `ollama` |
 | `AUST__LLM__CLAUDE__API_KEY` | Anthropic API key | `sk-ant-...` |
-| `AUST__LLM__CLAUDE__MODEL` | Claude model ID | `claude-sonnet-4-20250514` |
+| `AUST__LLM__CLAUDE__MODEL` | Claude model ID | `claude-sonnet-4-5` |
 | `AUST__LLM__OPENAI__API_KEY` | OpenAI API key | `sk-...` |
 | `AUST__LLM__OPENAI__MODEL` | OpenAI model ID | `gpt-4o` |
 | `AUST__LLM__OLLAMA__BASE_URL` | Ollama base URL | `http://localhost:11434` |
@@ -162,7 +161,10 @@ All variables follow the pattern `AUST__SECTION__KEY` (double underscore as sepa
 | `aust-offer-generator` | Pricing engine, XLSX template rendering, LibreOffice PDF conversion |
 | `aust-llm-providers` | Pluggable LLM abstraction (Claude, OpenAI, Ollama) behind a common trait |
 | `aust-storage` | Pluggable file storage abstraction (S3-compatible, local filesystem) |
-| `aust-calendar` | *(calendar logic lives in `aust-api` — no separate crate)* |
+| `aust-flash-contact` | Ultra-quick callback-request capture (public flash-contact form → DB) |
+| `flash-contact-bot` | Standalone Telegram bot binary that notifies/handles flash-contact callbacks (own Docker image) |
+
+Calendar logic has no dedicated crate — it lives in `aust-api` (`calendar_repo.rs`, `calendar_item_repo.rs`) and `aust-email-agent` (`calendar.rs`).
 
 ## Database
 
@@ -181,8 +183,11 @@ Migration files are in `migrations/`. Key tables:
 | `inquiries` | Moving inquiries, status tracking, volume and distance |
 | `volume_estimations` | Estimation results (method: vision / inventory / depth_sensor / video) |
 | `offers` | Generated offers with pricing, PDF storage key, line items |
-| `inquiry_employees` | Employee assignments per inquiry per day |
+| `invoices` | Issued invoices and payment tracking |
+| `employees` | Field staff — profile, auth, documents, clock times |
+| `inquiry_employees` / `calendar_item_employees` | Employee assignments (one row per employee per `job_date`) |
 | `calendar_items` | Non-inquiry calendar work items |
+| `flash_contacts` | Quick callback requests from the public flash-contact form |
 | `users` | Admin users (email + password hash + role) |
 | `email_threads` / `email_messages` | Full email conversation history |
 
@@ -205,33 +210,33 @@ See [docs/API.md](docs/API.md) for the full API reference with request/response 
 
 ## Deployment
 
-The backend runs as a systemd service (`aust-backend.service`) built from a release binary.
+Production runs as Docker containers on a single VPS (`docker compose`), fronted
+by a Cloudflare Tunnel. The backend container applies DB migrations automatically
+on startup via `sqlx::migrate!()` — there is no manual migration step.
 
-### Full deploy
+See [DEPLOYMENT.md](DEPLOYMENT.md) for the full runbook (staging, rollback,
+restore drill, VPS layout).
 
-```bash
-# Backup DB → git pull → cargo build --release → restart service → health check
-./scripts/deploy-prod.sh
-```
-
-### Manual restart
+### Deploy
 
 ```bash
-sudo systemctl restart aust-backend
-journalctl -u aust-backend -f
+# Backend + flash-bot only (build image → backup VPS → push → restart → health check)
+bash scripts/deploy-prod.sh
+
+# Backend + flash-bot + frontend (frontend ships to KAS hosting via FTP)
+bash scripts/deploy-full.sh
 ```
+
+Both scripts require a clean working tree on `main`. They back up the production
+DB + MinIO before making any change and tag the previous image as `:previous`
+for one-step rollback.
 
 ### Database backups
 
-```bash
-# Manual backup (stored in backups/db/ as gzipped pg_dump, 30-backup rotation)
-./scripts/backup.sh
-
-# Install daily backup timer (runs at 03:00)
-sudo cp scripts/aust-backup.service scripts/aust-backup.timer /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now aust-backup.timer
-```
+A nightly cron on the VPS runs `backup.sh` at 03:00 UTC — `pg_dump` + a MinIO
+tarball into `/opt/aust/backups/`, 7-day retention, with Telegram size-anomaly
+alerts. Pull backups off-site with `bash scripts/pull-backups.sh`. Install the
+VPS cron once with `bash scripts/setup-backups.sh`.
 
 ## Development Workflow
 
@@ -259,8 +264,8 @@ cargo clippy -p aust-api
 # Format
 cargo fmt --all
 
-# Follow server logs
-journalctl -u aust-backend -f
+# Follow server logs (production — container)
+ssh root@<vps> 'docker logs -f aust_backend'
 
 # Health checks
 curl http://localhost:8080/health

@@ -50,8 +50,8 @@ Main entity tracking the full lifecycle of a moving job.
 | `source` | VARCHAR(50) | How the inquiry arrived (direct_email, photo_webapp, mobile_app, etc.) |
 | `estimated_volume_m3` | DOUBLE PRECISION | Total estimated move volume |
 | `distance_km` | DOUBLE PRECISION | ORS-calculated route distance |
-| `preferred_date` | TIMESTAMPTZ | Customer-requested date |
-| `scheduled_date` | DATE | Admin-confirmed job date |
+| `preferred_date` | TIMESTAMPTZ | **Deprecated** — kept but no longer read by app code (backfilled into `scheduled_date`, migration `20260401000000`). Use `scheduled_date`. |
+| `scheduled_date` | DATE | The single job-date field (admin-confirmed or backfilled) |
 | `start_time` | TIME | Job start time, default 09:00 |
 | `end_time` | TIME | Job end time, default 17:00 |
 | `services` | JSONB | Boolean flags: packing, assembly, disassembly, storage, disposal, parking_ban_origin, parking_ban_destination |

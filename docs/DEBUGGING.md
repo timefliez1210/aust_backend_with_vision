@@ -9,11 +9,13 @@
 
 **Symptom**: Assign a Mitarbeiter to an accepted inquiry, open the employee's hours dashboard for the current month → planned hours show 0 / assignment not listed.
 
-**Root cause**: SQL filter uses `COALESCE(cb.booking_date, i.preferred_date::date) BETWEEN $start AND $end`. When a newly accepted inquiry has no calendar booking AND no preferred_date, COALESCE returns NULL → BETWEEN with NULL is always false → row silently excluded.
+**Root cause**: SQL filter uses `COALESCE(i.scheduled_date, ...) BETWEEN $start AND $end`.
+When a newly accepted inquiry has no `scheduled_date`, COALESCE returns NULL → BETWEEN
+with NULL is always false → row silently excluded.
 
-**Fix**: Add `ie.created_at::date` as third fallback:
+**Fix**: Add `ie.job_date` / `ie.created_at::date` as a fallback:
 ```sql
-COALESCE(cb.booking_date, i.preferred_date::date, ie.created_at::date) BETWEEN $1 AND $2
+COALESCE(i.scheduled_date, ie.job_date, ie.created_at::date) BETWEEN $1 AND $2
 ```
 
 **Files**: `crates/api/src/routes/admin.rs` — `employee_hours_summary()` and `fetch_employee_month_hours()`.
@@ -38,12 +40,17 @@ COALESCE(cb.booking_date, i.preferred_date::date, ie.created_at::date) BETWEEN $
 
 **Root cause**: Two running instances of the backend are both polling `/getUpdates` with the same bot token. The Telegram API delivers each update to only one poller — they race, neither processes correctly.
 
-**Fix**: Ensure only one instance runs at a time. Check with `systemctl status aust-backend` and kill any orphaned processes before starting a new one:
+**Fix**: Ensure only one instance polls at a time. In local dev kill orphaned
+processes before starting a new one; in production there is exactly one
+`aust_backend` container:
 ```bash
-pkill -f "target/debug/aust_backend"
-# or in production:
-sudo systemctl restart aust-backend
+pkill -f "target/debug/aust_backend"          # local dev
+ssh root@<vps> 'docker compose -f /opt/aust/docker-compose.yml restart backend'  # prod
 ```
+
+> Note: a second offender used to be the laptop's `aust-flash-bot.service`
+> polling the same token as the VPS bot. The laptop is fully out of prod as of
+> 2026-05-22 — see [DEPLOYMENT.md](../DEPLOYMENT.md).
 
 **Files**: `crates/email-agent/src/telegram.rs` — polling loop.
 
@@ -141,22 +148,21 @@ which soffice  # verify
 
 ---
 
-## 10. Calendar COALESCE NULL Pattern (General)
+## 11. Effective-Date COALESCE NULL Pattern (General)
 
-Several queries use `COALESCE(cb.booking_date, i.preferred_date::date)` to get an "effective date" for an inquiry. This pattern is fragile when:
-- No calendar booking exists yet (newly accepted inquiry)
-- `preferred_date` is NULL (inquiry from kontakt form, no date specified)
+Several queries COALESCE a chain of date columns to get an "effective date" for an
+inquiry. (Historically the chain started with `cb.booking_date` from the old
+`calendar_bookings` table and `i.preferred_date` — both retired: calendar bookings
+are now `calendar_items`, and `preferred_date` was replaced by `scheduled_date`.)
+The pattern is fragile when every column in the chain is NULL — any `BETWEEN`,
+`ORDER BY`, or `WHERE` on the result silently drops or mis-orders those rows.
 
-Both being NULL is the worst case — any `BETWEEN`, `ORDER BY`, or `WHERE` on the COALESCE result will silently drop or mis-order these rows.
-
-**General fix pattern**: Always add a final non-null fallback:
+**General fix pattern**: Always end the chain with a guaranteed-non-null column:
 ```sql
-COALESCE(cb.booking_date, i.preferred_date::date, ie.created_at::date)
--- or for inquiries without an ie row:
-COALESCE(cb.booking_date, i.preferred_date::date, i.created_at::date)
+COALESCE(i.scheduled_date, ie.job_date, i.created_at::date)
 ```
 
-Search for this pattern in new queries before shipping:
+Search for fragile effective-date COALESCEs before shipping:
 ```bash
-grep -rn "COALESCE.*booking_date.*preferred_date" crates/
+grep -rn "COALESCE.*scheduled_date" crates/
 ```

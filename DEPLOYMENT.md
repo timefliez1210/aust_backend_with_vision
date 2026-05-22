@@ -9,31 +9,31 @@ Covers local staging, backup/restore, and production deployment for the AUST bac
 ```
 Dev laptop
   │
-  │  ssh -i ~/.ssh/id_ed25519 root@72.62.89.179
+  │  ssh -i ~/.ssh/id_ed25519 root@187.124.161.90
   │  scp / rsync
   ▼
-VPS (Hostinger 72.62.89.179)
+VPS (Hostinger 187.124.161.90)
   │
   │  /opt/aust/docker-compose.yml  (= docker/docker-compose.prod.yml)
   │  /opt/aust/.env                (secrets — NOT in repo)
   │  /opt/aust/migrations/         (uploaded by deploy-prod.sh)
   │  /opt/aust/backups/            (daily postgres + minio dumps)
   │
-  ├─ container: aust_postgres      (postgres:16-alpine, 127.0.0.1:5432)
-  ├─ container: aust_minio         (minio/minio, 127.0.0.1:9000/9001)
-  └─ container: aust_backend       (Dockerfile.backend, 127.0.0.1:8080)
+  ├─ container: aust_postgres            (postgres:16-alpine, 127.0.0.1:5432)
+  ├─ container: aust_minio               (minio/minio, 127.0.0.1:9000/9001)
+  ├─ container: aust_backend             (Dockerfile.backend, 127.0.0.1:8080)
+  └─ container: aust_flash_contact_bot   (Dockerfile.flash-contact-bot)
        │
        │  HTTP on 127.0.0.1:8080 (not exposed to internet directly)
        ▼
   Cloudflare Tunnel (cloudflared daemon on VPS)
        │
        ▼
-  https://aufraeumhelden.com   (public domain, Cloudflare-proxied)
+  https://api.aufraeumhelden.com   (public API, Cloudflare-proxied)
 
 Frontend (SvelteKit)
-  — currently deployed via FTP to KAS shared hosting
-  — migration to container in progress (Dockerfile.frontend exists,
-    staging already runs it; prod containerisation not yet done)
+  — built by deploy-full.sh, deployed via FTP to KAS shared hosting
+    (the public marketing site www.aust-umzuege.de)
 ```
 
 ---
@@ -147,7 +147,7 @@ bash scripts/pull-backups.sh
 ```
 
 Rsyncs `/opt/aust/backups/` on the VPS to `~/aust-backups/` on the dev machine.
-Requires SSH access to `root@72.62.89.179` (ProtonVPN may be needed).
+Requires SSH access to `root@187.124.161.90` (ProtonVPN may be needed).
 
 ### Restore into staging containers
 
@@ -190,36 +190,30 @@ Key backend service config:
 ### Regular deploy
 
 ```bash
-bash scripts/deploy-prod.sh
+bash scripts/deploy-prod.sh    # backend + flash-contact-bot
+bash scripts/deploy-full.sh    # backend + flash-contact-bot + frontend (FTP to KAS)
 ```
 
+Both default `VPS_IP` to the production VPS; override with `VPS_IP=<ip> bash scripts/deploy-...`.
 Pre-flight checks: working tree clean, on `main` branch, SSH reachable, `/opt/aust/docker-compose.yml` present.
 
-Steps:
+Steps (`deploy-prod.sh`):
 1. SSH to VPS and run `/opt/aust/backup.sh` — full postgres dump + MinIO snapshot before touching anything.
-2. Build `aust_backend:latest` locally from `docker/Dockerfile.backend`.
-3. Tag existing VPS image as `aust_backend:previous` (rollback anchor).
-4. `docker save | gzip` → `/tmp/aust_backend.tar.gz`.
-5. `scp` tarball to VPS `/tmp/`.
-6. `docker load` on VPS, delete tarball.
-7. Upload `migrations/` to `/opt/aust/migrations/`.
-8. `docker compose up -d backend` on VPS — container starts, `sqlx::migrate!()` applies any new migrations automatically.
-9. Health poll: 12 attempts × 5 s. Prints rollback command on failure.
+2. Build `aust_backend:latest` + `aust_flash_contact_bot:latest` locally.
+3. Tag existing VPS images as `:previous` (rollback anchor).
+4. `docker save | gzip` → `scp` to VPS → `docker load`.
+5. Upload `migrations/` to `/opt/aust/migrations/`.
+6. `docker compose up -d backend flash-contact-bot` on VPS — container starts, `sqlx::migrate!()` applies any new migrations automatically.
+7. Health poll: 12 attempts × 5 s. Prints rollback command on failure.
 
-### One-time systemd → container cutover
+`deploy-full.sh` additionally builds the SvelteKit frontend and uploads it to KAS shared
+hosting via FTP (`FTP_PASS` required — in `frontend/.env` or exported).
 
-```bash
-bash scripts/cutover-systemd-to-container.sh
-```
+### Provisioning a fresh VPS
 
-Steps:
-1. `systemctl stop aust-backend && systemctl disable aust-backend`.
-2. Uploads `docker/docker-compose.prod.yml` → `/opt/aust/docker-compose.yml`.
-3. Calls `deploy-prod.sh` (builds + loads image + starts container).
-4. Verifies `https://aufraeumhelden.com/health`.
-
-Expected downtime: ~30 seconds. The binary at `/opt/aust/bin/aust_backend` is **not** deleted;
-emergency rollback: `systemctl enable aust-backend && systemctl start aust-backend`.
+`bash scripts/bootstrap-new-vps.sh <VPS_IP> root <CLOUDFLARED_TOKEN>` installs Docker,
+cloudflared, and the `/opt/aust` layout on a new host. Follow it with a normal
+`VPS_IP=<ip> bash scripts/deploy-prod.sh`.
 
 ---
 
@@ -255,20 +249,17 @@ locally. Alert the team and do not skip the next scheduled backup until the root
 
 ---
 
-## 6. Open Follow-ups  <!-- was §5 -->
+## 6. Known Issues & Follow-ups
 
-These must be addressed before (or as part of) the cutover:
-
-**`/opt/aust/.env` hostname check** — The env file on the VPS must use compose service names, not
-`localhost`, for internal service URLs. Verify before running the cutover script:
-- `DATABASE_URL` (or `AUST__DATABASE__URL`) must point to `postgres:5432`, not `localhost:5432`.
+**`/opt/aust/.env` hostname rule** — The env file on the VPS must use compose service names,
+not `localhost`, for internal service URLs (the backend runs inside the compose network):
+- `AUST__DATABASE__URL` must point to `postgres:5432`, not `localhost:5432`.
 - S3 endpoint must point to `http://minio:9000`, not `http://localhost:9000`.
-If either still references `localhost`, the backend container will fail to connect to its dependencies.
+If either references `localhost`, the backend container cannot reach its dependencies.
 
-**Frontend not containerized for prod** — `Dockerfile.frontend` exists and works in staging, but
-production frontend is still deployed via FTP to KAS shared hosting. The prod compose file has no
-`frontend` service. Containerising prod frontend requires a separate Nginx/Caddy reverse proxy or
-Cloudflare routing change.
+**Frontend not containerized for prod** — `Dockerfile.frontend` exists and works in staging,
+but the production marketing site is deployed via FTP to KAS shared hosting (where its
+`send-mail.php` form handler runs). The prod compose file has no `frontend` service.
 
 **Mailpit healthcheck cosmetic failure** — The `staging-mailpit` container healthcheck reports
 unhealthy in some environments. This does not block staging operation; the container serves SMTP
@@ -281,7 +272,7 @@ and the web UI regardless.
 **Backend (Docker)**
 
 ```bash
-ssh -i ~/.ssh/id_ed25519 root@72.62.89.179 \
+ssh -i ~/.ssh/id_ed25519 root@187.124.161.90 \
   'docker tag aust_backend:previous aust_backend:latest \
    && cd /opt/aust && docker compose up -d backend'
 ```
@@ -289,12 +280,7 @@ ssh -i ~/.ssh/id_ed25519 root@72.62.89.179 \
 `deploy-prod.sh` tags the previous image as `:previous` before each deploy, so one rollback step
 is always available.
 
+The same `:previous` mechanism applies to `aust_flash_contact_bot`.
+
 **Database** — No rollback needed. All migrations are additive-only (columns/tables added, never
-dropped or altered destructively). Rolling back the binary without touching the DB is safe.
-
-**Emergency (pre-container)** — If the container is broken and the systemd binary is still present:
-
-```bash
-ssh -i ~/.ssh/id_ed25519 root@72.62.89.179 \
-  'systemctl enable aust-backend && systemctl start aust-backend'
-```
+dropped or altered destructively). Rolling back the image without touching the DB is safe.
