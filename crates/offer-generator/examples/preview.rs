@@ -99,6 +99,7 @@ async fn main() {
                 source_image_urls: None,
             },
         ],
+        headline_override: None,
     };
 
     let xlsx = generate_offer_xlsx(&data).expect("XLSX generation failed");

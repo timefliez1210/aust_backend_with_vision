@@ -309,6 +309,13 @@ async fn update_item(
     }
     if body.scheduled_date.is_some() {
         sets.push(format!("scheduled_date = ${idx}"));
+        // Preserve the multi-day span: shift end_date by the same delta unless the caller
+        // is overriding end_date explicitly below. Without this, dragging forward leaves
+        // end_date < scheduled_date and the generate_series in fetch_schedule_calendar_items
+        // returns empty, making the item vanish from the calendar.
+        if body.end_date.is_none() {
+            sets.push(format!("end_date = end_date + (${idx}::date - scheduled_date)"));
+        }
         idx += 1;
     }
     if body.start_time.is_some() {

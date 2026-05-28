@@ -480,6 +480,12 @@ pub(crate) async fn build_offer_with_overrides(
         rate_per_person_hour: rate_override,
         line_items: all_items,
         detected_items: detected_items.clone(),
+        headline_override: inquiry
+            .custom_fields
+            .get("offer_headline_override")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
     };
 
     // 8. Generate XLSX (direct XML manipulation of template)

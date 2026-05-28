@@ -70,6 +70,7 @@ fn preview_offer_pdf() {
             make_item("Aktenschrank je angefangener m", "Aktenschrank", 8.0, 0.80, Some("0.8 × 0.4 × 1.8 m")),
             make_item("Stehlampe", "Stehlampe", 2.0, 0.20, None),
         ],
+        headline_override: None,
     };
 
     // Generate XLSX

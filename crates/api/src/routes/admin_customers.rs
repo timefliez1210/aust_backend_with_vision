@@ -297,12 +297,25 @@ pub(super) async fn update_customer(
     // Some("") = clear to NULL. Trim the value; empty string after trim clears email.
     let email_update = request.email.as_deref().map(|s| s.trim());
 
+    // Drop empty/invalid values that would violate DB CHECK constraints.
+    // Empty string from a cleared <select> is treated as "don't touch".
+    let customer_type = request
+        .customer_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| matches!(*s, "private" | "business"));
+    let salutation = request
+        .salutation
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
     let repo_row = admin_repo::update_customer(
         &state.db, id,
-        request.name.as_deref(), request.salutation.as_deref(),
+        request.name.as_deref(), salutation,
         request.first_name.as_deref(), request.last_name.as_deref(),
         request.phone.as_deref(), email_update,
-        request.customer_type.as_deref(), request.company_name.as_deref(),
+        customer_type, request.company_name.as_deref(),
         billing_address_id,
     )
     .await?;

@@ -347,6 +347,12 @@ pub(crate) async fn update_fields(
             estimated_volume_m3 = COALESCE($5, estimated_volume_m3),
             distance_km = COALESCE($6, distance_km),
             scheduled_date = COALESCE($7, scheduled_date),
+            end_date = CASE
+                WHEN $20 THEN $21
+                WHEN $7 IS NOT NULL AND end_date IS NOT NULL
+                    THEN end_date + ($7::date - scheduled_date)
+                ELSE end_date
+            END,
             start_time = COALESCE($8, start_time),
             end_time = COALESCE($9, end_time),
             origin_address_id = COALESCE($10, origin_address_id),
@@ -358,7 +364,6 @@ pub(crate) async fn update_fields(
             billing_address_id = COALESCE($16, billing_address_id),
             custom_fields = COALESCE($17, custom_fields),
             employee_notes = COALESCE($18, employee_notes),
-            end_date = CASE WHEN $20 THEN $21 ELSE end_date END,
             has_pauschale = COALESCE($22, has_pauschale),
             updated_at = $19
         WHERE id = $1

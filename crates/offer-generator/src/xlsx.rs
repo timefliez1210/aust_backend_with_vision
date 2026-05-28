@@ -86,6 +86,10 @@ pub struct OfferData {
     /// Optional detected/parsed inventory items added to the second sheet.
     /// If empty, no second sheet is created.
     pub detected_items: Vec<DetectedItemRow>,
+    /// Optional free-text override for the A29 headline (default: "Umzugspauschale X.X m³").
+    /// Lets Alex re-label the main service line for non-volume jobs (Umzugshelfer, Lagerung, …).
+    #[serde(default)]
+    pub headline_override: Option<String>,
 }
 
 /// A single line item written into one row of the XLSX offer template (rows 31-42).
@@ -388,11 +392,15 @@ fn build_cell_modifications(
     mods.push(("F27".into(), CellValue::Text(data.dest_city.clone())));
     mods.push(("F28".into(), CellValue::Text(data.dest_floor_info.clone())));
 
-    // Volume description
-    mods.push((
-        "A29".into(),
-        CellValue::Text(format!("Umzugspauschale {:.1} m³", data.volume_m3)),
-    ));
+    // Volume description (A29) — overridable so Alex can re-label for non-volume jobs.
+    let headline = data
+        .headline_override
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| format!("Umzugspauschale {:.1} m³", data.volume_m3));
+    mods.push(("A29".into(), CellValue::Text(headline)));
 
     // --- Line items: dynamic row assignment with alternating styles ---
     //
@@ -1676,6 +1684,7 @@ mod tests {
             rate_per_person_hour: 30.0,
             line_items: vec![],
             detected_items: vec![],
+        headline_override: None,
         }
     }
 
