@@ -50,7 +50,9 @@ struct TgChat {
 // ── Main loop ─────────────────────────────────────────────────────────────────
 
 pub async fn run(db: PgPool, bot_token: String, admin_chat_id: i64) -> Result<()> {
-    let client = Client::new();
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(POLL_TIMEOUT_SECS + 10))
+        .build()?;
     let base = format!("https://api.telegram.org/bot{}", bot_token);
     let mut offset: i64 = 0;
     let mut backoff_secs: u64 = 5;

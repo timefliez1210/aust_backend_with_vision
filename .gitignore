@@ -1,6 +1,5 @@
 # Generated files
 /target/
-Cargo.lock
 
 # Environment files
 .env

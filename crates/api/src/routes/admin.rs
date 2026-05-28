@@ -348,7 +348,7 @@ async fn delete_user(
         return Err(ApiError::NotFound(format!("Benutzer {id} nicht gefunden")));
     }
 
-    tracing::info!(admin = %claims.sub, admin_email = %claims.email, deleted_user = %id, "Admin deleted user");
+    tracing::info!(admin = %claims.sub, deleted_user = %id, "Admin deleted user");
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -557,7 +557,7 @@ async fn update_employee(
     )
     .await?;
 
-    tracing::info!(admin = %claims.sub, admin_email = %claims.email, employee_id = %id, "Admin updated employee");
+    tracing::info!(admin = %claims.sub, employee_id = %id, "Admin updated employee");
     let employee = fetch_employee_json(&state.db, id).await?;
     Ok(Json(employee))
 }
@@ -580,7 +580,7 @@ async fn delete_employee(
         return Err(ApiError::NotFound("Mitarbeiter nicht gefunden".into()));
     }
 
-    tracing::info!(admin = %claims.sub, admin_email = %claims.email, employee_id = %id, "Admin soft-deleted employee");
+    tracing::info!(admin = %claims.sub, employee_id = %id, "Admin soft-deleted employee");
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 

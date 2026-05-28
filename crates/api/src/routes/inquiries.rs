@@ -586,7 +586,7 @@ async fn delete_inquiry(
         return Err(ApiError::NotFound(format!("Inquiry {id} not found")));
     }
 
-    tracing::info!(admin = %claims.sub, admin_email = %claims.email, inquiry_id = %id, "Admin hard-deleted inquiry");
+    tracing::info!(admin = %claims.sub, inquiry_id = %id, "Admin hard-deleted inquiry");
     Ok(StatusCode::NO_CONTENT)
 }
 

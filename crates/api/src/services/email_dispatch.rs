@@ -63,7 +63,7 @@ pub async fn send_offer_email(
     .await
     .map_err(|e| e.to_string())?;
 
-    info!("Offer email sent to {to}");
+    info!(offer_id = %offer_id, "Offer email sent");
     Ok(())
 }
 
@@ -122,7 +122,7 @@ pub async fn send_offer_email_custom(
     .await
     .map_err(|e| e.to_string())?;
 
-    info!("Offer email sent to {to} (custom)");
+    info!(offer_id = %offer_id, "Offer email sent (custom)");
     Ok(())
 }
 

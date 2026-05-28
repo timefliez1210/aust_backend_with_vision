@@ -320,7 +320,7 @@ pub(super) async fn update_customer(
     )
     .await?;
 
-    tracing::info!(admin = %claims.sub, admin_email = %claims.email, customer_id = %id, "Admin updated customer");
+    tracing::info!(admin = %claims.sub, customer_id = %id, "Admin updated customer");
 
     repo_row
         .map(|c| Json(CustomerListItem {
@@ -425,7 +425,7 @@ pub(super) async fn delete_customer(
     if rows == 0 {
         return Err(ApiError::NotFound(format!("Kunde {id} nicht gefunden")));
     }
-    tracing::info!(admin = %claims.sub, admin_email = %claims.email, customer_id = %id, "Admin deleted customer");
+    tracing::info!(admin = %claims.sub, customer_id = %id, "Admin deleted customer");
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
