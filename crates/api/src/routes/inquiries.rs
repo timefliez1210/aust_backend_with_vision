@@ -811,6 +811,29 @@ async fn put_inquiry_employees(
     Path(id): Path<Uuid>,
     Json(body): Json<Vec<BulkEmployeeAssignmentBody>>,
 ) -> Result<Json<Vec<calendar_repo::EmployeeAssignmentRow>>, ApiError> {
+    // Validate every job_date lies within the inquiry's [scheduled_date, end_date] span.
+    // Without this, the frontend could submit assignments for days outside the booking,
+    // which the calendar view (driven by generate_series on the inquiry span) silently hides.
+    let span: Option<(Option<chrono::NaiveDate>, Option<chrono::NaiveDate>)> = sqlx::query_as(
+        "SELECT scheduled_date, end_date FROM inquiries WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let (start, end) = span.ok_or_else(|| ApiError::NotFound(format!("Inquiry {id} not found")))?;
+    if let Some(start) = start {
+        let end = end.unwrap_or(start);
+        for b in &body {
+            if b.job_date < start || b.job_date > end {
+                return Err(ApiError::BadRequest(format!(
+                    "Mitarbeiter-Datum {} liegt außerhalb des Zeitraums ({} – {})",
+                    b.job_date, start, end
+                )));
+            }
+        }
+    }
+
     let inputs: Vec<calendar_repo::EmployeeAssignmentInput> = body.into_iter().map(|b| {
         calendar_repo::EmployeeAssignmentInput {
             employee_id: b.employee_id,

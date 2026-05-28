@@ -603,6 +603,25 @@ async fn put_item_employees(
     Path(id): Path<Uuid>,
     Json(body): Json<Vec<BulkItemEmployeeBody>>,
 ) -> Result<Json<Vec<calendar_repo::EmployeeAssignmentRow>>, ApiError> {
+    // Validate every job_date lies within the calendar item's [scheduled_date, end_date] span.
+    let span: Option<(chrono::NaiveDate, Option<chrono::NaiveDate>)> = sqlx::query_as(
+        "SELECT scheduled_date, end_date FROM calendar_items WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let (start, end) = span.ok_or_else(|| ApiError::NotFound(format!("Termin {id} not found")))?;
+    let end = end.unwrap_or(start);
+    for b in &body {
+        if b.job_date < start || b.job_date > end {
+            return Err(ApiError::BadRequest(format!(
+                "Mitarbeiter-Datum {} liegt außerhalb des Zeitraums ({} – {})",
+                b.job_date, start, end
+            )));
+        }
+    }
+
     let inputs: Vec<calendar_repo::EmployeeAssignmentInput> = body.into_iter().map(|b| {
         calendar_repo::EmployeeAssignmentInput {
             employee_id: b.employee_id,
