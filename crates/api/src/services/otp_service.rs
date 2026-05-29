@@ -170,7 +170,7 @@ pub(crate) async fn handle_request_otp(
         send_otp_email(email_config, &email, subject, &body_text)
             .await
             .map_err(|e| {
-                tracing::error!("Failed to send OTP email to {email}: {e}");
+                tracing::error!(label = backend.user_label(), "Failed to send OTP email: {e}");
                 ApiError::Internal("E-Mail konnte nicht gesendet werden".into())
             })?;
 

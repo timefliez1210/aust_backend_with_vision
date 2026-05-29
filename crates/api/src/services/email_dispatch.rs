@@ -164,7 +164,7 @@ pub(crate) async fn find_or_create_offer_thread(
         .unwrap_or(None);
 
     let Some(customer) = customer else {
-        warn!("Cannot create email thread: customer not found for {customer_email}");
+        warn!(inquiry_id = %inquiry_id, "Cannot create email thread: customer not found");
         return None;
     };
 

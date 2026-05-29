@@ -169,7 +169,7 @@ impl EmailProcessor {
         {
             Ok(Some((id,))) => id,
             Ok(None) => {
-                warn!("Customer not found after upsert for {customer_email}");
+                warn!("Customer not found after upsert");
                 return None;
             }
             Err(e) => {

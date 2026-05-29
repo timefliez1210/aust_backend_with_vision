@@ -136,11 +136,28 @@ pub(crate) async fn upsert_pricing(
 // Number sequences (invoice / KVA)
 // ---------------------------------------------------------------------------
 
+/// Sequence names allowed to be inlined into SQL by this module.
+///
+/// `format!`-built SQL is unavoidable for sequence names (Postgres does not
+/// accept them as bind parameters), so we gate it on an explicit allowlist
+/// rather than trusting callers. Mirrors the `resolve_doc_column` pattern in
+/// `employee_repo.rs`.
+const ALLOWED_SEQUENCES: &[&str] = &["invoice_number_seq", "offer_number_seq"];
+
+fn resolve_seq(seq: &str) -> Result<&'static str, ApiError> {
+    ALLOWED_SEQUENCES
+        .iter()
+        .find(|s| **s == seq)
+        .copied()
+        .ok_or_else(|| ApiError::Internal(format!("unknown sequence: {seq}")))
+}
+
 /// Read the next value each sequence will hand out, without consuming it.
 ///
 /// `last_value` is the most recently issued value; `is_called` is false only
 /// for a freshly created sequence that has never had `nextval` called on it.
 async fn next_for_seq(db: &PgPool, seq: &str) -> Result<i64, ApiError> {
+    let seq = resolve_seq(seq)?;
     let (last_value, is_called): (i64, bool) =
         sqlx::query_as(&format!("SELECT last_value, is_called FROM {seq}"))
             .fetch_one(db)
@@ -156,9 +173,10 @@ pub(crate) async fn get_next_numbers(db: &PgPool) -> Result<NextNumbers, ApiErro
 }
 
 /// Set the next value a sequence will hand out. `setval(seq, n, false)` means
-/// the following `nextval` returns exactly `n`. `seq` is always a hardcoded
-/// constant (never user input), so inlining it into the SQL is safe.
+/// the following `nextval` returns exactly `n`. `seq` must be in
+/// `ALLOWED_SEQUENCES` — `resolve_seq` rejects anything else.
 async fn set_next_for_seq(db: &PgPool, seq: &str, n: i64) -> Result<(), ApiError> {
+    let seq = resolve_seq(seq)?;
     sqlx::query(&format!("SELECT setval('{seq}', $1, false)"))
         .bind(n)
         .execute(db)

@@ -53,7 +53,8 @@ impl SmtpClient {
             .map_err(|e| EmailError::Smtp(format!("SMTP send failed: {e}")))?;
 
         let status = format!("{} {}", response.code(), response.first_line().unwrap_or("OK"));
-        info!("Email sent to {to}: {status}");
+        let _ = to;
+        info!("Email sent: {status}");
         Ok(status)
     }
 
