@@ -13,7 +13,7 @@ use tracing::{debug, warn};
 
 use crate::error::Result;
 use crate::llm::{AssistantLlmProvider, ModelTier};
-use crate::memory::durable::{self, MemoryKind, RememberParams};
+use crate::memory::durable::MemoryKind;
 use crate::memory::proposals::{self, NewProposal};
 use aust_llm_providers::LlmMessage;
 
@@ -70,48 +70,40 @@ pub async fn reflect(
             "Reflection produced memory proposal"
         );
 
-        if p.confidence >= 0.7 {
-            // Auto-store high-confidence proposals.
-            let kind = parse_kind(&p.kind);
-            durable::remember(
-                pool,
-                RememberParams {
-                    kind,
-                    scope: &p.scope,
-                    key: &p.key,
-                    value: p.value.clone(),
-                    source: "post_action_hook",
-                    confidence: p.confidence,
-                },
-            )
-            .await?;
-            debug!("Auto-stored memory proposal: {}", p.key);
+        // H4: route ALL reflections through `pending_memory_proposals` for Alex
+        // to approve, regardless of confidence. Previously high-confidence
+        // proposals were auto-stored via `durable::remember`, which bypassed
+        // the Safety::Confirm gate that B6 put on the `remember` tool to block
+        // prompt-injection planted durable rules. The LLM's self-reported
+        // confidence is derived from attacker-influenceable content, so it is
+        // not a safe authority for skipping confirmation.
+        let kind = parse_kind(&p.kind);
+        let rationale = if p.confidence >= 0.7 {
+            "post_action_hook (high confidence — awaiting approval)"
         } else {
-            // Low-confidence: persist into pending_memory_proposals for Alex
-            // to review during the next consolidation / morning briefing.
-            let kind = parse_kind(&p.kind);
-            match proposals::enqueue(
-                pool,
-                NewProposal {
-                    session_id,
-                    kind,
-                    scope: &p.scope,
-                    key: &p.key,
-                    value: p.value.clone(),
-                    confidence: p.confidence as f32,
-                    source_episodes: vec![],
-                    rationale: Some("post_action_hook (low confidence)"),
-                },
-            )
-            .await
-            {
-                Ok(_) => debug!(
-                    confidence = p.confidence,
-                    key = p.key,
-                    "Low-confidence proposal queued for review"
-                ),
-                Err(e) => warn!("Failed to enqueue pending proposal: {e}"),
-            }
+            "post_action_hook (low confidence)"
+        };
+        match proposals::enqueue(
+            pool,
+            NewProposal {
+                session_id,
+                kind,
+                scope: &p.scope,
+                key: &p.key,
+                value: p.value.clone(),
+                confidence: p.confidence as f32,
+                source_episodes: vec![],
+                rationale: Some(rationale),
+            },
+        )
+        .await
+        {
+            Ok(_) => debug!(
+                confidence = p.confidence,
+                key = p.key,
+                "Memory proposal queued for review (H4: no auto-store)"
+            ),
+            Err(e) => warn!("Failed to enqueue pending proposal: {e}"),
         }
     }
 

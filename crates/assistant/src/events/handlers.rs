@@ -113,14 +113,16 @@ pub async fn handle_offer_drafted(
     let brutto = brutto_cents as f64 / 100.0;
     let offer_id = payload["offer_id"].as_str().unwrap_or("?");
 
-    // Post a notification. The inline keyboard [Senden] is implemented as a
-    // pending_action callback via the bridge layer. Here we post a plain message
-    // indicating what Alex should do — the bridge is responsible for attaching
-    // inline buttons when it detects this event.
+    // B4: previous text told Alex to tap "/approve <id>" / "/deny <id>" — but
+    // no such command parser existed and no inline buttons were attached, so
+    // tapping or typing either did nothing. Until the SMTP/S3 send path is
+    // plumbed through OfferService and the inline keyboard wired, give Alex an
+    // honest hand-off to the admin panel rather than a phantom command.
     let msg = format!(
         "✉️ Angebot fertig für {name}: {brutto:.2} € brutto.\n\
-         Angebot-ID: {offer_id}\n\
-         Tippe /approve {offer_id} um es zu senden, oder /deny {offer_id} um es zu verwerfen."
+         Angebot-ID: {offer_id}\n\n\
+         Bitte über das Admin-Panel prüfen und senden — der Agent-Sendpfad \
+         wird verdrahtet, sobald OfferService::send (SMTP + PDF-Anhang) bereit ist."
     );
     let _ = notifier.post(chat_id, msg).await;
     Ok(())

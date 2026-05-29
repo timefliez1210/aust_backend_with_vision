@@ -247,20 +247,19 @@ async fn handle_edit_request(
     pending_id: Uuid,
     pending: &aust_assistant::confirmation::PendingAction,
 ) {
-    // Mark as 'edited' so it's no longer pending.
-    // The user's follow-up text will be routed back through the driver with
-    // context that they're overriding pending action <id>.
-    if let Err(e) = confirmation::resolve(
-        pool,
-        pending_id,
-        Resolution::Edited(pending.proposed_args.clone()),
-    )
-    .await
-    {
-        warn!("edit pending_action {pending_id}: {e}");
+    // H1: previous behaviour resolved the action as Edited(proposed_args) and
+    // asked "Was soll ich ändern?" — but the follow-up message had no link to
+    // the pending action, so the edit was silently dropped. Cancel the original
+    // pending action and prompt Alex to describe the change. The next user
+    // message goes through the normal LLM-driven path, which has the cancelled
+    // tool call in session history and can re-propose with adjusted args.
+    if let Err(e) = confirmation::resolve(pool, pending_id, Resolution::Canceled).await {
+        warn!("edit→cancel pending_action {pending_id}: {e}");
     }
 
-    let body = "✏️ Was soll ich ändern? Schreib mir deine Anpassung.";
+    let body = "✏️ Was soll ich anders machen? Beschreib die Änderung \
+                (z. B. anderer Empfänger, Betrag oder Datum) und ich \
+                erstelle einen neuen Vorschlag zur Bestätigung.";
     if let Some(msg_id) = pending.telegram_message_id {
         telegram_output::edit_message_remove_keyboard(client, bot_token, chat_id, msg_id, body).await;
     } else {
