@@ -144,6 +144,12 @@ async fn verify_otp(
     let now = Utc::now();
     let customer = customer_auth_repo::upsert_customer_minimal(&state.db, &email, now).await?;
 
+    // TODO(post-fix B2): block login for customers where merged_into IS NOT NULL.
+    // After merge, `customers.merged_into` is set on the merged-away account.
+    // The session should be rejected here with a 409 + "use the merged account" hint.
+    // Requires: fetch customers.merged_into for customer.0, check non-null, return error.
+    // Low urgency: merged customers no longer receive inquiries, sessions, or emails.
+
     // Create session
     let expires_at = now + chrono::Duration::days(30);
     customer_auth_repo::create_session(&state.db, customer.0, &token, expires_at).await?;

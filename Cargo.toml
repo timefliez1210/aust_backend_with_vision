@@ -6,7 +6,7 @@ authors = ["AUST Team"]
 license = "MIT"
 
 [workspace]
-members = ["crates/api", "crates/core", "crates/email-agent", "crates/distance-calculator", "crates/llm-providers", "crates/offer-generator", "crates/storage", "crates/volume-estimator", "crates/flash-contact", "crates/flash-contact-bot"]
+members = ["crates/api", "crates/core", "crates/email-agent", "crates/distance-calculator", "crates/llm-providers", "crates/offer-generator", "crates/storage", "crates/volume-estimator", "crates/flash-contact", "crates/flash-contact-bot", "crates/assistant"]
 
 [workspace.package]
 version = "0.1.0"
@@ -16,6 +16,7 @@ license = "MIT"
 
 [dependencies]
 aust-api = { workspace = true }
+aust-assistant = { workspace = true }
 aust-core = { workspace = true }
 aust-flash-contact = { workspace = true }
 aust-email-agent = { workspace = true }
@@ -23,6 +24,7 @@ aust-llm-providers = { workspace = true }
 aust-storage = { workspace = true }
 aust-volume-estimator = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 axum = { workspace = true }
 sqlx = { workspace = true }
 config = { workspace = true }
@@ -126,6 +128,7 @@ aust-offer-generator = { path = "crates/offer-generator" }
 aust-llm-providers = { path = "crates/llm-providers" }
 aust-storage = { path = "crates/storage" }
 aust-flash-contact = { path = "crates/flash-contact" }
+aust-assistant = { path = "crates/assistant" }
 
 [profile.release]
 lto = true

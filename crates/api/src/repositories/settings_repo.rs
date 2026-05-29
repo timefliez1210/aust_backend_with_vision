@@ -173,3 +173,24 @@ pub(crate) async fn set_next_invoice(db: &PgPool, n: i64) -> Result<(), ApiError
 pub(crate) async fn set_next_offer(db: &PgPool, n: i64) -> Result<(), ApiError> {
     set_next_for_seq(db, "offer_number_seq", n).await
 }
+
+// ---------------------------------------------------------------------------
+// Feature flags
+// ---------------------------------------------------------------------------
+
+/// Return the value of the `agent_owns_approval` feature flag.
+///
+/// Defaults to `false` if the settings row is absent or cannot be parsed.
+/// When `true`, the Telegram approval-post code path should be skipped and
+/// the agent's event consumer handles approval routing instead.
+#[allow(dead_code)]
+pub(crate) async fn agent_owns_approval(db: &PgPool) -> bool {
+    let result: Result<Option<(serde_json::Value,)>, _> =
+        sqlx::query_as("SELECT value FROM settings WHERE key = 'agent_owns_approval'")
+            .fetch_optional(db)
+            .await;
+    match result {
+        Ok(Some((v,))) => v.as_bool().unwrap_or(false),
+        _ => false,
+    }
+}

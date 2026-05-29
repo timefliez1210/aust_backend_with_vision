@@ -363,6 +363,7 @@ pub(crate) async fn generate_inquiry_offer(
         existing_offer_id,
         fahrt_flat_total: request.fahrt_flat_total,
         fahrt_reset: request.fahrt_reset,
+        volume_m3: None,
     };
 
     let result = build_offer_with_overrides(

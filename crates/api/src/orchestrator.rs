@@ -7,6 +7,7 @@
 //! - `services::email_dispatch`   — SMTP sending + email thread management
 
 use crate::repositories::{address_repo, customer_repo, estimation_repo, inquiry_repo, offer_repo};
+use crate::services::assistant_bridge::telegram_input;
 use crate::services::telegram_service::{
     handle_offer_approval, handle_offer_denial, handle_offer_edit, send_telegram_message,
 };
@@ -15,7 +16,7 @@ use aust_core::models::{MovingInquiry, Services};
 use aust_distance_calculator::{RouteCalculator, RouteRequest};
 use reqwest::Client;
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 pub use crate::services::email_dispatch::{send_offer_email, send_offer_email_custom};
@@ -146,8 +147,76 @@ pub async fn run_offer_event_handler(
                 )
                 .await;
             }
+            ApprovalDecision::AssistantText { chat_id, text, .. } => {
+                // Check if this chat is bound to the assistant. If so, delegate to the bridge.
+                // If unbound, the EditInstructions variant (emitted in parallel) covers legacy flow.
+                match aust_assistant::bindings::resolve(&state.db, chat_id).await {
+                    Ok(_binding) => {
+                        debug!(chat_id, "AssistantText: bound chat — routing to agent bridge");
+                        telegram_input::handle_text_message(
+                            &state.db,
+                            &client,
+                            bot_token,
+                            chat_id,
+                            &text,
+                            state.assistant_llm.clone(),
+                            &state.tool_registry,
+                            &state.soul,
+                            state.services.clone(),
+                        )
+                        .await;
+                    }
+                    Err(aust_assistant::AssistantError::UnboundChat(_)) => {
+                        debug!(chat_id, "AssistantText: unbound chat — skipping agent dispatch");
+                    }
+                    Err(e) => {
+                        warn!(chat_id, "AssistantText: binding lookup failed: {e}");
+                    }
+                }
+            }
+            ApprovalDecision::AssistantCallback {
+                chat_id,
+                message_id: _,
+                callback_data,
+                callback_query_id,
+            } => {
+                // Always answer the callback query first to dismiss Telegram's loading state.
+                answer_callback_query(&client, bot_token, &callback_query_id).await;
+
+                match aust_assistant::bindings::resolve(&state.db, chat_id).await {
+                    Ok(_binding) => {
+                        debug!(chat_id, %callback_data, "AssistantCallback: routing to agent bridge");
+                        telegram_input::handle_callback_query(
+                            &state.db,
+                            &client,
+                            bot_token,
+                            chat_id,
+                            &callback_data,
+                            state.assistant_llm.clone(),
+                            &state.tool_registry,
+                            state.services.clone(),
+                        )
+                        .await;
+                    }
+                    Err(aust_assistant::AssistantError::UnboundChat(_)) => {
+                        warn!(chat_id, %callback_data, "AssistantCallback: pa: callback from unbound chat — ignoring");
+                    }
+                    Err(e) => {
+                        warn!(chat_id, "AssistantCallback: binding lookup failed: {e}");
+                    }
+                }
+            }
             _ => {} // ignore non-offer events
         }
+    }
+}
+
+/// Answer a Telegram callback query to dismiss the loading indicator.
+async fn answer_callback_query(client: &Client, bot_token: &str, callback_query_id: &str) {
+    let url = format!("https://api.telegram.org/bot{bot_token}/answerCallbackQuery");
+    let payload = serde_json::json!({ "callback_query_id": callback_query_id });
+    if let Err(e) = client.post(&url).json(&payload).send().await {
+        warn!("answer_callback_query failed: {e}");
     }
 }
 
@@ -360,6 +429,21 @@ async fn handle_complete_inquiry(
         }
         customer_id_tx
     };
+
+    // Emit inquiry.created domain event (non-fatal).
+    {
+        let emitter = state.events.clone();
+        let payload = serde_json::json!({
+            "inquiry_id": inquiry_id,
+            "customer_id": customer_id,
+        });
+        let aggregate = format!("inquiry:{inquiry_id}");
+        tokio::spawn(async move {
+            if let Err(e) = emitter.emit("inquiry.created", &aggregate, payload).await {
+                tracing::warn!("Failed to emit inquiry.created event: {e}");
+            }
+        });
+    }
 
     // 6. Create a volume estimation record (manual, from inquiry data)
     let estimation_id = Uuid::now_v7();

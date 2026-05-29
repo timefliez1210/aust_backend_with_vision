@@ -94,13 +94,57 @@ pub async fn try_auto_generate_offer(state: Arc<AppState>, inquiry_id: Uuid) {
 
     match build_offer(&state.db, &*state.storage, &state.config, inquiry_id, Some(30)).await {
         Ok(generated) => {
+            let offer_id = generated.offer.id;
+            let customer_id = generated.offer.inquiry_id; // used below for event payload
             info!(
                 "Offer {} generated for quote {inquiry_id} (€{:.2})",
-                generated.offer.id,
+                offer_id,
                 generated.offer.price_cents as f64 / 100.0
             );
 
-            send_offer_to_telegram(&state.config.telegram, &generated).await;
+            // Emit offer.drafted domain event (non-fatal).
+            {
+                let emitter = state.events.clone();
+                let payload = serde_json::json!({
+                    "offer_id": offer_id,
+                    "inquiry_id": inquiry_id,
+                    // customer_id is not directly available here; callers can look it up via inquiry
+                });
+                let _ = customer_id; // suppress unused warning
+                let aggregate = format!("offer:{offer_id}");
+                tokio::spawn(async move {
+                    if let Err(e) = emitter.emit("offer.drafted", &aggregate, payload).await {
+                        tracing::warn!("Failed to emit offer.drafted event: {e}");
+                    }
+                });
+            }
+
+            // Feature flag: when agent_owns_approval=true, skip the legacy Telegram post.
+            // The offer.drafted event was already emitted above; the agent's
+            // handle_offer_drafted handler will post the approval message.
+            // Rollback: `UPDATE settings SET value = 'false' WHERE key = 'agent_owns_approval';`
+            let agent_owns = crate::repositories::settings_repo::agent_owns_approval(&state.db).await;
+
+            // Store the approval routing decision on the offer row at draft time (B4).
+            // The event consumer reads `offers.approval_owner` instead of re-reading the flag,
+            // so flipping the flag mid-flight cannot produce double-posts or lost-posts.
+            let approval_owner_str = if agent_owns { "agent" } else { "legacy" };
+            if let Err(e) = sqlx::query(
+                "UPDATE offers SET approval_owner = $1 WHERE id = $2"
+            )
+            .bind(approval_owner_str)
+            .bind(offer_id)
+            .execute(&state.db)
+            .await
+            {
+                tracing::warn!("Failed to set approval_owner on offer {offer_id}: {e}");
+            }
+
+            if agent_owns {
+                info!("Skipping legacy Telegram approval post — agent_owns_approval=true. Event consumer will handle it.");
+            } else {
+                send_offer_to_telegram(&state.config.telegram, &generated).await;
+            }
         }
         Err(e) => {
             error!("Auto-offer generation failed for inquiry {inquiry_id}: {e}");

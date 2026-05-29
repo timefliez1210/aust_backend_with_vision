@@ -84,6 +84,10 @@ pub(crate) struct OfferOverrides {
     pub persons: Option<u32>,
     pub hours: Option<f64>,
     pub rate: Option<f64>,
+    /// Override the volume used for pricing (m³). When set, replaces the
+    /// inquiry's stored `estimated_volume_m3` for computation only — does not
+    /// mutate the inquiry row.
+    pub volume_m3: Option<f64>,
     /// Custom non-labor line items. When set, replaces `build_line_items()` output.
     pub line_items: Option<Vec<OfferLineItem>>,
     /// When set, UPDATE this offer in-place instead of INSERTing a new one.
@@ -98,75 +102,42 @@ pub(crate) struct OfferOverrides {
     pub fahrt_reset: bool,
 }
 
-/// Generate an offer with no manual overrides — delegates to `build_offer_with_overrides`.
+/// All data fetched and computed during offer generation, before PDF render / S3 / DB.
 ///
-/// **Caller**: `orchestrator::try_auto_generate_offer`, and any code path that needs a
-/// fresh offer without manual adjustments.
-/// **Why**: Convenience wrapper so callers do not need to construct a default
-/// `OfferOverrides` struct.
-///
-/// # Parameters
-/// - `db` — live PostgreSQL connection pool
-/// - `storage` — S3-compatible storage for uploading the PDF
-/// - `config` — application config (company depot address, rate per km, etc.)
-/// - `inquiry_id` — the inquiry to generate an offer for
-/// - `valid_days` — optional number of days until the offer expires
-///
-/// # Returns
-/// `GeneratedOffer` containing the persisted `Offer` record, the raw PDF bytes, and the
-/// `TelegramSummary` for the approval caption.
-///
-/// # Errors
-/// Propagates all errors from `build_offer_with_overrides`.
-pub(crate) async fn build_offer(
-    db: &PgPool,
-    storage: &dyn StorageProvider,
-    config: &Config,
-    inquiry_id: Uuid,
-    valid_days: Option<i64>,
-) -> Result<GeneratedOffer, ApiError> {
-    build_offer_with_overrides(db, storage, config, inquiry_id, valid_days, &OfferOverrides::default()).await
+/// Returned by `run_offer_computation` and consumed by both `build_offer_with_overrides`
+/// (which adds render + persist) and the service bridge's `preview_offer` (pure path).
+pub(crate) struct OfferComputationContext {
+    pub inquiry: Inquiry,
+    pub volume: f64,
+    pub distance: f64,
+    pub customer: CustomerRow,
+    pub origin: Option<AddressRow>,
+    pub destination: Option<AddressRow>,
+    pub stop_address: Option<AddressRow>,
+    pub detected_items: Vec<aust_offer_generator::DetectedItemRow>,
+    pub pricing_result: aust_core::models::PricingResult, // from PricingEngine::calculate
+    pub line_items: Vec<OfferLineItem>,
+    pub rate_override: f64,
+    pub actual_netto_cents: i64,
+    pub admin_fahrt_euros: Option<f64>,
 }
 
-/// Core offer generation pipeline with optional manual overrides.
+/// Run the pure computation phase of offer generation (steps 1–7).
 ///
-/// **Caller**: `build_offer` (no overrides), `generate_offer` route handler (API),
-/// `orchestrator::try_auto_generate_offer` (background), `admin::regenerate_offer` (dashboard).
-/// **Why**: Central function for the entire inquiry-to-offer pipeline: fetches all required
-/// data, computes pricing, builds XLSX via template, converts to PDF via LibreOffice,
-/// uploads to S3, and inserts (or updates in-place) the offer DB record.
-///
-/// # Parameters
-/// - `db` — live PostgreSQL connection pool
-/// - `storage` — S3-compatible storage provider
-/// - `config` — application config including depot address, km rate, JWT secret, etc.
-/// - `inquiry_id` — the inquiry to generate an offer for; must have `estimated_volume_m3`
-/// - `valid_days` — optional offer validity period; stored in `offers.valid_until`
-/// - `overrides` — optional manual overrides for price, persons, hours, rate, or line items;
-///   when `existing_offer_id` is set, the existing offer record is updated in-place
-///   (preserving `offer_number` and `created_at`)
-///
-/// # Returns
-/// `GeneratedOffer` with the persisted `Offer`, raw PDF/XLSX bytes, customer email, and
-/// a `TelegramSummary` for the approval message caption.
+/// Fetches inquiry, customer, addresses, pricing settings; applies overrides;
+/// builds line items; resolves rate; computes totals. Returns a context struct
+/// that can be handed to the render + persist phase or used as-is for a preview.
 ///
 /// # Errors
 /// - 404 if inquiry or customer not found
 /// - 400 if inquiry has no volume estimate
-/// - 500 on XLSX generation, PDF conversion, S3 upload, or DB errors
-///
-/// # Math
-/// Labor netto = `hours × persons × rate`
-/// Actual netto = `sum(flat_total for Fahrkostenpauschale) + sum(qty × price for non-labor items) + labor_netto`
-/// `rate = calculate_rate_override(price_override, rate_override, persons, hours, line_items)`
-pub(crate) async fn build_offer_with_overrides(
+/// - 500 on pricing/DB errors
+pub(crate) async fn run_offer_computation(
     db: &PgPool,
-    storage: &dyn StorageProvider,
     config: &Config,
     inquiry_id: Uuid,
-    valid_days: Option<i64>,
     overrides: &OfferOverrides,
-) -> Result<GeneratedOffer, ApiError> {
+) -> Result<OfferComputationContext, ApiError> {
     // 1. Fetch inquiry
     let inquiry_row: InquiryRow = offer_repo::fetch_inquiry_for_offer(db, inquiry_id)
         .await
@@ -175,9 +146,14 @@ pub(crate) async fn build_offer_with_overrides(
 
     let inquiry = Inquiry::from(inquiry_row);
 
-    let volume = inquiry
-        .estimated_volume_m3
-        .ok_or_else(|| ApiError::BadRequest("Inquiry has no volume estimate".into()))?;
+    // Use the override volume if provided; otherwise require the inquiry's stored estimate.
+    let volume = if let Some(v) = overrides.volume_m3 {
+        v
+    } else {
+        inquiry
+            .estimated_volume_m3
+            .ok_or_else(|| ApiError::BadRequest("Inquiry has no volume estimate".into()))?
+    };
 
     let distance = inquiry.distance_km.unwrap_or(0.0);
 
@@ -200,23 +176,13 @@ pub(crate) async fn build_offer_with_overrides(
         method: e.method,
     });
 
-    // 5. Parse detected items from result_data
+    // 5. Parse detected items
     let detected_items = parse_detected_items(estimation.as_ref());
 
     // 6. Calculate pricing
-    let origin_floor = origin
-        .as_ref()
-        .and_then(|a| a.floor.as_deref())
-        .map(parse_floor);
-    let dest_floor = destination
-        .as_ref()
-        .and_then(|a| a.floor.as_deref())
-        .map(parse_floor);
-
-    let stop_floor = stop_address
-        .as_ref()
-        .and_then(|a| a.floor.as_deref())
-        .map(parse_floor);
+    let origin_floor = origin.as_ref().and_then(|a| a.floor.as_deref()).map(parse_floor);
+    let dest_floor = destination.as_ref().and_then(|a| a.floor.as_deref()).map(parse_floor);
+    let stop_floor = stop_address.as_ref().and_then(|a| a.floor.as_deref()).map(parse_floor);
 
     let pricing_input = PricingInput {
         volume_m3: volume,
@@ -230,13 +196,10 @@ pub(crate) async fn build_offer_with_overrides(
         has_elevator_stop: stop_address.as_ref().and_then(|a| a.elevator),
     };
 
-    // Standard pricing: DB-backed settings override the config/env defaults.
     let pricing = settings_repo::get_pricing(db, config).await?;
-
     let pricing_engine = PricingEngine::with_rate(pricing.rate_per_person_hour_cents, pricing.saturday_surcharge_cents);
     let mut pricing_result = pricing_engine.calculate(&pricing_input);
 
-    // Apply overrides
     if let Some(p) = overrides.persons {
         pricing_result.estimated_helpers = p;
     }
@@ -247,19 +210,9 @@ pub(crate) async fn build_offer_with_overrides(
         pricing_result.total_price_cents = price;
     }
 
-    // 7. Build line items.
-    //    Frontend sends a fully ordered list (line_items=Some). Backend trusts the order
-    //    and only resolves special items in-place: labor (filled with persons/hours/rate),
-    //    Fahrkostenpauschale (admin override or ORS), Nürnbergerversicherung (canonical
-    //    coverage line). If insurance is absent from the list, it is omitted from the offer
-    //    (= admin removed it). Custom items with quantity=0 are filtered out (skeleton
-    //    placeholders the admin left blank).
-    //
-    //    When line_items is None (auto-gen / Telegram path): compose default order matching
-    //    the admin UI's preferred sequence.
+    // 7. Build line items (same logic as build_offer_with_overrides)
     let inquiry_services = inquiry.services.clone().unwrap_or_default();
 
-    // Resolved fahrt value: Some(euros) if admin-set (or previously admin-set), None if ORS should calculate.
     let admin_fahrt_euros: Option<f64> = if overrides.fahrt_reset {
         None
     } else if let Some(v) = overrides.fahrt_flat_total {
@@ -300,27 +253,20 @@ pub(crate) async fn build_offer_with_overrides(
     let resolved_fahrt_item = if let Some(total) = admin_fahrt_euros {
         OfferLineItem {
             description: "Fahrkostenpauschale".to_string(),
-            quantity: 0.0,
-            unit_price: 0.0,
-            is_labor: false,
             flat_total: Some(total),
-            remark: None,
+            ..Default::default()
         }
     } else {
         build_fahrt_item(config, pricing.fahrt_rate_per_km, origin.as_ref(), destination.as_ref(), stop_address.as_ref(), distance).await
     };
 
     let line_items: Vec<OfferLineItem> = if let Some(ref items) = overrides.line_items {
-        // Admin sent an authoritative ordered list. Resolve special items in-place,
-        // filter qty=0 placeholders, preserve order.
         let mut result = Vec::with_capacity(items.len());
         for li in items {
             let is_labor_item = li.is_labor || li.description.ends_with("Umzugshelfer");
             let is_fahrt = li.description == "Fahrkostenpauschale";
             let is_insurance = li.description == "Nürnbergerversicherung";
-
             if is_labor_item {
-                // Unit price filled in after rate resolution below
                 result.push(make_labor(0.0));
             } else if is_fahrt {
                 result.push(resolved_fahrt_item.clone());
@@ -329,11 +275,9 @@ pub(crate) async fn build_offer_with_overrides(
             } else if li.quantity > 0.0 {
                 result.push(li.clone());
             }
-            // qty=0 custom items: dropped (skeleton placeholders)
         }
         result
     } else {
-        // Auto-gen / Telegram path: labor first, then service items, then fahrt, insurance last.
         let service_prices = ServicePrices::from_pricing(&pricing);
         let auto = build_line_items(&inquiry_services, &service_prices);
         let mut services_items: Vec<OfferLineItem> = Vec::new();
@@ -360,16 +304,101 @@ pub(crate) async fn build_offer_with_overrides(
         &line_items,
     );
 
-    // Fill labor unit_price now that rate is resolved.
     let line_items: Vec<OfferLineItem> = line_items
         .into_iter()
         .map(|mut li| {
-            if li.is_labor {
-                li.unit_price = rate_override;
-            }
+            if li.is_labor { li.unit_price = rate_override; }
             li
         })
         .collect();
+
+    let actual_netto: f64 = line_items.iter().map(|item| {
+        if let Some(ft) = item.flat_total {
+            ft
+        } else if item.is_labor {
+            item.quantity * item.unit_price * pricing_result.estimated_helpers as f64
+        } else {
+            item.quantity * item.unit_price
+        }
+    }).sum();
+    let actual_netto_cents = (actual_netto * 100.0).round() as i64;
+
+    Ok(OfferComputationContext {
+        inquiry,
+        volume,
+        distance,
+        customer,
+        origin,
+        destination,
+        stop_address,
+        detected_items,
+        pricing_result,
+        line_items,
+        rate_override,
+        actual_netto_cents,
+        admin_fahrt_euros,
+    })
+}
+
+/// Generate an offer with no manual overrides — delegates to `build_offer_with_overrides`.
+///
+/// **Caller**: `orchestrator::try_auto_generate_offer`, and any code path that needs a
+/// fresh offer without manual adjustments.
+/// **Why**: Convenience wrapper so callers do not need to construct a default
+/// `OfferOverrides` struct.
+///
+/// # Parameters
+/// - `db` — live PostgreSQL connection pool
+/// - `storage` — S3-compatible storage for uploading the PDF
+/// - `config` — application config (company depot address, rate per km, etc.)
+/// - `inquiry_id` — the inquiry to generate an offer for
+/// - `valid_days` — optional number of days until the offer expires
+///
+/// # Returns
+/// `GeneratedOffer` containing the persisted `Offer` record, the raw PDF bytes, and the
+/// `TelegramSummary` for the approval caption.
+///
+/// # Errors
+/// Propagates all errors from `build_offer_with_overrides`.
+pub(crate) async fn build_offer(
+    db: &PgPool,
+    storage: &dyn StorageProvider,
+    config: &Config,
+    inquiry_id: Uuid,
+    valid_days: Option<i64>,
+) -> Result<GeneratedOffer, ApiError> {
+    build_offer_with_overrides(db, storage, config, inquiry_id, valid_days, &OfferOverrides::default()).await
+}
+
+/// Core offer generation pipeline with optional manual overrides.
+///
+/// Calls `run_offer_computation` for steps 1–7, then renders the XLSX,
+/// converts to PDF, uploads to S3, and inserts (or updates) the DB record.
+pub(crate) async fn build_offer_with_overrides(
+    db: &PgPool,
+    storage: &dyn StorageProvider,
+    config: &Config,
+    inquiry_id: Uuid,
+    valid_days: Option<i64>,
+    overrides: &OfferOverrides,
+) -> Result<GeneratedOffer, ApiError> {
+    // Steps 1–7: pure computation (data fetch + pricing + line items).
+    let ctx = run_offer_computation(db, config, inquiry_id, overrides).await?;
+
+    let inquiry = ctx.inquiry;
+    let volume = ctx.volume;
+    let distance = ctx.distance;
+    let customer = ctx.customer;
+    let origin = ctx.origin;
+    let destination = ctx.destination;
+    let _stop_address = ctx.stop_address;
+    let detected_items = ctx.detected_items;
+    let pricing_result = ctx.pricing_result;
+    let line_items = ctx.line_items;
+    let rate_override = ctx.rate_override;
+    let actual_netto_cents = ctx.actual_netto_cents;
+    let admin_fahrt_euros = ctx.admin_fahrt_euros;
+    let inquiry_services = inquiry.services.clone().unwrap_or_default();
 
     // 8. Build OfferData
     let now = chrono::Utc::now();
@@ -533,18 +562,6 @@ pub(crate) async fn build_offer_with_overrides(
         admin_fahrt_euros.map(|euros| (euros * 100.0).round() as i32)
     };
 
-    // Compute actual netto from line items (must match XLSX SUM(G31:G42))
-    let actual_netto: f64 = offer_data.line_items.iter().map(|item| {
-        if let Some(ft) = item.flat_total {
-            ft
-        } else if item.is_labor {
-            item.quantity * item.unit_price * pricing_result.estimated_helpers as f64
-        } else {
-            item.quantity * item.unit_price
-        }
-    }).sum();
-    let actual_netto_cents = (actual_netto * 100.0).round() as i64;
-
     let repo_row = if overrides.existing_offer_id.is_some() {
         offer_repo::update_returning(
             db, offer_id, actual_netto_cents, Some(&s3_key), OfferStatus::Draft.as_str(),
@@ -554,33 +571,40 @@ pub(crate) async fn build_offer_with_overrides(
         .await
         .map_err(ApiError::Database)?
     } else {
-        match offer_repo::insert_returning(
+        // B7: Before inserting a new offer, supersede any existing active offer for this
+        // inquiry. This prevents `offers_inquiry_active_unique` constraint violations when
+        // `commit_offer_draft` is called multiple times (e.g. from the RecomputeOffer tool).
+        // The 'superseded' status is excluded from the unique partial index (migration
+        // 20260609000026), so the subsequent INSERT will succeed cleanly.
+        let supersede_result = sqlx::query(
+            r#"
+            UPDATE offers
+               SET status = 'superseded', updated_at = NOW()
+             WHERE inquiry_id = $1
+               AND status NOT IN ('rejected', 'cancelled', 'superseded')
+            "#,
+        )
+        .bind(inquiry_id)
+        .execute(db)
+        .await
+        .map_err(ApiError::Database)?;
+
+        if supersede_result.rows_affected() > 0 {
+            tracing::info!(
+                inquiry_id = %inquiry_id,
+                "Superseded {} existing active offer(s) before inserting new draft",
+                supersede_result.rows_affected()
+            );
+        }
+
+        offer_repo::insert_returning(
             db, offer_id, inquiry_id, actual_netto_cents, "EUR", valid_until_date,
             Some(&s3_key), OfferStatus::Draft.as_str(), now, &offer_number,
             pricing_result.estimated_helpers as i32, pricing_result.estimated_hours,
             rate_cents, &line_items_json, fahrt_override_cents,
         )
         .await
-        {
-            Ok(row) => row,
-            Err(sqlx::Error::Database(ref e)) if e.constraint() == Some("offers_inquiry_active_unique") => {
-                // M1 guard: concurrent offer generation beat us — the unique partial index
-                // prevented a duplicate. Treat as idempotent success by fetching the existing offer.
-                tracing::info!(inquiry_id = %inquiry_id, "Concurrent offer generation detected (unique constraint) — returning existing offer");
-                let existing_id = offer_repo::fetch_active_id_for_inquiry(db, inquiry_id)
-                    .await
-                    .map_err(ApiError::Database)?
-                    .ok_or_else(|| ApiError::Internal("Offer exists but could not be fetched".into()))?;
-                offer_repo::update_returning(
-                    db, existing_id, actual_netto_cents, Some(&s3_key), OfferStatus::Draft.as_str(),
-                    pricing_result.estimated_helpers as i32, pricing_result.estimated_hours,
-                    rate_cents, &line_items_json, fahrt_override_cents,
-                )
-                .await
-                .map_err(ApiError::Database)?
-            }
-            Err(e) => return Err(ApiError::Database(e)),
-        }
+        .map_err(ApiError::Database)?
     };
 
     // Map repo row to Offer domain model
@@ -641,12 +665,12 @@ pub(crate) async fn build_offer_with_overrides(
     let origin_full = if origin_street.is_empty() {
         String::new()
     } else {
-        format!("{}, {}", origin_street, origin_city)
+        format!("{origin_street}, {origin_city}")
     };
     let dest_full = if dest_street.is_empty() {
         String::new()
     } else {
-        format!("{}, {}", dest_street, dest_city)
+        format!("{dest_street}, {dest_city}")
     };
 
     let summary = TelegramSummary {
@@ -1919,5 +1943,40 @@ mod tests {
         input.scheduled_date = Some(chrono::NaiveDate::from_ymd_opt(2026, 3, 1).unwrap());
         let result2 = engine.calculate(&input);
         assert_eq!(result2.breakdown.date_adjustment_cents, 0, "no surcharge on Sunday");
+    }
+
+    // --- compute_offer golden-value test ---
+
+    /// Verify that `calculate_rate_override` (the deterministic core of compute_offer)
+    /// produces stable results for a seeded set of inputs. This locks the computation
+    /// so refactors cannot silently change pricing arithmetic.
+    #[test]
+    fn calculate_rate_override_golden_values() {
+        // No override: default rate is 30.0 EUR.
+        let rate = calculate_rate_override(None, None, 3, 5.0, &[]);
+        assert!((rate - 30.0).abs() < 0.001, "default rate should be 30.0");
+
+        // Explicit rate override takes precedence.
+        let rate = calculate_rate_override(None, Some(45.0), 3, 5.0, &[]);
+        assert!((rate - 45.0).abs() < 0.001, "explicit rate should be 45.0");
+
+        // Price override back-calculates rate.
+        // Target netto = 900 EUR = 90_000 cents. No non-labor items.
+        // labor_netto = 900.0; persons = 3, hours = 5.0 → rate = 900 / (3*5) = 60.0
+        let rate = calculate_rate_override(Some(90_000), None, 3, 5.0, &[]);
+        assert!((rate - 60.0).abs() < 0.001, "back-calculated rate should be 60.0");
+
+        // Price override with non-labor items.
+        // Target = 900 EUR. Non-labor = 100 EUR. Labor = 800 EUR. rate = 800/(3*5) ≈ 53.33
+        let non_labor = OfferLineItem {
+            description: "Halteverbotszone".to_string(),
+            quantity: 1.0,
+            unit_price: 100.0,
+            is_labor: false,
+            ..Default::default()
+        };
+        let rate = calculate_rate_override(Some(90_000), None, 3, 5.0, &[non_labor]);
+        let expected = 800.0 / 15.0;
+        assert!((rate - expected).abs() < 0.001, "rate with non-labor items: expected {expected:.4}, got {rate:.4}");
     }
 }

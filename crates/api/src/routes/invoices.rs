@@ -342,6 +342,33 @@ async fn create_invoice(
         ).await?;
         tx.commit().await?;
 
+        // Emit invoice.issued for both partial invoices (non-fatal).
+        {
+            let emitter = state.events.clone();
+            let p1 = serde_json::json!({
+                "invoice_id": first_id,
+                "inquiry_id": inquiry_id,
+                "invoice_number": first_num,
+                "invoice_type": "partial_first",
+            });
+            let p2 = serde_json::json!({
+                "invoice_id": final_id,
+                "inquiry_id": inquiry_id,
+                "invoice_number": final_num,
+                "invoice_type": "partial_final",
+            });
+            let agg1 = format!("invoice:{first_id}");
+            let agg2 = format!("invoice:{final_id}");
+            tokio::spawn(async move {
+                if let Err(e) = emitter.emit("invoice.issued", &agg1, p1).await {
+                    tracing::warn!("Failed to emit invoice.issued (partial_first): {e}");
+                }
+                if let Err(e) = emitter.emit("invoice.issued", &agg2, p2).await {
+                    tracing::warn!("Failed to emit invoice.issued (partial_final): {e}");
+                }
+            });
+        }
+
         let first_row = fetch_invoice_row(&state.db, first_id).await?;
         let final_row = fetch_invoice_row(&state.db, final_id).await?;
 
@@ -382,6 +409,23 @@ async fn create_invoice(
         let s3_key = upload_invoice_pdf(&*state.storage, inv_id, &pdf).await?;
 
         invoice_repo::insert_full(&state.db, inv_id, inquiry_id, &invoice_num, &s3_key, now).await?;
+
+        // Emit invoice.issued domain event (non-fatal).
+        {
+            let emitter = state.events.clone();
+            let payload = serde_json::json!({
+                "invoice_id": inv_id,
+                "inquiry_id": inquiry_id,
+                "invoice_number": invoice_num,
+                "invoice_type": "full",
+            });
+            let aggregate = format!("invoice:{inv_id}");
+            tokio::spawn(async move {
+                if let Err(e) = emitter.emit("invoice.issued", &aggregate, payload).await {
+                    tracing::warn!("Failed to emit invoice.issued event: {e}");
+                }
+            });
+        }
 
         let row = fetch_invoice_row(&state.db, inv_id).await?;
         Ok(Json(vec![build_invoice_response(row, offer_netto)]))

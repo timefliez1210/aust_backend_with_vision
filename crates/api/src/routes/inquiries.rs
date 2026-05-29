@@ -516,6 +516,24 @@ async fn update_inquiry(
         let _ = inquiry_repo::auto_update_billing_on_completed(&state.db, id).await;
     }
 
+    // Emit status.changed domain event when a status transition was requested (non-fatal).
+    if let Some(ref new_status) = request.status {
+        let emitter = state.events.clone();
+        let old_status = current_inquiry.status.clone();
+        let new_status = new_status.clone();
+        let payload = serde_json::json!({
+            "inquiry_id": id,
+            "old_status": old_status,
+            "new_status": new_status,
+        });
+        let aggregate = format!("inquiry:{id}");
+        tokio::spawn(async move {
+            if let Err(e) = emitter.emit("status.changed", &aggregate, payload).await {
+                tracing::warn!("Failed to emit status.changed event: {e}");
+            }
+        });
+    }
+
     let response = inquiry_builder::build_inquiry_response(&state.db, id).await?;
     Ok(Json(response))
 }

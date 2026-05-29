@@ -8,6 +8,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+// Assistant bootstrap imports.
+use aust_assistant::events::{AssistantEventConsumer, TelegramNotifier};
+use aust_assistant::{OllamaAssistantLlm, Soul, ToolRegistry};
+use aust_api::services::assistant_bridge::TelegramNotifierImpl;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Load .env file (ignore if missing)
@@ -81,8 +86,49 @@ async fn main() -> Result<()> {
     let cal_alternatives_count = config.calendar.alternatives_count;
     let cal_search_window_days = config.calendar.search_window_days;
 
+    // Build assistant dependencies (LLM, tool registry, soul).
+    // Soul is loaded from SOUL.md; missing file is non-fatal — falls back to a stub.
+    let assistant_llm: std::sync::Arc<dyn aust_assistant::AssistantLlmProvider> = {
+        let (base_url, api_key) = config
+            .llm
+            .ollama
+            .as_ref()
+            .map(|o| (o.base_url.clone(), o.api_key.clone()))
+            .unwrap_or_else(|| ("http://localhost:11434".to_string(), None));
+        std::sync::Arc::new(OllamaAssistantLlm::new(base_url, api_key))
+    };
+    let tool_registry = std::sync::Arc::new(ToolRegistry::new());
+    let soul: std::sync::Arc<Soul> = {
+        let soul_path = std::path::Path::new("SOUL.md");
+        match aust_assistant::soul::load(soul_path) {
+            Ok(s) => {
+                tracing::info!("SOUL.md loaded");
+                std::sync::Arc::new(s)
+            }
+            Err(e) => {
+                tracing::warn!("SOUL.md not found or invalid ({e}); using stub soul");
+                std::sync::Arc::new(Soul {
+                    persona: "Ich bin der AUST-Assistent.".to_string(),
+                    hard_rules: String::new(),
+                    domain_primer: String::new(),
+                    tone: String::new(),
+                    escalation: String::new(),
+                })
+            }
+        }
+    };
+
     // Create app state
-    let state = AppState::new(config.clone(), db, llm, storage, vision_service);
+    let state = AppState::new(
+        config.clone(),
+        db,
+        llm,
+        storage,
+        vision_service,
+        assistant_llm,
+        tool_registry,
+        soul,
+    );
 
     // Start email processor as background task
     let poll_interval = config.email.poll_interval_secs;
@@ -143,6 +189,76 @@ async fn main() -> Result<()> {
         }
     });
     tracing::info!("Flash contact reminder task started");
+
+    // ── Assistant event consumer ───────────────────────────────────────────────
+    // Build the TelegramNotifier (concrete reqwest-backed impl) and spawn the
+    // AssistantEventConsumer that drives event handlers (inquiry.created,
+    // offer.drafted, status.changed, etc.).
+    {
+        let notifier: Arc<dyn TelegramNotifier> = Arc::new(
+            TelegramNotifierImpl::new(config.telegram.bot_token.clone()),
+        );
+        let services_arc = Arc::new(state.services.clone());
+        let consumer = AssistantEventConsumer::new(
+            state.db.clone(),
+            services_arc,
+            notifier,
+        );
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        tokio::spawn(consumer.run_forever(Duration::from_secs(5), shutdown));
+        tracing::info!("Assistant event consumer started (5 s poll)");
+    }
+
+    // ── Pending-action expiry loop ─────────────────────────────────────────────
+    // Marks timed-out pending_actions as 'expired' every 5 minutes.
+    {
+        let expiry_pool = state.db.clone();
+        let expiry_tg_token = config.telegram.bot_token.clone();
+        let expiry_notifier = TelegramNotifierImpl::new(expiry_tg_token);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(300));
+            loop {
+                interval.tick().await;
+                match aust_assistant::confirmation::expire_stale(&expiry_pool).await {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        tracing::info!("Expired {n} stale pending_action(s)");
+                        // Notify the owner chat if any pending actions expired.
+                        let owner_chat: Option<(i64,)> = sqlx::query_as(
+                            "SELECT chat_id FROM telegram_chat_bindings WHERE role = 'owner' LIMIT 1"
+                        )
+                        .fetch_optional(&expiry_pool)
+                        .await
+                        .ok()
+                        .flatten();
+                        if let Some((chat_id,)) = owner_chat {
+                            let _ = expiry_notifier
+                                .post(chat_id, format!("⏰ {n} ausstehende Aktion(en) sind abgelaufen. Bitte erneut versuchen."))
+                                .await;
+                        }
+                    }
+                    Err(e) => tracing::warn!("expire_stale failed: {e}"),
+                }
+            }
+        });
+        tracing::info!("Pending-action expiry loop started");
+    }
+
+    // ── Retention sweeper ─────────────────────────────────────────────────────
+    // Runs every 6 hours, cleaning up stale rows across assistant tables.
+    {
+        let retention_pool = state.db.clone();
+        tokio::spawn(async move {
+            // Stagger the first run by 10 minutes so startup isn't noisy.
+            tokio::time::sleep(Duration::from_secs(600)).await;
+            let mut interval = tokio::time::interval(Duration::from_secs(6 * 3600));
+            loop {
+                interval.tick().await;
+                aust_assistant::retention::run_retention_pass(&retention_pool).await;
+            }
+        });
+        tracing::info!("Retention sweeper started (6 h interval)");
+    }
 
     // Create router and start server
     let app = create_router(state);

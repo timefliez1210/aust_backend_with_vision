@@ -6,4 +6,6 @@ pub(crate) mod offer_pipeline;
 pub(crate) mod otp_service;
 pub(crate) mod telegram_service;
 pub(crate) mod vision;
+pub mod assistant_bridge;
 pub mod flash_contact_service;
+pub mod bridge;

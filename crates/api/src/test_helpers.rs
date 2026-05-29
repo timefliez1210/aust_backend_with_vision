@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+use aust_assistant::{Soul, ToolRegistry};
+use aust_assistant::llm::MockAssistantLlm;
 use aust_core::config::*;
 use aust_core::Config;
 use aust_llm_providers::MockLlmProvider;
@@ -9,6 +11,17 @@ use sqlx::PgPool;
 use std::sync::Arc;
 
 use crate::AppState;
+
+/// Create a stub Soul for tests (no SOUL.md required).
+fn stub_soul() -> Arc<Soul> {
+    Arc::new(Soul {
+        persona: "Test assistant.".to_string(),
+        hard_rules: String::new(),
+        domain_primer: String::new(),
+        tone: String::new(),
+        escalation: String::new(),
+    })
+}
 
 /// Creates a test database pool and runs all migrations.
 pub async fn test_db_pool() -> PgPool {
@@ -91,7 +104,10 @@ pub async fn test_app_state_with_pool(pool: PgPool) -> AppState {
     let storage: Arc<dyn aust_storage::StorageProvider> =
         Arc::new(LocalStorage::new("/tmp/aust-test-uploads").expect("create test storage"));
 
-    AppState::new(config, pool, llm, storage, None)
+    let assistant_llm: Arc<dyn aust_assistant::AssistantLlmProvider> =
+        Arc::new(MockAssistantLlm::always("ok"));
+    let tool_registry = Arc::new(ToolRegistry::new());
+    AppState::new(config, pool, llm, storage, None, assistant_llm, tool_registry, stub_soul())
 }
 
 /// Creates a test AppState with a mock vision service at the given URL.
@@ -103,8 +119,11 @@ pub async fn test_app_state_with_vision(pool: PgPool, vision_url: &str) -> AppSt
         Arc::new(LocalStorage::new("/tmp/aust-test-uploads").expect("create test storage"));
     let vision = VisionServiceClient::new(vision_url, Some(vision_url), Some(vision_url), 30, 0)
         .expect("create test vision client");
+    let assistant_llm: Arc<dyn aust_assistant::AssistantLlmProvider> =
+        Arc::new(MockAssistantLlm::always("ok"));
+    let tool_registry = Arc::new(ToolRegistry::new());
 
-    AppState::new(config, pool, llm, storage, Some(vision))
+    AppState::new(config, pool, llm, storage, Some(vision), assistant_llm, tool_registry, stub_soul())
 }
 
 /// Generate a valid JWT token for testing using the test config's secret.

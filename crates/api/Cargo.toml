@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 aust-core = { workspace = true }
+aust-assistant = { workspace = true }
 aust-flash-contact = { workspace = true }
 aust-llm-providers = { workspace = true }
 aust-storage = { workspace = true }
@@ -36,6 +37,7 @@ lettre = { workspace = true }
 reqwest = { workspace = true }
 rand = { workspace = true }
 hex = { workspace = true }
+async-trait = { workspace = true }
 
 [dev-dependencies]
 wiremock = "0.6"

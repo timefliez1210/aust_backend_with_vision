@@ -56,6 +56,21 @@ pub enum ApprovalDecision {
     OfferEditText(String),
     /// A complete inquiry is ready to become a quote + offer
     InquiryComplete(Box<aust_core::models::MovingInquiry>),
+    /// Free-text message from a chat that may be bound to the assistant agent.
+    /// The orchestrator checks `telegram_chat_bindings` and routes accordingly.
+    AssistantText {
+        chat_id: i64,
+        text: String,
+        message_id: i64,
+        from_user_id: Option<i64>,
+    },
+    /// A `pa:<uuid>:<action>` callback from an assistant-bound chat.
+    AssistantCallback {
+        chat_id: i64,
+        message_id: i64,
+        callback_data: String,
+        callback_query_id: String,
+    },
 }
 
 /// Calendar commands from Telegram.
@@ -217,10 +232,11 @@ impl TelegramBot {
                         responses.push(resp);
                     }
 
-            // Handle text message (edit instructions or calendar commands from admin)
+            // Handle text message (edit instructions, calendar commands, or assistant input)
             if let Some(message) = &update.message
-                && message.chat.id == self.admin_chat_id
-                    && let Some(text) = &message.text {
+                && let Some(text) = &message.text {
+                    let is_admin = message.chat.id == self.admin_chat_id;
+                    if is_admin {
                         if let Some(cmd) = Self::parse_calendar_command(text) {
                             responses.push(ApprovalResponse {
                                 draft_id: "calendar_command".to_string(),
@@ -228,17 +244,47 @@ impl TelegramBot {
                             });
                         } else if !text.starts_with('/') {
                             debug!(
-                                "Received text from admin: {}",
+                                "Received text from admin (chat {}): {}",
+                                message.chat.id,
                                 &text[..text.len().min(80)]
                             );
-                            // This is edit instructions — the processor will match it
-                            // to whichever draft is currently awaiting edit
+                            // Emit EditInstructions for the legacy offer-edit flow AND
+                            // AssistantText so the orchestrator can route to the agent if
+                            // this chat is in telegram_chat_bindings.
                             responses.push(ApprovalResponse {
                                 draft_id: "edit_instructions".to_string(),
                                 decision: ApprovalDecision::EditInstructions(text.clone()),
                             });
+                            responses.push(ApprovalResponse {
+                                draft_id: "assistant_text".to_string(),
+                                decision: ApprovalDecision::AssistantText {
+                                    chat_id: message.chat.id,
+                                    text: text.clone(),
+                                    message_id: message.message_id,
+                                    from_user_id: message.from.as_ref().map(|u| u.id),
+                                },
+                            });
+                        }
+                    } else {
+                        // Non-admin chat — emit AssistantText for any non-command text.
+                        if !text.starts_with('/') {
+                            debug!(
+                                "Received text from non-admin chat {}: {}",
+                                message.chat.id,
+                                &text[..text.len().min(80)]
+                            );
+                            responses.push(ApprovalResponse {
+                                draft_id: "assistant_text".to_string(),
+                                decision: ApprovalDecision::AssistantText {
+                                    chat_id: message.chat.id,
+                                    text: text.clone(),
+                                    message_id: message.message_id,
+                                    from_user_id: message.from.as_ref().map(|u| u.id),
+                                },
+                            });
                         }
                     }
+                }
         }
 
         Ok(responses)
@@ -250,6 +296,30 @@ impl TelegramBot {
         data: &str,
         callback: &CallbackQuery,
     ) -> Option<ApprovalResponse> {
+        // Intercept `pa:` prefix — route to assistant agent via orchestrator.
+        // Do NOT answer the callback here; the orchestrator will do it after dispatch.
+        if data.starts_with("pa:") {
+            let chat_id = callback
+                .message
+                .as_ref()
+                .map(|m| m.chat.id)
+                .unwrap_or(self.admin_chat_id);
+            let message_id = callback
+                .message
+                .as_ref()
+                .map(|m| m.message_id)
+                .unwrap_or(0);
+            return Some(ApprovalResponse {
+                draft_id: "assistant_callback".to_string(),
+                decision: ApprovalDecision::AssistantCallback {
+                    chat_id,
+                    message_id,
+                    callback_data: data.to_string(),
+                    callback_query_id: callback.id.clone(),
+                },
+            });
+        }
+
         let parts: Vec<&str> = data.splitn(2, ':').collect();
         if parts.len() != 2 {
             warn!("Invalid callback data: {data}");
@@ -537,6 +607,84 @@ impl TelegramBot {
     }
 }
 
+// --- Unit tests ---
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper that mirrors the `pa:` interception logic in `handle_callback`.
+    fn is_assistant_callback(data: &str) -> bool {
+        data.starts_with("pa:")
+    }
+
+    #[test]
+    fn pa_prefix_is_intercepted_as_assistant_callback() {
+        let id = uuid::Uuid::new_v4();
+        let data = format!("pa:{id}:confirm");
+        assert!(is_assistant_callback(&data));
+    }
+
+    #[test]
+    fn legacy_offer_approve_is_not_intercepted() {
+        assert!(!is_assistant_callback("offer_approve:some-uuid"));
+    }
+
+    #[test]
+    fn legacy_approve_is_not_intercepted() {
+        assert!(!is_assistant_callback("approve:draft-id"));
+    }
+
+    #[test]
+    fn legacy_cap_yes_is_not_intercepted() {
+        assert!(!is_assistant_callback("cap_yes:some-id"));
+    }
+
+    #[test]
+    fn assistant_text_variant_has_correct_fields() {
+        let d = ApprovalDecision::AssistantText {
+            chat_id: 42,
+            text: "Hallo".to_string(),
+            message_id: 99,
+            from_user_id: Some(7),
+        };
+        match d {
+            ApprovalDecision::AssistantText { chat_id, text, message_id, from_user_id } => {
+                assert_eq!(chat_id, 42);
+                assert_eq!(text, "Hallo");
+                assert_eq!(message_id, 99);
+                assert_eq!(from_user_id, Some(7));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn assistant_callback_variant_has_correct_fields() {
+        let id = uuid::Uuid::new_v4();
+        let data = format!("pa:{id}:confirm");
+        let d = ApprovalDecision::AssistantCallback {
+            chat_id: 42,
+            message_id: 10,
+            callback_data: data.clone(),
+            callback_query_id: "cq-id".to_string(),
+        };
+        match d {
+            ApprovalDecision::AssistantCallback {
+                chat_id,
+                callback_data,
+                callback_query_id,
+                ..
+            } => {
+                assert_eq!(chat_id, 42);
+                assert_eq!(callback_data, data);
+                assert_eq!(callback_query_id, "cq-id");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+}
+
 // --- Telegram API types ---
 
 #[derive(Debug, Deserialize)]
@@ -562,14 +710,27 @@ struct Update {
 struct CallbackQuery {
     id: String,
     data: Option<String>,
+    /// The message the button was attached to (for extracting message_id).
+    message: Option<CallbackMessage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CallbackMessage {
+    message_id: i64,
+    chat: TgChat,
 }
 
 #[derive(Debug, Deserialize)]
 struct TgMessage {
-    #[allow(dead_code)]
     message_id: i64,
     chat: TgChat,
     text: Option<String>,
+    from: Option<TgUser>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TgUser {
+    id: i64,
 }
 
 #[derive(Debug, Deserialize)]

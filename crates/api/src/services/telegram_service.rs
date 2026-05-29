@@ -756,6 +756,7 @@ pub(crate) async fn handle_offer_edit(
         persons: overrides.persons,
         hours: overrides.hours,
         rate: overrides.rate,
+        volume_m3: overrides.volume_m3,
         line_items: None,
         existing_offer_id: Some(old_offer_id),
         fahrt_flat_total: None, // loaded from DB inside build_offer_with_overrides

@@ -23,6 +23,9 @@ pub enum OfferStatus {
     Rejected,
     /// Offer validity period has passed without a response.
     Expired,
+    /// A newer draft was committed for this inquiry; this offer is no longer active.
+    /// Excluded from the `offers_inquiry_active_unique` partial index.
+    Superseded,
 }
 
 impl OfferStatus {
@@ -35,6 +38,7 @@ impl OfferStatus {
             Self::Accepted => "accepted",
             Self::Rejected => "rejected",
             Self::Expired => "expired",
+            Self::Superseded => "superseded",
         }
     }
 }
@@ -63,6 +67,7 @@ impl std::str::FromStr for OfferStatus {
             "accepted" => Ok(Self::Accepted),
             "rejected" => Ok(Self::Rejected),
             "expired" => Ok(Self::Expired),
+            "superseded" => Ok(Self::Superseded),
             other => Err(format!("unknown OfferStatus: {other}")),
         }
     }

@@ -15,7 +15,7 @@ services:
   # ── PostgreSQL ─────────────────────────────────────────────────────────────
   # Isolated staging database — completely separate from the production volume.
   staging-postgres:
-    image: postgres:16-alpine
+    image: pgvector/pgvector:pg16
     container_name: aust_staging_postgres
     restart: unless-stopped
     environment:

@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod agent_activity;
 pub(crate) mod admin_customers;
 pub(crate) mod admin_emails;
 pub mod auth;

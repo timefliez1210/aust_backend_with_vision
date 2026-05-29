@@ -238,6 +238,21 @@ pub(super) async fn send_draft_email(
         // Update offer and inquiry status
         admin_repo::mark_offer_sent(&state.db, oid, now).await?;
         admin_repo::mark_inquiry_offer_sent(&state.db, iid, now).await?;
+
+        // Emit offer.sent domain event (non-fatal).
+        {
+            let emitter = state.events.clone();
+            let payload = serde_json::json!({
+                "offer_id": oid,
+                "inquiry_id": iid,
+            });
+            let aggregate = format!("offer:{oid}");
+            tokio::spawn(async move {
+                if let Err(e) = emitter.emit("offer.sent", &aggregate, payload).await {
+                    tracing::warn!("Failed to emit offer.sent event: {e}");
+                }
+            });
+        }
     } else {
         // Plain email — no offer PDF attached (e.g. general inquiry reply)
         send_plain_email(&state.config.email, &customer_email, &subject, &body)
