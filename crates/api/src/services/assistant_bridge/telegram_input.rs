@@ -62,22 +62,26 @@ pub async fn handle_text_message(
 
     match driver::process_turn(pool, llm, registry, soul, services, input).await {
         Ok(result) => {
-            // Post the reply.
-            telegram_output::post_text(client, bot_token, chat_id, &result.reply).await;
-
-            // If a pending action was enqueued, post the inline keyboard.
             if result.awaiting_confirmation {
-                // The summary is embedded in the driver reply text when awaiting_confirmation.
-                // We use the reply as the keyboard message body.
+                // M3: avoid the duplicate message — when awaiting confirmation, the
+                // keyboard message body IS the user-visible reply. Post it once,
+                // attached to the inline keyboard, with the rich German summary
+                // built by the tool's `summarize()`.
+                let summary = result
+                    .pending_summary_de
+                    .as_deref()
+                    .unwrap_or(result.reply.as_str());
                 confirm_dispatcher::maybe_post_keyboard(
                     pool,
                     client,
                     bot_token,
                     chat_id,
                     result.pending_action_id,
-                    &result.reply,
+                    summary,
                 )
                 .await;
+            } else {
+                telegram_output::post_text(client, bot_token, chat_id, &result.reply).await;
             }
         }
         Err(e) => {

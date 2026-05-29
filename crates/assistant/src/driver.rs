@@ -47,6 +47,11 @@ pub struct TurnResult {
     pub awaiting_confirmation: bool,
     /// The ID of the pending action, if any.
     pub pending_action_id: Option<uuid::Uuid>,
+    /// German summary of the proposed action, populated when `awaiting_confirmation`
+    /// is true. The Telegram bridge uses this as the keyboard message body instead
+    /// of `reply` so Alex sees a concrete action ("Rechnung … an … senden?") rather
+    /// than the generic "Soll ich 'send_invoice' wirklich ausführen?" placeholder.
+    pub pending_summary_de: Option<String>,
 }
 
 /// Maximum tool-calling iterations per turn (prevents infinite loops).
@@ -105,6 +110,7 @@ pub async fn process_turn(
     let mut reply = String::new();
     let mut awaiting_confirmation = false;
     let mut pending_action_id: Option<uuid::Uuid> = None;
+    let mut pending_summary_de: Option<String> = None;
 
     for iteration in 0..MAX_TOOL_ITERATIONS {
         let response = llm
@@ -201,12 +207,11 @@ pub async fn process_turn(
                         .await
                         .unwrap_or_else(|e| warn!("Audit write failed: {e}"));
 
+                        let summary = tool.summarize(&validated_args);
                         pending_action_id = Some(pending_id);
                         awaiting_confirmation = true;
-                        reply = format!(
-                            "Soll ich '{}' wirklich ausführen? (Bestätigung erforderlich)",
-                            call.name
-                        );
+                        reply = summary.clone();
+                        pending_summary_de = Some(summary);
                         break;
                     }
 
@@ -219,6 +224,7 @@ pub async fn process_turn(
                         user_id: binding.user_id,
                         chat_id: input.chat_id,
                         session_id,
+                        confirmed: false,
                     };
 
                     let exec_result = tool.execute(&ctx, &validated_args).await;
@@ -307,6 +313,7 @@ pub async fn process_turn(
         reply,
         awaiting_confirmation,
         pending_action_id,
+        pending_summary_de,
     })
 }
 
@@ -334,7 +341,10 @@ pub async fn resume_confirmed(
         return Err(AssistantError::PendingActionNotFound(pending_id));
     }
 
-    confirmation::resolve(pool, pending_id, resolution.clone()).await?;
+    // H3: validate the resuming chat owns the pending action so a different
+    // Telegram chat cannot hijack a confirmation queued elsewhere. Falls back
+    // to plain resolve when chat_id was not recorded at enqueue time (legacy rows).
+    confirmation::resolve_from_chat(pool, pending_id, resolution.clone(), chat_id).await?;
 
     let args = match &resolution {
         Resolution::Confirmed => pending.proposed_args.clone(),
@@ -356,6 +366,9 @@ pub async fn resume_confirmed(
         user_id,
         chat_id,
         session_id: pending.session_id,
+        // B1: the resume path is the only place `confirmed = true` is set.
+        // Confirm-safety tools branch on this to perform their real side effect.
+        confirmed: true,
     };
 
     let start = Instant::now();

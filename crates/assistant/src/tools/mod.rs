@@ -69,6 +69,11 @@ pub struct ToolCtx {
     pub chat_id: i64,
     /// Session ID for audit logging.
     pub session_id: Uuid,
+    /// True only when this execution is the resume of a previously-confirmed
+    /// `Safety::Confirm` action. `Safety::Confirm` tools must check this and
+    /// return their `pending_confirmation` marker when false; perform the real
+    /// side effect when true. Read/Write tools should ignore this flag.
+    pub confirmed: bool,
 }
 
 /// A typed, schema-validated assistant tool.
@@ -91,6 +96,17 @@ pub trait Tool: Send + Sync {
 
     /// Execute the tool with pre-validated arguments.
     async fn execute(&self, ctx: &ToolCtx, args: &Value) -> Result<Value>;
+
+    /// Human-readable German summary of the proposed action, shown on the
+    /// Telegram confirmation keyboard for `Safety::Confirm` tools.
+    ///
+    /// Called at enqueue time (before any side effect) so Alex sees the
+    /// recipient / amount / target spelled out rather than a bare tool name.
+    /// The default returns a generic prompt; Confirm tools should override
+    /// it with a concrete summary built from `args`.
+    fn summarize(&self, _args: &Value) -> String {
+        format!("Soll ich '{}' wirklich ausführen?", self.name())
+    }
 }
 
 /// A registry of all available tools, filtered by role.
@@ -379,6 +395,7 @@ mod tests {
             user_id: uuid::Uuid::nil(),
             chat_id: 0,
             session_id: uuid::Uuid::nil(),
+            confirmed: false,
         }
     }
 

@@ -802,7 +802,7 @@ mod tests {
     async fn test_agent_memory_never_touched(pool: PgPool) {
         let before = count_agent_memory(&pool).await;
         // Just verify the sweeper doesn't interact with agent_memory.
-        let now = Utc::now();
+        let _now = Utc::now();
         let _ = run_retention_pass(&pool).await;
         let after = count_agent_memory(&pool).await;
         assert_eq!(before, after, "agent_memory must not be touched by any sweeper");

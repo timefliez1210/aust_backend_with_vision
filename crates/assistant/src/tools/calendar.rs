@@ -373,6 +373,7 @@ mod tests {
             user_id: uuid::Uuid::nil(),
             chat_id: 0,
             session_id: uuid::Uuid::nil(),
+            confirmed: false,
         }
     }
 
