@@ -1,0 +1,35 @@
+[package]
+name = "aust-assistant"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+aust-core = { workspace = true }
+aust-llm-providers = { workspace = true }
+
+tokio = { workspace = true }
+sqlx = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+tokio-util = { workspace = true }
+
+# JSON Schema validation for tool arguments.
+jsonschema = "0.28"
+
+# Statistical learning foundation (Phase 5 training — only the skeleton is wired now).
+linfa = "0.7"
+linfa-trees = "0.7"
+ndarray = "0.16"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+sqlx = { workspace = true, features = ["migrate"] }
