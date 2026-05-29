@@ -316,4 +316,6 @@ class VisionPipeline:
             bbox=best.bbox,
             bbox_image_index=best.image_index,
             crop_base64=best.crop_base64,
+            is_moveable=best.is_moveable,
+            packs_into_boxes=best.packs_into_boxes,
         )

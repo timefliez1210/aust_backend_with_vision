@@ -5,13 +5,14 @@ sends item crop thumbnails to the locally-loaded Qwen2-VL-7B to identify
 items that are the same physical object photographed from different angles,
 and optionally corrects misclassified labels.
 
-GPU budget on L4 (24GB):
-  Photo pipeline (DINO + SAM 2 + DA)  ~8GB
-  Qwen2-VL-7B-Instruct (BF16)        ~14GB
-  ─────────────────────────────────────────
-  Total                               ~22GB  (fits with 2GB headroom)
+GPU budget on L4 (22GB usable):
+  Qwen2-VL-7B-Instruct (BF16) alone   ~14GB
+  DINO + SAM 2 (×2) + DA              ~8GB
 
-No model swapping needed — all models stay resident simultaneously.
+These do NOT co-fit with forward-pass headroom, so the pipeline SWAPS:
+VisionPipeline.run() calls unload_detection_models() → load_qwen_vlm() before
+this stage and ensure_detection_models() after. Qwen is not resident during
+detection. (See model_loader.py.)
 """
 from __future__ import annotations
 
@@ -27,14 +28,23 @@ import torch
 if TYPE_CHECKING:
     from app.vision.model_loader import ModelRegistry
 
-from app.models.schemas import DetectedItem, classify_item, lookup_re_volume
+from app.models.schemas import DetectedItem, classify_item, get_item_flags, lookup_re_volume
 
 logger = logging.getLogger(__name__)
 
-# Cap items per VLM call to control latency and context window size.
-# CLIP dedup runs first and reduces item count to ~30-60, so this cap is
-# rarely hit. Set to 60 to handle the post-CLIP list in a single pass.
-_MAX_ITEMS_PER_CALL = 60
+# Images per VLM call. Qwen2-VL-7B reasons reliably over a small handful of
+# thumbnails; given a large grid (e.g. 60) it collapses to echoing the prompt's
+# format example instead of analysing. We therefore process the items in small
+# chunks rather than one capped mega-call — every item is seen, and the model
+# gets a tractable comparison set. Items are sorted by (category, label) before
+# chunking so same-type candidates (the only plausible duplicates) land in the
+# same chunk.
+_IMAGES_PER_VLM_CALL = 12
+
+# Canonical example embedded in the prompt. If the model echoes it verbatim it
+# is parroting, not analysing — _parse_response discards an exact match.
+_PROMPT_EXAMPLE_GROUPS = [[0, 2], [1, 3]]
+_PROMPT_EXAMPLE_RELABELS = {"4": "armchair"}
 
 
 def vlm_dedup(
@@ -78,20 +88,39 @@ def vlm_dedup(
         logger.info("VLM dedup: no crop thumbnails available — skipping")
         return items
 
-    if len(items_with_crop) > _MAX_ITEMS_PER_CALL:
-        logger.info(
-            "VLM dedup: capping to %d items (total %d)",
-            _MAX_ITEMS_PER_CALL, len(items_with_crop),
-        )
-        items_with_crop = items_with_crop[:_MAX_ITEMS_PER_CALL]
+    # Sort so same-type items (the only plausible duplicates) cluster together,
+    # then split into small chunks. Every item is seen by the VLM exactly once;
+    # nothing is silently dropped by a cap. Indices returned per chunk are
+    # remapped back to positions in this sorted items_with_crop list, which is
+    # what _apply_results expects.
+    items_with_crop.sort(key=lambda pair: (pair[1].category or "", pair[1].name or ""))
 
-    try:
-        duplicate_groups, relabels = _run_vlm_call(items_with_crop, registry)
-    except Exception:
-        logger.exception("VLM dedup call raised — returning items unchanged")
+    all_groups: list[list[int]] = []
+    all_relabels: dict[str, str] = {}
+
+    n = len(items_with_crop)
+    n_chunks = (n + _IMAGES_PER_VLM_CALL - 1) // _IMAGES_PER_VLM_CALL
+    for c in range(n_chunks):
+        start = c * _IMAGES_PER_VLM_CALL
+        chunk = items_with_crop[start : start + _IMAGES_PER_VLM_CALL]
+        if len(chunk) < 2:
+            continue  # nothing to compare in a singleton chunk
+        try:
+            groups, relabels = _run_vlm_call(chunk, registry)
+        except Exception:
+            logger.exception("VLM dedup chunk %d/%d raised — skipping chunk", c + 1, n_chunks)
+            continue
+        # Remap chunk-local indices -> global items_with_crop positions
+        for g in groups:
+            all_groups.append([start + li for li in g])
+        for k, v in relabels.items():
+            all_relabels[str(start + int(k))] = v
+
+    if not all_groups and not all_relabels:
+        logger.info("VLM dedup: no duplicates or relabels across %d chunks", n_chunks)
         return items
 
-    return _apply_results(items, items_with_crop, duplicate_groups, relabels)
+    return _apply_results(items, items_with_crop, all_groups, all_relabels)
 
 
 # ---------------------------------------------------------------------------
@@ -236,6 +265,16 @@ def _parse_response(
         logger.warning("VLM JSON parse error: %s — skipping dedup", exc)
         return [], {}
 
+    # Guard: the model sometimes echoes the prompt's format example verbatim
+    # instead of analysing the thumbnails. Treat that as a no-op rather than
+    # acting on hallucinated indices.
+    if (
+        data.get("duplicate_groups") == _PROMPT_EXAMPLE_GROUPS
+        and data.get("relabels") == _PROMPT_EXAMPLE_RELABELS
+    ):
+        logger.warning("VLM response is the prompt example verbatim (parroting) — discarding")
+        return [], {}
+
     # Validate duplicate_groups
     valid_groups: list[list[int]] = []
     for group in data.get("duplicate_groups", []):
@@ -322,6 +361,8 @@ def _apply_results(
             bbox=best.bbox,
             bbox_image_index=best.bbox_image_index,
             crop_base64=best.crop_base64,
+            is_moveable=best.is_moveable,
+            packs_into_boxes=best.packs_into_boxes,
         )
 
     # --- Label corrections ---
@@ -334,6 +375,8 @@ def _apply_results(
 
         base = updates.get(orig_idx, item)
         re_result = lookup_re_volume(new_label)
+        # Moveability/box flags follow the corrected label, not the old one.
+        is_moveable, packs_into_boxes = get_item_flags(new_label)
 
         if re_result:
             vol_m3, re_total, units, german_name = re_result
@@ -351,6 +394,8 @@ def _apply_results(
                 bbox=base.bbox,
                 bbox_image_index=base.bbox_image_index,
                 crop_base64=base.crop_base64,
+                is_moveable=is_moveable,
+                packs_into_boxes=packs_into_boxes,
             )
         else:
             updated = DetectedItem(
@@ -367,6 +412,8 @@ def _apply_results(
                 bbox=base.bbox,
                 bbox_image_index=base.bbox_image_index,
                 crop_base64=base.crop_base64,
+                is_moveable=is_moveable,
+                packs_into_boxes=packs_into_boxes,
             )
 
         updates[orig_idx] = updated

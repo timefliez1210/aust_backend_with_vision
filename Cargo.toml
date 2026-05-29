@@ -92,11 +92,6 @@ jsonwebtoken = "9"
 # Validation
 validator = { version = "0.19", features = ["derive"] }
 
-# PDF generation
-typst = "0.12"
-typst-pdf = "0.12"
-
-
 # ZIP archive manipulation
 zip = "2"
 

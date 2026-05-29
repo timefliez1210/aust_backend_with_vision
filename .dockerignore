@@ -1,0 +1,40 @@
+# Source-only build context — keep the image build deterministic and slim.
+
+# Build artefacts
+target/
+frontend/node_modules/
+frontend/.svelte-kit/
+frontend/build/
+
+# Secrets / local config (NEVER ship into images)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials*.json
+
+# Local data dirs that exist at the repo root in dev
+app/
+uploads/
+logs/
+backups/
+debug_*.xlsx
+TODO.md
+
+# VCS / editor noise
+.git/
+.gitignore
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Submodule scratch
+frontend/node_modules
+
+# Docs/examples not needed at runtime
+README.md
+AGENTS.md
+CLAUDE.md
+docs/

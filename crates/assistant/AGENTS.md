@@ -1,7 +1,9 @@
 # crates/assistant — In-Telegram Chief-of-Staff Agent
 
-Phase 0 foundation: soul loader, three-layer memory, tool registry, driver loop, learning skeleton.
-All subsystems are present as working stubs so later phases can fill in tools/learners without architectural changes.
+Working subsystem: soul loader, three-layer memory, tool registry, driver
+loop, event consumer, retention sweeper, confirmation queue, role-gated
+tool dispatch. Wired end-to-end through `crates/api::services::assistant_bridge`
+into the `aust-email-agent` Telegram poller.
 
 ## Module Map
 
@@ -53,14 +55,27 @@ All subsystems are present as working stubs so later phases can fill in tools/le
 - `NoopTranscriber::transcribe` returns `Err(VoiceUnsupported)` — Phase 6 wires real ASR.
 - Tools never call `offer_builder` directly (would create circular dep); `DraftOffer` returns a marker JSON.
 
-## Phases
+## Status
 
 | Phase | Status | Description |
 |-------|--------|-------------|
-| 0 | Done | Foundation — all stubs wired, 36 tests green |
-| 1 | TODO | Wire Telegram bot update handler to `driver::process_turn` |
-| 2 | TODO | Real offer drafting via injected service trait |
-| 3 | TODO | Telegram confirmation keyboards, nightly consolidation scheduler |
-| 4 | TODO | Embedding-based episode clustering |
+| 0 | Done | Foundation — soul, memory, registry, driver |
+| 1 | Done | Telegram → `driver::process_turn` via `assistant_bridge` |
+| 2 | Done | Real offer drafting + 60+ tools wired through `ServiceBundle` |
+| 3 | Done | Confirmation keyboards (`Tool::summarize` + `ctx.confirmed`), event consumer, retention sweepers |
+| 4 | Deferred | Embedding-based episode clustering (Ollama Cloud has no embedding model) |
 | 5 | TODO | Train LinfaPredictor on offer_observations (min 50 rows) |
 | 6 | TODO | WhisperTranscriber — real voice input |
+
+## Known partial wires
+
+- `SendInvoice`, `SendPaymentReminder`, `SendOfferToCustomer`, `SendEmail`,
+  `UpdatePricing` return `AssistantError::NotWired` on confirm — they need
+  SMTP/S3 plumbed through the bridge to become real actions.
+- `apply_nl_override` is rule-based (LLM variant deferred).
+- `post_action::reflect` and `hooks::consolidate` are not scheduled — and
+  would need to route through `pending_memory_proposals` before being safe
+  to schedule (auto-store at confidence ≥ 0.7 currently bypasses B6's
+  Confirm gate on `remember`).
+- `agent_owns_approval=true` notifies "/approve …" but no `/approve` parser
+  and no inline Senden button exist — keep the flag false until B4 ships.
