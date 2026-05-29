@@ -293,12 +293,20 @@ impl Tool for SendOfferToCustomer {
     fn safety(&self) -> Safety { Safety::Confirm }
     fn min_role(&self) -> Role { Role::Owner }
 
-    async fn execute(&self, _ctx: &ToolCtx, args: &Value) -> Result<Value> {
-        let inquiry_id = super::parse_uuid(args, "inquiry_id", self.name())?;
-        Ok(super::pending_confirmation(
-            self.name(),
-            args,
-            format!("Angebot für Anfrage {inquiry_id} an Kunden senden?"),
+    fn summarize(&self, args: &Value) -> String {
+        let inquiry_id = args["inquiry_id"].as_str().unwrap_or("?");
+        format!("Angebot für Anfrage {inquiry_id} per E-Mail an den Kunden senden?")
+    }
+
+    async fn execute(&self, ctx: &ToolCtx, args: &Value) -> Result<Value> {
+        let _inquiry_id = super::parse_uuid(args, "inquiry_id", self.name())?;
+        if !ctx.confirmed {
+            return Ok(super::pending_confirmation(self.name(), args, self.summarize(args)));
+        }
+        // Offer-PDF send (S3 fetch + SMTP attach + status transition) is not yet
+        // exposed via the OfferService trait — see legacy /offers/:id/send route.
+        Err(crate::error::AssistantError::NotWired(
+            "Angebotsversand per E-Mail".to_string(),
         ))
     }
 }
@@ -326,13 +334,26 @@ impl Tool for CancelOffer {
     fn safety(&self) -> Safety { Safety::Confirm }
     fn min_role(&self) -> Role { Role::Owner }
 
-    async fn execute(&self, _ctx: &ToolCtx, args: &Value) -> Result<Value> {
+    fn summarize(&self, args: &Value) -> String {
+        let inquiry_id = args["inquiry_id"].as_str().unwrap_or("?");
+        let reason = args["reason"].as_str().unwrap_or("ohne Grund");
+        format!("Angebot der Anfrage {inquiry_id} stornieren? Grund: {reason}")
+    }
+
+    async fn execute(&self, ctx: &ToolCtx, args: &Value) -> Result<Value> {
         let inquiry_id = super::parse_uuid(args, "inquiry_id", self.name())?;
-        Ok(super::pending_confirmation(
-            self.name(),
-            args,
-            format!("Angebot der Anfrage {inquiry_id} stornieren?"),
-        ))
+        let reason = super::parse_str(args, "reason", self.name())?;
+        if !ctx.confirmed {
+            return Ok(super::pending_confirmation(self.name(), args, self.summarize(args)));
+        }
+        // No customer-facing notification — cancelling on Alex's request reflects
+        // an internal decision (the customer is informed separately if needed).
+        // The existing service surface treats cancel as a manual rejection with reason.
+        ctx.services
+            .offers
+            .mark_offer_rejected(inquiry_id, "agent_cancel", Some(reason))
+            .await?;
+        Ok(json!({ "status": "canceled", "inquiry_id": inquiry_id }))
     }
 }
 

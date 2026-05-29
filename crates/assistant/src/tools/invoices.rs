@@ -203,9 +203,23 @@ impl Tool for SendInvoice {
     fn safety(&self) -> Safety { Safety::Confirm }
     fn min_role(&self) -> Role { Role::Owner }
 
-    async fn execute(&self, _ctx: &ToolCtx, args: &Value) -> Result<Value> {
-        let id = parse_uuid(args, "invoice_id", self.name())?;
-        Ok(pending_confirmation(self.name(), args, format!("Rechnung {id} senden?")))
+    fn summarize(&self, args: &Value) -> String {
+        let id = args["invoice_id"].as_str().unwrap_or("?");
+        format!("Rechnung {id} per E-Mail an den Kunden senden?")
+    }
+
+    async fn execute(&self, ctx: &ToolCtx, args: &Value) -> Result<Value> {
+        let _id = parse_uuid(args, "invoice_id", self.name())?;
+        if !ctx.confirmed {
+            return Ok(pending_confirmation(self.name(), args, self.summarize(args)));
+        }
+        // The PDF send pipeline (S3 fetch + SMTP attach) is plumbed through the
+        // legacy route handler and not yet exposed via the InvoiceService trait.
+        // Returning NotWired surfaces the fact that the action did NOT happen,
+        // rather than the silent no-op the marker pattern previously produced.
+        Err(crate::error::AssistantError::NotWired(
+            "Rechnungsversand per E-Mail".to_string(),
+        ))
     }
 }
 
@@ -232,13 +246,19 @@ impl Tool for SendPaymentReminder {
     fn safety(&self) -> Safety { Safety::Confirm }
     fn min_role(&self) -> Role { Role::Owner }
 
-    async fn execute(&self, _ctx: &ToolCtx, args: &Value) -> Result<Value> {
-        let id = parse_uuid(args, "invoice_id", self.name())?;
+    fn summarize(&self, args: &Value) -> String {
+        let id = args["invoice_id"].as_str().unwrap_or("?");
         let level = args["level"].as_i64().unwrap_or(1);
-        Ok(pending_confirmation(
-            self.name(),
-            args,
-            format!("Mahnung Stufe {level} für Rechnung {id} senden?"),
+        format!("Mahnung Stufe {level} für Rechnung {id} senden?")
+    }
+
+    async fn execute(&self, ctx: &ToolCtx, args: &Value) -> Result<Value> {
+        let _id = parse_uuid(args, "invoice_id", self.name())?;
+        if !ctx.confirmed {
+            return Ok(pending_confirmation(self.name(), args, self.summarize(args)));
+        }
+        Err(crate::error::AssistantError::NotWired(
+            "Mahnungsversand per E-Mail".to_string(),
         ))
     }
 }
@@ -264,9 +284,21 @@ impl Tool for VoidInvoice {
     fn safety(&self) -> Safety { Safety::Confirm }
     fn min_role(&self) -> Role { Role::Owner }
 
-    async fn execute(&self, _ctx: &ToolCtx, args: &Value) -> Result<Value> {
+    fn summarize(&self, args: &Value) -> String {
+        let id = args["id"].as_str().unwrap_or("?");
+        let reason = args["reason"].as_str().unwrap_or("ohne Grund");
+        format!("Rechnung {id} stornieren (void)? Grund: {reason}")
+    }
+
+    async fn execute(&self, ctx: &ToolCtx, args: &Value) -> Result<Value> {
         let id = parse_uuid(args, "id", self.name())?;
-        Ok(pending_confirmation(self.name(), args, format!("Rechnung {id} stornieren?")))
+        if !ctx.confirmed {
+            return Ok(pending_confirmation(self.name(), args, self.summarize(args)));
+        }
+        // B3 widened the DB CHECK to accept 'void'. The bridge's update_status
+        // pass-through is enough — no PDF/email pipeline needed for voiding.
+        let detail = ctx.services.invoices.update_status(id, "void").await?;
+        Ok(json!({ "status": "voided", "id": id, "invoice": detail }))
     }
 }
 

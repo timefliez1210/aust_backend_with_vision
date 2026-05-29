@@ -49,6 +49,14 @@ pub enum AssistantError {
     #[error("Voice transcription not yet supported (Phase 6)")]
     VoiceUnsupported,
 
+    /// A capability is not yet wired into the assistant — used by Confirm
+    /// tools whose backing service method requires plumbing (SMTP, S3) that
+    /// the service trait does not yet expose. Tells Alex explicitly that the
+    /// action did NOT happen, rather than the silent no-op the marker pattern
+    /// previously caused.
+    #[error("Aktion noch nicht final verdrahtet: {0}. Bitte vorerst über das Admin-Panel ausführen.")]
+    NotWired(String),
+
     /// Generic internal error.
     #[error("Internal error: {0}")]
     Internal(String),

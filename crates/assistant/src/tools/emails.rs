@@ -150,9 +150,20 @@ impl Tool for SendEmail {
     fn safety(&self) -> Safety { Safety::Confirm }
     fn min_role(&self) -> Role { Role::Owner }
 
-    async fn execute(&self, _ctx: &ToolCtx, args: &Value) -> Result<Value> {
-        let to = parse_str(args, "to", self.name())?;
-        Ok(pending_confirmation(self.name(), args, format!("E-Mail an {to} senden?")))
+    fn summarize(&self, args: &Value) -> String {
+        let to = args["to"].as_str().unwrap_or("?");
+        let subject = args["subject"].as_str().unwrap_or("(ohne Betreff)");
+        format!("E-Mail an {to} senden? Betreff: {subject}")
+    }
+
+    async fn execute(&self, ctx: &ToolCtx, args: &Value) -> Result<Value> {
+        let _to = parse_str(args, "to", self.name())?;
+        if !ctx.confirmed {
+            return Ok(pending_confirmation(self.name(), args, self.summarize(args)));
+        }
+        Err(crate::error::AssistantError::NotWired(
+            "Ad-hoc E-Mail-Versand".to_string(),
+        ))
     }
 }
 

@@ -73,11 +73,31 @@ impl Tool for UpdatePricing {
     fn safety(&self) -> Safety { Safety::Confirm }
     fn min_role(&self) -> Role { Role::Owner }
 
-    async fn execute(&self, _ctx: &ToolCtx, args: &Value) -> Result<Value> {
-        Ok(pending_confirmation(
-            self.name(),
-            args,
-            "Preiskonfiguration aktualisieren (wirkt geschäftsweit)?".to_string(),
+    fn summarize(&self, args: &Value) -> String {
+        let patch = &args["patch"];
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(v) = patch["base_rate_eur"].as_f64() {
+            parts.push(format!("Stundensatz {v:.2} €"));
+        }
+        if let Some(v) = patch["saturday_surcharge_pct"].as_f64() {
+            parts.push(format!("Samstagszuschlag {v:.0}%"));
+        }
+        if let Some(v) = patch["vat_rate_pct"].as_f64() {
+            parts.push(format!("MwSt {v:.0}%"));
+        }
+        if let Some(v) = patch["min_hours"].as_f64() {
+            parts.push(format!("Mindeststunden {v:.1}"));
+        }
+        let detail = if parts.is_empty() { "(keine Änderungen)".to_string() } else { parts.join(", ") };
+        format!("Preiskonfiguration aktualisieren — {detail}? Wirkt auf alle künftigen Angebote.")
+    }
+
+    async fn execute(&self, ctx: &ToolCtx, args: &Value) -> Result<Value> {
+        if !ctx.confirmed {
+            return Ok(pending_confirmation(self.name(), args, self.summarize(args)));
+        }
+        Err(crate::error::AssistantError::NotWired(
+            "Preiskonfiguration-Update (SettingsService::update_pricing)".to_string(),
         ))
     }
 }
