@@ -61,6 +61,13 @@ impl Tool for Remember {
         Role::Owner
     }
 
+    fn summarize(&self, args: &Value) -> String {
+        let kind = args["kind"].as_str().unwrap_or("?");
+        let scope = args["scope"].as_str().unwrap_or("?");
+        let key = args["key"].as_str().unwrap_or("?");
+        format!("{kind} merken — Bereich '{scope}', Schlüssel '{key}'?")
+    }
+
     async fn execute(&self, ctx: &ToolCtx, args: &Value) -> Result<Value> {
         let kind_str = args["kind"].as_str().ok_or_else(|| AssistantError::ArgValidation {
             tool: self.name().to_string(),

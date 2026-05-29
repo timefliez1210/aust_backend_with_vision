@@ -182,14 +182,25 @@ impl Tool for MergeCustomers {
     fn safety(&self) -> Safety { Safety::Confirm }
     fn min_role(&self) -> Role { Role::Owner }
 
-    async fn execute(&self, _ctx: &ToolCtx, args: &Value) -> Result<Value> {
+    fn summarize(&self, args: &Value) -> String {
+        let keep = args["keep_id"].as_str().unwrap_or("?");
+        let merge = args["merge_id"].as_str().unwrap_or("?");
+        format!("Kunde {merge} in {keep} zusammenführen? Alle Anfragen werden umgehängt.")
+    }
+
+    async fn execute(&self, ctx: &ToolCtx, args: &Value) -> Result<Value> {
         let keep_id = parse_uuid(args, "keep_id", self.name())?;
         let merge_id = parse_uuid(args, "merge_id", self.name())?;
-        Ok(pending_confirmation(
-            self.name(),
-            args,
-            format!("Kunde {merge_id} in {keep_id} zusammenführen?"),
-        ))
+        if !ctx.confirmed {
+            return Ok(pending_confirmation(self.name(), args, self.summarize(args)));
+        }
+        let snapshot = ctx.services.customers.merge(keep_id, merge_id).await?;
+        Ok(json!({
+            "status": "merged",
+            "keep_id": keep_id,
+            "merged_id": merge_id,
+            "kept_customer": snapshot,
+        }))
     }
 }
 

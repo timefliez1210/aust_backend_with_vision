@@ -235,13 +235,34 @@ impl Tool for RequestInfoFromCustomer {
     fn safety(&self) -> Safety { Safety::Confirm }
     fn min_role(&self) -> Role { Role::Owner }
 
-    async fn execute(&self, _ctx: &ToolCtx, args: &Value) -> Result<Value> {
+    fn summarize(&self, args: &Value) -> String {
+        let id = args["inquiry_id"].as_str().unwrap_or("?");
+        format!("Infoanforderung per E-Mail an Kunden für Anfrage {id} senden?")
+    }
+
+    async fn execute(&self, ctx: &ToolCtx, args: &Value) -> Result<Value> {
         let id = parse_uuid(args, "inquiry_id", self.name())?;
-        Ok(pending_confirmation(
-            self.name(),
-            args,
-            format!("Infoanforderung an Kunden für Anfrage {id} senden?"),
-        ))
+        let draft = parse_str(args, "draft_email_de", self.name())?;
+        if !ctx.confirmed {
+            return Ok(pending_confirmation(self.name(), args, self.summarize(args)));
+        }
+        // The actual draft goes out via the email pipeline once we add
+        // EmailService::send (next slice). For now we transition the inquiry
+        // to info_requested and record the draft as a note so the action is
+        // observable even before SMTP is wired.
+        ctx.services
+            .inquiries
+            .add_note(id, &format!("Info-Anfrage an Kunden (Entwurf):\n{draft}"), "agent")
+            .await?;
+        ctx.services
+            .inquiries
+            .update_status(id, "info_requested", Some("Agent requested info from customer"))
+            .await?;
+        Ok(json!({
+            "status": "info_requested",
+            "inquiry_id": id,
+            "note": "Status auf info_requested gesetzt; E-Mail-Versand erfolgt nach Wiring der EmailService::send Capability."
+        }))
     }
 }
 
@@ -268,13 +289,20 @@ impl Tool for CancelInquiry {
     fn safety(&self) -> Safety { Safety::Confirm }
     fn min_role(&self) -> Role { Role::Owner }
 
-    async fn execute(&self, _ctx: &ToolCtx, args: &Value) -> Result<Value> {
+    fn summarize(&self, args: &Value) -> String {
+        let id = args["inquiry_id"].as_str().unwrap_or("?");
+        let reason = args["reason"].as_str().unwrap_or("ohne Grund");
+        format!("Anfrage {id} stornieren? Grund: {reason}")
+    }
+
+    async fn execute(&self, ctx: &ToolCtx, args: &Value) -> Result<Value> {
         let id = parse_uuid(args, "inquiry_id", self.name())?;
-        Ok(pending_confirmation(
-            self.name(),
-            args,
-            format!("Anfrage {id} stornieren?"),
-        ))
+        let reason = parse_str(args, "reason", self.name())?;
+        if !ctx.confirmed {
+            return Ok(pending_confirmation(self.name(), args, self.summarize(args)));
+        }
+        ctx.services.inquiries.cancel_inquiry(id, reason).await?;
+        Ok(json!({ "status": "canceled", "inquiry_id": id }))
     }
 }
 

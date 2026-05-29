@@ -212,9 +212,18 @@ impl Tool for DeleteCalendarItem {
     fn safety(&self) -> Safety { Safety::Confirm }
     fn min_role(&self) -> Role { Role::Owner }
 
-    async fn execute(&self, _ctx: &ToolCtx, args: &Value) -> Result<Value> {
+    fn summarize(&self, args: &Value) -> String {
+        let id = args["id"].as_str().unwrap_or("?");
+        format!("Kalendereintrag {id} löschen?")
+    }
+
+    async fn execute(&self, ctx: &ToolCtx, args: &Value) -> Result<Value> {
         let id = parse_uuid(args, "id", self.name())?;
-        Ok(pending_confirmation(self.name(), args, format!("Kalendereintrag {id} löschen?")))
+        if !ctx.confirmed {
+            return Ok(pending_confirmation(self.name(), args, self.summarize(args)));
+        }
+        ctx.services.calendar.delete_item(id).await?;
+        Ok(json!({ "status": "deleted", "id": id }))
     }
 }
 
@@ -314,9 +323,20 @@ impl Tool for CancelTermin {
     fn safety(&self) -> Safety { Safety::Confirm }
     fn min_role(&self) -> Role { Role::Owner }
 
-    async fn execute(&self, _ctx: &ToolCtx, args: &Value) -> Result<Value> {
+    fn summarize(&self, args: &Value) -> String {
+        let id = args["id"].as_str().unwrap_or("?");
+        let reason = args["reason"].as_str().unwrap_or("ohne Grund");
+        format!("Termin {id} stornieren? Grund: {reason}")
+    }
+
+    async fn execute(&self, ctx: &ToolCtx, args: &Value) -> Result<Value> {
         let id = parse_uuid(args, "id", self.name())?;
-        Ok(pending_confirmation(self.name(), args, format!("Termin {id} stornieren?")))
+        let reason = parse_str(args, "reason", self.name())?;
+        if !ctx.confirmed {
+            return Ok(pending_confirmation(self.name(), args, self.summarize(args)));
+        }
+        ctx.services.calendar.cancel_termin(id, reason).await?;
+        Ok(json!({ "status": "canceled", "id": id }))
     }
 }
 

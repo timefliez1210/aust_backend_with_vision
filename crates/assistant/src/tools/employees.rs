@@ -152,15 +152,21 @@ impl Tool for SetEmployeeActive {
     fn safety(&self) -> Safety { Safety::Confirm }
     fn min_role(&self) -> Role { Role::Owner }
 
-    async fn execute(&self, _ctx: &ToolCtx, args: &Value) -> Result<Value> {
-        let id = parse_uuid(args, "id", self.name())?;
+    fn summarize(&self, args: &Value) -> String {
+        let id = args["id"].as_str().unwrap_or("?");
         let active = args["active"].as_bool().unwrap_or(false);
         let action = if active { "aktivieren" } else { "deaktivieren" };
-        Ok(pending_confirmation(
-            self.name(),
-            args,
-            format!("Mitarbeiter {id} {action}?"),
-        ))
+        format!("Mitarbeiter {id} {action}?")
+    }
+
+    async fn execute(&self, ctx: &ToolCtx, args: &Value) -> Result<Value> {
+        let id = parse_uuid(args, "id", self.name())?;
+        let active = args["active"].as_bool().unwrap_or(false);
+        if !ctx.confirmed {
+            return Ok(pending_confirmation(self.name(), args, self.summarize(args)));
+        }
+        ctx.services.employees.set_active(id, active).await?;
+        Ok(json!({ "status": "updated", "id": id, "active": active }))
     }
 }
 
