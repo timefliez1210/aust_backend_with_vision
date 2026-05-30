@@ -195,10 +195,12 @@ async fn handle_confirm(
 
     match driver::resume_confirmed(pool, llm, registry, services, params).await {
         Ok(result) => {
-            let summary = result["summary"].as_str()
-                .unwrap_or(result.to_string().as_str())
-                .to_string();
-            let body = format!("✅ Bestätigt: {summary}");
+            // Prefer a tool-supplied human summary; otherwise show a clean generic
+            // confirmation rather than dumping the raw result JSON at Alex.
+            let body = match result["summary"].as_str() {
+                Some(s) => format!("✅ Bestätigt: {s}"),
+                None => "✅ Erledigt.".to_string(),
+            };
 
             // Update the original message to remove keyboard.
             if let Some(msg_id) = pending.telegram_message_id {

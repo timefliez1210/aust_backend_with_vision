@@ -133,7 +133,10 @@ impl ToolRegistry {
         registry.register(Box::new(offers::CommitOfferDraft));
         registry.register(Box::new(offers::RecomputeOffer));
         registry.register(Box::new(offers::ApplyNaturalLanguageOverride));
-        registry.register(Box::new(offers::SendOfferToCustomer));
+        // SendOfferToCustomer is unregistered until OfferService::send (SMTP + PDF
+        // attach) is plumbed — its execute() only returns NotWired, so exposing it
+        // would walk Alex to a confirmation for an action the agent cannot perform.
+        // Re-register here once the send path lands. Offer sending: use admin panel.
         registry.register(Box::new(offers::CancelOffer));
         registry.register(Box::new(offers::GetOfferHistory));
         registry.register(Box::new(offers::MarkOfferAccepted));
@@ -171,7 +174,8 @@ impl ToolRegistry {
         registry.register(Box::new(emails::GetEmail));
         registry.register(Box::new(emails::ListThread));
         registry.register(Box::new(emails::DraftReply));
-        registry.register(Box::new(emails::SendEmail));
+        // SendEmail unregistered until the SMTP send path is exposed via
+        // EmailService — execute() is NotWired-only today. Re-register when wired.
         registry.register(Box::new(emails::MarkEmailHandled));
         registry.register(Box::new(emails::CategorizeEmail));
 
@@ -182,8 +186,10 @@ impl ToolRegistry {
         registry.register(Box::new(invoices::CreateInvoice));
         registry.register(Box::new(invoices::UpdateInvoiceStatus));
         registry.register(Box::new(invoices::RecordPayment));
-        registry.register(Box::new(invoices::SendInvoice));
-        registry.register(Box::new(invoices::SendPaymentReminder));
+        // SendInvoice / SendPaymentReminder unregistered until the invoice SMTP+PDF
+        // send path is exposed via InvoiceService — both are NotWired-only today.
+        // VoidInvoice stays: it executes a real status transition. Use admin panel
+        // for sending invoices/reminders until these are wired.
         registry.register(Box::new(invoices::VoidInvoice));
 
         // Estimates
@@ -198,7 +204,8 @@ impl ToolRegistry {
         // Settings
         registry.register(Box::new(settings::GetSettings));
         registry.register(Box::new(settings::GetPricingConfig));
-        registry.register(Box::new(settings::UpdatePricing));
+        // UpdatePricing unregistered until SettingsService exposes a pricing
+        // mutation — execute() is NotWired-only today. Re-register when wired.
 
         // Reviews
         registry.register(Box::new(reviews::ListReviews));
