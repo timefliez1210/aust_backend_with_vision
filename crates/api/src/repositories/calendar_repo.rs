@@ -13,6 +13,10 @@ pub(crate) struct ScheduleInquiryRow {
     pub inquiry_id: Uuid,
     pub customer_name: Option<String>,
     #[sqlx(default)]
+    pub customer_email: Option<String>,
+    #[sqlx(default)]
+    pub customer_phone: Option<String>,
+    #[sqlx(default)]
     pub customer_type: Option<String>,
     #[sqlx(default)]
     pub company_name: Option<String>,
@@ -157,6 +161,8 @@ pub(crate) async fn fetch_schedule_inquiries(
                 NULLIF(TRIM(COALESCE(c.first_name,'') || ' ' || COALESCE(c.last_name,'')), ''),
                 c.name, c.email
             )                                                         AS customer_name,
+            c.email                                                   AS customer_email,
+            c.phone                                                   AS customer_phone,
             c.customer_type,
             c.company_name,
             CASE WHEN ao.id IS NOT NULL THEN ao.street || ', ' || ao.city END AS departure_address,

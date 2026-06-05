@@ -45,6 +45,10 @@ struct ScheduleInquiry {
     inquiry_id: Uuid,
     customer_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    customer_email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    customer_phone: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     customer_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     company_name: Option<String>,
@@ -302,6 +306,8 @@ async fn get_schedule(
         inquiry_map.entry(r.effective_date).or_default().push(ScheduleInquiry {
             inquiry_id: r.inquiry_id,
             customer_name: r.customer_name,
+            customer_email: r.customer_email,
+            customer_phone: r.customer_phone,
             customer_type: r.customer_type,
             company_name: r.company_name,
             departure_address: r.departure_address,

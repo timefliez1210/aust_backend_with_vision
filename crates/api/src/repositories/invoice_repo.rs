@@ -385,6 +385,45 @@ pub(crate) async fn count_unpaid(
     Ok(count)
 }
 
+/// Overwrite an invoice's number.
+///
+/// **Caller**: `invoices::update_invoice_number`
+/// **Why**: Recovery path when the system counter fell out of sync with manually-sent
+/// invoices. The `invoices_invoice_number_key` UNIQUE constraint guards collisions;
+/// the caller maps that violation to a friendly message.
+pub(crate) async fn update_invoice_number(
+    pool: &PgPool,
+    inv_id: Uuid,
+    invoice_number: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE invoices SET invoice_number = $1 WHERE id = $2")
+        .bind(invoice_number)
+        .bind(inv_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Move `invoice_number_seq` forward so the next generated number is `> seq`.
+///
+/// **Caller**: `invoices::update_invoice_number`
+/// **Why**: After an overwrite to a higher number, the auto-counter must catch up so
+/// the next generated invoice doesn't collide. `GREATEST` guarantees the sequence
+/// only ever advances — never rewinds (which would risk reusing a number).
+pub(crate) async fn advance_invoice_sequence(
+    pool: &PgPool,
+    seq: i64,
+) -> Result<(), sqlx::Error> {
+    // setval(..., is_called = true) ⇒ next nextval() returns the set value + 1.
+    sqlx::query(
+        "SELECT setval('invoice_number_seq', GREATEST((SELECT last_value FROM invoice_number_seq), $1), true)",
+    )
+    .bind(seq)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Transition inquiry to paid if not already.
 ///
 /// **Caller**: `invoices::update_invoice`

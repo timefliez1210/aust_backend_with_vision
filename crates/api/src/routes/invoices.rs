@@ -11,7 +11,7 @@ use axum::{
     extract::{Path, State},
     http::{header, StatusCode},
     response::Response,
-    routing::{get, post},
+    routing::{get, patch, post},
     Json, Router,
 };
 use chrono::Utc;
@@ -48,6 +48,7 @@ pub(crate) fn router() -> Router<Arc<AppState>> {
         )
         .route("/{id}/invoices/{inv_id}/pdf", get(get_invoice_pdf))
         .route("/{id}/invoices/{inv_id}/send", post(send_invoice))
+        .route("/{id}/invoices/{inv_id}/number", patch(update_invoice_number))
 }
 
 // Row types re-imported from invoice_repo
@@ -430,6 +431,83 @@ async fn create_invoice(
         let row = fetch_invoice_row(&state.db, inv_id).await?;
         Ok(Json(vec![build_invoice_response(row, offer_netto)]))
     }
+}
+
+/// Request body for `PATCH /inquiries/{id}/invoices/{inv_id}/number`.
+#[derive(Debug, Deserialize)]
+pub struct UpdateInvoiceNumberRequest {
+    /// The corrected invoice number, e.g. `"2026-0053"`.
+    pub invoice_number: String,
+}
+
+/// `PATCH /api/v1/inquiries/{id}/invoices/{inv_id}/number` — Overwrite invoice number.
+///
+/// **Caller**: Admin dashboard — pencil/edit control next to an invoice number.
+/// **Why**: Recovery path for when the in-system counter falls out of sync with
+/// invoices Alex sent manually (the counter didn't advance, so a generated invoice
+/// got a too-low / colliding number). This lets him set the correct number on the
+/// invoice, regenerates the PDF so it shows that number, and nudges the
+/// `invoice_number_seq` forward so the next generated number won't collide again.
+///
+/// # Errors
+/// - 400 if the new number is empty or already used by another invoice
+/// - 404 if the invoice (for this inquiry) is not found
+async fn update_invoice_number(
+    State(state): State<Arc<AppState>>,
+    Path((inquiry_id, inv_id)): Path<(Uuid, Uuid)>,
+    Json(req): Json<UpdateInvoiceNumberRequest>,
+) -> Result<Json<InvoiceResponse>, ApiError> {
+    let new_number = req.invoice_number.trim().to_string();
+    if new_number.is_empty() {
+        return Err(ApiError::BadRequest("Rechnungsnummer darf nicht leer sein".into()));
+    }
+
+    // Ensure the invoice exists for this inquiry before we touch anything.
+    let row = invoice_repo::fetch_by_id_and_inquiry(&state.db, inv_id, inquiry_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Invoice {inv_id} not found")))?;
+
+    if new_number == row.invoice_number {
+        // No-op overwrite — return current state without regenerating.
+        let offer_netto = get_offer_netto(&state.db, inquiry_id).await?;
+        return Ok(Json(build_invoice_response(row, offer_netto)));
+    }
+
+    // Persist the new number (UNIQUE constraint guards against collisions).
+    invoice_repo::update_invoice_number(&state.db, inv_id, &new_number)
+        .await
+        .map_err(|e| {
+            if let sqlx::Error::Database(ref db_err) = e
+                && db_err.constraint() == Some("invoices_invoice_number_key") {
+                    return ApiError::BadRequest(format!(
+                        "Rechnungsnummer {new_number} wird bereits verwendet"
+                    ));
+                }
+            ApiError::Database(e)
+        })?;
+
+    // Nudge the sequence forward so the next auto-generated number won't collide.
+    // Only when the number is in the standard `YYYY-NNNN` shape we can parse.
+    if let Some(seq) = parse_invoice_sequence(&new_number) {
+        invoice_repo::advance_invoice_sequence(&state.db, seq).await?;
+    }
+
+    // Regenerate the PDF so it shows the corrected number, then return fresh state.
+    let updated = fetch_invoice_row(&state.db, inv_id).await?;
+    regenerate_invoice_pdf(&state, &updated).await?;
+
+    tracing::info!(%inv_id, %inquiry_id, old = %row.invoice_number, new = %new_number, "Invoice number overwritten");
+
+    let final_row = fetch_invoice_row(&state.db, inv_id).await?;
+    let offer_netto = get_offer_netto(&state.db, inquiry_id).await?;
+    Ok(Json(build_invoice_response(final_row, offer_netto)))
+}
+
+/// Extract the trailing sequence integer from a `YYYY-NNNN` invoice number.
+/// Returns `None` for free-form numbers we can't map onto `invoice_number_seq`.
+fn parse_invoice_sequence(invoice_number: &str) -> Option<i64> {
+    let (_, seq) = invoice_number.split_once('-')?;
+    seq.parse::<i64>().ok()
 }
 
 /// `GET /api/v1/inquiries/{id}/invoices/{inv_id}` — Get a single invoice.
@@ -1120,9 +1198,25 @@ async fn ensure_invoice_pdf(
         tracing::warn!(invoice_id = %row.id, "Invoice row has no pdf_s3_key — regenerating");
     }
 
-    // Load invoice context. No manual price fallback here — we are healing an
-    // existing row, the offer price (or its absence) is already reflected in
-    // the invoice's stored amounts, and we cannot safely invent a price.
+    regenerate_invoice_pdf(state, row).await
+}
+
+/// Rebuild an invoice's PDF from its current row state and store the new key.
+///
+/// **Callers**: `ensure_invoice_pdf` (self-heal when the object is missing) and
+/// `update_invoice_number` (after an invoice number overwrite, so the PDF shows
+/// the corrected number).
+///
+/// Rebuilds the same line items the invoice was created with (KVA items + any
+/// stored extras), using `row.invoice_number` as the document number, then uploads
+/// and points `pdf_s3_key` at the fresh file.
+async fn regenerate_invoice_pdf(
+    state: &AppState,
+    row: &InvoiceRow,
+) -> Result<(), ApiError> {
+    // Load invoice context. No manual price fallback here — the offer price (or its
+    // absence) is already reflected in the invoice's stored amounts, and we cannot
+    // safely invent a price.
     let ctx = load_invoice_context(&state.db, row.inquiry_id, None).await?;
     let today = Utc::now().date_naive();
 

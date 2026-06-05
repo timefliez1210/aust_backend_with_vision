@@ -318,7 +318,18 @@ pub(super) async fn update_customer(
         customer_type, request.company_name.as_deref(),
         billing_address_id,
     )
-    .await?;
+    .await
+    .map_err(|e| {
+        // A duplicate email hits the customers_email_key UNIQUE constraint. Surface a
+        // clear German message instead of a raw 500 ("email nicht speicherbar").
+        if let sqlx::Error::Database(ref db_err) = e
+            && db_err.constraint() == Some("customers_email_key") {
+                return ApiError::Validation(
+                    "Diese E-Mail-Adresse wird bereits von einem anderen Kunden verwendet".into(),
+                );
+            }
+        ApiError::Database(e)
+    })?;
 
     tracing::info!(admin = %claims.sub, customer_id = %id, "Admin updated customer");
 
