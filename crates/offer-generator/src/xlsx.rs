@@ -1688,6 +1688,71 @@ mod tests {
         }
     }
 
+    /// One-off renderer: rebuild the editable XLSX for offer 2026-0188
+    /// (inquiry 019e4455-…, offer 019e8f82-…) from the data pulled off prod.
+    ///
+    /// Field values mirror the sent PDF exactly (moving date 24.07. and the
+    /// email on the PDF, not the since-drifted live DB values). Line items are
+    /// the verbatim `offers.line_items_json`. Run explicitly:
+    ///   cargo test -p aust-offer-generator --lib render_offer_2026_0188 -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn render_offer_2026_0188() {
+        let li = |description: &str, quantity: f64, unit_price: f64, is_labor: bool, flat_total: Option<f64>, remark: Option<&str>| OfferLineItem {
+            description: description.to_string(),
+            quantity,
+            unit_price,
+            is_labor,
+            flat_total,
+            remark: remark.map(|s| s.to_string()),
+        };
+
+        let data = OfferData {
+            offer_number: "2026-0188".to_string(),
+            date: chrono::NaiveDate::from_ymd_opt(2026, 6, 4).unwrap(),
+            valid_until: None,
+            customer_salutation: "Frau".to_string(),
+            customer_name: "Anna-Maria Flohr-Missou".to_string(),
+            customer_street: "Gerhardthauptmannstr. 56".to_string(),
+            customer_city: "40699 Ekrath".to_string(),
+            customer_phone: "017664117821".to_string(),
+            customer_email: Some("delphinchris007@web.de".to_string()),
+            company_name: None,
+            attention_line: None,
+            greeting: "Sehr geehrte Frau Flohr-Missou,".to_string(),
+            moving_date: "24.07.2026".to_string(),
+            origin_street: "Gerhardthauptmannstr. 56".to_string(),
+            origin_city: "40699 Ekrath".to_string(),
+            origin_floor_info: "1. OG".to_string(),
+            dest_street: "Goethestraße 52".to_string(),
+            dest_city: "31135 Hildesheim".to_string(),
+            dest_floor_info: "EG".to_string(),
+            volume_m3: 40.0,
+            persons: 5,
+            estimated_hours: 21.0,
+            rate_per_person_hour: 35.0,
+            line_items: vec![
+                li("5 Umzugshelfer", 21.0, 35.0, true, None, None),
+                li("Halteverbotszone", 1.0, 100.0, false, None, Some("Entladestelle")),
+                li("Umzugsmaterial", 4.0, 30.0, false, None, Some("Stretchfolie, Decken, Gurte, Klebeband,Luftpolsterfolie")),
+                li("Verkauf Seidenpapier", 2.0, 15.0, false, None, Some("500x750")),
+                li("Verkauf U-Karton", 50.0, 2.1, false, None, Some("590x318x328")),
+                li("Verkauf B-Karton", 20.0, 2.2, false, None, Some("400x318x328")),
+                li("Verleih Kleiderboxen", 4.0, 5.0, false, None, Some("610x520x1370")),
+                li("Fahrkostenpauschale", 0.0, 0.0, false, Some(900.0), None),
+                li("Nürnbergerversicherung", 1.0, 0.0, false, Some(0.0), Some("Deckungssumme: 620,00 Euro / m³")),
+                li("Sonstiges", 1.0, 10.0, false, None, Some("Einpackservice zuzüglich zum Preis je gepackten Karton")),
+            ],
+            detected_items: vec![],
+            headline_override: None,
+        };
+
+        let bytes = generate_offer_xlsx(&data).expect("generate should succeed");
+        let path = "/tmp/angebot_2026-0188.xlsx";
+        std::fs::write(path, &bytes).expect("write xlsx");
+        println!("WROTE {} ({} bytes)", path, bytes.len());
+    }
+
     #[test]
     fn generate_returns_valid_zip() {
         let data = minimal_offer_data();

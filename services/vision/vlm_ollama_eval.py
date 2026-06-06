@@ -157,11 +157,15 @@ def main(model: str = "both", smoke: bool = False, max_dim: int = 512, num_ctx: 
     else:
         prompt = PROMPT_HEADER.format(catalogue=catalogue)
 
-    models = ["gemma4:e4b", "qwen2.5-vl:7b"] if model == "both" else [model]
+    models = ["gemma4:e4b", "qwen2.5vl:7b"] if model == "both" else [model]
     worker = OllamaVLM()
     for m in models:
         print(f"\n{'='*70}\nRunning {m} on {len(images_b64)} images (num_ctx={num_ctx})\n{'='*70}")
-        res = worker.run.remote(m, images_b64, prompt, num_ctx)
+        try:
+            res = worker.run.remote(m, images_b64, prompt, num_ctx)
+        except Exception as exc:  # one model failing must not abort the others
+            print(f"[{m}] FAILED: {exc}")
+            continue
         print(f"[{m}] pull={res['pull_s']}s gen={res['gen_s']}s "
               f"prompt_tokens={res['prompt_eval_count']} out_tokens={res['eval_count']}")
         print(res["text"])
