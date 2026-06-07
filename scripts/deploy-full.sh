@@ -135,6 +135,10 @@ ok "Image built: ${FLASH_BOT_IMAGE}:latest"
 # ---------------------------------------------------------------------------
 step "Building frontend (bun run build)"
 cd "${FRONTEND_DIR}"
+# Clean stale build artifacts first: adapter-static precompress hits a flaky
+# ENOENT when re-building on top of a previous build/ (stale hashed CSS chunks
+# referenced in the manifest but no longer on disk). 2026-06-07 deploy incident.
+rm -rf build .svelte-kit
 bun run build
 ok "SvelteKit build complete"
 
