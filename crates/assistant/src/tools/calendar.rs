@@ -114,6 +114,36 @@ impl Tool for GetEmployeeAssignments {
     }
 }
 
+// ── GetAssignedCrew ───────────────────────────────────────────────────────────
+
+pub struct GetAssignedCrew;
+
+#[async_trait]
+impl Tool for GetAssignedCrew {
+    fn name(&self) -> &'static str { "get_assigned_crew" }
+    fn description(&self) -> &'static str {
+        "Listet die zugewiesenen Mitarbeiter eines Termins (Kalendereintrag) ODER einer Anfrage. Die ID darf eine Termin- oder Anfrage-ID sein. NUR diese Liste verwenden — niemals Mitarbeiter raten."
+    }
+    fn params_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "format": "uuid" }
+            },
+            "required": ["id"]
+        })
+    }
+    fn safety(&self) -> Safety { Safety::Read }
+    fn min_role(&self) -> Role { Role::Operator }
+
+    async fn execute(&self, ctx: &ToolCtx, args: &Value) -> Result<Value> {
+        let id = parse_uuid(args, "id", self.name())?;
+        let crew = ctx.services.calendar.get_assigned_crew(id).await?;
+        let count = crew.len();
+        Ok(json!({ "crew": crew, "count": count }))
+    }
+}
+
 // ── CreateCalendarItem ────────────────────────────────────────────────────────
 
 pub struct CreateCalendarItem;

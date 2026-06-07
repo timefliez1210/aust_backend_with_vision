@@ -146,6 +146,7 @@ impl ToolRegistry {
         registry.register(Box::new(calendar::GetCalendar));
         registry.register(Box::new(calendar::FindAvailableSlots));
         registry.register(Box::new(calendar::GetEmployeeAssignments));
+        registry.register(Box::new(calendar::GetAssignedCrew));
         registry.register(Box::new(calendar::CreateCalendarItem));
         registry.register(Box::new(calendar::UpdateCalendarItem));
         registry.register(Box::new(calendar::DeleteCalendarItem));

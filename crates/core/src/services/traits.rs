@@ -201,6 +201,18 @@ pub struct EmployeeWorkloadEntry {
     pub category: String,
 }
 
+/// A single crew member assigned to a termin (calendar item) or an inquiry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CrewMember {
+    pub employee_id: Uuid,
+    pub first_name: String,
+    pub last_name: String,
+    pub job_date: NaiveDate,
+    /// Origin of the assignment: `"termin"` (calendar_item_employees) or
+    /// `"auftrag"` (inquiry_employees).
+    pub source: String,
+}
+
 /// Patch for updating customer fields.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CustomerPatch {
@@ -537,6 +549,13 @@ pub trait CalendarService: Send + Sync {
         from: NaiveDate,
         to: NaiveDate,
     ) -> Result<Vec<EmployeeWorkloadEntry>, ServiceError>;
+
+    /// Fetch the crew assigned to a termin (calendar item) **or** an inquiry.
+    ///
+    /// The `id` may reference either a `calendar_item` or an `inquiry` — both
+    /// assignment tables are checked, so the caller does not need to know which
+    /// kind of id it holds. Returns an empty vec when nothing is assigned.
+    async fn get_assigned_crew(&self, id: Uuid) -> Result<Vec<CrewMember>, ServiceError>;
 }
 
 // ── Customer ──────────────────────────────────────────────────────────────────

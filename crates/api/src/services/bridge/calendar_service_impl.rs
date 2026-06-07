@@ -6,8 +6,8 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use aust_core::services::{
-    AvailableSlot, CalendarItem, CalendarItemPatch, CalendarService, EmployeeWorkloadEntry,
-    ServiceError,
+    AvailableSlot, CalendarItem, CalendarItemPatch, CalendarService, CrewMember,
+    EmployeeWorkloadEntry, ServiceError,
 };
 
 use crate::repositories::calendar_item_repo;
@@ -458,6 +458,46 @@ impl CalendarService for CalendarServiceImpl {
                     title,
                     category,
                 }
+            })
+            .collect())
+    }
+
+    async fn get_assigned_crew(&self, id: Uuid) -> Result<Vec<CrewMember>, ServiceError> {
+        // The id may be a calendar_item OR an inquiry — crew lives in two
+        // separate junction tables. Check both so the caller (the assistant)
+        // doesn't have to know which kind of id it holds. This is the read path
+        // that prevents the agent from confabulating a crew list.
+        let rows: Vec<(Uuid, String, String, NaiveDate, String)> = sqlx::query_as(
+            r#"
+            SELECT e.id   AS employee_id,
+                   e.first_name AS first_name,
+                   e.last_name  AS last_name,
+                   cie.job_date AS job_date,
+                   'termin'::text AS source
+            FROM calendar_item_employees cie
+            JOIN employees e ON e.id = cie.employee_id
+            WHERE cie.calendar_item_id = $1
+            UNION ALL
+            SELECT e.id, e.first_name, e.last_name, ie.job_date, 'auftrag'::text
+            FROM inquiry_employees ie
+            JOIN employees e ON e.id = ie.employee_id
+            WHERE ie.inquiry_id = $1
+            ORDER BY last_name, first_name
+            "#,
+        )
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(super::map_sqlx)?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(employee_id, first_name, last_name, job_date, source)| CrewMember {
+                employee_id,
+                first_name,
+                last_name,
+                job_date,
+                source,
             })
             .collect())
     }

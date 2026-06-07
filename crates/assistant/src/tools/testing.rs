@@ -12,7 +12,7 @@ use uuid::Uuid;
 use aust_core::models::{CustomerSnapshot, InquiryListItem, InquiryResponse, InquiryStatus, Services};
 use aust_core::services::{
     AddressPatch, AddressService, AvailableSlot, CalendarItem, CalendarItemPatch, CalendarService,
-    ComputedLineItem, CustomerPatch, CustomerService, DistanceResult, EmailDetail, EmailService,
+    ComputedLineItem, CrewMember, CustomerPatch, CustomerService, DistanceResult, EmailDetail, EmailService,
     EmailSummary, EmployeePatch, EmployeeRecord, EmployeeService, EmployeeWorkloadEntry,
     EstimationService, EstimationSummary, FeedbackRecord, InquiryService, InvoiceDetail,
     InvoiceReminder, InvoiceService, InvoiceSummary, MetricsService, OfferComputation, OfferDraft,
@@ -345,6 +345,16 @@ impl CalendarService for MockCalendarService {
             calendar_item_id: None,
             title: "Umzug".to_string(),
             category: "moving".to_string(),
+        }])
+    }
+
+    async fn get_assigned_crew(&self, _id: Uuid) -> Result<Vec<CrewMember>, ServiceError> {
+        Ok(vec![CrewMember {
+            employee_id: Uuid::new_v4(),
+            first_name: "Test".to_string(),
+            last_name: "Mitarbeiter".to_string(),
+            job_date: NaiveDate::from_ymd_opt(2026, 6, 12).unwrap(),
+            source: "termin".to_string(),
         }])
     }
 }

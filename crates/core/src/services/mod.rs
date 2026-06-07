@@ -14,7 +14,7 @@ pub use bundle::ServiceBundle;
 pub use error::ServiceError;
 pub use traits::{
     AddressService, AddressPatch, AvailableSlot, CalendarItem, CalendarItemPatch, CalendarService,
-    ComputedLineItem, CustomerPatch, CustomerService, DistanceResult, EmailDetail, EmailService,
+    ComputedLineItem, CrewMember, CustomerPatch, CustomerService, DistanceResult, EmailDetail, EmailService,
     EmailSummary, EmployeePatch, EmployeeRecord, EmployeeService, EmployeeWorkloadEntry,
     EstimationService, EstimationSummary, FeedbackRecord, InquiryService, InvoiceDetail,
     InvoiceReminder, InvoiceService, InvoiceSummary, MetricsService, OfferComputation, OfferDraft,

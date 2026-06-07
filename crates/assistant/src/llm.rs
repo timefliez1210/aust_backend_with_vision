@@ -136,6 +136,54 @@ impl OllamaAssistantLlm {
             ModelTier::Cheap => "deepseek-v4-flash",
         }
     }
+
+    /// POST `body` to `url` with the Bearer header, retrying transient failures
+    /// before giving up. Returns the parsed JSON body on success.
+    ///
+    /// Why: Ollama Cloud over the VPS link occasionally drops a single request
+    /// (connection reset / gateway 5xx). A single conversational turn makes
+    /// several of these calls, so one blip used to silently kill the whole
+    /// reply (the bot just went quiet). We retry transient errors with a short
+    /// backoff; 4xx (auth, bad request) fail fast since they won't self-heal.
+    async fn post_json_with_retry(&self, url: &str, body: &Value) -> Result<Value> {
+        const MAX_ATTEMPTS: usize = 3;
+        let mut last_err: Option<AssistantError> = None;
+        for attempt in 1..=MAX_ATTEMPTS {
+            let mut req = self.http.post(url).json(body);
+            if let Some(key) = &self.api_key {
+                req = req.header("Authorization", format!("Bearer {key}"));
+            }
+            match req.send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        return resp.json().await.map_err(|e| {
+                            AssistantError::Internal(format!("JSON parse error: {e}"))
+                        });
+                    }
+                    let text = resp.text().await.unwrap_or_default();
+                    let snippet: String = text.chars().take(200).collect();
+                    let err = AssistantError::Internal(format!(
+                        "Ollama {url} returned {status}: {snippet}"
+                    ));
+                    // 4xx won't fix itself (auth/bad request) — fail fast.
+                    if !status.is_server_error() {
+                        return Err(err);
+                    }
+                    last_err = Some(err);
+                }
+                Err(e) => {
+                    last_err = Some(AssistantError::Internal(format!("HTTP error: {e}")));
+                }
+            }
+            if attempt < MAX_ATTEMPTS {
+                let backoff = std::time::Duration::from_millis(400 * attempt as u64);
+                tokio::time::sleep(backoff).await;
+            }
+        }
+        Err(last_err
+            .unwrap_or_else(|| AssistantError::Internal("request failed".to_string())))
+    }
 }
 
 #[async_trait]
@@ -201,28 +249,7 @@ impl AssistantLlmProvider for OllamaAssistantLlm {
             "stream": false,
         });
 
-        let mut req = self.http.post(&url).json(&body);
-        if let Some(key) = &self.api_key {
-            req = req.header("Authorization", format!("Bearer {key}"));
-        }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| AssistantError::Internal(format!("HTTP error: {e}")))?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(AssistantError::Internal(format!(
-                "Ollama /api/chat returned {status}: {}",
-                body.chars().take(200).collect::<String>()
-            )));
-        }
-
-        let json: Value = resp
-            .json()
-            .await
-            .map_err(|e| AssistantError::Internal(format!("JSON parse error: {e}")))?;
+        let json = self.post_json_with_retry(&url, &body).await?;
 
         // Parse Ollama response: either tool_calls or content.
         let message = &json["message"];
@@ -255,28 +282,7 @@ impl AssistantLlmProvider for OllamaAssistantLlm {
             "prompt": text,
         });
 
-        let mut req = self.http.post(&url).json(&body);
-        if let Some(key) = &self.api_key {
-            req = req.header("Authorization", format!("Bearer {key}"));
-        }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| AssistantError::Internal(format!("Embedding HTTP error: {e}")))?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(AssistantError::Internal(format!(
-                "Ollama /api/embeddings returned {status}: {}",
-                body.chars().take(200).collect::<String>()
-            )));
-        }
-
-        let json: Value = resp
-            .json()
-            .await
-            .map_err(|e| AssistantError::Internal(format!("Embedding JSON error: {e}")))?;
+        let json = self.post_json_with_retry(&url, &body).await?;
 
         let embedding = json["embedding"]
             .as_array()
