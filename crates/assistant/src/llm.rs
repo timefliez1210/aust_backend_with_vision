@@ -80,6 +80,9 @@ pub struct OllamaAssistantLlm {
     cheap: Arc<dyn LlmProvider>,
     /// Ollama base URL for the raw embedding endpoint.
     base_url: String,
+    /// API key for the raw `/api/chat` (tool-calling) and `/api/embeddings` requests.
+    /// Ollama Cloud requires `Authorization: Bearer <key>`; without it requests 401.
+    api_key: Option<String>,
     http: reqwest::Client,
 }
 
@@ -115,6 +118,7 @@ impl OllamaAssistantLlm {
             main,
             cheap,
             base_url: url,
+            api_key: api_key.filter(|k| !k.is_empty()),
             http,
         }
     }
@@ -197,13 +201,23 @@ impl AssistantLlmProvider for OllamaAssistantLlm {
             "stream": false,
         });
 
-        let resp = self
-            .http
-            .post(&url)
-            .json(&body)
+        let mut req = self.http.post(&url).json(&body);
+        if let Some(key) = &self.api_key {
+            req = req.header("Authorization", format!("Bearer {key}"));
+        }
+        let resp = req
             .send()
             .await
             .map_err(|e| AssistantError::Internal(format!("HTTP error: {e}")))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(AssistantError::Internal(format!(
+                "Ollama /api/chat returned {status}: {}",
+                body.chars().take(200).collect::<String>()
+            )));
+        }
 
         let json: Value = resp
             .json()
@@ -241,13 +255,23 @@ impl AssistantLlmProvider for OllamaAssistantLlm {
             "prompt": text,
         });
 
-        let resp = self
-            .http
-            .post(&url)
-            .json(&body)
+        let mut req = self.http.post(&url).json(&body);
+        if let Some(key) = &self.api_key {
+            req = req.header("Authorization", format!("Bearer {key}"));
+        }
+        let resp = req
             .send()
             .await
             .map_err(|e| AssistantError::Internal(format!("Embedding HTTP error: {e}")))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(AssistantError::Internal(format!(
+                "Ollama /api/embeddings returned {status}: {}",
+                body.chars().take(200).collect::<String>()
+            )));
+        }
 
         let json: Value = resp
             .json()
