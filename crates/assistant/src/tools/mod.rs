@@ -212,6 +212,7 @@ impl ToolRegistry {
         // Reviews
         registry.register(Box::new(reviews::ListReviews));
         registry.register(Box::new(reviews::ListFeedback));
+        registry.register(Box::new(reviews::CreateFeedback));
         registry.register(Box::new(reviews::RespondToReview));
         registry.register(Box::new(reviews::MarkFeedbackResolved));
 

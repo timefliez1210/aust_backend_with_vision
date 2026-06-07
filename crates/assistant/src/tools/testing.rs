@@ -730,6 +730,25 @@ impl ReviewService for MockReviewService {
         }])
     }
 
+    async fn create_feedback(
+        &self,
+        report_type: &str,
+        priority: &str,
+        title: &str,
+        description: Option<&str>,
+        _location: Option<&str>,
+    ) -> Result<FeedbackRecord, ServiceError> {
+        Ok(FeedbackRecord {
+            id: Uuid::new_v4(),
+            inquiry_id: None,
+            category: Some(format!("{report_type}/{priority}")),
+            description: description.unwrap_or(title).to_string(),
+            resolved: false,
+            notes: None,
+            created_at: Utc::now(),
+        })
+    }
+
     async fn set_review_response_draft(
         &self,
         _id: Uuid,

@@ -800,6 +800,19 @@ pub trait ReviewService: Send + Sync {
         unresolved_only: bool,
     ) -> Result<Vec<FeedbackRecord>, ServiceError>;
 
+    /// File a new feedback report (bug or feature request) into the pipeline.
+    ///
+    /// `report_type` must be "bug" or "feature"; `priority` one of
+    /// "low" / "medium" / "high" / "critical". Returns `Validation` on bad enums.
+    async fn create_feedback(
+        &self,
+        report_type: &str,
+        priority: &str,
+        title: &str,
+        description: Option<&str>,
+        location: Option<&str>,
+    ) -> Result<FeedbackRecord, ServiceError>;
+
     /// Set a draft response on a review.
     async fn set_review_response_draft(
         &self,

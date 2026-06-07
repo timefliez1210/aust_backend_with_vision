@@ -59,6 +59,63 @@ impl Tool for ListFeedback {
     }
 }
 
+// ── CreateFeedback ────────────────────────────────────────────────────────────
+
+pub struct CreateFeedback;
+
+#[async_trait]
+impl Tool for CreateFeedback {
+    fn name(&self) -> &'static str { "create_feedback" }
+    fn description(&self) -> &'static str {
+        "Meldet einen Bug oder Feature-Wunsch in die Entwickler-Pipeline (feedback_reports). \
+         Nutze das, wenn du selbst auf einen Fehler/Backend-Defekt stößt (z. B. ein Tool liefert \
+         einen Systemfehler) oder Alex sich ein neues Feature wünscht. report_type: 'bug' bei \
+         Fehlern, 'feature' bei Wünschen. title kurz und prägnant; description mit Kontext \
+         (was wurde versucht, welche IDs, welche Fehlermeldung). priority default 'medium'."
+    }
+    fn params_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "report_type": { "type": "string", "enum": ["bug", "feature"] },
+                "title":       { "type": "string", "minLength": 1 },
+                "description": { "type": "string" },
+                "priority":    { "type": "string", "enum": ["low", "medium", "high", "critical"] },
+                "location":    { "type": "string", "description": "Bereich/Seite/Tool, z. B. 'assistant: set_offer_status' oder '/admin/calendar'." }
+            },
+            "required": ["report_type", "title"]
+        })
+    }
+    fn safety(&self) -> Safety { Safety::Write }
+    fn min_role(&self) -> Role { Role::Operator }
+
+    async fn execute(&self, ctx: &ToolCtx, args: &Value) -> Result<Value> {
+        let report_type = parse_str(args, "report_type", self.name())?;
+        let title = parse_str(args, "title", self.name())?;
+        let priority = args["priority"].as_str().unwrap_or("medium");
+        let description = args["description"].as_str();
+        let location = args["location"].as_str();
+        match ctx
+            .services
+            .reviews
+            .create_feedback(report_type, priority, title, description, location)
+            .await
+        {
+            Ok(rec) => Ok(json!({
+                "ok": true,
+                "id": rec.id,
+                "report_type": report_type,
+                "priority": priority,
+                "title": title
+            })),
+            Err(aust_core::services::ServiceError::Validation(msg)) => {
+                Ok(json!({ "ok": false, "message": msg }))
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
 // ── RespondToReview ───────────────────────────────────────────────────────────
 
 pub struct RespondToReview;
@@ -164,6 +221,22 @@ mod tests {
         let services = testing::mock_bundle(uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
         let r = ListFeedback.execute(&ctx(services), &json!({ "unresolved_only": true })).await.unwrap();
         assert_eq!(r["count"], json!(1));
+    }
+
+    #[tokio::test]
+    async fn create_feedback_ok() {
+        let services = testing::mock_bundle(uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let r = CreateFeedback
+            .execute(&ctx(services), &json!({
+                "report_type": "bug",
+                "title": "offers.updated_at fehlt",
+                "description": "accept schlug fehl",
+                "priority": "high"
+            }))
+            .await
+            .unwrap();
+        assert_eq!(r["ok"], json!(true));
+        assert_eq!(r["report_type"], json!("bug"));
     }
 
     #[tokio::test]

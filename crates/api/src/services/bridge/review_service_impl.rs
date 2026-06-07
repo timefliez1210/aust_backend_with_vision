@@ -89,6 +89,62 @@ impl ReviewService for ReviewServiceImpl {
             .collect())
     }
 
+    async fn create_feedback(
+        &self,
+        report_type: &str,
+        priority: &str,
+        title: &str,
+        description: Option<&str>,
+        location: Option<&str>,
+    ) -> Result<FeedbackRecord, ServiceError> {
+        // Validate against the table CHECK constraints up front so the agent gets a
+        // clear message instead of an opaque DB error.
+        if !matches!(report_type, "bug" | "feature") {
+            return Err(ServiceError::Validation(format!(
+                "report_type muss 'bug' oder 'feature' sein, nicht '{report_type}'."
+            )));
+        }
+        if !matches!(priority, "low" | "medium" | "high" | "critical") {
+            return Err(ServiceError::Validation(format!(
+                "priority muss low/medium/high/critical sein, nicht '{priority}'."
+            )));
+        }
+        let title = title.trim();
+        if title.is_empty() {
+            return Err(ServiceError::Validation(
+                "title darf nicht leer sein.".to_string(),
+            ));
+        }
+
+        let row: (Uuid, String, Option<String>, String, chrono::DateTime<chrono::Utc>) =
+            sqlx::query_as(
+                r#"
+                INSERT INTO feedback_reports (report_type, priority, title, description, location)
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING id, title, description, status, created_at
+                "#,
+            )
+            .bind(report_type)
+            .bind(priority)
+            .bind(title)
+            .bind(description)
+            .bind(location)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(super::map_sqlx)?;
+
+        let (id, title, description, status, created_at) = row;
+        Ok(FeedbackRecord {
+            id,
+            inquiry_id: None,
+            category: Some(format!("{report_type}/{priority}")),
+            description: description.unwrap_or_else(|| title.clone()),
+            resolved: status == "resolved",
+            notes: None,
+            created_at,
+        })
+    }
+
     async fn set_review_response_draft(
         &self,
         id: Uuid,
