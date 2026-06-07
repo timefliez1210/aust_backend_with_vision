@@ -86,6 +86,7 @@ impl CalendarService for CalendarServiceImpl {
                 category,
                 scheduled_date,
                 end_date,
+                kind: "termin".to_string(),
             })
             .collect();
         items.extend(inq_rows.into_iter().map(
@@ -95,6 +96,7 @@ impl CalendarService for CalendarServiceImpl {
                 category: service_type.unwrap_or_else(|| "umzug".to_string()),
                 scheduled_date,
                 end_date,
+                kind: "auftrag".to_string(),
             },
         ));
         items.sort_by(|a, b| a.scheduled_date.cmp(&b.scheduled_date));
@@ -175,6 +177,7 @@ impl CalendarService for CalendarServiceImpl {
             category: category.to_string(),
             scheduled_date: Some(scheduled_date),
             end_date,
+            kind: "termin".to_string(),
         })
     }
 
@@ -218,7 +221,7 @@ impl CalendarService for CalendarServiceImpl {
         let (id, title, category, scheduled_date, end_date) =
             row.ok_or_else(|| ServiceError::NotFound(format!("Kalendereintrag {id}")))?;
 
-        Ok(CalendarItem { id, title, category, scheduled_date, end_date })
+        Ok(CalendarItem { id, title, category, scheduled_date, end_date, kind: "termin".to_string() })
     }
 
     async fn delete_item(&self, id: Uuid) -> Result<(), ServiceError> {
@@ -301,6 +304,7 @@ impl CalendarService for CalendarServiceImpl {
             category: "moving".to_string(),
             scheduled_date: Some(date),
             end_date: None,
+            kind: "termin".to_string(),
         })
     }
 
@@ -367,7 +371,7 @@ impl CalendarService for CalendarServiceImpl {
         let (id, title, category, scheduled_date, end_date) =
             row.ok_or_else(|| ServiceError::NotFound(format!("Termin {termin_id}")))?;
 
-        Ok(CalendarItem { id, title, category, scheduled_date, end_date })
+        Ok(CalendarItem { id, title, category, scheduled_date, end_date, kind: "termin".to_string() })
     }
 
     async fn cancel_termin(&self, id: Uuid, _reason: &str) -> Result<(), ServiceError> {
@@ -500,5 +504,58 @@ impl CalendarService for CalendarServiceImpl {
                 source,
             })
             .collect())
+    }
+
+    async fn set_inquiry_crew(
+        &self,
+        inquiry_id: Uuid,
+        crew: Vec<Uuid>,
+        date: Option<NaiveDate>,
+    ) -> Result<Vec<CrewMember>, ServiceError> {
+        // Resolve the job date: explicit arg wins, otherwise the inquiry's own
+        // scheduled_date. This is what stops crew rows from being stranded on a
+        // stale date (the 2026-05-27 vs 2026-06-12 Schauer bug).
+        let inq: Option<(Option<NaiveDate>,)> =
+            sqlx::query_as("SELECT scheduled_date FROM inquiries WHERE id = $1")
+                .bind(inquiry_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(super::map_sqlx)?;
+        let scheduled = inq
+            .ok_or_else(|| ServiceError::NotFound(format!("Anfrage {inquiry_id}")))?
+            .0;
+        let job_date = date.or(scheduled).ok_or_else(|| {
+            ServiceError::Validation(
+                "Anfrage hat kein geplantes Datum — bitte Datum angeben.".to_string(),
+            )
+        })?;
+
+        // Replace the crew wholesale: clear existing rows, insert the new set.
+        // No status change, no calendar_item created — purely the inquiry crew.
+        let mut tx = self.pool.begin().await.map_err(super::map_sqlx)?;
+        sqlx::query("DELETE FROM inquiry_employees WHERE inquiry_id = $1")
+            .bind(inquiry_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(super::map_sqlx)?;
+        for employee_id in &crew {
+            sqlx::query(
+                r#"
+                INSERT INTO inquiry_employees (inquiry_id, employee_id, job_date)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (inquiry_id, employee_id, job_date) DO NOTHING
+                "#,
+            )
+            .bind(inquiry_id)
+            .bind(employee_id)
+            .bind(job_date)
+            .execute(&mut *tx)
+            .await
+            .map_err(super::map_sqlx)?;
+        }
+        tx.commit().await.map_err(super::map_sqlx)?;
+
+        // Return the freshly written crew so the caller can confirm the result.
+        self.get_assigned_crew(inquiry_id).await
     }
 }

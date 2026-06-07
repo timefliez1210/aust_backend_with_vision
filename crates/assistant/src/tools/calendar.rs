@@ -17,7 +17,7 @@ pub struct GetCalendar;
 impl Tool for GetCalendar {
     fn name(&self) -> &'static str { "get_calendar" }
     fn description(&self) -> &'static str {
-        "Gibt Kalendereinträge für einen Datumsbereich zurück (Umzugstermine, Mitarbeiteraufgaben, interne Ereignisse)."
+        "Gibt Kalendereinträge für einen Datumsbereich zurück (Umzugstermine, Mitarbeiteraufgaben, interne Ereignisse). Jeder Eintrag hat ein Feld 'kind': \"termin\" = Kalendereintrag (ID ist calendar_item), \"auftrag\" = Umzug aus einer Anfrage (ID ist inquiry_id). Danach richtet sich, welches Schreib-Tool zu verwenden ist."
     }
     fn params_schema(&self) -> Value {
         json!({
@@ -265,7 +265,7 @@ pub struct ScheduleInquiry;
 impl Tool for ScheduleInquiry {
     fn name(&self) -> &'static str { "schedule_inquiry" }
     fn description(&self) -> &'static str {
-        "Plant einen Umzug für eine Anfrage auf ein Datum mit zugewiesener Crew. Nur für Inhaber."
+        "Plant eine Anfrage erstmalig ein: setzt Datum + Crew, ändert den Status auf 'scheduled' UND legt einen Kalendereintrag an. NUR zum erstmaligen Verplanen verwenden. Wenn die Anfrage schon geplant ist und nur die Crew geändert werden soll, set_inquiry_crew nutzen (legt keinen doppelten Kalendereintrag an). Nur für Inhaber."
     }
     fn params_schema(&self) -> Value {
         json!({
@@ -295,6 +295,43 @@ impl Tool for ScheduleInquiry {
     }
 }
 
+// ── SetInquiryCrew ────────────────────────────────────────────────────────────
+
+pub struct SetInquiryCrew;
+
+#[async_trait]
+impl Tool for SetInquiryCrew {
+    fn name(&self) -> &'static str { "set_inquiry_crew" }
+    fn description(&self) -> &'static str {
+        "Setzt die zugewiesene Crew einer ANFRAGE (Auftrag, kind=\"auftrag\"). Ersetzt die bestehende Crew vollständig. Ändert NICHT den Status und legt KEINEN neuen Kalendereintrag an. Ohne 'date' wird das geplante Datum der Anfrage verwendet. Für Kalendereinträge (kind=\"termin\") stattdessen reassign_termin/assign_employee nutzen. Nur für Inhaber."
+    }
+    fn params_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "inquiry_id": { "type": "string", "format": "uuid" },
+                "crew":       { "type": "array", "items": { "type": "string", "format": "uuid" } },
+                "date":       { "type": "string", "format": "date" }
+            },
+            "required": ["inquiry_id", "crew"]
+        })
+    }
+    fn safety(&self) -> Safety { Safety::Write }
+    fn min_role(&self) -> Role { Role::Owner }
+
+    async fn execute(&self, ctx: &ToolCtx, args: &Value) -> Result<Value> {
+        let inquiry_id = parse_uuid(args, "inquiry_id", self.name())?;
+        let crew: Vec<Uuid> = args["crew"]
+            .as_array()
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().and_then(|s| s.parse().ok())).collect())
+            .unwrap_or_default();
+        let date = args["date"].as_str().and_then(|s| s.parse::<NaiveDate>().ok());
+        let crew = ctx.services.calendar.set_inquiry_crew(inquiry_id, crew, date).await?;
+        let count = crew.len();
+        Ok(json!({ "crew": crew, "count": count }))
+    }
+}
+
 // ── ReassignTermin ────────────────────────────────────────────────────────────
 
 pub struct ReassignTermin;
@@ -303,7 +340,7 @@ pub struct ReassignTermin;
 impl Tool for ReassignTermin {
     fn name(&self) -> &'static str { "reassign_termin" }
     fn description(&self) -> &'static str {
-        "Verschiebt einen Termin (anderes Datum und/oder andere Crew). Nur für Inhaber."
+        "Verschiebt einen KALENDEREINTRAG (kind=\"termin\", calendar_item-ID) auf ein anderes Datum und/oder ändert dessen Crew. Funktioniert NUR mit Termin-IDs, nicht mit Anfrage-IDs — für Aufträge (kind=\"auftrag\") set_inquiry_crew verwenden. Nur für Inhaber."
     }
     fn params_schema(&self) -> Value {
         json!({

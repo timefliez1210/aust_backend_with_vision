@@ -151,6 +151,7 @@ impl ToolRegistry {
         registry.register(Box::new(calendar::UpdateCalendarItem));
         registry.register(Box::new(calendar::DeleteCalendarItem));
         registry.register(Box::new(calendar::ScheduleInquiry));
+        registry.register(Box::new(calendar::SetInquiryCrew));
         registry.register(Box::new(calendar::ReassignTermin));
         registry.register(Box::new(calendar::CancelTermin));
         registry.register(Box::new(calendar::AssignEmployee));

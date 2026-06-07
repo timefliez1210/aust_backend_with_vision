@@ -244,6 +244,7 @@ impl CalendarService for MockCalendarService {
             category: "moving".to_string(),
             scheduled_date: Some(from),
             end_date: None,
+            kind: "termin".to_string(),
         }])
     }
 
@@ -269,6 +270,7 @@ impl CalendarService for MockCalendarService {
             category: category.to_string(),
             scheduled_date: Some(scheduled_date),
             end_date,
+            kind: "termin".to_string(),
         })
     }
 
@@ -283,6 +285,7 @@ impl CalendarService for MockCalendarService {
             category: patch.category.unwrap_or_else(|| "moving".to_string()),
             scheduled_date: patch.scheduled_date,
             end_date: patch.end_date,
+            kind: "termin".to_string(),
         })
     }
 
@@ -303,6 +306,7 @@ impl CalendarService for MockCalendarService {
             category: "moving".to_string(),
             scheduled_date: Some(date),
             end_date: None,
+            kind: "termin".to_string(),
         })
     }
 
@@ -318,6 +322,7 @@ impl CalendarService for MockCalendarService {
             category: "moving".to_string(),
             scheduled_date: new_date,
             end_date: None,
+            kind: "termin".to_string(),
         })
     }
 
@@ -356,6 +361,25 @@ impl CalendarService for MockCalendarService {
             job_date: NaiveDate::from_ymd_opt(2026, 6, 12).unwrap(),
             source: "termin".to_string(),
         }])
+    }
+
+    async fn set_inquiry_crew(
+        &self,
+        _inquiry_id: Uuid,
+        crew: Vec<Uuid>,
+        date: Option<NaiveDate>,
+    ) -> Result<Vec<CrewMember>, ServiceError> {
+        let job_date = date.unwrap_or_else(|| NaiveDate::from_ymd_opt(2026, 6, 12).unwrap());
+        Ok(crew
+            .into_iter()
+            .map(|employee_id| CrewMember {
+                employee_id,
+                first_name: "Test".to_string(),
+                last_name: "Mitarbeiter".to_string(),
+                job_date,
+                source: "auftrag".to_string(),
+            })
+            .collect())
     }
 }
 

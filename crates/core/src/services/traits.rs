@@ -126,6 +126,12 @@ pub struct CalendarItem {
     pub category: String,
     pub scheduled_date: Option<NaiveDate>,
     pub end_date: Option<NaiveDate>,
+    /// Origin of this row, so the caller knows which write tools apply:
+    /// `"termin"` → a `calendar_items` row (use reassign_termin / delete /
+    /// assign_employee with this id); `"auftrag"` → a moving job derived from
+    /// an `inquiries` row (the id is an inquiry_id — use set_inquiry_crew /
+    /// schedule_inquiry, NOT the calendar_item tools).
+    pub kind: String,
 }
 
 /// A lightweight email message summary.
@@ -556,6 +562,19 @@ pub trait CalendarService: Send + Sync {
     /// assignment tables are checked, so the caller does not need to know which
     /// kind of id it holds. Returns an empty vec when nothing is assigned.
     async fn get_assigned_crew(&self, id: Uuid) -> Result<Vec<CrewMember>, ServiceError>;
+
+    /// Replace the crew assigned to an **inquiry** (writes `inquiry_employees`).
+    ///
+    /// Unlike [`CalendarService::schedule_inquiry`], this does NOT change the
+    /// inquiry status and does NOT create a calendar item — it only sets the
+    /// crew. The assignment date defaults to the inquiry's `scheduled_date`
+    /// when `date` is `None`. Returns the resulting crew.
+    async fn set_inquiry_crew(
+        &self,
+        inquiry_id: Uuid,
+        crew: Vec<Uuid>,
+        date: Option<NaiveDate>,
+    ) -> Result<Vec<CrewMember>, ServiceError>;
 }
 
 // ── Customer ──────────────────────────────────────────────────────────────────
