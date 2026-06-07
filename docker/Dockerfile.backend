@@ -35,6 +35,8 @@ WORKDIR /app
 COPY --from=builder /app/target/release/aust_backend ./aust_backend
 COPY config ./config
 COPY migrations ./migrations
+# Assistant persona file — the binary loads SOUL.md from the working dir at startup.
+COPY crates/assistant/prompts/SOUL.md ./SOUL.md
 
 RUN useradd -u 1000 -m aust && chown -R aust:aust /app
 USER aust
