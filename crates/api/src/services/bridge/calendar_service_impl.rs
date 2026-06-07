@@ -29,12 +29,16 @@ impl CalendarService for CalendarServiceImpl {
         from: NaiveDate,
         to: NaiveDate,
     ) -> Result<Vec<CalendarItem>, ServiceError> {
-        let rows: Vec<(Uuid, String, String, Option<NaiveDate>, Option<NaiveDate>)> =
+        // Internal calendar items overlapping the range. Use overlap logic
+        // (start <= to AND end >= from) so multi-day items that begin before the
+        // window are still returned.
+        let cal_rows: Vec<(Uuid, String, String, Option<NaiveDate>, Option<NaiveDate>)> =
             sqlx::query_as(
                 r#"
                 SELECT id, title, category, scheduled_date, end_date
                 FROM calendar_items
-                WHERE scheduled_date >= $1 AND scheduled_date <= $2
+                WHERE scheduled_date <= $2
+                  AND COALESCE(end_date, scheduled_date) >= $1
                 ORDER BY scheduled_date ASC, start_time ASC
                 "#,
             )
@@ -44,7 +48,37 @@ impl CalendarService for CalendarServiceImpl {
             .await
             .map_err(super::map_sqlx)?;
 
-        Ok(rows
+        // Actual moving jobs (inquiries with a scheduled date) overlapping the
+        // range. Without this the assistant's calendar was blind to every real
+        // Umzug/Montage — only internal calendar_items showed up.
+        let inq_rows: Vec<(Uuid, String, Option<String>, Option<NaiveDate>, Option<NaiveDate>)> =
+            sqlx::query_as(
+                r#"
+                SELECT
+                    i.id,
+                    COALESCE(
+                        NULLIF(TRIM(COALESCE(c.first_name,'') || ' ' || COALESCE(c.last_name,'')), ''),
+                        c.name, c.email, 'Anfrage'
+                    ) AS title,
+                    i.service_type,
+                    i.scheduled_date,
+                    i.end_date
+                FROM inquiries i
+                JOIN customers c ON c.id = i.customer_id
+                WHERE i.scheduled_date IS NOT NULL
+                  AND i.scheduled_date <= $2
+                  AND COALESCE(i.end_date, i.scheduled_date) >= $1
+                  AND i.status NOT IN ('cancelled', 'rejected', 'expired')
+                ORDER BY i.scheduled_date ASC
+                "#,
+            )
+            .bind(from)
+            .bind(to)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(super::map_sqlx)?;
+
+        let mut items: Vec<CalendarItem> = cal_rows
             .into_iter()
             .map(|(id, title, category, scheduled_date, end_date)| CalendarItem {
                 id,
@@ -53,7 +87,18 @@ impl CalendarService for CalendarServiceImpl {
                 scheduled_date,
                 end_date,
             })
-            .collect())
+            .collect();
+        items.extend(inq_rows.into_iter().map(
+            |(id, title, service_type, scheduled_date, end_date)| CalendarItem {
+                id,
+                title,
+                category: service_type.unwrap_or_else(|| "umzug".to_string()),
+                scheduled_date,
+                end_date,
+            },
+        ));
+        items.sort_by(|a, b| a.scheduled_date.cmp(&b.scheduled_date));
+        Ok(items)
     }
 
     async fn find_available_slots(
