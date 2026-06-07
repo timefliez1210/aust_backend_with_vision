@@ -336,6 +336,7 @@ dependencies = [
  "aust-core",
  "aust-llm-providers",
  "chrono",
+ "chrono-tz",
  "jsonschema",
  "linfa",
  "linfa-trees",

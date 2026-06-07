@@ -476,9 +476,38 @@ mod tests {
 
 fn build_system_prompt(soul: &Soul, memory_context: &str) -> String {
     let soul_text = soul.as_system_prompt();
+    let now = current_datetime_context();
+    let base = format!("{soul_text}\n\n---\n\n{now}");
     if memory_context.is_empty() {
-        soul_text
+        base
     } else {
-        format!("{soul_text}\n\n---\n\n{memory_context}")
+        format!("{base}\n\n---\n\n{memory_context}")
     }
+}
+
+/// Current wall-clock context in Europe/Berlin, injected into every system prompt
+/// so the assistant resolves relative dates ("heute", "kommende Woche") on its own
+/// instead of asking the user.
+fn current_datetime_context() -> String {
+    use chrono::Datelike;
+    use chrono_tz::Europe::Berlin;
+
+    let now = chrono::Utc::now().with_timezone(&Berlin);
+    let weekday = match now.weekday() {
+        chrono::Weekday::Mon => "Montag",
+        chrono::Weekday::Tue => "Dienstag",
+        chrono::Weekday::Wed => "Mittwoch",
+        chrono::Weekday::Thu => "Donnerstag",
+        chrono::Weekday::Fri => "Freitag",
+        chrono::Weekday::Sat => "Samstag",
+        chrono::Weekday::Sun => "Sonntag",
+    };
+    format!(
+        "# Aktuelles Datum und Uhrzeit\n\
+         Heute ist {weekday}, der {}. Uhrzeit: {} (Zeitzone Europe/Berlin).\n\
+         Nutze dieses Datum, um relative Angaben wie \"heute\", \"morgen\", \"diese Woche\" \
+         oder \"kommende Woche\" selbst aufzulösen. Frage NICHT nach dem aktuellen Datum oder Jahr.",
+        now.format("%d.%m.%Y"),
+        now.format("%H:%M")
+    )
 }
