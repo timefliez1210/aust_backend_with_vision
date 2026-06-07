@@ -659,11 +659,16 @@ impl EmailProcessor {
                 continue;
             }
 
-            // Forward offer-related events to the orchestrator via channel
+            // Forward offer-related and assistant events to the orchestrator via channel.
+            // AssistantText/AssistantCallback are routed there so the orchestrator can
+            // resolve telegram_chat_bindings and dispatch to the agent bridge; for an
+            // unbound chat it no-ops and the parallel EditInstructions covers legacy flow.
             match &response.decision {
                 ApprovalDecision::OfferApprove(_)
                 | ApprovalDecision::OfferEdit(_)
-                | ApprovalDecision::OfferDeny(_) => {
+                | ApprovalDecision::OfferDeny(_)
+                | ApprovalDecision::AssistantText { .. }
+                | ApprovalDecision::AssistantCallback { .. } => {
                     if let Some(tx) = &self.offer_tx {
                         let _ = tx.send(response.decision);
                     }
