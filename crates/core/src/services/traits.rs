@@ -228,6 +228,20 @@ pub struct CustomerPatch {
     pub last_name: Option<String>,
 }
 
+/// Fields for creating a new customer (e.g. phone / walk-in intake).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NewCustomer {
+    pub first_name: Option<String>,
+    pub last_name: Option<String>,
+    pub email: Option<String>,
+    pub phone: Option<String>,
+    /// `"private"` (default) or `"business"`.
+    pub customer_type: Option<String>,
+    pub company_name: Option<String>,
+    /// `"Herr"`, `"Frau"` or `"Divers"`.
+    pub salutation: Option<String>,
+}
+
 /// An estimation result summary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EstimationSummary {
@@ -584,6 +598,10 @@ pub trait CalendarService: Send + Sync {
 pub trait CustomerService: Send + Sync {
     /// Fetch a customer snapshot by ID.
     async fn get(&self, id: Uuid) -> Result<CustomerSnapshot, ServiceError>;
+
+    /// Create a new customer record. Requires at least a first/last name or a
+    /// company name. Returns the created snapshot.
+    async fn create(&self, new: NewCustomer) -> Result<CustomerSnapshot, ServiceError>;
 
     /// Full-text search across customer name and email.
     async fn search(

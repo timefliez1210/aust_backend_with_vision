@@ -158,6 +158,7 @@ impl ToolRegistry {
 
         // Customers
         registry.register(Box::new(customers::GetCustomer));
+        registry.register(Box::new(customers::CreateCustomer));
         registry.register(Box::new(customers::SearchCustomers));
         registry.register(Box::new(customers::ListCustomerInquiries));
         registry.register(Box::new(customers::UpdateCustomer));

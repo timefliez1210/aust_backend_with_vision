@@ -57,6 +57,10 @@ pub struct TurnResult {
 /// Maximum tool-calling iterations per turn (prevents infinite loops).
 const MAX_TOOL_ITERATIONS: usize = 10;
 
+/// How many times one turn may be bounced back to the model for citing an
+/// ungrounded ID before we stop relaying its (still fabricated) reply.
+const MAX_GROUNDING_CORRECTIONS: usize = 1;
+
 /// Process one incoming Telegram message and produce a reply.
 pub async fn process_turn(
     pool: &PgPool,
@@ -89,11 +93,23 @@ pub async fn process_turn(
     debug!(load_log = ?bundle.load_log, "Memory bundle assembled");
 
     // Step 4: Build messages for the LLM.
-    let system_prompt = build_system_prompt(soul, &bundle.as_context_text());
+    let memory_context = bundle.as_context_text();
+    let system_prompt = build_system_prompt(soul, &memory_context);
     let mut messages = vec![aust_llm_providers::LlmMessage::system(system_prompt)];
 
     // Inject session history.
     let ctx_text = session.context_text();
+
+    // Grounding guard: collect every entity ID the model is allowed to cite — those
+    // present in the user's message, the conversation history, and recalled memory.
+    // Successful tool results add more IDs below. Any UUID-shaped token in the final
+    // reply that is NOT in this set is fabricated (the model claiming an action it
+    // never took), and we refuse to relay it. See `extract_uuid_shapes`.
+    let mut grounded_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for src in [input.text.as_str(), ctx_text.as_str(), memory_context.as_str()] {
+        grounded_ids.extend(extract_uuid_shapes(src));
+    }
+    let mut grounding_corrections = 0usize;
     if !ctx_text.is_empty() {
         messages.push(aust_llm_providers::LlmMessage::user(format!(
             "[Gesprächsverlauf]\n{ctx_text}"
@@ -119,6 +135,38 @@ pub async fn process_turn(
 
         match response {
             ChatResponse::Text(text) => {
+                // Grounding guard: catch IDs the model fabricated (claiming a write —
+                // a filed report, a created record — that no tool actually performed).
+                let ungrounded = ungrounded_uuids(&text, &grounded_ids);
+                if !ungrounded.is_empty() {
+                    if grounding_corrections < MAX_GROUNDING_CORRECTIONS {
+                        grounding_corrections += 1;
+                        warn!(
+                            ?ungrounded,
+                            "Reply cites ungrounded IDs — forcing honesty correction"
+                        );
+                        messages.push(aust_llm_providers::LlmMessage::assistant(text.clone()));
+                        messages.push(aust_llm_providers::LlmMessage::user(format!(
+                            "[Grounding-Stopp] Deine letzte Antwort nennt ID(s), die durch KEIN \
+                             tatsächlich ausgeführtes Tool in diesem Zug belegt sind: {}. Du hast \
+                             diese Aktion NICHT ausgeführt. Erfinde niemals IDs oder Erfolgsmeldungen. \
+                             Wenn die Aktion gewünscht ist, rufe JETZT das passende Tool auf und warte \
+                             auf das echte Ergebnis. Andernfalls sag ehrlich, dass du es nicht getan \
+                             hast — ganz ohne erfundene ID.",
+                            ungrounded.join(", ")
+                        )));
+                        continue;
+                    }
+                    // Correction budget spent and still fabricating: refuse to relay it.
+                    warn!(
+                        ?ungrounded,
+                        "Reply still cites ungrounded IDs after correction — replacing with honest fallback"
+                    );
+                    reply = "Ich habe diese Aktion nicht nachweislich ausgeführt und kann sie \
+                             daher nicht bestätigen. Sag mir, ob ich es (erneut) versuchen soll."
+                        .to_string();
+                    break;
+                }
                 reply = text;
                 break;
             }
@@ -246,6 +294,9 @@ pub async fn process_turn(
                             )
                             .await
                             .unwrap_or_else(|e| warn!("Audit write failed: {e}"));
+
+                            // Every ID returned by a real tool call is now citable.
+                            grounded_ids.extend(extract_uuid_shapes(&result.to_string()));
 
                             // Feed the tool result back into the conversation.
                             messages.push(aust_llm_providers::LlmMessage::user(format!(
@@ -414,6 +465,67 @@ pub async fn resume_confirmed(
     }
 }
 
+/// Extract all UUID-shaped tokens (8-4-4-4-12 alphanumeric groups) from text,
+/// lowercased. Deliberately matches *alphanumeric* groups, not strict hex, so it
+/// also catches malformed fabrications like `b8c5d9f3-2e4a-5f6g-0b9c-3d4e5f6g7a8c`
+/// (note the invalid `g`) that a strict UUID parser would silently skip.
+pub(crate) fn extract_uuid_shapes(s: &str) -> Vec<String> {
+    const GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
+    let bytes = s.as_bytes();
+    let n = bytes.len();
+    let is_an = |b: u8| b.is_ascii_alphanumeric();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < n {
+        let mut pos = i;
+        let mut matched = true;
+        for (gi, &glen) in GROUPS.iter().enumerate() {
+            let mut k = 0;
+            while k < glen && pos < n && is_an(bytes[pos]) {
+                pos += 1;
+                k += 1;
+            }
+            if k != glen {
+                matched = false;
+                break;
+            }
+            if gi < GROUPS.len() - 1 {
+                if pos < n && bytes[pos] == b'-' {
+                    pos += 1;
+                } else {
+                    matched = false;
+                    break;
+                }
+            }
+        }
+        // Require clean boundaries so a longer run isn't partially matched.
+        let prev_ok = i == 0 || !(is_an(bytes[i - 1]) || bytes[i - 1] == b'-');
+        let next_ok = pos >= n || !(is_an(bytes[pos]) || bytes[pos] == b'-');
+        if matched && prev_ok && next_ok {
+            out.push(s[i..pos].to_ascii_lowercase());
+            i = pos;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Return the deduplicated UUID-shaped tokens in `text` that are not present in
+/// `grounded` (i.e. not backed by user input, history, memory, or a tool result).
+pub(crate) fn ungrounded_uuids(
+    text: &str,
+    grounded: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut seen = Vec::new();
+    for u in extract_uuid_shapes(text) {
+        if !grounded.contains(&u) && !seen.contains(&u) {
+            seen.push(u);
+        }
+    }
+    seen
+}
+
 /// Extract entity scopes from a tool-call argument map (S4 helper).
 ///
 /// Returns scope strings like `"inquiry:<uuid>"`, `"customer:<uuid>"`, etc.
@@ -471,6 +583,37 @@ mod tests {
         let args = json!({ "inquiry_id": id });
         let new_scopes = extract_scopes_from_args(&args, &existing, 10);
         assert!(new_scopes.is_empty(), "duplicate scope must not be added");
+    }
+
+    /// Grounding: a real UUID in backticks is extracted (lowercased).
+    #[test]
+    fn extract_uuid_shapes_finds_real_uuid() {
+        let out = extract_uuid_shapes("Report `37BEE26C-412B-4DBE-A70F-1684FC0831C2` erfasst.");
+        assert_eq!(out, vec!["37bee26c-412b-4dbe-a70f-1684fc0831c2"]);
+    }
+
+    /// Grounding: the malformed fabrication (invalid hex `g`) is still caught,
+    /// because matching is alphanumeric-shaped, not strict hex.
+    #[test]
+    fn extract_uuid_shapes_catches_malformed_fabrication() {
+        let out = extract_uuid_shapes("ID b8c5d9f3-2e4a-5f6g-0b9c-3d4e5f6g7a8c geschlossen");
+        assert_eq!(out, vec!["b8c5d9f3-2e4a-5f6g-0b9c-3d4e5f6g7a8c"]);
+    }
+
+    /// Grounding: plain prose with no IDs yields nothing.
+    #[test]
+    fn extract_uuid_shapes_ignores_prose() {
+        assert!(extract_uuid_shapes("Alles erledigt, kein Problem.").is_empty());
+    }
+
+    /// Grounding: an ID present in the grounded set is allowed; a fabricated one is flagged.
+    #[test]
+    fn ungrounded_uuids_flags_only_unbacked_ids() {
+        let mut grounded = std::collections::HashSet::new();
+        grounded.insert("37bee26c-412b-4dbe-a70f-1684fc0831c2".to_string());
+        let text = "Echt: 37bee26c-412b-4dbe-a70f-1684fc0831c2, erfunden: 7a4f8c2e-1d3b-4e5f-9a8b-2c3d4e5f6a7b.";
+        let out = ungrounded_uuids(text, &grounded);
+        assert_eq!(out, vec!["7a4f8c2e-1d3b-4e5f-9a8b-2c3d4e5f6a7b"]);
     }
 }
 

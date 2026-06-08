@@ -412,6 +412,18 @@ impl CustomerService for MockCustomerService {
         Ok(mock_customer_snapshot(id))
     }
 
+    async fn create(
+        &self,
+        new: aust_core::services::NewCustomer,
+    ) -> Result<CustomerSnapshot, ServiceError> {
+        let mut snap = mock_customer_snapshot(Uuid::new_v4());
+        snap.first_name = new.first_name;
+        snap.last_name = new.last_name;
+        snap.phone = new.phone;
+        snap.email = new.email;
+        Ok(snap)
+    }
+
     async fn search(
         &self,
         _query: &str,

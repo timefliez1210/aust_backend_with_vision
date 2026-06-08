@@ -5,7 +5,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use aust_core::models::{CustomerSnapshot, InquiryListItem};
-use aust_core::services::{CustomerPatch, CustomerService, ServiceError};
+use aust_core::services::{CustomerPatch, CustomerService, NewCustomer, ServiceError};
 
 use crate::services::inquiry_builder;
 
@@ -67,6 +67,86 @@ impl CustomerService for CustomerServiceImpl {
         let (id, salutation, first_name, last_name, email, phone, customer_type, company_name) =
             row.ok_or_else(|| ServiceError::NotFound(format!("Kunde {id}")))?;
 
+        Ok(row_to_snapshot(id, salutation, first_name, last_name, email, phone, customer_type, company_name))
+    }
+
+    async fn create(&self, new: NewCustomer) -> Result<CustomerSnapshot, ServiceError> {
+        // Validate customer_type against the DB CHECK (private|business) up front so
+        // a bad value returns a clean German message instead of an opaque 500.
+        let customer_type = match new.customer_type.as_deref().map(str::trim) {
+            None | Some("") => "private",
+            Some(t @ ("private" | "business")) => t,
+            Some(other) => {
+                return Err(ServiceError::Validation(format!(
+                    "Ungültiger Kundentyp '{other}' (erlaubt: private, business)."
+                )))
+            }
+        };
+
+        let salutation = match new.salutation.as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some(s @ ("Herr" | "Frau" | "Divers")) => Some(s.to_string()),
+            Some(other) => {
+                return Err(ServiceError::Validation(format!(
+                    "Ungültige Anrede '{other}' (erlaubt: Herr, Frau, Divers)."
+                )))
+            }
+        };
+
+        let first = new.first_name.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let last = new.last_name.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let company = new.company_name.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let email = new.email.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let phone = new.phone.as_deref().map(str::trim).filter(|s| !s.is_empty());
+
+        if first.is_none() && last.is_none() && company.is_none() {
+            return Err(ServiceError::Validation(
+                "Mindestens Vor-/Nachname oder Firmenname erforderlich.".to_string(),
+            ));
+        }
+
+        let name = match (first, last) {
+            (Some(f), Some(l)) => Some(format!("{f} {l}")),
+            (Some(f), None) => Some(f.to_string()),
+            (None, Some(l)) => Some(l.to_string()),
+            (None, None) => company.map(str::to_string),
+        };
+
+        let id = Uuid::now_v7();
+        let now = chrono::Utc::now();
+
+        let row: (
+            Uuid,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            r#"
+            INSERT INTO customers
+                (id, email, name, salutation, first_name, last_name, phone, customer_type, company_name, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)
+            RETURNING id, salutation, first_name, last_name, email, phone, customer_type, company_name
+            "#,
+        )
+        .bind(id)
+        .bind(email)
+        .bind(name.as_deref())
+        .bind(salutation.as_deref())
+        .bind(first)
+        .bind(last)
+        .bind(phone)
+        .bind(customer_type)
+        .bind(company)
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(super::map_sqlx)?;
+
+        let (id, salutation, first_name, last_name, email, phone, customer_type, company_name) = row;
         Ok(row_to_snapshot(id, salutation, first_name, last_name, email, phone, customer_type, company_name))
     }
 

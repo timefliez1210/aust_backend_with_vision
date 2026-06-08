@@ -17,7 +17,7 @@ pub use traits::{
     ComputedLineItem, CrewMember, CustomerPatch, CustomerService, DistanceResult, EmailDetail, EmailService,
     EmailSummary, EmployeePatch, EmployeeRecord, EmployeeService, EmployeeWorkloadEntry,
     EstimationService, EstimationSummary, FeedbackRecord, InquiryService, InvoiceDetail,
-    InvoiceReminder, InvoiceService, InvoiceSummary, MetricsService, OfferComputation, OfferDraft,
+    InvoiceReminder, InvoiceService, InvoiceSummary, MetricsService, NewCustomer, OfferComputation, OfferDraft,
     OfferOverrides, OfferPreview, OfferService, OfferVersion, PipelineMetrics, PricingConfig,
     ReviewRecord, ReviewService, RevisionStatus, SettingsService, TodoRecord, TodoService,
 };

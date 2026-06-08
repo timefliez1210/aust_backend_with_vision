@@ -90,6 +90,47 @@ impl Tool for ListCustomerInquiries {
     }
 }
 
+// ── CreateCustomer ────────────────────────────────────────────────────────────
+
+pub struct CreateCustomer;
+
+#[async_trait]
+impl Tool for CreateCustomer {
+    fn name(&self) -> &'static str { "create_customer" }
+    fn description(&self) -> &'static str {
+        "Legt einen neuen Kundendatensatz an — z. B. für telefonische oder Walk-in-Anfragen. \
+         Mindestens Vor-/Nachname oder Firmenname ist nötig. customer_type ist 'private' (Standard) \
+         oder 'business'. E-Mail und Telefon sind optional."
+    }
+    fn params_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "first_name":    { "type": "string" },
+                "last_name":     { "type": "string" },
+                "email":         { "type": "string" },
+                "phone":         { "type": "string" },
+                "customer_type": { "type": "string", "enum": ["private", "business"] },
+                "company_name":  { "type": "string" },
+                "salutation":    { "type": "string", "enum": ["Herr", "Frau", "Divers"] }
+            }
+        })
+    }
+    fn safety(&self) -> Safety { Safety::Write }
+    fn min_role(&self) -> Role { Role::Operator }
+
+    async fn execute(&self, ctx: &ToolCtx, args: &Value) -> Result<Value> {
+        let new: aust_core::services::NewCustomer = serde_json::from_value(args.clone())?;
+        match ctx.services.customers.create(new).await {
+            Ok(snap) => Ok(json!({ "ok": true, "customer": snap })),
+            Err(aust_core::services::ServiceError::Validation(msg)) => {
+                Ok(json!({ "ok": false, "message": msg }))
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
 // ── UpdateCustomer ────────────────────────────────────────────────────────────
 
 pub struct UpdateCustomer;
@@ -243,6 +284,17 @@ mod tests {
         let services = testing::mock_bundle(uuid::Uuid::new_v4(), id, uuid::Uuid::new_v4());
         let r = ListCustomerInquiries.execute(&ctx(services), &json!({ "customer_id": id })).await.unwrap();
         assert_eq!(r["count"], json!(0));
+    }
+
+    #[tokio::test]
+    async fn create_customer_ok() {
+        let services = testing::mock_bundle(uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let r = CreateCustomer
+            .execute(&ctx(services), &json!({ "first_name": "Clemens", "last_name": "Fabig", "phone": "09286284042" }))
+            .await
+            .unwrap();
+        assert_eq!(r["ok"], json!(true));
+        assert!(r["customer"]["id"].is_string());
     }
 
     #[tokio::test]
