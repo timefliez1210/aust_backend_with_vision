@@ -20,6 +20,7 @@ pub mod inquiry_service_impl;
 pub mod invoice_service_impl;
 pub mod metrics_service_impl;
 pub mod offer_service_impl;
+pub mod reminder_service_impl;
 pub mod review_service_impl;
 pub mod settings_service_impl;
 pub mod todo_service_impl;
@@ -34,6 +35,7 @@ pub use inquiry_service_impl::InquiryServiceImpl;
 pub use invoice_service_impl::InvoiceServiceImpl;
 pub use metrics_service_impl::MetricsServiceImpl;
 pub use offer_service_impl::OfferServiceImpl;
+pub use reminder_service_impl::ReminderServiceImpl;
 pub use review_service_impl::ReviewServiceImpl;
 pub use settings_service_impl::SettingsServiceImpl;
 pub use todo_service_impl::TodoServiceImpl;
@@ -62,6 +64,7 @@ pub fn build_service_bundle(
         settings: Arc::new(SettingsServiceImpl::new(pool.clone(), config)),
         reviews: Arc::new(ReviewServiceImpl::new(pool.clone())),
         metrics: Arc::new(MetricsServiceImpl::new(pool.clone())),
-        todos: Arc::new(TodoServiceImpl::new(pool)),
+        todos: Arc::new(TodoServiceImpl::new(pool.clone())),
+        reminders: Arc::new(ReminderServiceImpl::new(pool)),
     }
 }

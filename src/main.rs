@@ -260,6 +260,30 @@ async fn main() -> Result<()> {
         tracing::info!("Retention sweeper started (6 h interval)");
     }
 
+    // ── Reminder tick ───────────────────────────────────────────────────────────
+    // Every 60s: reconcile the unhandled-email nag and fire any due reminders
+    // (set_reminder + the auto email reminders) back to Telegram.
+    {
+        let reminder_pool = state.db.clone();
+        let reminder_notifier: Arc<dyn TelegramNotifier> =
+            Arc::new(TelegramNotifierImpl::new(config.telegram.bot_token.clone()));
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                if let Err(e) = aust_assistant::hooks::reminders::run_reminder_tick(
+                    &reminder_pool,
+                    reminder_notifier.as_ref(),
+                )
+                .await
+                {
+                    tracing::warn!("Reminder tick failed: {e}");
+                }
+            }
+        });
+        tracing::info!("Reminder tick started (60 s interval)");
+    }
+
     // Create router and start server
     let app = create_router(state);
 

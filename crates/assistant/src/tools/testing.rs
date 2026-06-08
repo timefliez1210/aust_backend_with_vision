@@ -17,8 +17,8 @@ use aust_core::services::{
     EstimationService, EstimationSummary, FeedbackRecord, InquiryService, InvoiceDetail,
     InvoiceReminder, InvoiceService, InvoiceSummary, MetricsService, OfferComputation, OfferDraft,
     OfferOverrides as CoreOfferOverrides, OfferPreview, OfferService, OfferVersion,
-    PipelineMetrics, PricingConfig, ReviewRecord, ReviewService, RevisionStatus, ServiceBundle,
-    ServiceError, SettingsService, TodoRecord, TodoService,
+    PipelineMetrics, PricingConfig, ReminderRecord, ReminderService, ReviewRecord, ReviewService,
+    RevisionStatus, ServiceBundle, ServiceError, SettingsService, TodoRecord, TodoService,
 };
 
 // ── Inquiry mock ──────────────────────────────────────────────────────────────
@@ -244,6 +244,9 @@ impl CalendarService for MockCalendarService {
             category: "moving".to_string(),
             scheduled_date: Some(from),
             end_date: None,
+            start_time: None,
+            end_time: None,
+            location: None,
             kind: "termin".to_string(),
         }])
     }
@@ -270,6 +273,9 @@ impl CalendarService for MockCalendarService {
             category: category.to_string(),
             scheduled_date: Some(scheduled_date),
             end_date,
+            start_time: None,
+            end_time: None,
+            location: None,
             kind: "termin".to_string(),
         })
     }
@@ -285,6 +291,9 @@ impl CalendarService for MockCalendarService {
             category: patch.category.unwrap_or_else(|| "moving".to_string()),
             scheduled_date: patch.scheduled_date,
             end_date: patch.end_date,
+            start_time: None,
+            end_time: None,
+            location: None,
             kind: "termin".to_string(),
         })
     }
@@ -306,6 +315,9 @@ impl CalendarService for MockCalendarService {
             category: "moving".to_string(),
             scheduled_date: Some(date),
             end_date: None,
+            start_time: None,
+            end_time: None,
+            location: None,
             kind: "termin".to_string(),
         })
     }
@@ -322,6 +334,9 @@ impl CalendarService for MockCalendarService {
             category: "moving".to_string(),
             scheduled_date: new_date,
             end_date: None,
+            start_time: None,
+            end_time: None,
+            location: None,
             kind: "termin".to_string(),
         })
     }
@@ -846,6 +861,48 @@ impl TodoService for MockTodoService {
     }
 }
 
+// ── Reminder mock ───────────────────────────────────────────────────────────────
+
+pub struct MockReminderService;
+
+fn mock_reminder(chat_id: i64, text: &str, due_at: chrono::DateTime<Utc>, recurring: bool) -> ReminderRecord {
+    ReminderRecord {
+        id: Uuid::new_v4(),
+        chat_id,
+        text: text.to_string(),
+        due_at,
+        recurrence: if recurring { "recurring" } else { "none" }.to_string(),
+        source: "manual".to_string(),
+        active: true,
+        fired_count: 0,
+        created_at: Utc::now(),
+    }
+}
+
+#[async_trait]
+impl ReminderService for MockReminderService {
+    async fn create(
+        &self,
+        chat_id: i64,
+        text: &str,
+        due_at: chrono::DateTime<Utc>,
+        recurring: bool,
+    ) -> Result<ReminderRecord, ServiceError> {
+        Ok(mock_reminder(chat_id, text, due_at, recurring))
+    }
+
+    async fn list(&self, chat_id: i64, _active_only: bool) -> Result<Vec<ReminderRecord>, ServiceError> {
+        Ok(vec![mock_reminder(chat_id, "Kunde anrufen", Utc::now(), false)])
+    }
+
+    async fn cancel(&self, id: Uuid) -> Result<ReminderRecord, ServiceError> {
+        let mut r = mock_reminder(0, "Kunde anrufen", Utc::now(), false);
+        r.id = id;
+        r.active = false;
+        Ok(r)
+    }
+}
+
 // ── Bundle factory ────────────────────────────────────────────────────────────
 
 /// A pre-wired `ServiceBundle` with all-mock implementations and a fixed inquiry/offer ID.
@@ -864,5 +921,6 @@ pub fn mock_bundle(inquiry_id: Uuid, customer_id: Uuid, offer_id: Uuid) -> Servi
         reviews: Arc::new(MockReviewService),
         metrics: Arc::new(MockMetricsService),
         todos: Arc::new(MockTodoService),
+        reminders: Arc::new(MockReminderService),
     }
 }

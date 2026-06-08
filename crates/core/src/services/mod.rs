@@ -19,5 +19,6 @@ pub use traits::{
     EstimationService, EstimationSummary, FeedbackRecord, InquiryService, InvoiceDetail,
     InvoiceReminder, InvoiceService, InvoiceSummary, MetricsService, NewCustomer, OfferComputation, OfferDraft,
     OfferOverrides, OfferPreview, OfferService, OfferVersion, PipelineMetrics, PricingConfig,
-    ReviewRecord, ReviewService, RevisionStatus, SettingsService, TodoRecord, TodoService,
+    ReminderRecord, ReminderService, ReviewRecord, ReviewService, RevisionStatus, SettingsService,
+    TodoRecord, TodoService,
 };

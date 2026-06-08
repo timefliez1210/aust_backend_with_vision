@@ -5,7 +5,7 @@ use std::sync::Arc;
 use super::traits::{
     AddressService, CalendarService, CustomerService, EmailService, EmployeeService,
     EstimationService, InquiryService, InvoiceService, MetricsService, OfferService,
-    ReviewService, SettingsService, TodoService,
+    ReminderService, ReviewService, SettingsService, TodoService,
 };
 
 /// A cloneable bundle of all domain service trait objects.
@@ -28,4 +28,5 @@ pub struct ServiceBundle {
     pub reviews: Arc<dyn ReviewService>,
     pub metrics: Arc<dyn MetricsService>,
     pub todos: Arc<dyn TodoService>,
+    pub reminders: Arc<dyn ReminderService>,
 }

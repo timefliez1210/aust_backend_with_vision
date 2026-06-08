@@ -152,7 +152,8 @@ impl Tool for UpdateCustomer {
                         "phone":      { "type": "string" },
                         "email":      { "type": "string" },
                         "first_name": { "type": "string" },
-                        "last_name":  { "type": "string" }
+                        "last_name":  { "type": "string" },
+                        "salutation": { "type": "string", "enum": ["Herr", "Frau", "Divers"] }
                     }
                 }
             },

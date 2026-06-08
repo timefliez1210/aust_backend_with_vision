@@ -18,6 +18,7 @@ pub mod inquiries;
 pub mod invoices;
 pub mod meta;
 pub mod offers;
+pub mod reminders;
 pub mod reviews;
 pub mod settings;
 
@@ -225,6 +226,11 @@ impl ToolRegistry {
         registry.register(Box::new(meta::CreateTodo));
         registry.register(Box::new(meta::ListTodos));
         registry.register(Box::new(meta::ResolveTodo));
+
+        // Reminders
+        registry.register(Box::new(reminders::SetReminder));
+        registry.register(Box::new(reminders::ListReminders));
+        registry.register(Box::new(reminders::CancelReminder));
 
         registry
     }

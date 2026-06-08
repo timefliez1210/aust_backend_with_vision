@@ -9,7 +9,7 @@
 //! The assembly is pure read-only: no writes, no LLM calls. The scheduler wires
 //! this into a morning cron job (not yet implemented — Phase 3).
 
-use chrono::{NaiveDate, Utc};
+use chrono::{NaiveDate, NaiveTime, Utc};
 use serde::Serialize;
 use sqlx::PgPool;
 
@@ -22,6 +22,12 @@ pub struct BriefingAppointment {
     pub title: String,
     pub category: String,
     pub scheduled_date: Option<NaiveDate>,
+    /// Start time of day, if set.
+    pub start_time: Option<NaiveTime>,
+    /// Free-text location/address, if set.
+    pub location: Option<String>,
+    /// `"termin"` (internal calendar item) or `"auftrag"` (a scheduled move).
+    pub kind: String,
 }
 
 /// An overdue invoice summary in the briefing.
@@ -80,7 +86,17 @@ impl Briefing {
                 self.todays_appointments.len()
             ));
             for a in &self.todays_appointments {
-                lines.push(format!("  • {} ({})", a.title, a.category));
+                let time = a
+                    .start_time
+                    .map(|t| format!("{} ", t.format("%H:%M")))
+                    .unwrap_or_default();
+                let loc = a
+                    .location
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map(|s| format!(" — {s}"))
+                    .unwrap_or_default();
+                lines.push(format!("  • {time}{} ({}){loc}", a.title, a.category));
             }
         }
 
@@ -124,26 +140,79 @@ pub async fn assemble(pool: &PgPool) -> Result<Briefing> {
         ..Default::default()
     };
 
-    // 1. Today's calendar appointments.
-    let appointments: Vec<(uuid::Uuid, String, String, Option<NaiveDate>)> = sqlx::query_as(
+    // 1. Today's appointments — BOTH internal calendar items AND scheduled
+    //    moving jobs (inquiries). Use overlap logic (start <= today <= end) so
+    //    multi-day jobs show on every day they run, not just the start day.
+    //    Previously this queried calendar_items with `scheduled_date = today`
+    //    only, so every scheduled Auftrag and every day-2+ of a multi-day job
+    //    was invisible in the briefing.
+    type ApptRow = (
+        uuid::Uuid,
+        String,
+        String,
+        Option<NaiveDate>,
+        Option<NaiveTime>,
+        Option<String>,
+        String,
+    );
+
+    let cal_items: Vec<ApptRow> = sqlx::query_as(
         r#"
-        SELECT id, title, category, scheduled_date
+        SELECT id, title, category, scheduled_date, start_time, location, 'termin'::text AS kind
         FROM calendar_items
-        WHERE scheduled_date = $1
-        ORDER BY start_time ASC
+        WHERE scheduled_date <= $1
+          AND COALESCE(end_date, scheduled_date) >= $1
+          AND status IS DISTINCT FROM 'cancelled'
+        ORDER BY start_time ASC NULLS LAST
         "#,
     )
     .bind(today)
     .fetch_all(pool)
     .await?;
 
-    briefing.todays_appointments = appointments
+    let jobs: Vec<ApptRow> = sqlx::query_as(
+        r#"
+        SELECT
+            i.id,
+            COALESCE(
+                NULLIF(TRIM(COALESCE(c.first_name,'') || ' ' || COALESCE(c.last_name,'')), ''),
+                c.name, c.email, 'Anfrage'
+            ) AS title,
+            COALESCE(i.service_type, 'umzug') AS category,
+            i.scheduled_date,
+            i.start_time,
+            NULLIF(TRIM(
+                COALESCE(a.street, '') || ' ' || COALESCE(a.house_number, '') || ', ' ||
+                COALESCE(a.postal_code, '') || ' ' || COALESCE(a.city, '')
+            ), ', ') AS location,
+            'auftrag'::text AS kind
+        FROM inquiries i
+        JOIN customers c ON c.id = i.customer_id
+        LEFT JOIN addresses a ON a.id = i.origin_address_id
+        WHERE i.scheduled_date IS NOT NULL
+          AND i.scheduled_date <= $1
+          AND COALESCE(i.end_date, i.scheduled_date) >= $1
+          AND i.status NOT IN ('cancelled', 'rejected', 'expired')
+        ORDER BY i.start_time ASC NULLS LAST
+        "#,
+    )
+    .bind(today)
+    .fetch_all(pool)
+    .await?;
+
+    briefing.todays_appointments = cal_items
         .into_iter()
-        .map(|(id, title, category, scheduled_date)| BriefingAppointment {
-            id,
-            title,
-            category,
-            scheduled_date,
+        .chain(jobs)
+        .map(|(id, title, category, scheduled_date, start_time, location, kind)| {
+            BriefingAppointment {
+                id,
+                title,
+                category,
+                scheduled_date,
+                start_time,
+                location,
+                kind,
+            }
         })
         .collect();
 
@@ -234,6 +303,9 @@ mod tests {
                 title: "Umzug Müller".to_string(),
                 category: "Umzug".to_string(),
                 scheduled_date: Some(NaiveDate::from_ymd_opt(2026, 6, 9).unwrap()),
+                start_time: NaiveTime::from_hms_opt(9, 30, 0),
+                location: Some("Hauptstr. 1, 31137 Hildesheim".to_string()),
+                kind: "auftrag".to_string(),
             }],
             overdue_invoices: vec![BriefingInvoice {
                 id: Uuid::now_v7(),
@@ -252,6 +324,9 @@ mod tests {
         let text = briefing.to_telegram_text();
         assert!(text.contains("Umzug Müller"));
         assert!(text.contains("09.06.2026"));
+        // Time and address must now be surfaced in the line.
+        assert!(text.contains("09:30"));
+        assert!(text.contains("Hauptstr. 1"));
     }
 
     #[test]

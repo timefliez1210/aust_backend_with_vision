@@ -12,6 +12,18 @@ use aust_core::services::{
 
 use crate::repositories::calendar_item_repo;
 
+/// Row shape for a single `calendar_items` read with time + location columns.
+type TerminRow = (
+    Uuid,
+    String,
+    String,
+    Option<NaiveDate>,
+    Option<NaiveDate>,
+    Option<NaiveTime>,
+    Option<NaiveTime>,
+    Option<String>,
+);
+
 pub struct CalendarServiceImpl {
     pool: PgPool,
 }
@@ -32,28 +44,47 @@ impl CalendarService for CalendarServiceImpl {
         // Internal calendar items overlapping the range. Use overlap logic
         // (start <= to AND end >= from) so multi-day items that begin before the
         // window are still returned.
-        let cal_rows: Vec<(Uuid, String, String, Option<NaiveDate>, Option<NaiveDate>)> =
-            sqlx::query_as(
-                r#"
-                SELECT id, title, category, scheduled_date, end_date
+        type CalRow = (
+            Uuid,
+            String,
+            String,
+            Option<NaiveDate>,
+            Option<NaiveDate>,
+            Option<NaiveTime>,
+            Option<NaiveTime>,
+            Option<String>,
+        );
+        let cal_rows: Vec<CalRow> = sqlx::query_as(
+            r#"
+                SELECT id, title, category, scheduled_date, end_date,
+                       start_time, end_time, location
                 FROM calendar_items
                 WHERE scheduled_date <= $2
                   AND COALESCE(end_date, scheduled_date) >= $1
                 ORDER BY scheduled_date ASC, start_time ASC
                 "#,
-            )
-            .bind(from)
-            .bind(to)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(super::map_sqlx)?;
+        )
+        .bind(from)
+        .bind(to)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(super::map_sqlx)?;
 
         // Actual moving jobs (inquiries with a scheduled date) overlapping the
         // range. Without this the assistant's calendar was blind to every real
         // Umzug/Montage — only internal calendar_items showed up.
-        let inq_rows: Vec<(Uuid, String, Option<String>, Option<NaiveDate>, Option<NaiveDate>)> =
-            sqlx::query_as(
-                r#"
+        type InqRow = (
+            Uuid,
+            String,
+            Option<String>,
+            Option<NaiveDate>,
+            Option<NaiveDate>,
+            Option<NaiveTime>,
+            Option<NaiveTime>,
+            Option<String>,
+        );
+        let inq_rows: Vec<InqRow> = sqlx::query_as(
+            r#"
                 SELECT
                     i.id,
                     COALESCE(
@@ -62,41 +93,60 @@ impl CalendarService for CalendarServiceImpl {
                     ) AS title,
                     i.service_type,
                     i.scheduled_date,
-                    i.end_date
+                    i.end_date,
+                    i.start_time,
+                    i.end_time,
+                    NULLIF(TRIM(
+                        COALESCE(a.street, '') || ' ' || COALESCE(a.house_number, '') || ', ' ||
+                        COALESCE(a.postal_code, '') || ' ' || COALESCE(a.city, '')
+                    ), ', ') AS location
                 FROM inquiries i
                 JOIN customers c ON c.id = i.customer_id
+                LEFT JOIN addresses a ON a.id = i.origin_address_id
                 WHERE i.scheduled_date IS NOT NULL
                   AND i.scheduled_date <= $2
                   AND COALESCE(i.end_date, i.scheduled_date) >= $1
                   AND i.status NOT IN ('cancelled', 'rejected', 'expired')
                 ORDER BY i.scheduled_date ASC
                 "#,
-            )
-            .bind(from)
-            .bind(to)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(super::map_sqlx)?;
+        )
+        .bind(from)
+        .bind(to)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(super::map_sqlx)?;
 
         let mut items: Vec<CalendarItem> = cal_rows
             .into_iter()
-            .map(|(id, title, category, scheduled_date, end_date)| CalendarItem {
-                id,
-                title,
-                category,
-                scheduled_date,
-                end_date,
-                kind: "termin".to_string(),
-            })
+            .map(
+                |(id, title, category, scheduled_date, end_date, start_time, end_time, location)| {
+                    CalendarItem {
+                        id,
+                        title,
+                        category,
+                        scheduled_date,
+                        end_date,
+                        start_time,
+                        end_time,
+                        location,
+                        kind: "termin".to_string(),
+                    }
+                },
+            )
             .collect();
         items.extend(inq_rows.into_iter().map(
-            |(id, title, service_type, scheduled_date, end_date)| CalendarItem {
-                id,
-                title,
-                category: service_type.unwrap_or_else(|| "umzug".to_string()),
-                scheduled_date,
-                end_date,
-                kind: "auftrag".to_string(),
+            |(id, title, service_type, scheduled_date, end_date, start_time, end_time, location)| {
+                CalendarItem {
+                    id,
+                    title,
+                    category: service_type.unwrap_or_else(|| "umzug".to_string()),
+                    scheduled_date,
+                    end_date,
+                    start_time,
+                    end_time,
+                    location,
+                    kind: "auftrag".to_string(),
+                }
             },
         ));
         items.sort_by(|a, b| a.scheduled_date.cmp(&b.scheduled_date));
@@ -177,6 +227,9 @@ impl CalendarService for CalendarServiceImpl {
             category: category.to_string(),
             scheduled_date: Some(scheduled_date),
             end_date,
+            start_time: Some(default_time),
+            end_time: None,
+            location: None,
             kind: "termin".to_string(),
         })
     }
@@ -209,19 +262,29 @@ impl CalendarService for CalendarServiceImpl {
         .await
         .map_err(super::map_sqlx)?;
 
-        let row: Option<(Uuid, String, String, Option<NaiveDate>, Option<NaiveDate>)> =
-            sqlx::query_as(
-                "SELECT id, title, category, scheduled_date, end_date FROM calendar_items WHERE id = $1",
-            )
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(super::map_sqlx)?;
+        let row: Option<TerminRow> = sqlx::query_as(
+            "SELECT id, title, category, scheduled_date, end_date, start_time, end_time, location \
+             FROM calendar_items WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(super::map_sqlx)?;
 
-        let (id, title, category, scheduled_date, end_date) =
+        let (id, title, category, scheduled_date, end_date, start_time, end_time, location) =
             row.ok_or_else(|| ServiceError::NotFound(format!("Kalendereintrag {id}")))?;
 
-        Ok(CalendarItem { id, title, category, scheduled_date, end_date, kind: "termin".to_string() })
+        Ok(CalendarItem {
+            id,
+            title,
+            category,
+            scheduled_date,
+            end_date,
+            start_time,
+            end_time,
+            location,
+            kind: "termin".to_string(),
+        })
     }
 
     async fn delete_item(&self, id: Uuid) -> Result<(), ServiceError> {
@@ -304,6 +367,9 @@ impl CalendarService for CalendarServiceImpl {
             category: "moving".to_string(),
             scheduled_date: Some(date),
             end_date: None,
+            start_time: Some(default_time),
+            end_time: None,
+            location: None,
             kind: "termin".to_string(),
         })
     }
@@ -359,19 +425,29 @@ impl CalendarService for CalendarServiceImpl {
             }
         }
 
-        let row: Option<(Uuid, String, String, Option<NaiveDate>, Option<NaiveDate>)> =
-            sqlx::query_as(
-                "SELECT id, title, category, scheduled_date, end_date FROM calendar_items WHERE id = $1",
-            )
-            .bind(termin_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(super::map_sqlx)?;
+        let row: Option<TerminRow> = sqlx::query_as(
+            "SELECT id, title, category, scheduled_date, end_date, start_time, end_time, location \
+             FROM calendar_items WHERE id = $1",
+        )
+        .bind(termin_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(super::map_sqlx)?;
 
-        let (id, title, category, scheduled_date, end_date) =
+        let (id, title, category, scheduled_date, end_date, start_time, end_time, location) =
             row.ok_or_else(|| ServiceError::NotFound(format!("Termin {termin_id}")))?;
 
-        Ok(CalendarItem { id, title, category, scheduled_date, end_date, kind: "termin".to_string() })
+        Ok(CalendarItem {
+            id,
+            title,
+            category,
+            scheduled_date,
+            end_date,
+            start_time,
+            end_time,
+            location,
+            kind: "termin".to_string(),
+        })
     }
 
     async fn cancel_termin(&self, id: Uuid, _reason: &str) -> Result<(), ServiceError> {

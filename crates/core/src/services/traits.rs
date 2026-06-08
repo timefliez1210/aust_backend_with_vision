@@ -5,7 +5,7 @@
 //! in `crates/api/src/services/bridge/`.
 
 use async_trait::async_trait;
-use chrono::NaiveDate;
+use chrono::{NaiveDate, NaiveTime};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -126,6 +126,14 @@ pub struct CalendarItem {
     pub category: String,
     pub scheduled_date: Option<NaiveDate>,
     pub end_date: Option<NaiveDate>,
+    /// Start time of day (e.g. `10:00`), if set. Lives in `calendar_items` /
+    /// `inquiries`; previously dropped, which left the assistant blind to the
+    /// hour of every appointment.
+    pub start_time: Option<NaiveTime>,
+    /// End time of day, if set.
+    pub end_time: Option<NaiveTime>,
+    /// Free-text location/address for the appointment, if set.
+    pub location: Option<String>,
     /// Origin of this row, so the caller knows which write tools apply:
     /// `"termin"` → a `calendar_items` row (use reassign_termin / delete /
     /// assign_employee with this id); `"auftrag"` → a moving job derived from
@@ -226,6 +234,8 @@ pub struct CustomerPatch {
     pub email: Option<String>,
     pub first_name: Option<String>,
     pub last_name: Option<String>,
+    /// Anrede: `"Herr"` / `"Frau"` / `"Divers"`.
+    pub salutation: Option<String>,
 }
 
 /// Fields for creating a new customer (e.g. phone / walk-in intake).
@@ -330,6 +340,22 @@ pub struct TodoRecord {
     pub status: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub resolved_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// An active reminder the assistant fires back to a Telegram chat.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReminderRecord {
+    pub id: Uuid,
+    pub chat_id: i64,
+    pub text: String,
+    pub due_at: chrono::DateTime<chrono::Utc>,
+    /// `"none"` (one-shot) or `"recurring"` (every ~3h within business hours).
+    pub recurrence: String,
+    /// `"manual"` or `"email"` (auto-created by the email nag reconciler).
+    pub source: String,
+    pub active: bool,
+    pub fired_count: i32,
+    pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// An available calendar slot.
@@ -881,4 +907,30 @@ pub trait TodoService: Send + Sync {
 
     /// Resolve a to-do item.
     async fn resolve(&self, id: Uuid) -> Result<(), ServiceError>;
+}
+
+// ── Reminders ───────────────────────────────────────────────────────────────────
+
+/// Manage active reminders that the background tick fires back to Telegram.
+#[async_trait]
+pub trait ReminderService: Send + Sync {
+    /// Create a reminder for `chat_id`. `recurring` reminders re-fire every ~3h
+    /// within business hours until cancelled; otherwise it fires once.
+    async fn create(
+        &self,
+        chat_id: i64,
+        text: &str,
+        due_at: chrono::DateTime<chrono::Utc>,
+        recurring: bool,
+    ) -> Result<ReminderRecord, ServiceError>;
+
+    /// List reminders for a chat, optionally only the active ones.
+    async fn list(
+        &self,
+        chat_id: i64,
+        active_only: bool,
+    ) -> Result<Vec<ReminderRecord>, ServiceError>;
+
+    /// Deactivate a reminder ("turn it off"). Returns the cancelled record.
+    async fn cancel(&self, id: Uuid) -> Result<ReminderRecord, ServiceError>;
 }

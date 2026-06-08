@@ -239,6 +239,7 @@ impl CustomerService for CustomerServiceImpl {
                 email = COALESCE($3, email),
                 first_name = COALESCE($4, first_name),
                 last_name = COALESCE($5, last_name),
+                salutation = COALESCE($6, salutation),
                 name = CASE
                     WHEN $4 IS NOT NULL OR $5 IS NOT NULL
                     THEN COALESCE($4, first_name) || ' ' || COALESCE($5, last_name)
@@ -252,6 +253,7 @@ impl CustomerService for CustomerServiceImpl {
         .bind(patch.email.as_deref())
         .bind(patch.first_name.as_deref())
         .bind(patch.last_name.as_deref())
+        .bind(patch.salutation.as_deref())
         .execute(&self.pool)
         .await
         .map_err(super::map_sqlx)?;
