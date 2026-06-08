@@ -221,6 +221,37 @@ impl Tool for WeeklyPipeline {
     }
 }
 
+// ── DailyMetrics ──────────────────────────────────────────────────────────────
+
+pub struct DailyMetrics;
+
+#[async_trait]
+impl Tool for DailyMetrics {
+    fn name(&self) -> &'static str { "daily_metrics" }
+    fn description(&self) -> &'static str {
+        "Tageskennzahlen für einen bestimmten Tag (Standard: heute): heute angelegte Anfragen, versendete Angebote, ANGENOMMENE Angebote, für den Tag geplante Aufträge, erstellte Rechnungen und Netto-Umsatz der an diesem Tag angenommenen Angebote. Nur für Inhaber."
+    }
+    fn params_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "date": { "type": "string", "format": "date", "description": "Tag (Standard: heute)" }
+            }
+        })
+    }
+    fn safety(&self) -> Safety { Safety::Read }
+    fn min_role(&self) -> Role { Role::Owner }
+
+    async fn execute(&self, ctx: &ToolCtx, args: &Value) -> Result<Value> {
+        let date = args["date"]
+            .as_str()
+            .and_then(|s| s.parse::<NaiveDate>().ok())
+            .unwrap_or_else(|| chrono::Local::now().date_naive());
+        let metrics = ctx.services.metrics.daily(date).await?;
+        Ok(serde_json::to_value(&metrics)?)
+    }
+}
+
 // ── CreateTodo ────────────────────────────────────────────────────────────────
 
 pub struct CreateTodo;

@@ -9,6 +9,78 @@ use super::{
     parse_str, parse_uuid, pending_confirmation, Safety, Tool, ToolCtx,
 };
 
+// ── CreateInquiry ─────────────────────────────────────────────────────────────
+
+/// Create a new inquiry for an existing customer (phone / on-site intake).
+pub struct CreateInquiry;
+
+#[async_trait]
+impl Tool for CreateInquiry {
+    fn name(&self) -> &'static str { "create_inquiry" }
+    fn description(&self) -> &'static str {
+        "Legt eine NEUE Anfrage (Umzugsauftrag) für einen bestehenden Kunden an — z.B. nach Telefonat oder Besichtigung. Den Kunden ggf. zuerst mit create_customer anlegen und dessen ID hier als 'customer_id' verwenden. Adressen optional. Status wird 'pending'. Nur für Inhaber."
+    }
+    fn params_schema(&self) -> Value {
+        let addr = json!({
+            "type": "object",
+            "properties": {
+                "street":       { "type": "string" },
+                "house_number": { "type": "string" },
+                "postal_code":  { "type": "string" },
+                "city":         { "type": "string" },
+                "floor":        { "type": "string" },
+                "elevator":     { "type": "boolean" }
+            }
+        });
+        json!({
+            "type": "object",
+            "properties": {
+                "customer_id":          { "type": "string", "format": "uuid" },
+                "service_type":         { "type": "string", "description": "z.B. umzug, montage, entrümpelung" },
+                "scheduled_date":       { "type": "string", "format": "date" },
+                "estimated_volume_m3":  { "type": "number", "minimum": 0 },
+                "notes":                { "type": "string" },
+                "origin":               addr,
+                "destination":          addr
+            },
+            "required": ["customer_id"]
+        })
+    }
+    fn safety(&self) -> Safety { Safety::Write }
+    fn min_role(&self) -> Role { Role::Owner }
+
+    async fn execute(&self, ctx: &ToolCtx, args: &Value) -> Result<Value> {
+        let customer_id = parse_uuid(args, "customer_id", self.name())?;
+
+        let parse_addr = |v: &Value| -> Option<aust_core::services::NewAddress> {
+            if !v.is_object() {
+                return None;
+            }
+            Some(aust_core::services::NewAddress {
+                street: v["street"].as_str().map(str::to_string),
+                house_number: v["house_number"].as_str().map(str::to_string),
+                postal_code: v["postal_code"].as_str().map(str::to_string),
+                city: v["city"].as_str().map(str::to_string),
+                floor: v["floor"].as_str().map(str::to_string),
+                elevator: v["elevator"].as_bool(),
+            })
+        };
+
+        let new = aust_core::services::NewInquiry {
+            customer_id,
+            service_type: args["service_type"].as_str().map(str::to_string),
+            scheduled_date: args["scheduled_date"].as_str().and_then(|s| s.parse().ok()),
+            estimated_volume_m3: args["estimated_volume_m3"].as_f64(),
+            notes: args["notes"].as_str().map(str::to_string),
+            services: None,
+            origin: parse_addr(&args["origin"]),
+            destination: parse_addr(&args["destination"]),
+        };
+        let resp = ctx.services.inquiries.create_inquiry(new).await?;
+        Ok(serde_json::to_value(&resp)?)
+    }
+}
+
 // ── GetInquiry ────────────────────────────────────────────────────────────────
 
 /// Fetch a single inquiry by UUID and return its key fields as JSON.

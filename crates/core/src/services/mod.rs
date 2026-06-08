@@ -14,11 +14,11 @@ pub use bundle::ServiceBundle;
 pub use error::ServiceError;
 pub use traits::{
     AddressService, AddressPatch, AvailableSlot, CalendarItem, CalendarItemPatch, CalendarService,
-    ComputedLineItem, CrewMember, CustomerPatch, CustomerService, DistanceResult, EmailDetail, EmailService,
-    EmailSummary, EmployeePatch, EmployeeRecord, EmployeeService, EmployeeWorkloadEntry,
-    EstimationService, EstimationSummary, FeedbackRecord, InquiryService, InvoiceDetail,
-    InvoiceReminder, InvoiceService, InvoiceSummary, MetricsService, NewCustomer, OfferComputation, OfferDraft,
-    OfferOverrides, OfferPreview, OfferService, OfferVersion, PipelineMetrics, PricingConfig,
-    ReminderRecord, ReminderService, ReviewRecord, ReviewService, RevisionStatus, SettingsService,
-    TodoRecord, TodoService,
+    ComputedLineItem, CrewMember, CustomerPatch, CustomerService, DailyMetrics, DistanceResult,
+    EmailDetail, EmailService, EmailSummary, EmployeePatch, EmployeeRecord, EmployeeSchedulePatch, EmployeeService,
+    EmployeeWorkloadEntry, EstimationService, EstimationSummary, FeedbackRecord, InquiryService,
+    InvoiceDetail, InvoiceReminder, InvoiceService, InvoiceSummary, MetricsService, NewAddress,
+    NewCustomer, NewInquiry, OfferComputation, OfferDraft, OfferOverrides, OfferPreview, OfferService,
+    OfferVersion, PipelineMetrics, PricingConfig, ReminderRecord, ReminderService, ReviewRecord,
+    ReviewService, RevisionStatus, SettingsService, TodoRecord, TodoService,
 };

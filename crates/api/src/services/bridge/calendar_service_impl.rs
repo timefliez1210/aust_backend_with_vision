@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use aust_core::services::{
     AvailableSlot, CalendarItem, CalendarItemPatch, CalendarService, CrewMember,
-    EmployeeWorkloadEntry, ServiceError,
+    EmployeeSchedulePatch, EmployeeWorkloadEntry, ServiceError,
 };
 
 use crate::repositories::calendar_item_repo;
@@ -202,18 +202,21 @@ impl CalendarService for CalendarServiceImpl {
         title: &str,
         notes: Option<&str>,
         end_date: Option<NaiveDate>,
+        start_time: Option<NaiveTime>,
+        end_time: Option<NaiveTime>,
+        location: Option<&str>,
     ) -> Result<CalendarItem, ServiceError> {
-        let default_time = NaiveTime::from_hms_opt(8, 0, 0).unwrap_or_default();
+        let start = start_time.unwrap_or_else(|| NaiveTime::from_hms_opt(8, 0, 0).unwrap_or_default());
 
         let new_id = calendar_item_repo::insert_item(
             &self.pool,
             title,
             notes,
             category,
-            None,
+            location,
             Some(scheduled_date),
-            default_time,
-            None,
+            start,
+            end_time,
             0.0,
             None,
             end_date,
@@ -227,9 +230,9 @@ impl CalendarService for CalendarServiceImpl {
             category: category.to_string(),
             scheduled_date: Some(scheduled_date),
             end_date,
-            start_time: Some(default_time),
-            end_time: None,
-            location: None,
+            start_time: Some(start),
+            end_time,
+            location: location.map(str::to_string),
             kind: "termin".to_string(),
         })
     }
@@ -248,6 +251,9 @@ impl CalendarService for CalendarServiceImpl {
                 scheduled_date = COALESCE($4, scheduled_date),
                 end_date = COALESCE($5, end_date),
                 description = COALESCE($6, description),
+                start_time = COALESCE($7, start_time),
+                end_time = COALESCE($8, end_time),
+                location = COALESCE($9, location),
                 updated_at = NOW()
             WHERE id = $1
             "#,
@@ -258,6 +264,9 @@ impl CalendarService for CalendarServiceImpl {
         .bind(patch.scheduled_date)
         .bind(patch.end_date)
         .bind(patch.notes.as_deref())
+        .bind(patch.start_time)
+        .bind(patch.end_time)
+        .bind(patch.location.as_deref())
         .execute(&self.pool)
         .await
         .map_err(super::map_sqlx)?;
@@ -300,6 +309,8 @@ impl CalendarService for CalendarServiceImpl {
         date: NaiveDate,
         crew: Vec<Uuid>,
         notes: Option<&str>,
+        start_time: Option<NaiveTime>,
+        end_time: Option<NaiveTime>,
     ) -> Result<CalendarItem, ServiceError> {
         // Fetch inquiry title for the calendar item.
         let title_row: Option<(String,)> = sqlx::query_as(
@@ -317,34 +328,50 @@ impl CalendarService for CalendarServiceImpl {
 
         let title = title_row.map(|(t,)| t).unwrap_or_else(|| "Umzug".to_string());
 
-        // Update inquiry scheduled_date and status.
+        // Update inquiry scheduled_date, status and (when supplied) times. NULL
+        // start/end leave the existing values intact via COALESCE.
         sqlx::query(
-            "UPDATE inquiries SET scheduled_date = $1, status = 'scheduled', updated_at = NOW() WHERE id = $2",
+            r#"
+            UPDATE inquiries SET
+                scheduled_date = $1,
+                status = 'scheduled',
+                start_time = COALESCE($3, start_time),
+                end_time = COALESCE($4, end_time),
+                updated_at = NOW()
+            WHERE id = $2
+            "#,
         )
         .bind(date)
         .bind(inquiry_id)
+        .bind(start_time)
+        .bind(end_time)
         .execute(&self.pool)
         .await
         .map_err(super::map_sqlx)?;
 
-        // Assign employees (use existing inquiry_employees table).
+        // Assign employees (use existing inquiry_employees table), carrying the
+        // job's shift times onto each crew row when provided.
         for employee_id in &crew {
             let _ = sqlx::query(
                 r#"
-                INSERT INTO inquiry_employees (inquiry_id, employee_id, job_date)
-                VALUES ($1, $2, $3)
-                ON CONFLICT (inquiry_id, employee_id, job_date) DO NOTHING
+                INSERT INTO inquiry_employees (inquiry_id, employee_id, job_date, start_time, end_time)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (inquiry_id, employee_id, job_date) DO UPDATE SET
+                    start_time = COALESCE(EXCLUDED.start_time, inquiry_employees.start_time),
+                    end_time   = COALESCE(EXCLUDED.end_time, inquiry_employees.end_time)
                 "#,
             )
             .bind(inquiry_id)
             .bind(employee_id)
             .bind(date)
+            .bind(start_time)
+            .bind(end_time)
             .execute(&self.pool)
             .await;
         }
 
         // Create a calendar item referencing the inquiry.
-        let default_time = NaiveTime::from_hms_opt(8, 0, 0).unwrap_or_default();
+        let start = start_time.unwrap_or_else(|| NaiveTime::from_hms_opt(8, 0, 0).unwrap_or_default());
         let new_id = calendar_item_repo::insert_item(
             &self.pool,
             &title,
@@ -352,8 +379,8 @@ impl CalendarService for CalendarServiceImpl {
             "moving",
             None,
             Some(date),
-            default_time,
-            None,
+            start,
+            end_time,
             0.0,
             None,
             None,
@@ -367,8 +394,8 @@ impl CalendarService for CalendarServiceImpl {
             category: "moving".to_string(),
             scheduled_date: Some(date),
             end_date: None,
-            start_time: Some(default_time),
-            end_time: None,
+            start_time: Some(start),
+            end_time,
             location: None,
             kind: "termin".to_string(),
         })
@@ -547,18 +574,32 @@ impl CalendarService for CalendarServiceImpl {
         // separate junction tables. Check both so the caller (the assistant)
         // doesn't have to know which kind of id it holds. This is the read path
         // that prevents the agent from confabulating a crew list.
-        let rows: Vec<(Uuid, String, String, NaiveDate, String)> = sqlx::query_as(
+        type CrewRow = (
+            Uuid,
+            String,
+            String,
+            NaiveDate,
+            Option<NaiveTime>,
+            Option<NaiveTime>,
+            Option<f64>,
+            String,
+        );
+        let rows: Vec<CrewRow> = sqlx::query_as(
             r#"
             SELECT e.id   AS employee_id,
                    e.first_name AS first_name,
                    e.last_name  AS last_name,
                    cie.job_date AS job_date,
+                   cie.start_time AS start_time,
+                   cie.end_time AS end_time,
+                   cie.planned_hours::float8 AS planned_hours,
                    'termin'::text AS source
             FROM calendar_item_employees cie
             JOIN employees e ON e.id = cie.employee_id
             WHERE cie.calendar_item_id = $1
             UNION ALL
-            SELECT e.id, e.first_name, e.last_name, ie.job_date, 'auftrag'::text
+            SELECT e.id, e.first_name, e.last_name, ie.job_date,
+                   ie.start_time, ie.end_time, ie.planned_hours::float8, 'auftrag'::text
             FROM inquiry_employees ie
             JOIN employees e ON e.id = ie.employee_id
             WHERE ie.inquiry_id = $1
@@ -572,13 +613,20 @@ impl CalendarService for CalendarServiceImpl {
 
         Ok(rows
             .into_iter()
-            .map(|(employee_id, first_name, last_name, job_date, source)| CrewMember {
-                employee_id,
-                first_name,
-                last_name,
-                job_date,
-                source,
-            })
+            .map(
+                |(employee_id, first_name, last_name, job_date, start_time, end_time, planned_hours, source)| {
+                    CrewMember {
+                        employee_id,
+                        first_name,
+                        last_name,
+                        job_date,
+                        start_time,
+                        end_time,
+                        planned_hours,
+                        source,
+                    }
+                },
+            )
             .collect())
     }
 
@@ -633,5 +681,63 @@ impl CalendarService for CalendarServiceImpl {
 
         // Return the freshly written crew so the caller can confirm the result.
         self.get_assigned_crew(inquiry_id).await
+    }
+
+    async fn set_employee_schedule(
+        &self,
+        parent_id: Uuid,
+        employee_id: Uuid,
+        patch: EmployeeSchedulePatch,
+    ) -> Result<Vec<CrewMember>, ServiceError> {
+        // The parent may be an inquiry (auftrag) or a calendar item (termin).
+        // Try both junction tables; whichever holds the row gets updated.
+        let inq = sqlx::query(
+            r#"
+            UPDATE inquiry_employees SET
+                job_date      = COALESCE($3, job_date),
+                start_time    = COALESCE($4, start_time),
+                end_time      = COALESCE($5, end_time),
+                planned_hours = COALESCE($6::numeric, planned_hours),
+                updated_at    = NOW()
+            WHERE inquiry_id = $1 AND employee_id = $2
+            "#,
+        )
+        .bind(parent_id)
+        .bind(employee_id)
+        .bind(patch.job_date)
+        .bind(patch.start_time)
+        .bind(patch.end_time)
+        .bind(patch.planned_hours)
+        .execute(&self.pool)
+        .await
+        .map_err(super::map_sqlx)?;
+
+        let cal = sqlx::query(
+            r#"
+            UPDATE calendar_item_employees SET
+                job_date      = COALESCE($3, job_date),
+                start_time    = COALESCE($4, start_time),
+                end_time      = COALESCE($5, end_time),
+                planned_hours = COALESCE($6::numeric, planned_hours)
+            WHERE calendar_item_id = $1 AND employee_id = $2
+            "#,
+        )
+        .bind(parent_id)
+        .bind(employee_id)
+        .bind(patch.job_date)
+        .bind(patch.start_time)
+        .bind(patch.end_time)
+        .bind(patch.planned_hours)
+        .execute(&self.pool)
+        .await
+        .map_err(super::map_sqlx)?;
+
+        if inq.rows_affected() == 0 && cal.rows_affected() == 0 {
+            return Err(ServiceError::NotFound(format!(
+                "Mitarbeiter {employee_id} ist {parent_id} nicht zugewiesen"
+            )));
+        }
+
+        self.get_assigned_crew(parent_id).await
     }
 }

@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::error::{AssistantError, Result};
 use crate::roles::Role;
-use super::{parse_date, parse_str, parse_uuid, pending_confirmation, Safety, Tool, ToolCtx};
+use super::{parse_date, parse_str, parse_time_opt, parse_uuid, pending_confirmation, Safety, Tool, ToolCtx};
 
 // ── GetCalendar ───────────────────────────────────────────────────────────────
 
@@ -152,17 +152,20 @@ pub struct CreateCalendarItem;
 impl Tool for CreateCalendarItem {
     fn name(&self) -> &'static str { "create_calendar_item" }
     fn description(&self) -> &'static str {
-        "Erstellt einen Kalendereintrag (z.B. Urlaub, Krankheit, Blocker). Nur für Inhaber."
+        "Erstellt einen Kalendereintrag (z.B. Urlaub, Krankheit, Blocker, Besichtigung). Uhrzeiten als \"HH:MM\". Nur für Inhaber."
     }
     fn params_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "date":     { "type": "string", "format": "date" },
-                "category": { "type": "string", "minLength": 1 },
-                "title":    { "type": "string", "minLength": 1 },
-                "notes":    { "type": "string" },
-                "end_date": { "type": "string", "format": "date" }
+                "date":       { "type": "string", "format": "date" },
+                "category":   { "type": "string", "minLength": 1 },
+                "title":      { "type": "string", "minLength": 1 },
+                "notes":      { "type": "string" },
+                "end_date":   { "type": "string", "format": "date" },
+                "start_time": { "type": "string", "description": "Uhrzeit HH:MM" },
+                "end_time":   { "type": "string", "description": "Uhrzeit HH:MM" },
+                "location":   { "type": "string", "description": "Adresse / Ort" }
             },
             "required": ["date", "category", "title"]
         })
@@ -176,7 +179,14 @@ impl Tool for CreateCalendarItem {
         let title = parse_str(args, "title", self.name())?;
         let notes = args["notes"].as_str();
         let end_date = args["end_date"].as_str().and_then(|s| s.parse::<NaiveDate>().ok());
-        let item = ctx.services.calendar.create_item(date, category, title, notes, end_date).await?;
+        let start_time = parse_time_opt(args["start_time"].as_str());
+        let end_time = parse_time_opt(args["end_time"].as_str());
+        let location = args["location"].as_str();
+        let item = ctx
+            .services
+            .calendar
+            .create_item(date, category, title, notes, end_date, start_time, end_time, location)
+            .await?;
         Ok(serde_json::to_value(&item)?)
     }
 }
@@ -189,7 +199,7 @@ pub struct UpdateCalendarItem;
 impl Tool for UpdateCalendarItem {
     fn name(&self) -> &'static str { "update_calendar_item" }
     fn description(&self) -> &'static str {
-        "Aktualisiert Felder eines Kalendereintrags. Nur für Inhaber."
+        "Aktualisiert Felder eines Kalendereintrags (inkl. Start-/Endzeit und Ort). Uhrzeiten als \"HH:MM\". Nur für Inhaber."
     }
     fn params_schema(&self) -> Value {
         json!({
@@ -203,7 +213,10 @@ impl Tool for UpdateCalendarItem {
                         "category":       { "type": "string" },
                         "scheduled_date": { "type": "string", "format": "date" },
                         "end_date":       { "type": "string", "format": "date" },
-                        "notes":          { "type": "string" }
+                        "notes":          { "type": "string" },
+                        "start_time":     { "type": "string", "description": "Uhrzeit HH:MM" },
+                        "end_time":       { "type": "string", "description": "Uhrzeit HH:MM" },
+                        "location":       { "type": "string", "description": "Adresse / Ort" }
                     }
                 }
             },
@@ -215,8 +228,19 @@ impl Tool for UpdateCalendarItem {
 
     async fn execute(&self, ctx: &ToolCtx, args: &Value) -> Result<Value> {
         let id = parse_uuid(args, "id", self.name())?;
-        let patch: aust_core::services::CalendarItemPatch =
-            serde_json::from_value(args["patch"].clone())?;
+        // Build the patch manually so time fields accept flexible "HH:MM" input
+        // (chrono's serde expects "HH:MM:SS" and would reject "10:00").
+        let p = &args["patch"];
+        let patch = aust_core::services::CalendarItemPatch {
+            title: p["title"].as_str().map(str::to_string),
+            category: p["category"].as_str().map(str::to_string),
+            scheduled_date: p["scheduled_date"].as_str().and_then(|s| s.parse::<NaiveDate>().ok()),
+            end_date: p["end_date"].as_str().and_then(|s| s.parse::<NaiveDate>().ok()),
+            notes: p["notes"].as_str().map(str::to_string),
+            start_time: parse_time_opt(p["start_time"].as_str()),
+            end_time: parse_time_opt(p["end_time"].as_str()),
+            location: p["location"].as_str().map(str::to_string),
+        };
         let item = ctx.services.calendar.update_item(id, patch).await?;
         Ok(serde_json::to_value(&item)?)
     }
@@ -274,7 +298,9 @@ impl Tool for ScheduleInquiry {
                 "inquiry_id": { "type": "string", "format": "uuid" },
                 "date":       { "type": "string", "format": "date" },
                 "crew":       { "type": "array", "items": { "type": "string", "format": "uuid" } },
-                "notes":      { "type": "string" }
+                "notes":      { "type": "string" },
+                "start_time": { "type": "string", "description": "Uhrzeit HH:MM" },
+                "end_time":   { "type": "string", "description": "Uhrzeit HH:MM" }
             },
             "required": ["inquiry_id", "date", "crew"]
         })
@@ -290,7 +316,13 @@ impl Tool for ScheduleInquiry {
             .map(|arr| arr.iter().filter_map(|v| v.as_str().and_then(|s| s.parse().ok())).collect())
             .unwrap_or_default();
         let notes = args["notes"].as_str();
-        let item = ctx.services.calendar.schedule_inquiry(inquiry_id, date, crew, notes).await?;
+        let start_time = parse_time_opt(args["start_time"].as_str());
+        let end_time = parse_time_opt(args["end_time"].as_str());
+        let item = ctx
+            .services
+            .calendar
+            .schedule_inquiry(inquiry_id, date, crew, notes, start_time, end_time)
+            .await?;
         Ok(serde_json::to_value(&item)?)
     }
 }
@@ -435,6 +467,52 @@ impl Tool for AssignEmployee {
         let emp_id = parse_uuid(args, "employee_id", self.name())?;
         ctx.services.calendar.assign_employee(item_id, emp_id).await?;
         Ok(json!({ "ok": true }))
+    }
+}
+
+// ── SetEmployeeSchedule ───────────────────────────────────────────────────────
+
+pub struct SetEmployeeSchedule;
+
+#[async_trait]
+impl Tool for SetEmployeeSchedule {
+    fn name(&self) -> &'static str { "set_employee_schedule" }
+    fn description(&self) -> &'static str {
+        "Setzt für EINEN zugewiesenen Mitarbeiter Datum/Uhrzeiten/Planstunden auf einem Termin ODER Auftrag. 'parent_id' ist die Termin- oder Anfrage-ID (wie in get_assigned_crew), 'employee_id' der Mitarbeiter. Nur gesetzte Felder werden geändert. Uhrzeiten als \"HH:MM\". Nur für Inhaber."
+    }
+    fn params_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "parent_id":     { "type": "string", "format": "uuid", "description": "Termin- oder Anfrage-ID" },
+                "employee_id":   { "type": "string", "format": "uuid" },
+                "job_date":      { "type": "string", "format": "date" },
+                "start_time":    { "type": "string", "description": "Uhrzeit HH:MM" },
+                "end_time":      { "type": "string", "description": "Uhrzeit HH:MM" },
+                "planned_hours": { "type": "number", "minimum": 0 }
+            },
+            "required": ["parent_id", "employee_id"]
+        })
+    }
+    fn safety(&self) -> Safety { Safety::Write }
+    fn min_role(&self) -> Role { Role::Owner }
+
+    async fn execute(&self, ctx: &ToolCtx, args: &Value) -> Result<Value> {
+        let parent_id = parse_uuid(args, "parent_id", self.name())?;
+        let employee_id = parse_uuid(args, "employee_id", self.name())?;
+        let patch = aust_core::services::EmployeeSchedulePatch {
+            job_date: args["job_date"].as_str().and_then(|s| s.parse::<NaiveDate>().ok()),
+            start_time: parse_time_opt(args["start_time"].as_str()),
+            end_time: parse_time_opt(args["end_time"].as_str()),
+            planned_hours: args["planned_hours"].as_f64(),
+        };
+        let crew = ctx
+            .services
+            .calendar
+            .set_employee_schedule(parent_id, employee_id, patch)
+            .await?;
+        let count = crew.len();
+        Ok(json!({ "crew": crew, "count": count }))
     }
 }
 

@@ -12,13 +12,14 @@ use uuid::Uuid;
 use aust_core::models::{CustomerSnapshot, InquiryListItem, InquiryResponse, InquiryStatus, Services};
 use aust_core::services::{
     AddressPatch, AddressService, AvailableSlot, CalendarItem, CalendarItemPatch, CalendarService,
-    ComputedLineItem, CrewMember, CustomerPatch, CustomerService, DistanceResult, EmailDetail, EmailService,
-    EmailSummary, EmployeePatch, EmployeeRecord, EmployeeService, EmployeeWorkloadEntry,
-    EstimationService, EstimationSummary, FeedbackRecord, InquiryService, InvoiceDetail,
-    InvoiceReminder, InvoiceService, InvoiceSummary, MetricsService, OfferComputation, OfferDraft,
-    OfferOverrides as CoreOfferOverrides, OfferPreview, OfferService, OfferVersion,
-    PipelineMetrics, PricingConfig, ReminderRecord, ReminderService, ReviewRecord, ReviewService,
-    RevisionStatus, ServiceBundle, ServiceError, SettingsService, TodoRecord, TodoService,
+    ComputedLineItem, CrewMember, CustomerPatch, CustomerService, DailyMetrics, DistanceResult,
+    EmailDetail, EmailService, EmailSummary, EmployeePatch, EmployeeRecord, EmployeeSchedulePatch,
+    EmployeeService, EmployeeWorkloadEntry, EstimationService, EstimationSummary, FeedbackRecord,
+    InquiryService, InvoiceDetail, InvoiceReminder, InvoiceService, InvoiceSummary, MetricsService,
+    NewInquiry, OfferComputation, OfferDraft, OfferOverrides as CoreOfferOverrides, OfferPreview,
+    OfferService, OfferVersion, PipelineMetrics, PricingConfig, ReminderRecord, ReminderService,
+    ReviewRecord, ReviewService, RevisionStatus, ServiceBundle, ServiceError, SettingsService,
+    TodoRecord, TodoService,
 };
 
 // ── Inquiry mock ──────────────────────────────────────────────────────────────
@@ -67,6 +68,10 @@ impl InquiryService for MockInquiryService {
             is_multi_day: false,
             has_pauschale: false,
         })
+    }
+
+    async fn create_inquiry(&self, _new: NewInquiry) -> Result<InquiryResponse, ServiceError> {
+        self.get_inquiry(self.inquiry_id).await
     }
 
     async fn list_inquiries(
@@ -266,6 +271,9 @@ impl CalendarService for MockCalendarService {
         title: &str,
         _notes: Option<&str>,
         end_date: Option<NaiveDate>,
+        start_time: Option<chrono::NaiveTime>,
+        end_time: Option<chrono::NaiveTime>,
+        location: Option<&str>,
     ) -> Result<CalendarItem, ServiceError> {
         Ok(CalendarItem {
             id: Uuid::new_v4(),
@@ -273,9 +281,9 @@ impl CalendarService for MockCalendarService {
             category: category.to_string(),
             scheduled_date: Some(scheduled_date),
             end_date,
-            start_time: None,
-            end_time: None,
-            location: None,
+            start_time,
+            end_time,
+            location: location.map(str::to_string),
             kind: "termin".to_string(),
         })
     }
@@ -308,6 +316,8 @@ impl CalendarService for MockCalendarService {
         date: NaiveDate,
         _crew: Vec<Uuid>,
         _notes: Option<&str>,
+        start_time: Option<chrono::NaiveTime>,
+        end_time: Option<chrono::NaiveTime>,
     ) -> Result<CalendarItem, ServiceError> {
         Ok(CalendarItem {
             id: Uuid::new_v4(),
@@ -315,8 +325,8 @@ impl CalendarService for MockCalendarService {
             category: "moving".to_string(),
             scheduled_date: Some(date),
             end_date: None,
-            start_time: None,
-            end_time: None,
+            start_time,
+            end_time,
             location: None,
             kind: "termin".to_string(),
         })
@@ -374,6 +384,9 @@ impl CalendarService for MockCalendarService {
             first_name: "Test".to_string(),
             last_name: "Mitarbeiter".to_string(),
             job_date: NaiveDate::from_ymd_opt(2026, 6, 12).unwrap(),
+            start_time: None,
+            end_time: None,
+            planned_hours: None,
             source: "termin".to_string(),
         }])
     }
@@ -392,9 +405,32 @@ impl CalendarService for MockCalendarService {
                 first_name: "Test".to_string(),
                 last_name: "Mitarbeiter".to_string(),
                 job_date,
+                start_time: None,
+                end_time: None,
+                planned_hours: None,
                 source: "auftrag".to_string(),
             })
             .collect())
+    }
+
+    async fn set_employee_schedule(
+        &self,
+        _parent_id: Uuid,
+        employee_id: Uuid,
+        patch: EmployeeSchedulePatch,
+    ) -> Result<Vec<CrewMember>, ServiceError> {
+        Ok(vec![CrewMember {
+            employee_id,
+            first_name: "Test".to_string(),
+            last_name: "Mitarbeiter".to_string(),
+            job_date: patch
+                .job_date
+                .unwrap_or_else(|| NaiveDate::from_ymd_opt(2026, 6, 12).unwrap()),
+            start_time: patch.start_time,
+            end_time: patch.end_time,
+            planned_hours: patch.planned_hours,
+            source: "auftrag".to_string(),
+        }])
     }
 }
 
@@ -813,6 +849,18 @@ impl MetricsService for MockMetricsService {
             invoiced: 4,
             paid: 3,
             revenue_netto_cents: 250000,
+        })
+    }
+
+    async fn daily(&self, date: NaiveDate) -> Result<DailyMetrics, ServiceError> {
+        Ok(DailyMetrics {
+            date,
+            inquiries_created: 2,
+            offers_sent: 1,
+            offers_accepted: 1,
+            jobs_scheduled: 1,
+            invoices_created: 0,
+            revenue_accepted_netto_cents: 100000,
         })
     }
 }

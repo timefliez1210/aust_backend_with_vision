@@ -6,8 +6,9 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use aust_core::models::{InquiryListItem, InquiryResponse, InquiryStatus, Services};
-use aust_core::services::{InquiryService, ServiceError};
+use aust_core::services::{InquiryService, NewAddress, NewInquiry, ServiceError};
 
+use crate::repositories::{address_repo, inquiry_repo};
 use crate::services::inquiry_builder;
 use crate::ApiError;
 
@@ -25,6 +26,78 @@ impl InquiryServiceImpl {
 impl InquiryService for InquiryServiceImpl {
     async fn get_inquiry(&self, id: Uuid) -> Result<InquiryResponse, ServiceError> {
         match inquiry_builder::build_inquiry_response(&self.pool, id).await {
+            Ok(r) => Ok(r),
+            Err(ApiError::NotFound(msg)) => Err(ServiceError::NotFound(msg)),
+            Err(ApiError::BadRequest(msg)) => Err(ServiceError::Validation(msg)),
+            Err(other) => Err(ServiceError::Db(anyhow::anyhow!(other.to_string()))),
+        }
+    }
+
+    async fn create_inquiry(&self, new: NewInquiry) -> Result<InquiryResponse, ServiceError> {
+        // Helper: insert an address only when it carries at least a street or city.
+        async fn maybe_create_address(
+            tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+            addr: &Option<NewAddress>,
+        ) -> Result<Option<Uuid>, ServiceError> {
+            let Some(a) = addr else { return Ok(None) };
+            let has_content = a.street.as_deref().is_some_and(|s| !s.trim().is_empty())
+                || a.city.as_deref().is_some_and(|s| !s.trim().is_empty());
+            if !has_content {
+                return Ok(None);
+            }
+            let id = address_repo::create(
+                &mut **tx,
+                a.street.as_deref().unwrap_or(""),
+                a.city.as_deref().unwrap_or(""),
+                a.postal_code.as_deref(),
+                a.floor.as_deref(),
+                a.elevator,
+                a.house_number.as_deref(),
+                None,
+            )
+            .await
+            .map_err(super::map_sqlx)?;
+            Ok(Some(id))
+        }
+
+        let mut tx = self.pool.begin().await.map_err(super::map_sqlx)?;
+
+        let origin_id = maybe_create_address(&mut tx, &new.origin).await?;
+        let dest_id = maybe_create_address(&mut tx, &new.destination).await?;
+
+        let services = new.services.unwrap_or_default();
+        let services_json = serde_json::to_value(&services)
+            .map_err(|e| ServiceError::Validation(format!("Serialisierungsfehler: {e}")))?;
+        let empty_custom = serde_json::json!({});
+
+        let inquiry_id = Uuid::now_v7();
+        inquiry_repo::create(
+            &mut *tx,
+            inquiry_id,
+            new.customer_id,
+            origin_id,
+            dest_id,
+            None,
+            "pending",
+            new.estimated_volume_m3,
+            None,
+            new.scheduled_date,
+            new.notes.as_deref(),
+            &services_json,
+            "assistant",
+            new.service_type.as_deref(),
+            None,
+            None,
+            None,
+            &empty_custom,
+            Utc::now(),
+        )
+        .await
+        .map_err(super::map_sqlx)?;
+
+        tx.commit().await.map_err(super::map_sqlx)?;
+
+        match inquiry_builder::build_inquiry_response(&self.pool, inquiry_id).await {
             Ok(r) => Ok(r),
             Err(ApiError::NotFound(msg)) => Err(ServiceError::NotFound(msg)),
             Err(ApiError::BadRequest(msg)) => Err(ServiceError::Validation(msg)),

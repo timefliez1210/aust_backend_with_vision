@@ -120,6 +120,7 @@ impl ToolRegistry {
     pub fn new() -> Self {
         let mut registry = Self { tools: vec![] };
         // Inquiries
+        registry.register(Box::new(inquiries::CreateInquiry));
         registry.register(Box::new(inquiries::GetInquiry));
         registry.register(Box::new(inquiries::ListInquiries));
         registry.register(Box::new(inquiries::SearchInquiries));
@@ -156,6 +157,7 @@ impl ToolRegistry {
         registry.register(Box::new(calendar::ReassignTermin));
         registry.register(Box::new(calendar::CancelTermin));
         registry.register(Box::new(calendar::AssignEmployee));
+        registry.register(Box::new(calendar::SetEmployeeSchedule));
 
         // Customers
         registry.register(Box::new(customers::GetCustomer));
@@ -223,6 +225,7 @@ impl ToolRegistry {
         registry.register(Box::new(meta::Recall));
         registry.register(Box::new(meta::DailyBriefing));
         registry.register(Box::new(meta::WeeklyPipeline));
+        registry.register(Box::new(meta::DailyMetrics));
         registry.register(Box::new(meta::CreateTodo));
         registry.register(Box::new(meta::ListTodos));
         registry.register(Box::new(meta::ResolveTodo));
@@ -338,6 +341,14 @@ pub(crate) fn parse_date(args: &Value, key: &str, tool: &str) -> Result<chrono::
             tool: tool.to_string(),
             message: format!("{key} must be a date in YYYY-MM-DD format"),
         })
+}
+
+/// Helper: parse an optional time-of-day string. Accepts `HH:MM` and `HH:MM:SS`.
+pub(crate) fn parse_time_opt(s: Option<&str>) -> Option<chrono::NaiveTime> {
+    let s = s?;
+    chrono::NaiveTime::parse_from_str(s, "%H:%M:%S")
+        .or_else(|_| chrono::NaiveTime::parse_from_str(s, "%H:%M"))
+        .ok()
 }
 
 /// Helper: parse a required string argument.

@@ -184,6 +184,12 @@ pub struct CalendarItemPatch {
     pub scheduled_date: Option<NaiveDate>,
     pub end_date: Option<NaiveDate>,
     pub notes: Option<String>,
+    /// Start time of day (e.g. `10:00`). Previously unsettable from the assistant.
+    pub start_time: Option<NaiveTime>,
+    /// End time of day.
+    pub end_time: Option<NaiveTime>,
+    /// Free-text location/address for the appointment.
+    pub location: Option<String>,
 }
 
 /// A lightweight employee record for listing.
@@ -222,9 +228,28 @@ pub struct CrewMember {
     pub first_name: String,
     pub last_name: String,
     pub job_date: NaiveDate,
+    /// Per-assignment start time of the employee's shift, if set.
+    pub start_time: Option<NaiveTime>,
+    /// Per-assignment end time of the employee's shift, if set.
+    pub end_time: Option<NaiveTime>,
+    /// Planned hours for this assignment, if set.
+    pub planned_hours: Option<f64>,
     /// Origin of the assignment: `"termin"` (calendar_item_employees) or
     /// `"auftrag"` (inquiry_employees).
     pub source: String,
+}
+
+/// Patch for a single employee's schedule on an assignment (termin or auftrag).
+///
+/// All fields optional — only the provided ones are written. The `parent_id`
+/// passed alongside may reference either a `calendar_item` or an `inquiry`; the
+/// service updates whichever junction table holds the `(parent, employee)` row.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EmployeeSchedulePatch {
+    pub job_date: Option<NaiveDate>,
+    pub start_time: Option<NaiveTime>,
+    pub end_time: Option<NaiveTime>,
+    pub planned_hours: Option<f64>,
 }
 
 /// Patch for updating customer fields.
@@ -250,6 +275,32 @@ pub struct NewCustomer {
     pub company_name: Option<String>,
     /// `"Herr"`, `"Frau"` or `"Divers"`.
     pub salutation: Option<String>,
+}
+
+/// A new address supplied when creating an inquiry.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NewAddress {
+    pub street: Option<String>,
+    pub house_number: Option<String>,
+    pub postal_code: Option<String>,
+    pub city: Option<String>,
+    pub floor: Option<String>,
+    pub elevator: Option<bool>,
+}
+
+/// Fields for creating a new inquiry from the assistant (phone / on-site visit).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NewInquiry {
+    /// Existing customer this inquiry belongs to (create the customer first).
+    pub customer_id: Uuid,
+    /// `"umzug"` (default), `"montage"`, `"entrümpelung"`, …
+    pub service_type: Option<String>,
+    pub scheduled_date: Option<NaiveDate>,
+    pub estimated_volume_m3: Option<f64>,
+    pub notes: Option<String>,
+    pub services: Option<Services>,
+    pub origin: Option<NewAddress>,
+    pub destination: Option<NewAddress>,
 }
 
 /// An estimation result summary.
@@ -330,6 +381,24 @@ pub struct PipelineMetrics {
     pub revenue_netto_cents: i64,
 }
 
+/// Single-day operational metrics (status transitions that happened on a date).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DailyMetrics {
+    pub date: NaiveDate,
+    /// Inquiries created on this date.
+    pub inquiries_created: i64,
+    /// Offers sent to customers on this date.
+    pub offers_sent: i64,
+    /// Offers accepted by customers on this date.
+    pub offers_accepted: i64,
+    /// Jobs whose move is scheduled FOR this date.
+    pub jobs_scheduled: i64,
+    /// Invoices created on this date.
+    pub invoices_created: i64,
+    /// Netto revenue of offers accepted on this date.
+    pub revenue_accepted_netto_cents: i64,
+}
+
 /// A todo item.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TodoRecord {
@@ -407,6 +476,10 @@ pub struct EmailDetail {
 pub trait InquiryService: Send + Sync {
     /// Fetch the full canonical inquiry response for a given ID.
     async fn get_inquiry(&self, id: Uuid) -> Result<InquiryResponse, ServiceError>;
+
+    /// Create a new inquiry (optionally with origin/destination addresses) for an
+    /// existing customer. Inserted in `pending` status with source `assistant`.
+    async fn create_inquiry(&self, new: NewInquiry) -> Result<InquiryResponse, ServiceError>;
 
     /// List inquiries, optionally filtered.
     /// `status_filter` is a SQL-style text value (e.g. `"pending"`), `None` means all.
@@ -542,6 +615,7 @@ pub trait CalendarService: Send + Sync {
     ) -> Result<Vec<AvailableSlot>, ServiceError>;
 
     /// Create a non-job calendar item (urlaub, krankheit, blocker).
+    #[allow(clippy::too_many_arguments)]
     async fn create_item(
         &self,
         scheduled_date: NaiveDate,
@@ -549,6 +623,9 @@ pub trait CalendarService: Send + Sync {
         title: &str,
         notes: Option<&str>,
         end_date: Option<NaiveDate>,
+        start_time: Option<NaiveTime>,
+        end_time: Option<NaiveTime>,
+        location: Option<&str>,
     ) -> Result<CalendarItem, ServiceError>;
 
     /// Patch an existing calendar item.
@@ -561,13 +638,16 @@ pub trait CalendarService: Send + Sync {
     /// Delete a calendar item by ID.
     async fn delete_item(&self, id: Uuid) -> Result<(), ServiceError>;
 
-    /// Schedule an inquiry on a date with a crew.
+    /// Schedule an inquiry on a date with a crew. Optionally sets the start/end
+    /// time of day on the inquiry (and the created calendar item).
     async fn schedule_inquiry(
         &self,
         inquiry_id: Uuid,
         date: NaiveDate,
         crew: Vec<Uuid>,
         notes: Option<&str>,
+        start_time: Option<NaiveTime>,
+        end_time: Option<NaiveTime>,
     ) -> Result<CalendarItem, ServiceError>;
 
     /// Reassign a scheduled termin (change date and/or crew).
@@ -614,6 +694,17 @@ pub trait CalendarService: Send + Sync {
         inquiry_id: Uuid,
         crew: Vec<Uuid>,
         date: Option<NaiveDate>,
+    ) -> Result<Vec<CrewMember>, ServiceError>;
+
+    /// Update one employee's schedule (date / start / end / planned hours) on an
+    /// assignment. `parent_id` may be a `calendar_item` or an `inquiry` — the
+    /// matching junction row is located automatically. Returns the refreshed
+    /// crew for the parent.
+    async fn set_employee_schedule(
+        &self,
+        parent_id: Uuid,
+        employee_id: Uuid,
+        patch: EmployeeSchedulePatch,
     ) -> Result<Vec<CrewMember>, ServiceError>;
 }
 
@@ -883,6 +974,9 @@ pub trait MetricsService: Send + Sync {
         from: NaiveDate,
         to: NaiveDate,
     ) -> Result<PipelineMetrics, ServiceError>;
+
+    /// Return single-day metrics (status transitions that happened on `date`).
+    async fn daily(&self, date: NaiveDate) -> Result<DailyMetrics, ServiceError>;
 }
 
 // ── Todos ─────────────────────────────────────────────────────────────────────
