@@ -771,6 +771,12 @@ pub trait EmailService: Send + Sync {
 
     /// Set a label/category on an email.
     async fn categorize(&self, id: Uuid, label: &str) -> Result<(), ServiceError>;
+
+    /// Send an ad-hoc outbound email to an arbitrary recipient. Unlike `draft_reply`
+    /// / `request_info_from_customer`, this needs neither an inquiry nor an existing
+    /// thread — it is for fresh follow-ups, re-activation or correspondence with
+    /// historical contacts.
+    async fn send(&self, to: &str, subject: &str, body: &str) -> Result<(), ServiceError>;
 }
 
 // ── Invoice ───────────────────────────────────────────────────────────────────

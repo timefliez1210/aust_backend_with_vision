@@ -1,5 +1,7 @@
 //! Bridge impl for `EmailService`.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -8,11 +10,12 @@ use aust_core::services::{EmailDetail, EmailService, EmailSummary, ServiceError}
 
 pub struct EmailServiceImpl {
     pool: PgPool,
+    config: Arc<aust_core::Config>,
 }
 
 impl EmailServiceImpl {
-    pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+    pub fn new(pool: PgPool, config: Arc<aust_core::Config>) -> Self {
+        Self { pool, config }
     }
 }
 
@@ -150,6 +153,22 @@ impl EmailService for EmailServiceImpl {
             .execute(&self.pool)
             .await
             .map_err(super::map_sqlx)?;
+        Ok(())
+    }
+
+    async fn send(&self, to: &str, subject: &str, body: &str) -> Result<(), ServiceError> {
+        let to = to.trim();
+        if to.is_empty() || !to.contains('@') {
+            return Err(ServiceError::Validation(format!(
+                "Ungültige Empfängeradresse: '{to}'."
+            )));
+        }
+        // Note: ad-hoc sends are not persisted into email_messages — that table
+        // requires a thread_id (NOT NULL, FK to email_threads) and these messages
+        // by definition have no thread. Threaded correspondence goes via draft_reply.
+        crate::routes::admin_emails::send_plain_email(&self.config.email, to, subject, body)
+            .await
+            .map_err(|e| ServiceError::Db(anyhow::anyhow!("E-Mail-Versand fehlgeschlagen: {e}")))?;
         Ok(())
     }
 }

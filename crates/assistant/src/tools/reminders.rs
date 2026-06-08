@@ -16,6 +16,14 @@ use super::{parse_str, parse_uuid, Safety, Tool, ToolCtx};
 /// Parse a `due_at` argument into a UTC instant. Accepts an RFC 3339 timestamp
 /// (with offset) or a naive `YYYY-MM-DDTHH:MM[:SS]` / `YYYY-MM-DD HH:MM[:SS]`
 /// which is interpreted as Europe/Berlin local time.
+/// Format a UTC instant as Europe/Berlin local wall-clock time, e.g.
+/// `09.06.2026 12:00 Uhr`. The stored `due_at` is always UTC; surfacing the local
+/// time here stops the model (and Alex) misreading `…10:00Z` as "wrong time" when
+/// it is in fact the correct 12:00 Berlin.
+fn berlin_local(dt: DateTime<Utc>) -> String {
+    dt.with_timezone(&Berlin).format("%d.%m.%Y %H:%M Uhr").to_string()
+}
+
 fn parse_due_at(s: &str) -> Option<DateTime<Utc>> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
         return Some(dt.with_timezone(&Utc));
@@ -83,6 +91,7 @@ impl Tool for SetReminder {
                 "id": rec.id,
                 "text": rec.text,
                 "due_at": rec.due_at,
+                "due_at_local": berlin_local(rec.due_at),
                 "recurrence": rec.recurrence
             })),
             Err(aust_core::services::ServiceError::Validation(msg)) => {
@@ -113,7 +122,20 @@ impl Tool for ListReminders {
         let include_inactive = args["include_inactive"].as_bool().unwrap_or(false);
         let items = ctx.services.reminders.list(ctx.chat_id, !include_inactive).await?;
         let count = items.len();
-        Ok(json!({ "reminders": items, "count": count }))
+        // Enrich each row with the Berlin-local due time so the model reports the
+        // wall-clock time Alex expects rather than the raw UTC instant.
+        let reminders: Vec<Value> = items
+            .into_iter()
+            .map(|r| {
+                let due_local = berlin_local(r.due_at);
+                let mut v = serde_json::to_value(&r).unwrap_or_else(|_| json!({}));
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("due_at_local".to_string(), json!(due_local));
+                }
+                v
+            })
+            .collect();
+        Ok(json!({ "reminders": reminders, "count": count }))
     }
 }
 

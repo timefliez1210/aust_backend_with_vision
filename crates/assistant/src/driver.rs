@@ -110,6 +110,11 @@ pub async fn process_turn(
         grounded_ids.extend(extract_uuid_shapes(src));
     }
     let mut grounding_corrections = 0usize;
+    // How many tools actually ran (executed or got enqueued for confirmation) this
+    // turn. If the model finalises a reply claiming a completed write while this is
+    // still zero, it fabricated the action without calling any tool — the failure
+    // mode behind the "Erinnerung gesetzt, aber nichts passiert" incident.
+    let mut tools_acted_this_turn = 0usize;
     if !ctx_text.is_empty() {
         messages.push(aust_llm_providers::LlmMessage::user(format!(
             "[Gesprächsverlauf]\n{ctx_text}"
@@ -138,29 +143,47 @@ pub async fn process_turn(
                 // Grounding guard: catch IDs the model fabricated (claiming a write —
                 // a filed report, a created record — that no tool actually performed).
                 let ungrounded = ungrounded_uuids(&text, &grounded_ids);
-                if !ungrounded.is_empty() {
+                // Phantom-write guard: the reply claims a completed write (e.g. a set
+                // reminder) but not a single tool ran this turn — the model never
+                // actually performed it. This catches fabrications that cite no UUID
+                // and so slip past the ID-based grounding check above.
+                let phantom_write = tools_acted_this_turn == 0 && claims_completed_write(&text);
+                if !ungrounded.is_empty() || phantom_write {
                     if grounding_corrections < MAX_GROUNDING_CORRECTIONS {
                         grounding_corrections += 1;
-                        warn!(
-                            ?ungrounded,
-                            "Reply cites ungrounded IDs — forcing honesty correction"
-                        );
+                        let correction = if !ungrounded.is_empty() {
+                            warn!(
+                                ?ungrounded,
+                                "Reply cites ungrounded IDs — forcing honesty correction"
+                            );
+                            format!(
+                                "[Grounding-Stopp] Deine letzte Antwort nennt ID(s), die durch KEIN \
+                                 tatsächlich ausgeführtes Tool in diesem Zug belegt sind: {}. Du hast \
+                                 diese Aktion NICHT ausgeführt. Erfinde niemals IDs oder Erfolgsmeldungen. \
+                                 Wenn die Aktion gewünscht ist, rufe JETZT das passende Tool auf und warte \
+                                 auf das echte Ergebnis. Andernfalls sag ehrlich, dass du es nicht getan \
+                                 hast — ganz ohne erfundene ID.",
+                                ungrounded.join(", ")
+                            )
+                        } else {
+                            warn!("Reply claims a completed write but no tool ran — forcing honesty correction");
+                            "[Grounding-Stopp] Deine Antwort behauptet eine erledigte Aktion (z. B. eine \
+                             gesetzte Erinnerung, eine gespeicherte Änderung oder eine gesendete E-Mail), \
+                             aber in diesem Zug wurde KEIN Tool ausgeführt. Du hast nichts gespeichert. \
+                             Bestätige niemals eine Aktion, die du nicht über ein Tool ausgeführt hast. \
+                             Rufe JETZT das passende Tool auf (z. B. set_reminder) und warte auf das echte \
+                             Ergebnis, oder sag ehrlich, dass du es noch nicht getan hast."
+                                .to_string()
+                        };
                         messages.push(aust_llm_providers::LlmMessage::assistant(text.clone()));
-                        messages.push(aust_llm_providers::LlmMessage::user(format!(
-                            "[Grounding-Stopp] Deine letzte Antwort nennt ID(s), die durch KEIN \
-                             tatsächlich ausgeführtes Tool in diesem Zug belegt sind: {}. Du hast \
-                             diese Aktion NICHT ausgeführt. Erfinde niemals IDs oder Erfolgsmeldungen. \
-                             Wenn die Aktion gewünscht ist, rufe JETZT das passende Tool auf und warte \
-                             auf das echte Ergebnis. Andernfalls sag ehrlich, dass du es nicht getan \
-                             hast — ganz ohne erfundene ID.",
-                            ungrounded.join(", ")
-                        )));
+                        messages.push(aust_llm_providers::LlmMessage::user(correction));
                         continue;
                     }
                     // Correction budget spent and still fabricating: refuse to relay it.
                     warn!(
                         ?ungrounded,
-                        "Reply still cites ungrounded IDs after correction — replacing with honest fallback"
+                        phantom_write,
+                        "Reply still claims an unbacked action after correction — replacing with honest fallback"
                     );
                     reply = "Ich habe diese Aktion nicht nachweislich ausgeführt und kann sie \
                              daher nicht bestätigen. Sag mir, ob ich es (erneut) versuchen soll."
@@ -255,6 +278,7 @@ pub async fn process_turn(
                         .await
                         .unwrap_or_else(|e| warn!("Audit write failed: {e}"));
 
+                        tools_acted_this_turn += 1;
                         let summary = tool.summarize(&validated_args);
                         pending_action_id = Some(pending_id);
                         awaiting_confirmation = true;
@@ -277,6 +301,7 @@ pub async fn process_turn(
 
                     let exec_result = tool.execute(&ctx, &validated_args).await;
                     let duration_ms = start.elapsed().as_millis() as i32;
+                    tools_acted_this_turn += 1;
 
                     match exec_result {
                         Ok(result) => {
@@ -465,6 +490,44 @@ pub async fn resume_confirmed(
     }
 }
 
+/// Heuristic: does this reply assert that a write/side-effect was just completed?
+///
+/// Used only as a tripwire when *no* tool ran in the turn (see the phantom-write
+/// guard in `process_turn`). Because the zero-tools gate already establishes that
+/// the model called nothing, any first-person completion claim here is necessarily
+/// a fabrication. The phrases below are the common German confirmations the model
+/// emits for reminders, saves, sends and schedule changes. A read-summary that
+/// merely mentions e.g. "angelegt am …" never reaches this check, because reading
+/// requires a tool call (`tools_acted_this_turn > 0`).
+pub(crate) fn claims_completed_write(text: &str) -> bool {
+    let t = text.to_lowercase();
+    const CLAIMS: [&str; 22] = [
+        "erinnere dich",
+        "erinnerung gesetzt",
+        "erinnerung angelegt",
+        "erinnerung eingerichtet",
+        "erinnerung erstellt",
+        "erinnerung ist gesetzt",
+        "erinnerung wurde",
+        "habe dich erinnert",
+        "habe die erinnerung",
+        "habe ich angelegt",
+        "habe ich erstellt",
+        "habe ich gesetzt",
+        "habe ich gespeichert",
+        "habe ich aktualisiert",
+        "habe ich eingetragen",
+        "habe ich hinterlegt",
+        "habe ich versendet",
+        "habe ich gesendet",
+        "habe ich storniert",
+        "habe ich abgeschaltet",
+        "ist erledigt",
+        "habe ich erledigt",
+    ];
+    CLAIMS.iter().any(|c| t.contains(c))
+}
+
 /// Extract all UUID-shaped tokens (8-4-4-4-12 alphanumeric groups) from text,
 /// lowercased. Deliberately matches *alphanumeric* groups, not strict hex, so it
 /// also catches malformed fabrications like `b8c5d9f3-2e4a-5f6g-0b9c-3d4e5f6g7a8c`
@@ -614,6 +677,24 @@ mod tests {
         let text = "Echt: 37bee26c-412b-4dbe-a70f-1684fc0831c2, erfunden: 7a4f8c2e-1d3b-4e5f-9a8b-2c3d4e5f6a7b.";
         let out = ungrounded_uuids(text, &grounded);
         assert_eq!(out, vec!["7a4f8c2e-1d3b-4e5f-9a8b-2c3d4e5f6a7b"]);
+    }
+
+    /// Phantom-write: the exact fabrications from the reminder incident are caught.
+    #[test]
+    fn claims_completed_write_flags_reminder_confirmations() {
+        assert!(claims_completed_write("Erledigt! Ich erinnere dich morgen um 12 Uhr ans Mittagessen."));
+        assert!(claims_completed_write("Die Erinnerung wurde für 12:00 Uhr angelegt."));
+        assert!(claims_completed_write("Habe ich gespeichert."));
+        assert!(claims_completed_write("Erinnerung gesetzt ✅"));
+    }
+
+    /// Phantom-write: questions, plans and read-summaries are NOT flagged.
+    #[test]
+    fn claims_completed_write_ignores_non_claims() {
+        assert!(!claims_completed_write("Soll ich dich um 12 Uhr erinnern?"));
+        assert!(!claims_completed_write("Ich richte die Erinnerung jetzt ein …"));
+        assert!(!claims_completed_write("Der Auftrag hat 3 offene Positionen."));
+        assert!(!claims_completed_write("Wie kann ich helfen?"));
     }
 }
 

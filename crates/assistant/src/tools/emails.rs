@@ -133,16 +133,19 @@ pub struct SendEmail;
 impl Tool for SendEmail {
     fn name(&self) -> &'static str { "send_email" }
     fn description(&self) -> &'static str {
-        "Sendet eine E-Mail an einen Empfänger. Erfordert Bestätigung."
+        "Sendet eine eigenständige E-Mail an einen beliebigen Empfänger — ohne dass eine \
+         Anfrage oder ein bestehender E-Mail-Verlauf nötig ist (z. B. Nachfassen, \
+         Reaktivierung, allgemeine Korrespondenz). Für Antworten innerhalb eines \
+         bestehenden Verlaufs nutze stattdessen draft_reply. Erfordert Bestätigung. \
+         Anhänge werden derzeit nicht unterstützt."
     }
     fn params_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "to":          { "type": "string", "minLength": 1 },
-                "subject":     { "type": "string", "minLength": 1 },
-                "body":        { "type": "string", "minLength": 1 },
-                "attachments": { "type": "array", "items": { "type": "string" } }
+                "to":      { "type": "string", "minLength": 1, "description": "E-Mail-Adresse des Empfängers" },
+                "subject": { "type": "string", "minLength": 1 },
+                "body":    { "type": "string", "minLength": 1 }
             },
             "required": ["to", "subject", "body"]
         })
@@ -157,13 +160,19 @@ impl Tool for SendEmail {
     }
 
     async fn execute(&self, ctx: &ToolCtx, args: &Value) -> Result<Value> {
-        let _to = parse_str(args, "to", self.name())?;
+        let to = parse_str(args, "to", self.name())?;
+        let subject = parse_str(args, "subject", self.name())?;
+        let body = parse_str(args, "body", self.name())?;
         if !ctx.confirmed {
             return Ok(pending_confirmation(self.name(), args, self.summarize(args)));
         }
-        Err(crate::error::AssistantError::NotWired(
-            "Ad-hoc E-Mail-Versand".to_string(),
-        ))
+        match ctx.services.emails.send(to, subject, body).await {
+            Ok(()) => Ok(json!({ "ok": true, "to": to, "subject": subject })),
+            Err(aust_core::services::ServiceError::Validation(msg)) => {
+                Ok(json!({ "ok": false, "message": msg }))
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 }
 

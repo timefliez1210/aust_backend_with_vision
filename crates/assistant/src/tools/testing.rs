@@ -547,6 +547,10 @@ impl EmailService for MockEmailService {
     async fn categorize(&self, _id: Uuid, _label: &str) -> Result<(), ServiceError> {
         Ok(())
     }
+
+    async fn send(&self, _to: &str, _subject: &str, _body: &str) -> Result<(), ServiceError> {
+        Ok(())
+    }
 }
 
 // ── Invoice mock ──────────────────────────────────────────────────────────────

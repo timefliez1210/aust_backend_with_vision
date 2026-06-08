@@ -56,7 +56,7 @@ pub fn build_service_bundle(
         offers: Arc::new(OfferServiceImpl::new(pool.clone(), config.clone(), storage.clone())),
         calendar: Arc::new(CalendarServiceImpl::new(pool.clone())),
         customers: Arc::new(CustomerServiceImpl::new(pool.clone())),
-        emails: Arc::new(EmailServiceImpl::new(pool.clone())),
+        emails: Arc::new(EmailServiceImpl::new(pool.clone(), config.clone())),
         invoices: Arc::new(InvoiceServiceImpl::new(pool.clone(), storage.clone())),
         employees: Arc::new(EmployeeServiceImpl::new(pool.clone())),
         estimations: Arc::new(EstimationServiceImpl::new(pool.clone())),
