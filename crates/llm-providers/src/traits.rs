@@ -25,9 +25,13 @@ pub enum LlmRole {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmMessage {
     pub role: LlmRole,
-    /// UTF-8 message text. For the vision endpoint the image is passed
-    /// separately as raw bytes; `content` holds only the text prompt.
+    /// UTF-8 message text. Holds the text prompt; any images travel in `images`.
     pub content: String,
+    /// Base64-encoded images (no data-URI prefix) attached to this turn, passed
+    /// to vision-capable models via the Ollama `images` field. Empty for the
+    /// text-only case; skipped during serialization when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<String>,
 }
 
 impl LlmMessage {
@@ -39,6 +43,7 @@ impl LlmMessage {
         Self {
             role: LlmRole::System,
             content: content.into(),
+            images: Vec::new(),
         }
     }
 
@@ -47,6 +52,19 @@ impl LlmMessage {
         Self {
             role: LlmRole::User,
             content: content.into(),
+            images: Vec::new(),
+        }
+    }
+
+    /// Create a `User` message carrying one or more base64-encoded images.
+    ///
+    /// **Why**: lets the assistant forward photos / rasterized PDF pages from
+    /// Telegram into a vision-capable model alongside the text prompt.
+    pub fn user_with_images(content: impl Into<String>, images: Vec<String>) -> Self {
+        Self {
+            role: LlmRole::User,
+            content: content.into(),
+            images,
         }
     }
 
@@ -58,6 +76,7 @@ impl LlmMessage {
         Self {
             role: LlmRole::Assistant,
             content: content.into(),
+            images: Vec::new(),
         }
     }
 }

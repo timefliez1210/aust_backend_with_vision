@@ -668,7 +668,8 @@ impl EmailProcessor {
                 | ApprovalDecision::OfferEdit(_)
                 | ApprovalDecision::OfferDeny(_)
                 | ApprovalDecision::AssistantText { .. }
-                | ApprovalDecision::AssistantCallback { .. } => {
+                | ApprovalDecision::AssistantCallback { .. }
+                | ApprovalDecision::AssistantMedia { .. } => {
                     if let Some(tx) = &self.offer_tx {
                         let _ = tx.send(response.decision);
                     }

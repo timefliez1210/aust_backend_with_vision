@@ -206,6 +206,41 @@ pub async fn run_offer_event_handler(
                     }
                 }
             }
+            ApprovalDecision::AssistantMedia {
+                chat_id,
+                file_id,
+                kind,
+                mime_type,
+                caption,
+                ..
+            } => {
+                match aust_assistant::bindings::resolve(&state.db, chat_id).await {
+                    Ok(_binding) => {
+                        debug!(chat_id, %kind, "AssistantMedia: bound chat — routing to agent bridge");
+                        telegram_input::handle_media_message(
+                            &state.db,
+                            &client,
+                            bot_token,
+                            chat_id,
+                            &file_id,
+                            &kind,
+                            mime_type.as_deref(),
+                            caption.as_deref(),
+                            state.assistant_llm.clone(),
+                            &state.tool_registry,
+                            &state.soul,
+                            state.services.clone(),
+                        )
+                        .await;
+                    }
+                    Err(aust_assistant::AssistantError::UnboundChat(_)) => {
+                        debug!(chat_id, "AssistantMedia: unbound chat — skipping");
+                    }
+                    Err(e) => {
+                        warn!(chat_id, "AssistantMedia: binding lookup failed: {e}");
+                    }
+                }
+            }
             _ => {} // ignore non-offer events
         }
     }

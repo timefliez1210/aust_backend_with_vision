@@ -76,7 +76,11 @@ impl LlmProvider for OllamaProvider {
                     LlmRole::Assistant => "assistant".to_string(),
                 },
                 content: m.content.clone(),
-                images: None,
+                images: if m.images.is_empty() {
+                    None
+                } else {
+                    Some(m.images.clone())
+                },
             })
             .collect();
 

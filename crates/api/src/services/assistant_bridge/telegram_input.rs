@@ -58,6 +58,7 @@ pub async fn handle_text_message(
     let input = Input {
         text: text.to_string(),
         chat_id,
+        images: Vec::new(),
     };
 
     match driver::process_turn(pool, llm, registry, soul, services, input).await {
@@ -86,6 +87,86 @@ pub async fn handle_text_message(
         }
         Err(e) => {
             warn!(chat_id, "driver::process_turn error: {e}");
+            telegram_output::post_text(
+                client,
+                bot_token,
+                chat_id,
+                "⚠️ Es ist ein Fehler aufgetreten. Bitte versuche es erneut.",
+            )
+            .await;
+        }
+    }
+
+    true
+}
+
+/// Handle a photo / document (PDF) message from a Telegram chat.
+///
+/// Downloads the file, rasterizes PDFs to images, and runs a normal assistant
+/// turn with the images attached so the vision-capable model can see them.
+/// Returns `true` if handled (bound chat), `false` to fall through.
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_media_message(
+    pool: &PgPool,
+    client: &Client,
+    bot_token: &str,
+    chat_id: i64,
+    file_id: &str,
+    kind: &str,
+    mime_type: Option<&str>,
+    caption: Option<&str>,
+    llm: Arc<dyn AssistantLlmProvider>,
+    registry: &ToolRegistry,
+    soul: &Soul,
+    services: aust_core::services::ServiceBundle,
+) -> bool {
+    if bindings::resolve(pool, chat_id).await.is_err() {
+        return false; // unbound chat — not ours
+    }
+
+    info!(chat_id, kind, "Agent handling media message");
+
+    // Let Alex know we're working — vision turns take a few seconds (download +
+    // rasterize + model).
+    telegram_output::post_text(client, bot_token, chat_id, "🖼️ Einen Moment, ich schaue mir das an …").await;
+
+    let images = match super::media::prepare_images(client, bot_token, file_id, kind, mime_type).await {
+        Ok(imgs) => imgs,
+        Err(msg) => {
+            telegram_output::post_text(client, bot_token, chat_id, &msg).await;
+            return true;
+        }
+    };
+
+    // Caption becomes the prompt; with no caption, a neutral default instruction.
+    let text = caption
+        .filter(|c| !c.trim().is_empty())
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| {
+            "Der Nutzer hat dir eine Datei (Bild oder PDF) geschickt. Sieh sie dir an, \
+             fasse zusammen was relevant ist und frage nach, was er damit tun möchte."
+                .to_string()
+        });
+
+    let input = Input { text, chat_id, images };
+
+    match driver::process_turn(pool, llm, registry, soul, services, input).await {
+        Ok(result) => {
+            if result.awaiting_confirmation {
+                let summary = result
+                    .pending_summary_de
+                    .as_deref()
+                    .unwrap_or(result.reply.as_str());
+                confirm_dispatcher::maybe_post_keyboard(
+                    pool, client, bot_token, chat_id, result.pending_action_id, summary,
+                )
+                .await;
+            } else {
+                telegram_output::post_text(client, bot_token, chat_id, &result.reply).await;
+            }
+        }
+        Err(e) => {
+            warn!(chat_id, "driver::process_turn (media) error: {e}");
             telegram_output::post_text(
                 client,
                 bot_token,

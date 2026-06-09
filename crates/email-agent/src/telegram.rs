@@ -71,6 +71,22 @@ pub enum ApprovalDecision {
         callback_data: String,
         callback_query_id: String,
     },
+    /// A photo or document (PDF) message from a chat that may be bound to the
+    /// assistant agent. The orchestrator downloads the file via `getFile`,
+    /// rasterizes PDFs, and forwards the images to the assistant.
+    AssistantMedia {
+        chat_id: i64,
+        /// Telegram `file_id` of the largest photo size, or of the document.
+        file_id: String,
+        /// `"photo"` or `"document"`.
+        kind: String,
+        /// Document MIME type when known (e.g. `application/pdf`); `None` for photos.
+        mime_type: Option<String>,
+        /// Optional caption Alex typed alongside the media.
+        caption: Option<String>,
+        message_id: i64,
+        from_user_id: Option<i64>,
+    },
 }
 
 /// Calendar commands from Telegram.
@@ -285,6 +301,41 @@ impl TelegramBot {
                         }
                     }
                 }
+
+            // Handle photo / document (PDF) messages — emit AssistantMedia so the
+            // orchestrator can download, rasterize PDFs and route to the agent if
+            // the chat is bound. Telegram puts text in `text` and media in
+            // `photo`/`document`, so this is mutually exclusive with the block above.
+            if let Some(message) = &update.message {
+                let media = message
+                    .photo
+                    .as_ref()
+                    .and_then(|sizes| sizes.last())
+                    .map(|largest| (largest.file_id.clone(), "photo".to_string(), None))
+                    .or_else(|| {
+                        message.document.as_ref().map(|d| {
+                            (d.file_id.clone(), "document".to_string(), d.mime_type.clone())
+                        })
+                    });
+                if let Some((file_id, kind, mime_type)) = media {
+                    debug!(
+                        "Received {kind} from chat {} (file_id {})",
+                        message.chat.id, file_id
+                    );
+                    responses.push(ApprovalResponse {
+                        draft_id: "assistant_media".to_string(),
+                        decision: ApprovalDecision::AssistantMedia {
+                            chat_id: message.chat.id,
+                            file_id,
+                            kind,
+                            mime_type,
+                            caption: message.caption.clone(),
+                            message_id: message.message_id,
+                            from_user_id: message.from.as_ref().map(|u| u.id),
+                        },
+                    });
+                }
+            }
         }
 
         Ok(responses)
@@ -726,6 +777,28 @@ struct TgMessage {
     chat: TgChat,
     text: Option<String>,
     from: Option<TgUser>,
+    /// Present when the message is a photo — Telegram sends multiple sizes,
+    /// ascending; the last entry is the largest.
+    #[serde(default)]
+    photo: Option<Vec<TgPhotoSize>>,
+    /// Present when the message is a document (e.g. a PDF).
+    #[serde(default)]
+    document: Option<TgDocument>,
+    /// Caption text typed alongside a photo/document.
+    #[serde(default)]
+    caption: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TgPhotoSize {
+    file_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TgDocument {
+    file_id: String,
+    #[serde(default)]
+    mime_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

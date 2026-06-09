@@ -217,14 +217,20 @@ impl AssistantLlmProvider for OllamaAssistantLlm {
         let ollama_messages: Vec<Value> = messages
             .iter()
             .map(|m| {
-                serde_json::json!({
+                let mut msg = serde_json::json!({
                     "role": match m.role {
                         aust_llm_providers::LlmRole::System => "system",
                         aust_llm_providers::LlmRole::User => "user",
                         aust_llm_providers::LlmRole::Assistant => "assistant",
                     },
                     "content": m.content,
-                })
+                });
+                // Forward base64 images (photos / rasterized PDF pages) so the
+                // vision-capable model can see them. Omitted when empty.
+                if !m.images.is_empty() {
+                    msg["images"] = serde_json::json!(m.images);
+                }
+                msg
             })
             .collect();
 

@@ -27,6 +27,7 @@ RUN echo "deb http://deb.debian.org/debian bookworm main contrib" > /etc/apt/sou
     curl \
     tzdata \
     libreoffice-calc \
+    poppler-utils \
     --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 

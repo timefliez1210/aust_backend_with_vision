@@ -2,7 +2,7 @@
 //!
 //! This is the main entry point for processing a Telegram message:
 //!
-//! 1. Receive normalised `Input { text, chat_id }`
+//! 1. Receive normalised `Input { text, chat_id, images }`
 //! 2. Resolve binding → role (reject unbound chats)
 //! 3. Load / create session
 //! 4. Assemble prompt (SOUL + memory bundle + tools preamble + history + user message)
@@ -37,6 +37,10 @@ pub struct Input {
     pub text: String,
     /// Telegram chat ID.
     pub chat_id: i64,
+    /// Base64-encoded images attached to this message — photos sent by Alex and
+    /// rasterized PDF pages. Empty for plain text messages. Forwarded to the
+    /// vision-capable model on the first user turn.
+    pub images: Vec<String>,
 }
 
 /// The result of processing one input turn.
@@ -124,7 +128,16 @@ pub async fn process_turn(
         ));
     }
 
-    messages.push(aust_llm_providers::LlmMessage::user(input.text.clone()));
+    if input.images.is_empty() {
+        messages.push(aust_llm_providers::LlmMessage::user(input.text.clone()));
+    } else {
+        // Vision turn: attach the photos / rasterized PDF pages to the user message.
+        info!(chat_id = input.chat_id, image_count = input.images.len(), "Turn carries images");
+        messages.push(aust_llm_providers::LlmMessage::user_with_images(
+            input.text.clone(),
+            input.images.clone(),
+        ));
+    }
 
     // Step 5: Tool-calling iteration loop.
     let tool_schemas = registry.schemas_for_role(role);

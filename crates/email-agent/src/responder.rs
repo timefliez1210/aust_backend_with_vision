@@ -1,7 +1,7 @@
 use crate::calendar::AvailabilityResult;
 use crate::EmailError;
 use aust_core::models::{InquirySource, MissingField, MovingInquiry};
-use aust_llm_providers::{LlmMessage, LlmProvider, LlmRole};
+use aust_llm_providers::{LlmMessage, LlmProvider};
 use std::sync::Arc;
 use tracing::{debug, info};
 
@@ -128,14 +128,8 @@ Regeln:
         debug!("Generating follow-up email via LLM");
 
         let messages = vec![
-            LlmMessage {
-                role: LlmRole::System,
-                content: system_prompt.to_string(),
-            },
-            LlmMessage {
-                role: LlmRole::User,
-                content: user_prompt,
-            },
+            LlmMessage::system(system_prompt.to_string()),
+            LlmMessage::user(user_prompt),
         ];
 
         let response = self
@@ -223,14 +217,8 @@ Regeln:
         debug!("Revising draft via LLM: {}", &admin_instructions[..admin_instructions.len().min(80)]);
 
         let messages = vec![
-            LlmMessage {
-                role: LlmRole::System,
-                content: system_prompt.to_string(),
-            },
-            LlmMessage {
-                role: LlmRole::User,
-                content: user_prompt,
-            },
+            LlmMessage::system(system_prompt.to_string()),
+            LlmMessage::user(user_prompt),
         ];
 
         let response = self
@@ -271,14 +259,8 @@ Extrahiere diese Felder (wenn vorhanden):
 Antworte NUR mit dem JSON-Objekt, ohne Erklärungen. Setze fehlende Felder auf null."#;
 
         let messages = vec![
-            LlmMessage {
-                role: LlmRole::System,
-                content: system_prompt.to_string(),
-            },
-            LlmMessage {
-                role: LlmRole::User,
-                content: email_body.to_string(),
-            },
+            LlmMessage::system(system_prompt.to_string()),
+            LlmMessage::user(email_body.to_string()),
         ];
 
         let response = self
