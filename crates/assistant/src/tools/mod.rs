@@ -180,8 +180,9 @@ impl ToolRegistry {
         registry.register(Box::new(emails::GetEmail));
         registry.register(Box::new(emails::ListThread));
         registry.register(Box::new(emails::DraftReply));
-        // SendEmail unregistered until the SMTP send path is exposed via
-        // EmailService — execute() is NotWired-only today. Re-register when wired.
+        // SendEmail: wired in 51afc90 via EmailService::send (SMTP). Sends a
+        // standalone email to any recipient without an inquiry/thread.
+        registry.register(Box::new(emails::SendEmail));
         registry.register(Box::new(emails::MarkEmailHandled));
         registry.register(Box::new(emails::CategorizeEmail));
 
