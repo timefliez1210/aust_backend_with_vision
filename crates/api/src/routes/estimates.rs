@@ -408,8 +408,9 @@ async fn video_estimate(
         return Err(ApiError::Validation("At least one video file is required".into()));
     }
 
-    // Check vision service is configured before uploading
-    if state.vision_service.is_none() {
+    // Check an estimation backend is configured before uploading
+    // (the "vlm" backend needs no Modal client — it calls Ollama directly).
+    if state.vision_service.is_none() && state.config.vision_service.backend != "vlm" {
         return Err(ApiError::Internal("Vision service not configured".into()));
     }
 
@@ -497,97 +498,114 @@ async fn process_video_background(
     max_keyframes: Option<u32>,
     detection_threshold: Option<f64>,
 ) {
-    let client = match state.vision_service.as_ref() {
-        Some(c) => c,
-        None => {
-            tracing::error!(%estimation_id, "Vision service not configured in background task");
-            let _ = estimation_repo::mark_failed(&state.db, estimation_id).await;
-            return;
-        }
-    };
-
     tracing::info!(
         %inquiry_id,
         %estimation_id,
         video_size_mb = video_bytes.len() / (1024 * 1024),
-        "Background: calling vision service video endpoint..."
+        backend = %state.config.vision_service.backend,
+        "Background: starting video estimation..."
     );
 
-    let poll_interval =
-        std::time::Duration::from_secs(state.config.vision_service.poll_interval_secs);
-    let max_polls = state.config.vision_service.max_polls;
-    let max_retries_cfg = state.config.vision_service.max_retries;
-
-    let response = match client
-        .estimate_video_async(
-            &estimation_id.to_string(),
-            &video_bytes,
-            &video_mime,
-            max_keyframes,
-            detection_threshold,
-            poll_interval,
-            max_polls,
-            max_retries_cfg,
-        )
-        .await
+    let (items_value, total_volume, confidence) = if state.config.vision_service.backend
+        == "vlm"
     {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!(%inquiry_id, %estimation_id, error = %e, "Background: video estimation failed after all retries");
-            let _ = estimation_repo::mark_failed(&state.db, estimation_id).await;
-            return;
+        // Catalogue-grounded VLM: ffmpeg keyframes → Ollama vision model.
+        match crate::services::vision::try_vlm_video(&state, &video_bytes).await {
+            Ok((vol, conf, data)) => (data.unwrap_or(serde_json::Value::Null), vol, conf),
+            Err(e) => {
+                tracing::error!(%inquiry_id, %estimation_id, error = %e, "Background: VLM video estimation failed");
+                let _ = estimation_repo::mark_failed(&state.db, estimation_id).await;
+                return;
+            }
         }
+    } else {
+        let client = match state.vision_service.as_ref() {
+            Some(c) => c,
+            None => {
+                tracing::error!(%estimation_id, "Vision service not configured in background task");
+                let _ = estimation_repo::mark_failed(&state.db, estimation_id).await;
+                return;
+            }
+        };
+
+        let poll_interval =
+            std::time::Duration::from_secs(state.config.vision_service.poll_interval_secs);
+        let max_polls = state.config.vision_service.max_polls;
+        let max_retries_cfg = state.config.vision_service.max_retries;
+
+        let response = match client
+            .estimate_video_async(
+                &estimation_id.to_string(),
+                &video_bytes,
+                &video_mime,
+                max_keyframes,
+                detection_threshold,
+                poll_interval,
+                max_polls,
+                max_retries_cfg,
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(%inquiry_id, %estimation_id, error = %e, "Background: video estimation failed after all retries");
+                let _ = estimation_repo::mark_failed(&state.db, estimation_id).await;
+                return;
+            }
+        };
+
+        tracing::info!(
+            %inquiry_id,
+            %estimation_id,
+            items = response.detected_items.len(),
+            total_volume = response.total_volume_m3,
+            processing_ms = response.processing_time_ms,
+            "Background: vision service video response received"
+        );
+
+        // Upload crop thumbnails to S3 and replace base64 with S3 keys
+        let mut items_value = match serde_json::to_value(&response.detected_items) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(%estimation_id, error = %e, "Background: failed to serialize items");
+                let _ = estimation_repo::mark_failed(&state.db, estimation_id).await;
+                return;
+            }
+        };
+
+        if let Some(items_arr) = items_value.as_array_mut() {
+            for (idx, item_val) in items_arr.iter_mut().enumerate() {
+                if let Some(crop_b64) = item_val.get("crop_base64").and_then(|v| v.as_str())
+                    && !crop_b64.is_empty() {
+                        let name = item_val.get("name").and_then(|v| v.as_str()).unwrap_or("item");
+                        let safe_name = name.replace(' ', "_").to_lowercase();
+                        let key = format!("estimates/{inquiry_id}/{estimation_id}/crops/{safe_name}_{idx}.jpg");
+                        if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(crop_b64)
+                            && state
+                                .storage
+                                .upload(&key, Bytes::from(decoded), "image/jpeg")
+                                .await
+                                .is_ok()
+                            && let Some(obj) = item_val.as_object_mut()
+                            {
+                                obj.remove("crop_base64");
+                                obj.insert(
+                                    "crop_s3_key".to_string(),
+                                    serde_json::Value::String(key),
+                                );
+                            }
+                    }
+            }
+        }
+
+        (items_value, response.total_volume_m3, response.confidence_score)
     };
-
-    tracing::info!(
-        %inquiry_id,
-        %estimation_id,
-        items = response.detected_items.len(),
-        total_volume = response.total_volume_m3,
-        processing_ms = response.processing_time_ms,
-        "Background: vision service video response received"
-    );
-
-    // Upload crop thumbnails to S3 and replace base64 with S3 keys
-    let mut items_value = match serde_json::to_value(&response.detected_items) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::error!(%estimation_id, error = %e, "Background: failed to serialize items");
-            let _ = estimation_repo::mark_failed(&state.db, estimation_id).await;
-            return;
-        }
-    };
-
-    if let Some(items_arr) = items_value.as_array_mut() {
-        for (idx, item_val) in items_arr.iter_mut().enumerate() {
-            if let Some(crop_b64) = item_val.get("crop_base64").and_then(|v| v.as_str())
-                && !crop_b64.is_empty() {
-                    let name = item_val.get("name").and_then(|v| v.as_str()).unwrap_or("item");
-                    let safe_name = name.replace(' ', "_").to_lowercase();
-                    let key = format!("estimates/{inquiry_id}/{estimation_id}/crops/{safe_name}_{idx}.jpg");
-                    if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(crop_b64)
-                        && state
-                            .storage
-                            .upload(&key, Bytes::from(decoded), "image/jpeg")
-                            .await
-                            .is_ok()
-                        && let Some(obj) = item_val.as_object_mut()
-                        {
-                            obj.remove("crop_base64");
-                            obj.insert(
-                                "crop_s3_key".to_string(),
-                                serde_json::Value::String(key),
-                            );
-                        }
-                }
-        }
-    }
 
     let now = chrono::Utc::now();
 
     // Update estimation with results
     let _ = estimation_repo::mark_completed(
-        &state.db, estimation_id, Some(&items_value), response.total_volume_m3, response.confidence_score,
+        &state.db, estimation_id, Some(&items_value), total_volume, confidence,
     ).await;
 
     // Check if other videos for this quote are still processing

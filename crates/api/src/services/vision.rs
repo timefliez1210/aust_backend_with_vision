@@ -124,6 +124,65 @@ pub async fn try_vision_service_async(
     ))
 }
 
+/// Build a `VlmEstimator` from the app config.
+///
+/// **Caller**: `process_submission_background` / `process_video_background`
+/// when `vision_service.backend = "vlm"`.
+///
+/// # Errors
+/// `ApiError::Internal` when `llm.ollama` is not configured — the VLM backend
+/// reuses its `base_url`/`api_key` for the Ollama connection.
+pub fn build_vlm_estimator(
+    state: &AppState,
+) -> Result<aust_volume_estimator::VlmEstimator, ApiError> {
+    let ollama = state.config.llm.ollama.as_ref().ok_or_else(|| {
+        ApiError::Internal(
+            "vision backend 'vlm' requires llm.ollama config (base_url/api_key)".into(),
+        )
+    })?;
+    Ok(aust_volume_estimator::VlmEstimator::new(
+        ollama.base_url.clone(),
+        ollama.api_key.clone(),
+        state.config.vision_service.vlm_model.clone(),
+        state.config.vision_service.vlm_timeout_secs,
+    ))
+}
+
+/// Run VLM photo estimation and return the `(volume, confidence, result_data)`
+/// triple used by the background submission flow.
+///
+/// `result_data` is the full `VisionAnalysisResult` (items + not-moved notes);
+/// `parse_detected_items` already understands this shape.
+pub async fn try_vlm_photos(
+    state: &AppState,
+    images: &[(Vec<u8>, String)],
+) -> Result<(f64, f64, Option<serde_json::Value>), ApiError> {
+    let estimator = build_vlm_estimator(state)?;
+    let result = estimator
+        .estimate_photos(images)
+        .await
+        .map_err(|e| ApiError::Internal(format!("VLM estimation failed: {e}")))?;
+    let result_data = serde_json::to_value(&result)
+        .map_err(|e| ApiError::Internal(format!("Failed to serialize VLM result: {e}")))?;
+    Ok((result.total_volume_m3, result.confidence_score, Some(result_data)))
+}
+
+/// Run VLM video estimation (ffmpeg keyframes → photo path); same return shape
+/// as [`try_vlm_photos`].
+pub async fn try_vlm_video(
+    state: &AppState,
+    video_bytes: &[u8],
+) -> Result<(f64, f64, Option<serde_json::Value>), ApiError> {
+    let estimator = build_vlm_estimator(state)?;
+    let result = estimator
+        .estimate_video(video_bytes)
+        .await
+        .map_err(|e| ApiError::Internal(format!("VLM video estimation failed: {e}")))?;
+    let result_data = serde_json::to_value(&result)
+        .map_err(|e| ApiError::Internal(format!("Failed to serialize VLM result: {e}")))?;
+    Ok((result.total_volume_m3, result.confidence_score, Some(result_data)))
+}
+
 /// Parse a free-form address string into (street, city, postal_code).
 /// Best-effort: tries to split "Straße 1, 31157 Sarstedt" into parts.
 pub fn parse_address(addr: &str) -> (String, String, String) {

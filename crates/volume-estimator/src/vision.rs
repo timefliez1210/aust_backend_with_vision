@@ -4,7 +4,7 @@ use aust_llm_providers::LlmProvider;
 use std::sync::Arc;
 
 /// Extract JSON object from LLM response that may contain markdown code blocks or extra text.
-fn extract_json(text: &str) -> Option<&str> {
+pub(crate) fn extract_json(text: &str) -> Option<&str> {
     // Try to find JSON in a code block first
     if let Some(start) = text.find("```json") {
         let json_start = start + 7;

@@ -1845,25 +1845,32 @@ pub(crate) async fn process_submission_background(
         .map_err(|e| format!("Vision semaphore closed: {e}"))?;
     tracing::info!(estimation_id = %estimation_id, "Vision semaphore acquired, submitting to Modal");
 
-    // 3. Run volume estimation via async submit + poll (no LLM fallback).
-    //    If the vision service fails after all retries, the estimation is marked
-    //    'failed' by the tokio::spawn error handler — manual review required.
-    let (total_volume, confidence, result_data) = services::vision::try_vision_service_async(
-        &state,
-        &images,
-        estimation_id,
-        inquiry_id,
-        estimation_id,
-    )
-    .await
-    .map_err(|e| {
-        tracing::error!(
-            inquiry_id = %inquiry_id,
-            estimation_id = %estimation_id,
-            "Vision estimation failed after all retries — manual intervention required: {e}"
-        );
-        format!("Vision estimation failed: {e}")
-    })?;
+    // 3. Run volume estimation (no LLM-single-image fallback). Backend selection:
+    //    - "vlm": catalogue-grounded vision model via Ollama (single in-process call)
+    //    - "modal": Python GPU sidecar via async submit + poll
+    //    If estimation fails after all retries, the estimation is marked 'failed'
+    //    by the tokio::spawn error handler — manual review required.
+    let (total_volume, confidence, result_data) =
+        if state.config.vision_service.backend == "vlm" {
+            services::vision::try_vlm_photos(&state, &images).await
+        } else {
+            services::vision::try_vision_service_async(
+                &state,
+                &images,
+                estimation_id,
+                inquiry_id,
+                estimation_id,
+            )
+            .await
+        }
+        .map_err(|e| {
+            tracing::error!(
+                inquiry_id = %inquiry_id,
+                estimation_id = %estimation_id,
+                "Vision estimation failed after all retries — manual intervention required: {e}"
+            );
+            format!("Vision estimation failed: {e}")
+        })?;
 
     let method = if !depth_maps.is_empty() {
         EstimationMethod::DepthSensor
@@ -1951,29 +1958,49 @@ pub(crate) async fn process_video_background(
         .map_err(|e| format!("Vision semaphore closed: {e}"))?;
     tracing::info!(estimation_id = %estimation_id, "Vision semaphore acquired, submitting video to Modal");
 
-    // 2. Submit video job and poll for result via async pattern.
-    let client = state
-        .vision_service
-        .as_ref()
-        .ok_or("Vision service not configured")?;
+    // 2. Run video estimation. Backend selection:
+    //    - "vlm": ffmpeg keyframes → catalogue-grounded vision model via Ollama
+    //    - "modal": Python GPU sidecar (MASt3R + SAM 2) via async submit + poll
+    let (total_volume, confidence, result_data) =
+        if state.config.vision_service.backend == "vlm" {
+            services::vision::try_vlm_video(&state, &video_bytes)
+                .await
+                .map_err(|e| e.to_string())
+        } else {
+            let client = state
+                .vision_service
+                .as_ref()
+                .ok_or("Vision service not configured")?;
 
-    let poll_interval =
-        std::time::Duration::from_secs(state.config.vision_service.poll_interval_secs);
-    let max_polls = state.config.vision_service.max_polls;
-    let max_retries = state.config.vision_service.max_retries;
+            let poll_interval = std::time::Duration::from_secs(
+                state.config.vision_service.poll_interval_secs,
+            );
+            let max_polls = state.config.vision_service.max_polls;
+            let max_retries = state.config.vision_service.max_retries;
 
-    let response = client
-        .estimate_video_async(
-            &estimation_id.to_string(),
-            &video_bytes,
-            &mime_type,
-            None,
-            None,
-            poll_interval,
-            max_polls,
-            max_retries,
-        )
-        .await
+            client
+                .estimate_video_async(
+                    &estimation_id.to_string(),
+                    &video_bytes,
+                    &mime_type,
+                    None,
+                    None,
+                    poll_interval,
+                    max_polls,
+                    max_retries,
+                )
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|response| {
+                    let items = serde_json::to_value(&response.detected_items)
+                        .map_err(|e| format!("Failed to serialize items: {e}"))?;
+                    Ok((
+                        response.total_volume_m3,
+                        response.confidence_score,
+                        Some(items),
+                    ))
+                })
+        }
         .map_err(|e| {
             tracing::error!(
                 inquiry_id = %inquiry_id,
@@ -1985,8 +2012,7 @@ pub(crate) async fn process_video_background(
 
     tracing::info!(
         estimation_id = %estimation_id,
-        volume = response.total_volume_m3,
-        items = response.detected_items.len(),
+        volume = total_volume,
         "Video estimation succeeded"
     );
 
@@ -1996,8 +2022,6 @@ pub(crate) async fn process_video_background(
         "s3_key": s3_key,
         "mime_type": mime_type,
     });
-    let result_data = serde_json::to_value(&response.detected_items)
-        .map_err(|e| format!("Failed to serialize items: {e}"))?;
 
     estimation_repo::upsert(
         &state.db,
@@ -2005,9 +2029,9 @@ pub(crate) async fn process_video_background(
         inquiry_id,
         "video",
         &source_data,
-        Some(&result_data),
-        response.total_volume_m3,
-        response.confidence_score,
+        result_data.as_ref(),
+        total_volume,
+        confidence,
         chrono::Utc::now(),
     )
     .await
@@ -2015,7 +2039,7 @@ pub(crate) async fn process_video_background(
 
     // 4. Update inquiry status and trigger offer generation
     let now_update = chrono::Utc::now();
-    inquiry_repo::update_volume_and_status(&state.db, inquiry_id, response.total_volume_m3, "estimated", now_update)
+    inquiry_repo::update_volume_and_status(&state.db, inquiry_id, total_volume, "estimated", now_update)
         .await
         .map_err(|e| format!("Failed to update inquiry: {e}"))?;
 

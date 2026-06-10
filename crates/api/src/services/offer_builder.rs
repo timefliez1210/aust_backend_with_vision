@@ -1373,6 +1373,61 @@ mod tests {
         assert!(items[0].dimensions.is_some());
     }
 
+    /// The exact `result_data` shape stored by the VLM backend
+    /// (`VlmEstimator` → `try_vlm_photos`/`try_vlm_video`): a full
+    /// `VisionAnalysisResult` with counts baked into names, line-total
+    /// volumes, `re_catalog` source, and not-moved notes.
+    #[test]
+    fn parse_vlm_backend_result_data() {
+        let json = serde_json::json!({
+            "detected_items": [
+                {
+                    "name": "4× Stuhl",
+                    "volume_m3": 0.8,
+                    "confidence": 0.7,
+                    "dimensions": null,
+                    "category": null,
+                    "german_name": "Stuhl",
+                    "re_value": 8.0,
+                    "volume_source": "re_catalog",
+                    "bbox": null,
+                    "bbox_image_index": null,
+                    "crop_s3_key": null,
+                    "seen_in_images": null
+                },
+                {
+                    "name": "35× Umzugskarton",
+                    "volume_m3": 3.5,
+                    "confidence": 0.7,
+                    "dimensions": null,
+                    "category": "boxes",
+                    "german_name": "Umzugskarton bis 80 l",
+                    "re_value": 35.0,
+                    "volume_source": "re_catalog",
+                    "bbox": null,
+                    "bbox_image_index": null,
+                    "crop_s3_key": null,
+                    "seen_in_images": null
+                }
+            ],
+            "total_volume_m3": 4.3,
+            "confidence_score": 0.7,
+            "room_type": null,
+            "analysis_notes": "Nicht umgezogen (verbleibt in der Wohnung): Einbauküche (built-in)"
+        });
+        let est = make_vol_est(json);
+        let items = parse_detected_items(Some(&est));
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].name, "4× Stuhl");
+        assert!((items[0].volume_m3 - 0.8).abs() < 0.001);
+        assert_eq!(items[0].german_name.as_deref(), Some("Stuhl"));
+        assert_eq!(items[0].volume_source.as_deref(), Some("re_catalog"));
+        assert_eq!(items[1].name, "35× Umzugskarton");
+        assert!((items[1].re_value.unwrap() - 35.0).abs() < 0.001);
+        // No dimensions in VLM output — the XLSX sheet shows the column empty.
+        assert!(items[0].dimensions.is_none());
+    }
+
     #[test]
     fn parse_vision_llm_result_data() {
         let json = serde_json::json!({

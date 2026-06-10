@@ -1,0 +1,74 @@
+sofa | Sofa, Couch, Liege je Sitz | 0.4 m3 per seat
+couch | Sofa, Couch, Liege je Sitz | 0.4 m3 per seat
+armchair | Sessel mit Armlehnen | 0.8 m3
+chair | Stuhl | 0.2 m3
+stool | Stuhl, Hocker | 0.2 m3
+bench | Eckbank je Sitz | 0.2 m3 per seat
+ottoman | Ottoman | 0.4 m3
+recliner | Sessel mit Armlehnen | 0.8 m3
+bar stool | Stuhl mit Armlehnen | 0.3 m3
+table | Tisch | size-variant 0.4-0.8 m3
+desk | Schreibtisch | size-variant 0.8-1.2 m3
+dining table | Tisch über 1,2 m | 0.8 m3
+coffee table | Tisch bis 1,0 m | 0.5 m3
+kitchen island | Winkelkombination | 1.2 m3
+bed | Bett | size-variant 1.0-2.0 m3
+mattress | Bett (Matratze) | size-variant 1.0-2.0 m3
+crib | Kinderbett komplett | 0.5 m3
+bunk bed | Etagenbett komplett | 1.6 m3
+wardrobe | Schrank zerlegbar je angef. m | 0.8 m3 per meter
+closet | Schrank zerlegbar je angef. m | 0.8 m3 per meter
+dresser | Kommode | 0.7 m3
+chest of drawers | Kommode | 0.7 m3
+shelf | Regal zerlegbar je angef. m | 0.4 m3 per meter
+bookshelf | Bücherregal zerlegbar je angef. m | 0.4 m3 per meter
+cabinet | Kommode | 0.7 m3
+cupboard | Wohnz.-Schrank zerlegb. je angef. m | 0.8 m3 per meter
+nightstand | Nachttisch | 0.2 m3
+shoe rack | Schuhschrank | 0.4 m3
+coat rack | Kleiderablage | 0.2 m3
+tv | Fernseher | 0.3 m3
+television | Fernseher | 0.3 m3
+monitor | Fernseher | 0.3 m3
+computer | Computer: PC / EDV-Anlage | 0.5 m3
+laptop | Computer (Laptop) | 0.1 m3
+printer | Tischkopierer | 0.5 m3
+speaker | Stereoanlage | 0.4 m3
+stereo | Stereoanlage | 0.4 m3
+lamp | Deckenlampe | 0.2 m3 | BOX
+floor lamp | Stehlampe | 0.2 m3
+chandelier | Lüster | 0.5 m3 | NOT-MOVED
+refrigerator | Kühlschrank | size-variant 0.5-1.0 m3
+fridge | Kühlschrank | size-variant 0.5-1.0 m3
+freezer | Kühlschrank / Truhe bis 120 l | 0.5 m3
+washing machine | Waschmaschine / Trockner | 0.5 m3
+dryer | Waschmaschine / Trockner | 0.5 m3
+dishwasher | Geschirrspülmaschine | 0.5 m3
+oven | Herd | 0.5 m3
+microwave | Mikrowelle | 0.2 m3
+stove | Herd | 0.5 m3
+vacuum cleaner | Staubsauger | 0.1 m3
+fan | Ventilator | 0.2 m3
+heater | Heizgerät | 0.2 m3 | NOT-MOVED
+box | Umzugskarton bis 80 l | 0.1 m3
+carton | Umzugskarton bis 80 l | 0.1 m3
+moving box | Umzugskarton bis 80 l | 0.1 m3
+basket | Korb | 0.1 m3
+storage container | Umzugskarton über 80 l | 0.2 m3
+stroller | Kinderwagen | 0.3 m3
+suitcase | Koffer | 0.1 m3
+bag | Tasche | 0.1 m3
+bicycle | Fahrrad / Moped | 0.5 m3
+bike | Fahrrad / Moped | 0.5 m3
+treadmill | Laufband | 1.0 m3
+exercise equipment | Sportgerät | 0.5 m3
+piano | Klavier | 1.5 m3
+keyboard | Keyboard | 0.4 m3
+guitar | Gitarre | 0.2 m3
+plant | Blumenkübel / Kasten | 0.1 m3
+painting | Bilder | size-variant 0.1-0.2 m3
+mirror | Spiegel | 0.1 m3
+rug | Teppich | 0.3 m3
+carpet | Teppich | 0.3 m3
+curtain | Vorhang | 0.1 m3 | BOX
+ironing board | Bügelbrett | 0.1 m3

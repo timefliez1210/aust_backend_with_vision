@@ -237,6 +237,32 @@ pub struct VisionServiceConfig {
     /// Maximum number of poll attempts before declaring the job timed out.
     /// Default: 20 (20 × 60s = 20 min ceiling for photo; video may need more).
     pub max_polls: u32,
+    /// Which backend processes photo/video estimation jobs:
+    /// - `"modal"` — Python GPU sidecar (Grounding DINO + SAM 2 + depth) via submit/poll.
+    /// - `"vlm"` — catalogue-grounded vision model via Ollama (`VlmEstimator`);
+    ///   connects through `llm.ollama.base_url`/`api_key`.
+    #[serde(default = "default_vision_backend")]
+    pub backend: String,
+    /// Ollama model tag for the `"vlm"` backend.
+    /// minimax-m3 benchmarked closest to ground truth on the 59-photo reference set.
+    #[serde(default = "default_vlm_model")]
+    pub vlm_model: String,
+    /// Wall-clock ceiling in seconds for a single VLM generation. Thinking
+    /// models are slow: minimax-m3 needs ~14 min on a 59-photo set.
+    #[serde(default = "default_vlm_timeout_secs")]
+    pub vlm_timeout_secs: u64,
+}
+
+fn default_vision_backend() -> String {
+    "modal".to_string()
+}
+
+fn default_vlm_model() -> String {
+    "minimax-m3".to_string()
+}
+
+fn default_vlm_timeout_secs() -> u64 {
+    1800
 }
 
 impl Default for VisionServiceConfig {
@@ -250,6 +276,9 @@ impl Default for VisionServiceConfig {
             max_retries: 1,
             poll_interval_secs: 60,
             max_polls: 20,
+            backend: default_vision_backend(),
+            vlm_model: default_vlm_model(),
+            vlm_timeout_secs: default_vlm_timeout_secs(),
         }
     }
 }

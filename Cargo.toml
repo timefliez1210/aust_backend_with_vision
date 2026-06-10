@@ -57,7 +57,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # HTTP client (for external APIs)
-reqwest = { version = "0.12", features = ["json", "multipart"] }
+reqwest = { version = "0.12", features = ["json", "multipart", "stream"] }
 
 # Email
 lettre = { version = "0.11", features = ["tokio1-native-tls", "builder"] }
@@ -106,6 +106,7 @@ bytes = "1"
 
 # Futures utilities
 futures = "0.3"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 
 # Random number generation
 rand = "0.9"

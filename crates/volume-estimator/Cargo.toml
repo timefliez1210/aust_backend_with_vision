@@ -20,3 +20,6 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 bytes = { workspace = true }
 reqwest = { workspace = true }
+base64 = { workspace = true }
+image = { workspace = true }
+tempfile = { workspace = true }

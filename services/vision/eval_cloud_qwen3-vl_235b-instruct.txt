@@ -1,0 +1,65 @@
+MOVABLE INVENTORY:
+1x sofa (Sofa, Couch, Liege je Sitz) — 0.4 m3 per seat = 2.0 m3
+4x chair (Stuhl) — 0.2 m3 ea = 0.8 m3
+2x armchair (Sessel mit Armlehnen) — 0.8 m3 ea = 1.6 m3
+1x ottoman (Ottoman) — 0.4 m3 ea = 0.4 m3
+1x table (Tisch) — 0.6 m3 ea = 0.6 m3
+1x desk (Schreibtisch) — 1.0 m3 ea = 1.0 m3
+1x dining table (Tisch über 1,2 m) — 0.8 m3 ea = 0.8 m3
+1x coffee table (Tisch bis 1,0 m) — 0.5 m3 ea = 0.5 m3
+1x bed (Bett) — 1.5 m3 ea = 1.5 m3
+1x mattress (Bett (Matratze)) — 1.5 m3 ea = 1.5 m3
+2x wardrobe (Schrank zerlegbar je angef. m) — 0.8 m3 per meter = 3.2 m3
+1x dresser (Kommode) — 0.7 m3 ea = 0.7 m3
+1x chest of drawers (Kommode) — 0.7 m3 ea = 0.7 m3
+1x shelf (Regal zerlegbar je angef. m) — 0.4 m3 per meter = 0.8 m3
+1x bookshelf (Bücherregal zerlegbar je angef. m) — 0.4 m3 per meter = 0.4 m3
+1x cabinet (Kommode) — 0.7 m3 ea = 0.7 m3
+1x nightstand (Nachttisch) — 0.2 m3 ea = 0.2 m3
+1x shoe rack (Schuhschrank) — 0.4 m3 ea = 0.4 m3
+1x tv (Fernseher) — 0.3 m3 ea = 0.3 m3
+1x computer (Computer: PC / EDV-Anlage) — 0.5 m3 ea = 0.5 m3
+1x laptop (Computer (Laptop)) — 0.1 m3 ea = 0.1 m3
+1x printer (Tischkopierer) — 0.5 m3 ea = 0.5 m3
+1x speaker (Stereoanlage) — 0.4 m3 ea = 0.4 m3
+1x refrigerator (Kühlschrank) — 0.75 m3 ea = 0.75 m3
+1x washing machine (Waschmaschine / Trockner) — 0.5 m3 ea = 0.5 m3
+1x dishwasher (Geschirrspülmaschine) — 0.5 m3 ea = 0.5 m3
+1x oven (Herd) — 0.5 m3 ea = 0.5 m3
+1x microwave (Mikrowelle) — 0.2 m3 ea = 0.2 m3
+1x vacuum cleaner (Staubsauger) — 0.1 m3 ea = 0.1 m3
+1x fan (Ventilator) — 0.2 m3 ea = 0.2 m3
+1x box (Umzugskarton bis 80 l) — 0.1 m3 ea = 0.1 m3
+1x carton (Umzugskarton bis 80 l) — 0.1 m3 ea = 0.1 m3
+1x moving box (Umzugskarton bis 80 l) — 0.1 m3 ea = 0.1 m3
+1x basket (Korb) — 0.1 m3 ea = 0.1 m3
+1x storage container (Umzugskarton über 80 l) — 0.2 m3 ea = 0.2 m3
+1x stroller (Kinderwagen) — 0.3 m3 ea = 0.3 m3
+1x suitcase (Koffer) — 0.1 m3 ea = 0.1 m3
+1x bag (Tasche) — 0.1 m3 ea = 0.1 m3
+1x bicycle (Fahrrad / Moped) — 0.5 m3 ea = 0.5 m3
+1x treadmill (Laufband) — 1.0 m3 ea = 1.0 m3
+1x exercise equipment (Sportgerät) — 0.5 m3 ea = 0.5 m3
+1x piano (Klavier) — 1.5 m3 ea = 1.5 m3
+1x keyboard (Keyboard) — 0.4 m3 ea = 0.4 m3
+1x guitar (Gitarre) — 0.2 m3 ea = 0.2 m3
+1x plant (Blumenkübel / Kasten) — 0.1 m3 ea = 0.1 m3
+1x painting (Bilder) — 0.15 m3 ea = 0.15 m3
+1x mirror (Spiegel) — 0.1 m3 ea = 0.1 m3
+1x rug (Teppich) — 0.3 m3 ea = 0.3 m3
+1x carpet (Teppich) — 0.3 m3 ea = 0.3 m3
+1x curtain (Vorhang) — 0.1 m3 ea = 0.1 m3
+1x ironing board (Bügelbrett) — 0.1 m3 ea = 0.1 m3
+
+PACKED INTO BOXES:
+~10 Umzugskartons = 1.0 m3
+
+NOT MOVED (excluded):
+chandelier (Lüster) — NOT-MOVED flag
+heater (Heizgerät) — NOT-MOVED flag
+built-in kitchen units (Einbaukueche) — built-in, stays with property
+built-in oven (Herd) — built-in, stays with property
+built-in dishwasher (Geschirrspülmaschine) — built-in, stays with property
+radiators — built-in, stays with property
+
+TOTAL MOVABLE VOLUME: 42.9 m3

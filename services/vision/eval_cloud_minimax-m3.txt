@@ -1,0 +1,61 @@
+MOVABLE INVENTORY:
+1× shelf (Regal zerlegbar) — 0.4 m3 ea = 0.4 m3
+3× armchair (Sessel mit Armlehnen) — 0.8 m3 ea = 2.4 m3
+1× dresser (Kommode) — 0.7 m3 ea = 0.7 m3
+1× shelf (Regal, wine rack) — 0.4 m3 ea = 0.4 m3
+1× cupboard (Wohnz.-Schrank, 2m sideboard) — 0.8 m3/m × 2m = 1.6 m3
+1× dining table (Tisch über 1,2 m) — 0.8 m3 ea = 0.8 m3
+1× painting (Bilder, large canvas) — 0.2 m3 ea = 0.2 m3
+1× cabinet (Kommode, small wood) — 0.7 m3 ea = 0.7 m3
+1× suitcase (Koffer) — 0.1 m3 ea = 0.1 m3
+1× exercise equipment (Sportgerät, bike) — 0.5 m3 ea = 0.5 m3
+1× dresser (Kommode, Malm 8-drawer wide) — 0.7 m3 ea = 0.7 m3
+1× sofa (Sofa, je Sitz, L-sectional ~5 seats) — 0.4 m3 × 5 = 2.0 m3
+1× coffee table (Tisch bis 1,0 m) — 0.5 m3 ea = 0.5 m3
+1× rug (Teppich, striped) — 0.3 m3 ea = 0.3 m3
+1× cupboard (Wohnz.-Schrank, 2m TV-stand) — 0.8 m3/m × 2m = 1.6 m3
+1× TV (Fernseher) — 0.3 m3 ea = 0.3 m3
+1× plant (Blumenkübel) — 0.1 m3 ea = 0.1 m3
+2× armchair (Sessel mit Armlehnen, outdoor) — 0.8 m3 ea = 1.6 m3
+1× table (Tisch, outdoor) — 0.4 m3 ea = 0.4 m3
+1× washing machine (Waschmaschine) — 0.5 m3 ea = 0.5 m3
+1× bed frame (Bett) — 1.5 m3 ea = 1.5 m3
+1× mattress (Bett/Matratze) — 1.5 m3 ea = 1.5 m3
+1× wardrobe (Schrank, small) — 0.8 m3/m × 1m = 0.8 m3
+1× wardrobe (Schrank, large with mirror) — 0.8 m3/m × 2m = 1.6 m3
+1× rug (Teppich, grey shag) — 0.3 m3 ea = 0.3 m3
+1× mattress (Bett/Matratze, spare single) — 1.0 m3 ea = 1.0 m3
+1× shelf (Regal, Kallax) — 0.4 m3 ea = 0.4 m3
+1× basket (Korb, wicker) — 0.1 m3 ea = 0.1 m3
+1× monitor (Fernseher) — 0.3 m3 ea = 0.3 m3
+1× desk (Schreibtisch, white) — 0.8 m3 ea = 0.8 m3
+1× mirror (Spiegel, full-length) — 0.1 m3 ea = 0.1 m3
+1× cabinet (Kommode, grey with red handles) — 0.7 m3 ea = 0.7 m3
+1× desk (Schreibtisch, cluttered) — 0.8 m3 ea = 0.8 m3
+1× printer (Tischkopierer) — 0.5 m3 ea = 0.5 m3
+1× shelf (Regal, small white with tools) — 0.4 m3 ea = 0.4 m3
+1× chair (Stuhl, office) — 0.2 m3 ea = 0.2 m3
+1× ottoman (Ottoman, brown leather bench) — 0.4 m3 ea = 0.4 m3
+1× suitcase (Koffer, silver) — 0.1 m3 ea = 0.1 m3
+1× desk (Schreibtisch, office with PC) — 0.8 m3 ea = 0.8 m3
+1× computer (Computer: PC) — 0.5 m3 ea = 0.5 m3
+1× monitor (Fernseher) — 0.3 m3 ea = 0.3 m3
+1× coat rack (Kleiderablage, with winter coats) — 0.2 m3 ea = 0.2 m3
+1× coat rack (Kleiderablage, with hangers) — 0.2 m3 ea = 0.2 m3
+1× ironing board (Bügelbrett) — 0.1 m3 ea = 0.1 m3
+1× bag (Tasche, green) — 0.1 m3 ea = 0.1 m3
+1× moving box (Umzugskarton, DPD pre-packed) — 0.1 m3 ea = 0.1 m3
+1× basket (Korb, clear plastic) — 0.1 m3 ea = 0.1 m3
+1× table (Tisch, covered outdoor) — 0.4 m3 ea = 0.4 m3
+2× chair (Stuhl, covered outdoor) — 0.2 m3 ea = 0.4 m3
+1× laptop (Computer Laptop) — 0.1 m3 ea = 0.1 m3
+
+PACKED INTO BOXES:
+~20 Umzugskartons (clothes on racks, towels, kitchen items, books, small loose items) = 2.0 m3
+
+NOT MOVED (excluded):
+Built-in kitchen (Einbauküche) — lower cabinets, upper cabinets, tall cabinet — stays with property
+Built-in oven, built-in microwave, built-in fridge, built-in dishwasher — built-in appliances
+Radiator (Heizgerät/Heizkörper) — fixed heating
+
+TOTAL MOVABLE VOLUME: 32.6 m3
