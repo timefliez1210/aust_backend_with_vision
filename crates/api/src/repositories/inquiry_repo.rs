@@ -654,9 +654,11 @@ pub(crate) async fn fetch_updated_assignment(
                MIN(ie.start_time) AS start_time,
                MAX(ie.end_time)   AS end_time,
                COALESCE(MAX(ie.break_minutes), 0)::int AS break_minutes,
-               SUM(CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
-                         THEN (EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0)
-                         ELSE NULL END)::float8 AS actual_hours,
+               SUM(COALESCE(ie.actual_hours::float8,
+                        CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
+                             THEN (EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0
+                                   - COALESCE(ie.break_minutes, 0) / 60.0)::float8
+                             ELSE NULL END))::float8 AS actual_hours,
                STRING_AGG(ie.notes, '; ' ORDER BY ie.job_date) AS notes,
                MAX(ie.transport_mode)      AS transport_mode,
                MAX(ie.travel_costs_cents)  AS travel_costs_cents,
@@ -732,9 +734,11 @@ pub(crate) async fn fetch_employee_assignments_snapshot(
                ie.start_time,
                ie.end_time,
                COALESCE(ie.break_minutes, 0)::int AS break_minutes,
-               CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
-                    THEN (EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0)::float8
-                    ELSE NULL END AS actual_hours,
+               COALESCE(ie.actual_hours::float8,
+                    CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
+                         THEN (EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0
+                               - COALESCE(ie.break_minutes, 0) / 60.0)::float8
+                         ELSE NULL END) AS actual_hours,
                ie.employee_clock_in,
                ie.employee_clock_out,
                CASE WHEN ie.employee_clock_out IS NOT NULL AND ie.employee_clock_in IS NOT NULL

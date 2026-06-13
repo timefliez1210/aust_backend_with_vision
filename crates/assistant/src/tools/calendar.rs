@@ -478,7 +478,7 @@ pub struct SetEmployeeSchedule;
 impl Tool for SetEmployeeSchedule {
     fn name(&self) -> &'static str { "set_employee_schedule" }
     fn description(&self) -> &'static str {
-        "Setzt für EINEN zugewiesenen Mitarbeiter Datum/Uhrzeiten/Planstunden auf einem Termin ODER Auftrag. 'parent_id' ist die Termin- oder Anfrage-ID (wie in get_assigned_crew), 'employee_id' der Mitarbeiter. Nur gesetzte Felder werden geändert. Uhrzeiten als \"HH:MM\". Nur für Inhaber."
+        "Setzt für EINEN zugewiesenen Mitarbeiter Datum/Uhrzeiten/Stunden auf einem Termin ODER Auftrag. 'parent_id' ist die Termin- oder Anfrage-ID (wie in get_assigned_crew), 'employee_id' der Mitarbeiter. Plan-Zeiten: start_time/end_time/planned_hours. IST-Zeiten (gearbeitet): clock_in/clock_out/break_minutes — gearbeitete Stunden (actual_hours) werden daraus automatisch berechnet (clock_out − clock_in − Pause). Nur gesetzte Felder werden geändert. Uhrzeiten als \"HH:MM\". Nur für Inhaber."
     }
     fn params_schema(&self) -> Value {
         json!({
@@ -487,9 +487,12 @@ impl Tool for SetEmployeeSchedule {
                 "parent_id":     { "type": "string", "format": "uuid", "description": "Termin- oder Anfrage-ID" },
                 "employee_id":   { "type": "string", "format": "uuid" },
                 "job_date":      { "type": "string", "format": "date" },
-                "start_time":    { "type": "string", "description": "Uhrzeit HH:MM" },
-                "end_time":      { "type": "string", "description": "Uhrzeit HH:MM" },
-                "planned_hours": { "type": "number", "minimum": 0 }
+                "start_time":    { "type": "string", "description": "Geplanter Beginn HH:MM" },
+                "end_time":      { "type": "string", "description": "Geplantes Ende HH:MM" },
+                "planned_hours": { "type": "number", "minimum": 0 },
+                "clock_in":      { "type": "string", "description": "Tatsächlicher Arbeitsbeginn HH:MM (Ist-Zeit)" },
+                "clock_out":     { "type": "string", "description": "Tatsächliches Arbeitsende HH:MM (Ist-Zeit)" },
+                "break_minutes": { "type": "integer", "minimum": 0, "description": "Unbezahlte Pause in Minuten" }
             },
             "required": ["parent_id", "employee_id"]
         })
@@ -505,6 +508,9 @@ impl Tool for SetEmployeeSchedule {
             start_time: parse_time_opt(args["start_time"].as_str()),
             end_time: parse_time_opt(args["end_time"].as_str()),
             planned_hours: args["planned_hours"].as_f64(),
+            clock_in: parse_time_opt(args["clock_in"].as_str()),
+            clock_out: parse_time_opt(args["clock_out"].as_str()),
+            break_minutes: args["break_minutes"].as_i64().map(|v| v as i32),
         };
         let crew = ctx
             .services

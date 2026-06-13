@@ -277,16 +277,10 @@ pub(crate) async fn update_item_employee(
     misc_costs_cents: Option<i64>,
     meal_deduction: Option<&str>,
 ) -> Result<u64, sqlx::Error> {
-    let break_min_f = break_minutes.unwrap_or(0) as f64;
-    let computed_actual_hours: Option<f64> = if let Some(ah) = actual_hours_override {
-        Some(ah)
-    } else if let (Some(ci), Some(co)) = (clock_in, clock_out) {
-        let duration_secs = (co - ci).num_seconds() as f64;
-        Some(duration_secs / 3600.0 - break_min_f / 60.0)
-    } else {
-        None
-    };
-
+    // actual_hours: explicit override wins; otherwise derive from the EFFECTIVE
+    // post-update clock times + break (same self-healing fix as inquiry_repo —
+    // deriving from the request body alone never fires for single-field saves
+    // and nulled previously stored hours).
     let result = sqlx::query(
         r#"
         UPDATE calendar_item_employees SET
@@ -295,7 +289,18 @@ pub(crate) async fn update_item_employee(
             start_time          = COALESCE($5, start_time),
             end_time            = COALESCE($6, end_time),
             break_minutes       = COALESCE($7, break_minutes),
-            actual_hours        = $8,
+            actual_hours        = COALESCE(
+                $8,
+                CASE
+                    WHEN COALESCE($3, clock_in) IS NOT NULL
+                         AND COALESCE($4, clock_out) IS NOT NULL
+                    THEN ROUND((
+                        EXTRACT(EPOCH FROM (COALESCE($4, clock_out) - COALESCE($3, clock_in))) / 3600.0
+                        - COALESCE($7, break_minutes, 0) / 60.0
+                    )::numeric, 2)::float8
+                    ELSE actual_hours
+                END
+            ),
             notes               = COALESCE($9, notes),
             transport_mode      = COALESCE($11, transport_mode),
             travel_costs_cents  = COALESCE($12, travel_costs_cents),
@@ -314,7 +319,7 @@ pub(crate) async fn update_item_employee(
     .bind(start_time)
     .bind(end_time)
     .bind(break_minutes)
-    .bind(computed_actual_hours)
+    .bind(actual_hours_override)
     .bind(notes)
     .bind(day_date)
     .bind(transport_mode)
@@ -349,7 +354,8 @@ pub(crate) async fn fetch_item_employee(
                COALESCE(MAX(cie.break_minutes), 0)::int AS break_minutes,
                SUM(COALESCE(cie.actual_hours,
                             CASE WHEN cie.clock_out IS NOT NULL AND cie.clock_in IS NOT NULL
-                                 THEN (EXTRACT(EPOCH FROM (cie.clock_out - cie.clock_in)) / 3600.0)
+                                 THEN (EXTRACT(EPOCH FROM (cie.clock_out - cie.clock_in)) / 3600.0
+                                       - COALESCE(cie.break_minutes, 0) / 60.0)
                                  ELSE NULL END))::float8 AS actual_hours,
                STRING_AGG(cie.notes, '; ' ORDER BY cie.job_date) AS notes,
                MAX(cie.transport_mode)      AS transport_mode,
@@ -414,7 +420,8 @@ pub(crate) async fn fetch_item_employees(
                COALESCE(MAX(cie.break_minutes), 0)::int AS break_minutes,
                SUM(COALESCE(cie.actual_hours,
                             CASE WHEN cie.clock_out IS NOT NULL AND cie.clock_in IS NOT NULL
-                                 THEN (EXTRACT(EPOCH FROM (cie.clock_out - cie.clock_in)) / 3600.0)
+                                 THEN (EXTRACT(EPOCH FROM (cie.clock_out - cie.clock_in)) / 3600.0
+                                       - COALESCE(cie.break_minutes, 0) / 60.0)
                                  ELSE NULL END))::float8 AS actual_hours,
                STRING_AGG(cie.notes, '; ' ORDER BY cie.job_date) AS notes,
                MAX(cie.transport_mode)      AS transport_mode,

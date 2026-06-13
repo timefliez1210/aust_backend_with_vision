@@ -109,11 +109,16 @@ struct AssignEmployeeBody {
 }
 
 /// Body for updating hours/notes on an existing employee assignment.
+/// Time fields use the lenient parser (accepts "7:30", "07:30", "7.30").
 #[derive(Debug, Deserialize)]
 struct UpdateEmployeeBody {
+    #[serde(default, deserialize_with = "aust_core::models::deserialize_lenient_time")]
     clock_in: Option<NaiveTime>,
+    #[serde(default, deserialize_with = "aust_core::models::deserialize_lenient_time")]
     clock_out: Option<NaiveTime>,
+    #[serde(default, deserialize_with = "aust_core::models::deserialize_lenient_time")]
     start_time: Option<NaiveTime>,
+    #[serde(default, deserialize_with = "aust_core::models::deserialize_lenient_time")]
     end_time: Option<NaiveTime>,
     break_minutes: Option<i32>,
     actual_hours: Option<f64>,
@@ -547,7 +552,9 @@ async fn update_item_employee(
     ).await?;
 
     if rows == 0 {
-        return Err(ApiError::NotFound("Zuweisung nicht gefunden".into()));
+        return Err(ApiError::NotFound(
+            "Mitarbeiter ist an diesem Tag nicht zugewiesen — bitte erst zuweisen, dann Zeiten eintragen".into(),
+        ));
     }
 
     calendar_item_repo::fetch_item_employee(&state.db, id, emp_id)
@@ -578,14 +585,19 @@ async fn remove_item_employee(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Time fields use the lenient parser (accepts "7:30", "07:30", "7.30").
 #[derive(Debug, Deserialize)]
 struct BulkItemEmployeeBody {
     employee_id: Uuid,
     job_date: NaiveDate,
     notes: Option<String>,
+    #[serde(default, deserialize_with = "aust_core::models::deserialize_lenient_time")]
     start_time: Option<NaiveTime>,
+    #[serde(default, deserialize_with = "aust_core::models::deserialize_lenient_time")]
     end_time: Option<NaiveTime>,
+    #[serde(default, deserialize_with = "aust_core::models::deserialize_lenient_time")]
     clock_in: Option<NaiveTime>,
+    #[serde(default, deserialize_with = "aust_core::models::deserialize_lenient_time")]
     clock_out: Option<NaiveTime>,
     break_minutes: Option<i32>,
     actual_hours: Option<f64>,

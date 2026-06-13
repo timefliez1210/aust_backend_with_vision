@@ -415,9 +415,13 @@ fn parse_quantity_prefix(name: &str, total_volume_m3: f64) -> (String, i64, f64)
     let trimmed = name.trim();
     if let Some(pos) = trimmed.find('x') {
         let before = trimmed[..pos].trim();
-        let after = trimmed[pos + 1..].trim();
+        let after_raw = &trimmed[pos + 1..];
+        let after = after_raw.trim();
+        // Require whitespace right after the 'x' so dimension strings like
+        // "180x200 Matratze" are not misread as quantity 180.
+        let x_followed_by_space = after_raw.starts_with(char::is_whitespace);
         if let Ok(n) = before.parse::<i64>()
-            && n > 1 && !after.is_empty() {
+            && n > 1 && x_followed_by_space && !after.is_empty() {
                 let per_item = total_volume_m3 / n as f64;
                 return (after.to_string(), n, per_item);
             }

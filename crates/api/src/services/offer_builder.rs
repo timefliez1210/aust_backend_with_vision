@@ -296,13 +296,20 @@ pub(crate) async fn run_offer_computation(
         composed
     };
 
-    let rate_override = calculate_rate_override(
-        overrides.price_cents,
-        overrides.rate,
-        pricing_result.estimated_helpers,
-        pricing_result.estimated_hours,
-        &line_items,
-    );
+    let rate_override = if overrides.rate.is_none() && overrides.price_cents.is_none() {
+        // No override: use the configured (DB-backed) rate, not the hardcoded
+        // 30 € fallback inside calculate_rate_override — otherwise changing the
+        // Stundensatz setting affects the estimate but never the line items.
+        pricing.rate_per_person_hour_cents as f64 / 100.0
+    } else {
+        calculate_rate_override(
+            overrides.price_cents,
+            overrides.rate,
+            pricing_result.estimated_helpers,
+            pricing_result.estimated_hours,
+            &line_items,
+        )
+    };
 
     let line_items: Vec<OfferLineItem> = line_items
         .into_iter()
@@ -413,7 +420,7 @@ pub(crate) async fn build_offer_with_overrides(
         .map(|d| d.format("%d.%m.%Y").to_string())
         .unwrap_or_else(|| "nach Vereinbarung".to_string());
 
-    let origin_street = origin.as_ref().map(|a| a.street.clone()).unwrap_or_default();
+    let origin_street = origin.as_ref().map(format_street).unwrap_or_default();
     let origin_city = origin
         .as_ref()
         .map(format_city)
@@ -426,7 +433,7 @@ pub(crate) async fn build_offer_with_overrides(
 
     let dest_street = destination
         .as_ref()
-        .map(|a| a.street.clone())
+        .map(format_street)
         .unwrap_or_default();
     let dest_city = destination
         .as_ref()
@@ -449,12 +456,7 @@ pub(crate) async fn build_offer_with_overrides(
     let billing_addr = address_repo::fetch_optional(db, billing_addr_id).await?;
     let billing_street = billing_addr
         .as_ref()
-        .map(|a| {
-            match a.house_number.as_deref() {
-                Some(hn) if !hn.is_empty() => format!("{} {}", a.street, hn),
-                _ => a.street.clone(),
-            }
-        })
+        .map(format_street)
         .unwrap_or_else(|| origin_street.clone());
     let billing_city = billing_addr
         .as_ref()
@@ -760,6 +762,18 @@ fn format_services_display(services: &Services) -> String {
         parts.push("3,5t Transporter m. Koffer".to_string());
     }
     parts.join(", ")
+}
+
+/// Format a street line as "Street Hausnummer" (or just "Street" when no
+/// house number is stored). Legacy rows (pre-2026-05) may have the number
+/// embedded in `street` with `house_number` = NULL — those pass through as-is.
+///
+/// **Caller**: `build_offer_with_overrides` for the KVA from/to/billing address blocks.
+pub(crate) fn format_street(addr: &AddressRow) -> String {
+    match addr.house_number.as_deref().map(str::trim) {
+        Some(hn) if !hn.is_empty() => format!("{} {}", addr.street.trim(), hn),
+        _ => addr.street.trim().to_string(),
+    }
 }
 
 /// Format a city string as "PLZ City" (or just "City" when postal code is absent).

@@ -419,12 +419,17 @@ impl CalendarService for CalendarServiceImpl {
         }
 
         if let Some(crew) = new_crew {
-            // Replace calendar item employees.
-            sqlx::query("DELETE FROM calendar_item_employees WHERE calendar_item_id = $1")
-                .bind(termin_id)
-                .execute(&self.pool)
-                .await
-                .map_err(super::map_sqlx)?;
+            // Replace the crew SET while preserving rows that stay assigned —
+            // DELETE-all + re-INSERT wiped entered clock times/hours (same
+            // class as the 2026-06-10 PUT-wipe incident; see set_inquiry_crew).
+            sqlx::query(
+                "DELETE FROM calendar_item_employees WHERE calendar_item_id = $1 AND NOT (employee_id = ANY($2))",
+            )
+            .bind(termin_id)
+            .bind(&crew)
+            .execute(&self.pool)
+            .await
+            .map_err(super::map_sqlx)?;
 
             let date_row: Option<(Option<NaiveDate>,)> = sqlx::query_as(
                 "SELECT scheduled_date FROM calendar_items WHERE id = $1",
@@ -435,6 +440,22 @@ impl CalendarService for CalendarServiceImpl {
             .map_err(super::map_sqlx)?;
 
             if let Some((Some(date),)) = date_row {
+                // Stale rows OUTSIDE the item's current date span are removed,
+                // but only when they carry no recorded hours — rows with clock
+                // data are historical fact. In-span rows (multi-day items) stay.
+                let _ = sqlx::query(
+                    r#"
+                    DELETE FROM calendar_item_employees cie
+                    USING calendar_items ci
+                    WHERE cie.calendar_item_id = $1 AND ci.id = $1
+                      AND cie.job_date NOT BETWEEN ci.scheduled_date
+                          AND COALESCE(ci.end_date, ci.scheduled_date)
+                      AND cie.clock_in IS NULL AND cie.clock_out IS NULL AND cie.actual_hours IS NULL
+                    "#,
+                )
+                .bind(termin_id)
+                .execute(&self.pool)
+                .await;
                 for employee_id in &crew {
                     let _ = sqlx::query(
                         r#"
@@ -530,18 +551,30 @@ impl CalendarService for CalendarServiceImpl {
         to: NaiveDate,
     ) -> Result<Vec<EmployeeWorkloadEntry>, ServiceError> {
         // Query both inquiry assignments and calendar item assignments.
-        let rows: Vec<(NaiveDate, Option<Uuid>, Option<Uuid>, String, String)> =
+        type AssignmentRow = (
+            NaiveDate,
+            Option<Uuid>,
+            Option<Uuid>,
+            String,
+            String,
+            Option<NaiveTime>,
+            Option<NaiveTime>,
+            Option<f64>,
+        );
+        let rows: Vec<AssignmentRow> =
             sqlx::query_as(
                 r#"
                 SELECT ie.job_date, ie.inquiry_id, NULL::uuid AS calendar_item_id,
-                       COALESCE(c.name, 'Umzug') AS title, 'moving' AS category
+                       COALESCE(c.name, 'Umzug') AS title, 'moving' AS category,
+                       ie.clock_in, ie.clock_out, ie.actual_hours::float8 AS actual_hours
                 FROM inquiry_employees ie
                 JOIN inquiries i ON ie.inquiry_id = i.id
                 LEFT JOIN customers c ON i.customer_id = c.id
                 WHERE ie.employee_id = $1 AND ie.job_date BETWEEN $2 AND $3
                 UNION ALL
                 SELECT cie.job_date, NULL::uuid, cie.calendar_item_id,
-                       ci.title, ci.category
+                       ci.title, ci.category,
+                       cie.clock_in, cie.clock_out, cie.actual_hours::float8
                 FROM calendar_item_employees cie
                 JOIN calendar_items ci ON cie.calendar_item_id = ci.id
                 WHERE cie.employee_id = $1 AND cie.job_date BETWEEN $2 AND $3
@@ -557,13 +590,16 @@ impl CalendarService for CalendarServiceImpl {
 
         Ok(rows
             .into_iter()
-            .map(|(date, inquiry_id, calendar_item_id, title, category)| {
+            .map(|(date, inquiry_id, calendar_item_id, title, category, clock_in, clock_out, actual_hours)| {
                 EmployeeWorkloadEntry {
                     date,
                     inquiry_id,
                     calendar_item_id,
                     title,
                     category,
+                    clock_in,
+                    clock_out,
+                    actual_hours,
                 }
             })
             .collect())
@@ -582,6 +618,10 @@ impl CalendarService for CalendarServiceImpl {
             Option<NaiveTime>,
             Option<NaiveTime>,
             Option<f64>,
+            Option<NaiveTime>,
+            Option<NaiveTime>,
+            Option<i32>,
+            Option<f64>,
             String,
         );
         let rows: Vec<CrewRow> = sqlx::query_as(
@@ -593,13 +633,19 @@ impl CalendarService for CalendarServiceImpl {
                    cie.start_time AS start_time,
                    cie.end_time AS end_time,
                    cie.planned_hours::float8 AS planned_hours,
+                   cie.clock_in AS clock_in,
+                   cie.clock_out AS clock_out,
+                   cie.break_minutes AS break_minutes,
+                   cie.actual_hours::float8 AS actual_hours,
                    'termin'::text AS source
             FROM calendar_item_employees cie
             JOIN employees e ON e.id = cie.employee_id
             WHERE cie.calendar_item_id = $1
             UNION ALL
             SELECT e.id, e.first_name, e.last_name, ie.job_date,
-                   ie.start_time, ie.end_time, ie.planned_hours::float8, 'auftrag'::text
+                   ie.start_time, ie.end_time, ie.planned_hours::float8,
+                   ie.clock_in, ie.clock_out, ie.break_minutes, ie.actual_hours::float8,
+                   'auftrag'::text
             FROM inquiry_employees ie
             JOIN employees e ON e.id = ie.employee_id
             WHERE ie.inquiry_id = $1
@@ -614,7 +660,7 @@ impl CalendarService for CalendarServiceImpl {
         Ok(rows
             .into_iter()
             .map(
-                |(employee_id, first_name, last_name, job_date, start_time, end_time, planned_hours, source)| {
+                |(employee_id, first_name, last_name, job_date, start_time, end_time, planned_hours, clock_in, clock_out, break_minutes, actual_hours, source)| {
                     CrewMember {
                         employee_id,
                         first_name,
@@ -623,6 +669,10 @@ impl CalendarService for CalendarServiceImpl {
                         start_time,
                         end_time,
                         planned_hours,
+                        clock_in,
+                        clock_out,
+                        break_minutes,
+                        actual_hours,
                         source,
                     }
                 },
@@ -654,14 +704,36 @@ impl CalendarService for CalendarServiceImpl {
             )
         })?;
 
-        // Replace the crew wholesale: clear existing rows, insert the new set.
-        // No status change, no calendar_item created — purely the inquiry crew.
+        // Replace the crew SET while preserving rows that stay assigned —
+        // DELETE-all + re-INSERT wiped entered clock times/hours on existing
+        // rows (same class as the 2026-06-10 PUT-wipe incident). Rows for
+        // employees no longer in the list are removed; surviving rows keep all
+        // their data via ON CONFLICT DO NOTHING.
         let mut tx = self.pool.begin().await.map_err(super::map_sqlx)?;
-        sqlx::query("DELETE FROM inquiry_employees WHERE inquiry_id = $1")
-            .bind(inquiry_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(super::map_sqlx)?;
+        sqlx::query(
+            "DELETE FROM inquiry_employees WHERE inquiry_id = $1 AND NOT (employee_id = ANY($2))",
+        )
+        .bind(inquiry_id)
+        .bind(&crew)
+        .execute(&mut *tx)
+        .await
+        .map_err(super::map_sqlx)?;
+        // Stale rows on OTHER dates (the original stranded-date bug) are only
+        // removed when they carry no recorded hours — rows with clock data are
+        // historical fact and stay (multi-day inquiries).
+        sqlx::query(
+            r#"
+            DELETE FROM inquiry_employees
+            WHERE inquiry_id = $1 AND employee_id = ANY($2) AND job_date <> $3
+              AND clock_in IS NULL AND clock_out IS NULL AND actual_hours IS NULL
+            "#,
+        )
+        .bind(inquiry_id)
+        .bind(&crew)
+        .bind(job_date)
+        .execute(&mut *tx)
+        .await
+        .map_err(super::map_sqlx)?;
         for employee_id in &crew {
             sqlx::query(
                 r#"
@@ -691,6 +763,9 @@ impl CalendarService for CalendarServiceImpl {
     ) -> Result<Vec<CrewMember>, ServiceError> {
         // The parent may be an inquiry (auftrag) or a calendar item (termin).
         // Try both junction tables; whichever holds the row gets updated.
+        // actual_hours self-heals from the effective post-update clock times +
+        // break (same derivation as the admin PATCH paths in inquiry_repo /
+        // calendar_item_repo).
         let inq = sqlx::query(
             r#"
             UPDATE inquiry_employees SET
@@ -698,6 +773,18 @@ impl CalendarService for CalendarServiceImpl {
                 start_time    = COALESCE($4, start_time),
                 end_time      = COALESCE($5, end_time),
                 planned_hours = COALESCE($6::numeric, planned_hours),
+                clock_in      = COALESCE($7, clock_in),
+                clock_out     = COALESCE($8, clock_out),
+                break_minutes = COALESCE($9, break_minutes),
+                actual_hours  = CASE
+                    WHEN COALESCE($7, clock_in) IS NOT NULL
+                         AND COALESCE($8, clock_out) IS NOT NULL
+                    THEN ROUND((
+                        EXTRACT(EPOCH FROM (COALESCE($8, clock_out) - COALESCE($7, clock_in))) / 3600.0
+                        - COALESCE($9, break_minutes, 0) / 60.0
+                    )::numeric, 2)::float8
+                    ELSE actual_hours
+                END,
                 updated_at    = NOW()
             WHERE inquiry_id = $1 AND employee_id = $2
             "#,
@@ -708,6 +795,9 @@ impl CalendarService for CalendarServiceImpl {
         .bind(patch.start_time)
         .bind(patch.end_time)
         .bind(patch.planned_hours)
+        .bind(patch.clock_in)
+        .bind(patch.clock_out)
+        .bind(patch.break_minutes)
         .execute(&self.pool)
         .await
         .map_err(super::map_sqlx)?;
@@ -718,7 +808,19 @@ impl CalendarService for CalendarServiceImpl {
                 job_date      = COALESCE($3, job_date),
                 start_time    = COALESCE($4, start_time),
                 end_time      = COALESCE($5, end_time),
-                planned_hours = COALESCE($6::numeric, planned_hours)
+                planned_hours = COALESCE($6::numeric, planned_hours),
+                clock_in      = COALESCE($7, clock_in),
+                clock_out     = COALESCE($8, clock_out),
+                break_minutes = COALESCE($9, break_minutes),
+                actual_hours  = CASE
+                    WHEN COALESCE($7, clock_in) IS NOT NULL
+                         AND COALESCE($8, clock_out) IS NOT NULL
+                    THEN ROUND((
+                        EXTRACT(EPOCH FROM (COALESCE($8, clock_out) - COALESCE($7, clock_in))) / 3600.0
+                        - COALESCE($9, break_minutes, 0) / 60.0
+                    )::numeric, 2)::float8
+                    ELSE actual_hours
+                END
             WHERE calendar_item_id = $1 AND employee_id = $2
             "#,
         )
@@ -728,6 +830,9 @@ impl CalendarService for CalendarServiceImpl {
         .bind(patch.start_time)
         .bind(patch.end_time)
         .bind(patch.planned_hours)
+        .bind(patch.clock_in)
+        .bind(patch.clock_out)
+        .bind(patch.break_minutes)
         .execute(&self.pool)
         .await
         .map_err(super::map_sqlx)?;

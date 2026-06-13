@@ -68,7 +68,7 @@ pub struct GetEmployeeWorkload;
 #[async_trait]
 impl Tool for GetEmployeeWorkload {
     fn name(&self) -> &'static str { "get_employee_workload" }
-    fn description(&self) -> &'static str { "Listet Einsätze eines Mitarbeiters in einem Zeitraum. Nur für Inhaber." }
+    fn description(&self) -> &'static str { "Listet Einsätze eines Mitarbeiters in einem Zeitraum, inkl. Ist-Zeiten (clock_in/clock_out) und gearbeiteten Stunden (actual_hours); 'total_hours' summiert alle erfassten Stunden. Nur für Inhaber." }
     fn params_schema(&self) -> Value {
         json!({
             "type": "object",
@@ -89,7 +89,12 @@ impl Tool for GetEmployeeWorkload {
         let to = parse_date(args, "to", self.name())?;
         let entries = ctx.services.employees.get_workload(id, from, to).await?;
         let count = entries.len();
-        Ok(json!({ "entries": entries, "count": count }))
+        let total_hours: f64 = entries.iter().filter_map(|e| e.actual_hours).sum();
+        Ok(json!({
+            "entries": entries,
+            "count": count,
+            "total_hours": (total_hours * 100.0).round() / 100.0,
+        }))
     }
 }
 

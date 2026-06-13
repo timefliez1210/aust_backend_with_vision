@@ -337,6 +337,27 @@ pub fn generate_offer_xlsx(data: &OfferData) -> Result<Vec<u8>, OfferError> {
 /// - `Vec<(String, CellValue)>` — `(cell_ref, value)` pairs to apply to `sheet1.xml`
 /// - `Vec<u32>` — row numbers to hide (all unused line-item rows)
 /// - `Vec<u32>` — row numbers to un-hide (only the rows that contain a line item)
+/// Build the cell write for a complete from/to address block (A26 / F26).
+///
+/// Street, city and floor are stacked inside ONE cell with explicit line
+/// breaks; the template's separate city/floor rows 27/28 are hidden by the
+/// caller. Style 44 = same font with `wrapText` + top alignment, and row 26
+/// has auto height. This solves two layout problems at once:
+/// - long street lines (street + house number) exceed the narrow column and
+///   LibreOffice hard-clips the overflow — wrapText breaks them instead
+///   (found on offer 2026-0199: "… Hauptstraße 13" lost its house number);
+/// - when one side wraps to an extra line, the other side's lines stay
+///   gapless because they live in the same cell instead of fixed rows.
+fn address_block_cell(cell: &str, street: &str, city: &str, floor: &str) -> (String, CellValue) {
+    let block = [street, city, floor]
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    (cell.to_string(), CellValue::StyledText(block, "44"))
+}
+
 fn build_cell_modifications(
     data: &OfferData,
 ) -> (Vec<(String, CellValue)>, Vec<u32>, Vec<u32>) {
@@ -374,23 +395,43 @@ fn build_cell_modifications(
     mods.push(("B17".into(), CellValue::Text(data.moving_date.clone())));
     mods.push(("B18".into(), CellValue::Text(data.customer_phone.clone())));
     // E-Mail on the same row as the phone number (F18), matching the template label at E18.
-    // Only write email if present; customers without email leave this cell empty.
-    if let Some(ref email) = data.customer_email {
-        mods.push(("F18".into(), CellValue::StyledText(email.clone(), "0")));
-    }
+    // ALWAYS write the cell — the template carries a preset value, so skipping
+    // the write for customers without email leaked the previous customer's
+    // address onto the KVA (found on offer 2026-0199).
+    mods.push((
+        "F18".into(),
+        CellValue::StyledText(data.customer_email.clone().unwrap_or_default(), "0"),
+    ));
 
     // Greeting
     mods.push(("A20".into(), CellValue::Text(data.greeting.clone())));
 
-    // Origin address
-    mods.push(("A26".into(), CellValue::Text(data.origin_street.clone())));
-    mods.push(("A27".into(), CellValue::Text(data.origin_city.clone())));
-    mods.push(("A28".into(), CellValue::Text(data.origin_floor_info.clone())));
-
-    // Destination address
-    mods.push(("F26".into(), CellValue::Text(data.dest_street.clone())));
-    mods.push(("F27".into(), CellValue::Text(data.dest_city.clone())));
-    mods.push(("F28".into(), CellValue::Text(data.dest_floor_info.clone())));
+    // Origin / destination address blocks — each side stacked into one
+    // wrapping cell (see `address_block_cell`); rows 27/28 are hidden below.
+    mods.push(address_block_cell(
+        "A26",
+        &data.origin_street,
+        &data.origin_city,
+        &data.origin_floor_info,
+    ));
+    mods.push(address_block_cell(
+        "F26",
+        &data.dest_street,
+        &data.dest_city,
+        &data.dest_floor_info,
+    ));
+    // Clear the template presets in the now-hidden city/floor rows.
+    for cell in ["A27", "A28", "F27", "F28"] {
+        mods.push((cell.into(), CellValue::Text(String::new())));
+    }
+    // The template carries hidden mirror formulas I9:I12/L9:L12 (=A25..A28 /
+    // =F25..F28) outside the print area. With the multi-line A26/F26 block,
+    // I10/L10 would render three lines tall and blow up letter-address row 10
+    // (the "disconnected" gap between customer name and street). Nothing
+    // consumes them — blank them out.
+    for cell in ["I9", "I10", "I11", "I12", "L9", "L10", "L11", "L12"] {
+        mods.push((cell.into(), CellValue::Text(String::new())));
+    }
 
     // Volume description (A29) — overridable so Alex can re-label for non-volume jobs.
     let headline = data
@@ -422,6 +463,9 @@ fn build_cell_modifications(
 
     // 1. Hide ALL template rows 31-50 and clear their content
     let mut hidden_rows: Vec<u32> = (31..=50).collect();
+    // Rows 27/28 (template city/floor lines) are folded into the A26/F26
+    // address block cells — hide them so the block stays gapless.
+    hidden_rows.extend([27, 28]);
     let mut unhidden_rows: Vec<u32> = Vec::new();
 
     for row in 31..=50u32 {
@@ -1749,6 +1793,63 @@ mod tests {
 
         let bytes = generate_offer_xlsx(&data).expect("generate should succeed");
         let path = "/tmp/angebot_2026-0188.xlsx";
+        std::fs::write(path, &bytes).expect("write xlsx");
+        println!("WROTE {} ({} bytes)", path, bytes.len());
+    }
+
+    /// One-off renderer: rebuild the KVA for offer 2026-0199
+    /// (inquiry 019eb58f-a841-7880-b971-19217e14ccfe, Michael Montag) from prod
+    /// data — WITH the house numbers in the from/to address block that the old
+    /// pipeline dropped (street and house_number are separate columns; only
+    /// billing concatenated them). Run explicitly:
+    ///   cargo test -p aust-offer-generator --lib render_offer_2026_0199 -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn render_offer_2026_0199() {
+        let li = |description: &str, quantity: f64, unit_price: f64, is_labor: bool, flat_total: Option<f64>, remark: Option<&str>| OfferLineItem {
+            description: description.to_string(),
+            quantity,
+            unit_price,
+            is_labor,
+            flat_total,
+            remark: remark.map(|s| s.to_string()),
+        };
+
+        let data = OfferData {
+            offer_number: "2026-0199".to_string(),
+            date: chrono::NaiveDate::from_ymd_opt(2026, 6, 11).unwrap(),
+            valid_until: None,
+            customer_salutation: "Herrn".to_string(),
+            customer_name: "Michael Montag".to_string(),
+            customer_street: "Im Katthagen 18".to_string(),
+            customer_city: "31061 Alfeld".to_string(),
+            customer_phone: "01625635690".to_string(),
+            customer_email: None,
+            company_name: None,
+            attention_line: None,
+            greeting: "Sehr geehrter Herr Montag,".to_string(),
+            moving_date: "15.06.2026".to_string(),
+            origin_street: "Fa. Lagermeister, Hauptstraße 13".to_string(),
+            origin_city: "91301 Forchheim".to_string(),
+            origin_floor_info: "Keller".to_string(),
+            dest_street: "Im Katthagen 18".to_string(),
+            dest_city: "31061 Alfeld".to_string(),
+            dest_floor_info: "Erdgeschoss".to_string(),
+            volume_m3: 7.5,
+            persons: 1,
+            estimated_hours: 13.0,
+            rate_per_person_hour: 30.0,
+            line_items: vec![
+                li("1 Umzugshelfer", 13.0, 30.0, true, None, None),
+                li("Fahrkostenpauschale", 0.0, 0.0, false, Some(800.0), None),
+                li("Nürnbergerversicherung", 1.0, 0.0, false, Some(0.0), Some("Deckungssumme: 620,00 Euro / m³")),
+            ],
+            detected_items: vec![],
+            headline_override: None,
+        };
+
+        let bytes = generate_offer_xlsx(&data).expect("generate should succeed");
+        let path = "/tmp/angebot_2026-0199_korrigiert.xlsx";
         std::fs::write(path, &bytes).expect("write xlsx");
         println!("WROTE {} ({} bytes)", path, bytes.len());
     }

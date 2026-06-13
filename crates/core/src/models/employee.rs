@@ -103,7 +103,7 @@ pub struct UpdateAssignment {
 /// key). Strict `Option<NaiveTime>` parsing previously turned such input into
 /// a bare 422 before the handler ran — saves silently failed in the admin UI
 /// (2026-06-10 incident: hours on Lisa Lullies' job wouldn't stick).
-fn deserialize_lenient_time<'de, D>(de: D) -> Result<Option<NaiveTime>, D::Error>
+pub fn deserialize_lenient_time<'de, D>(de: D) -> Result<Option<NaiveTime>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {

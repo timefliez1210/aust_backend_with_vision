@@ -750,15 +750,22 @@ async fn generate_travel_expenses(
     let accommodation_eur = first.accommodation_cents.map(|c| c as f64 / 100.0).unwrap_or(0.0);
     let misc_costs_eur = first.misc_costs_cents.map(|c| c as f64 / 100.0).unwrap_or(0.0);
 
-    // 6. Meal deductions (simplified)
+    // 6. Meal deductions (simplified). Stored values from the admin UI:
+    //    "breakfast" | "lunch" | "dinner" | "breakfast_lunch" | "breakfast_dinner"
+    //    | "lunch_dinner" | "all". Frühstück kürzt 20%, Mittag und Abend je 40%.
     let mut breakfast_deduction = 0.0;
     let mut meal_deduction = 0.0;
     if let Some(ref md) = first.meal_deduction {
-        if md.contains("breakfast") {
-            breakfast_deduction = small_days as f64 * 14.0 * 0.20 + large_days as f64 * 28.0 * 0.20;
+        let all = md == "all";
+        let allowance_total = small_days as f64 * 14.0 + large_days as f64 * 28.0;
+        if all || md.contains("breakfast") {
+            breakfast_deduction = allowance_total * 0.20;
         }
-        if md.contains("lunch") || md.contains("dinner") {
-            meal_deduction = small_days as f64 * 14.0 * 0.40 + large_days as f64 * 28.0 * 0.40;
+        if all || md.contains("lunch") {
+            meal_deduction += allowance_total * 0.40;
+        }
+        if all || md.contains("dinner") {
+            meal_deduction += allowance_total * 0.40;
         }
     }
 
@@ -800,14 +807,19 @@ async fn generate_travel_expenses(
     ))
 }
 
+/// Time fields use the lenient parser (accepts "7:30", "07:30", "7.30").
 #[derive(Debug, Deserialize)]
 struct BulkEmployeeAssignmentBody {
     employee_id: Uuid,
     job_date: chrono::NaiveDate,
     notes: Option<String>,
+    #[serde(default, deserialize_with = "aust_core::models::deserialize_lenient_time")]
     start_time: Option<NaiveTime>,
+    #[serde(default, deserialize_with = "aust_core::models::deserialize_lenient_time")]
     end_time: Option<NaiveTime>,
+    #[serde(default, deserialize_with = "aust_core::models::deserialize_lenient_time")]
     clock_in: Option<NaiveTime>,
+    #[serde(default, deserialize_with = "aust_core::models::deserialize_lenient_time")]
     clock_out: Option<NaiveTime>,
     break_minutes: Option<i32>,
     actual_hours: Option<f64>,

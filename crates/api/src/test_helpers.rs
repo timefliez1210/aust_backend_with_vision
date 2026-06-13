@@ -30,7 +30,12 @@ pub async fn test_db_pool() -> PgPool {
     let pool = PgPool::connect(&url)
         .await
         .expect("Failed to connect to test database. Make sure aust_backend_test exists.");
-    sqlx::migrate!("../../migrations")
+    // ignore_missing: 20260428000000_backfill_end_date.sql was renamed to
+    // 20260611000000 (it was back-dated and broke fresh DBs); existing test
+    // databases still record the old version.
+    let mut migrator = sqlx::migrate!("../../migrations");
+    migrator.set_ignore_missing(true);
+    migrator
         .run(&pool)
         .await
         .expect("Failed to run migrations on test database");

@@ -375,6 +375,9 @@ impl CalendarService for MockCalendarService {
             calendar_item_id: None,
             title: "Umzug".to_string(),
             category: "moving".to_string(),
+            clock_in: None,
+            clock_out: None,
+            actual_hours: Some(7.5),
         }])
     }
 
@@ -387,6 +390,10 @@ impl CalendarService for MockCalendarService {
             start_time: None,
             end_time: None,
             planned_hours: None,
+            clock_in: None,
+            clock_out: None,
+            break_minutes: None,
+            actual_hours: None,
             source: "termin".to_string(),
         }])
     }
@@ -408,6 +415,10 @@ impl CalendarService for MockCalendarService {
                 start_time: None,
                 end_time: None,
                 planned_hours: None,
+                clock_in: None,
+                clock_out: None,
+                break_minutes: None,
+                actual_hours: None,
                 source: "auftrag".to_string(),
             })
             .collect())
@@ -429,6 +440,10 @@ impl CalendarService for MockCalendarService {
             start_time: patch.start_time,
             end_time: patch.end_time,
             planned_hours: patch.planned_hours,
+            clock_in: patch.clock_in,
+            clock_out: patch.clock_out,
+            break_minutes: patch.break_minutes,
+            actual_hours: None,
             source: "auftrag".to_string(),
         }])
     }
@@ -675,6 +690,9 @@ impl EmployeeService for MockEmployeeService {
             calendar_item_id: None,
             title: "Umzug".to_string(),
             category: "moving".to_string(),
+            clock_in: None,
+            clock_out: None,
+            actual_hours: Some(7.5),
         }])
     }
 

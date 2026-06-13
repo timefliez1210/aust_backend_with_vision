@@ -219,6 +219,12 @@ pub struct EmployeeWorkloadEntry {
     pub calendar_item_id: Option<Uuid>,
     pub title: String,
     pub category: String,
+    /// Actual clock-in time (Ist-Zeit), if recorded.
+    pub clock_in: Option<NaiveTime>,
+    /// Actual clock-out time (Ist-Zeit), if recorded.
+    pub clock_out: Option<NaiveTime>,
+    /// Worked hours for this assignment, if recorded.
+    pub actual_hours: Option<f64>,
 }
 
 /// A single crew member assigned to a termin (calendar item) or an inquiry.
@@ -234,6 +240,14 @@ pub struct CrewMember {
     pub end_time: Option<NaiveTime>,
     /// Planned hours for this assignment, if set.
     pub planned_hours: Option<f64>,
+    /// Actual clock-in time (Ist-Zeit), if recorded.
+    pub clock_in: Option<NaiveTime>,
+    /// Actual clock-out time (Ist-Zeit), if recorded.
+    pub clock_out: Option<NaiveTime>,
+    /// Unpaid break in minutes.
+    pub break_minutes: Option<i32>,
+    /// Worked hours: (clock_out − clock_in) − break, or a manual override.
+    pub actual_hours: Option<f64>,
     /// Origin of the assignment: `"termin"` (calendar_item_employees) or
     /// `"auftrag"` (inquiry_employees).
     pub source: String,
@@ -250,6 +264,12 @@ pub struct EmployeeSchedulePatch {
     pub start_time: Option<NaiveTime>,
     pub end_time: Option<NaiveTime>,
     pub planned_hours: Option<f64>,
+    /// Actual clock-in time (Ist-Zeit).
+    pub clock_in: Option<NaiveTime>,
+    /// Actual clock-out time (Ist-Zeit).
+    pub clock_out: Option<NaiveTime>,
+    /// Unpaid break in minutes.
+    pub break_minutes: Option<i32>,
 }
 
 /// Patch for updating customer fields.

@@ -770,7 +770,9 @@ pub(crate) async fn update_assignment(
     .await?;
 
     if rows_affected == 0 {
-        return Err(ApiError::NotFound("Zuweisung nicht gefunden".into()));
+        return Err(ApiError::NotFound(
+            "Mitarbeiter ist an diesem Tag nicht zugewiesen — bitte erst zuweisen, dann Zeiten eintragen".into(),
+        ));
     }
 
     let row = inquiry_repo::fetch_updated_assignment(&state.db, id, emp_id).await?;

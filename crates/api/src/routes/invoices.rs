@@ -669,13 +669,19 @@ async fn update_invoice(
                 // Resolve deposit invoice number
                 let deposit_number = resolve_deposit_number(&state.db, &row).await;
 
-                build_final_line_items(
+                let mut items = build_final_line_items(
                     &state.db,
                     &invoice_context,
                     first_netto,
                     &deposit_number,
                     Some(extras),
-                ).await?
+                ).await?;
+                let extras_netto: i64 = extras.iter().map(|e| e.price_cents).sum();
+                adjust_final_deduction_for_rounding(
+                    &mut items,
+                    offer_netto - first_netto + extras_netto,
+                );
+                items
             }
             _ => {
                 // Full invoice: base line + extras
@@ -1254,13 +1260,18 @@ async fn regenerate_invoice_pdf(
             let first_brutto = (offer_brutto as f64 * pct as f64 / 100.0).round() as i64;
             let first_netto = (first_brutto as f64 / 1.19).round() as i64;
             let deposit_number = resolve_deposit_number(&state.db, row).await;
-            let items = build_final_line_items(
+            let mut items = build_final_line_items(
                 &state.db,
                 &ctx,
                 first_netto,
                 &deposit_number,
                 if extras.is_empty() { None } else { Some(&extras) },
             ).await?;
+            let extras_netto: i64 = extras.iter().map(|e| e.price_cents).sum();
+            adjust_final_deduction_for_rounding(
+                &mut items,
+                ctx.offer.price_cents - first_netto + extras_netto,
+            );
             (InvoiceType::PartialFinal, items)
         }
         _ => {

@@ -342,9 +342,16 @@ pub(crate) async fn fetch_inquiry_employees(
     .await
 }
 
-/// Replace all employee assignments for an inquiry (full-replace semantics).
+/// Replace the SET of employee assignments for an inquiry, preserving stored
+/// time/hour/cost values on rows that survive the replacement.
 ///
 /// **Caller**: `calendar::put_inquiry_employees`
+///
+/// **Why not DELETE-all + INSERT**: the inquiry page auto-fires this PUT right
+/// after field-level saves, with UI default times in the payload. Full-replace
+/// silently wiped just-entered clock times (2026-06-10 incident: 20 saved
+/// edits on one job destroyed). Existing non-null values now win over the
+/// incoming payload; payload values only fill gaps and create new rows.
 pub(crate) async fn put_inquiry_employees(
     pool: &PgPool,
     inquiry_id: Uuid,
@@ -352,10 +359,25 @@ pub(crate) async fn put_inquiry_employees(
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
 
-    sqlx::query("DELETE FROM inquiry_employees WHERE inquiry_id = $1")
-        .bind(inquiry_id)
-        .execute(&mut *tx)
-        .await?;
+    // Delete only assignments that were removed from the list.
+    let keep_employee_ids: Vec<Uuid> = assignments.iter().map(|a| a.employee_id).collect();
+    let keep_job_dates: Vec<NaiveDate> = assignments.iter().map(|a| a.job_date).collect();
+    sqlx::query(
+        r#"
+        DELETE FROM inquiry_employees ie
+        WHERE ie.inquiry_id = $1
+          AND NOT EXISTS (
+            SELECT 1
+            FROM unnest($2::uuid[], $3::date[]) AS keep(employee_id, job_date)
+            WHERE keep.employee_id = ie.employee_id AND keep.job_date = ie.job_date
+          )
+        "#,
+    )
+    .bind(inquiry_id)
+    .bind(&keep_employee_ids)
+    .bind(&keep_job_dates)
+    .execute(&mut *tx)
+    .await?;
 
     for a in assignments {
         sqlx::query(
@@ -365,6 +387,19 @@ pub(crate) async fn put_inquiry_employees(
                  start_time, end_time, clock_in, clock_out, break_minutes, actual_hours,
                  transport_mode, travel_costs_cents, accommodation_cents, misc_costs_cents, meal_deduction)
             VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+            ON CONFLICT (inquiry_id, employee_id, job_date) DO UPDATE SET
+                notes               = COALESCE(EXCLUDED.notes, inquiry_employees.notes),
+                start_time          = COALESCE(inquiry_employees.start_time, EXCLUDED.start_time),
+                end_time            = COALESCE(inquiry_employees.end_time, EXCLUDED.end_time),
+                clock_in            = COALESCE(inquiry_employees.clock_in, EXCLUDED.clock_in),
+                clock_out           = COALESCE(inquiry_employees.clock_out, EXCLUDED.clock_out),
+                actual_hours        = COALESCE(inquiry_employees.actual_hours, EXCLUDED.actual_hours),
+                transport_mode      = COALESCE(inquiry_employees.transport_mode, EXCLUDED.transport_mode),
+                travel_costs_cents  = COALESCE(inquiry_employees.travel_costs_cents, EXCLUDED.travel_costs_cents),
+                accommodation_cents = COALESCE(inquiry_employees.accommodation_cents, EXCLUDED.accommodation_cents),
+                misc_costs_cents    = COALESCE(inquiry_employees.misc_costs_cents, EXCLUDED.misc_costs_cents),
+                meal_deduction      = COALESCE(inquiry_employees.meal_deduction, EXCLUDED.meal_deduction),
+                updated_at          = now()
             "#,
         )
         .bind(inquiry_id)
@@ -421,7 +456,9 @@ pub(crate) async fn fetch_calendar_item_employees(
     .await
 }
 
-/// Replace all employee assignments for a calendar item (full-replace semantics).
+/// Replace the SET of employee assignments for a calendar item, preserving
+/// stored time/hour/cost values on rows that survive the replacement.
+/// Same rationale as [`put_inquiry_employees`] — full-replace wiped entered hours.
 ///
 /// **Caller**: `calendar::put_calendar_item_employees`
 pub(crate) async fn put_calendar_item_employees(
@@ -431,19 +468,45 @@ pub(crate) async fn put_calendar_item_employees(
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
 
-    sqlx::query("DELETE FROM calendar_item_employees WHERE calendar_item_id = $1")
-        .bind(calendar_item_id)
-        .execute(&mut *tx)
-        .await?;
+    let keep_employee_ids: Vec<Uuid> = assignments.iter().map(|a| a.employee_id).collect();
+    let keep_job_dates: Vec<NaiveDate> = assignments.iter().map(|a| a.job_date).collect();
+    sqlx::query(
+        r#"
+        DELETE FROM calendar_item_employees cie
+        WHERE cie.calendar_item_id = $1
+          AND NOT EXISTS (
+            SELECT 1
+            FROM unnest($2::uuid[], $3::date[]) AS keep(employee_id, job_date)
+            WHERE keep.employee_id = cie.employee_id AND keep.job_date = cie.job_date
+          )
+        "#,
+    )
+    .bind(calendar_item_id)
+    .bind(&keep_employee_ids)
+    .bind(&keep_job_dates)
+    .execute(&mut *tx)
+    .await?;
 
     for a in assignments {
         sqlx::query(
             r#"
             INSERT INTO calendar_item_employees
-                (id, calendar_item_id, employee_id, job_date,
+                (id, calendar_item_id, employee_id, job_date, notes,
                  start_time, end_time, clock_in, clock_out, break_minutes, actual_hours,
                  transport_mode, travel_costs_cents, accommodation_cents, misc_costs_cents, meal_deduction)
-            VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+            VALUES (gen_random_uuid(), $1, $2, $3, $15, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+            ON CONFLICT (calendar_item_id, employee_id, job_date) DO UPDATE SET
+                notes               = COALESCE(EXCLUDED.notes, calendar_item_employees.notes),
+                start_time          = COALESCE(calendar_item_employees.start_time, EXCLUDED.start_time),
+                end_time            = COALESCE(calendar_item_employees.end_time, EXCLUDED.end_time),
+                clock_in            = COALESCE(calendar_item_employees.clock_in, EXCLUDED.clock_in),
+                clock_out           = COALESCE(calendar_item_employees.clock_out, EXCLUDED.clock_out),
+                actual_hours        = COALESCE(calendar_item_employees.actual_hours, EXCLUDED.actual_hours),
+                transport_mode      = COALESCE(calendar_item_employees.transport_mode, EXCLUDED.transport_mode),
+                travel_costs_cents  = COALESCE(calendar_item_employees.travel_costs_cents, EXCLUDED.travel_costs_cents),
+                accommodation_cents = COALESCE(calendar_item_employees.accommodation_cents, EXCLUDED.accommodation_cents),
+                misc_costs_cents    = COALESCE(calendar_item_employees.misc_costs_cents, EXCLUDED.misc_costs_cents),
+                meal_deduction      = COALESCE(calendar_item_employees.meal_deduction, EXCLUDED.meal_deduction)
             "#,
         )
         .bind(calendar_item_id)
@@ -460,6 +523,7 @@ pub(crate) async fn put_calendar_item_employees(
         .bind(a.accommodation_cents)
         .bind(a.misc_costs_cents)
         .bind(&a.meal_deduction)
+        .bind(&a.notes)
         .execute(&mut *tx)
         .await?;
     }

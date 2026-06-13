@@ -84,17 +84,29 @@ impl EmployeeService for EmployeeServiceImpl {
         from: NaiveDate,
         to: NaiveDate,
     ) -> Result<Vec<EmployeeWorkloadEntry>, ServiceError> {
-        let rows: Vec<(NaiveDate, Option<Uuid>, Option<Uuid>, String, String)> = sqlx::query_as(
+        type WorkloadRow = (
+            NaiveDate,
+            Option<Uuid>,
+            Option<Uuid>,
+            String,
+            String,
+            Option<chrono::NaiveTime>,
+            Option<chrono::NaiveTime>,
+            Option<f64>,
+        );
+        let rows: Vec<WorkloadRow> = sqlx::query_as(
             r#"
             SELECT ie.job_date, ie.inquiry_id, NULL::uuid AS calendar_item_id,
-                   COALESCE(c.name, 'Umzug') AS title, 'moving'::text AS category
+                   COALESCE(c.name, 'Umzug') AS title, 'moving'::text AS category,
+                   ie.clock_in, ie.clock_out, ie.actual_hours::float8 AS actual_hours
             FROM inquiry_employees ie
             JOIN inquiries i ON ie.inquiry_id = i.id
             LEFT JOIN customers c ON i.customer_id = c.id
             WHERE ie.employee_id = $1 AND ie.job_date BETWEEN $2 AND $3
             UNION ALL
             SELECT cie.job_date, NULL::uuid, cie.calendar_item_id,
-                   ci.title, ci.category
+                   ci.title, ci.category,
+                   cie.clock_in, cie.clock_out, cie.actual_hours::float8
             FROM calendar_item_employees cie
             JOIN calendar_items ci ON cie.calendar_item_id = ci.id
             WHERE cie.employee_id = $1 AND cie.job_date BETWEEN $2 AND $3
@@ -110,8 +122,17 @@ impl EmployeeService for EmployeeServiceImpl {
 
         Ok(rows
             .into_iter()
-            .map(|(date, inquiry_id, calendar_item_id, title, category)| {
-                EmployeeWorkloadEntry { date, inquiry_id, calendar_item_id, title, category }
+            .map(|(date, inquiry_id, calendar_item_id, title, category, clock_in, clock_out, actual_hours)| {
+                EmployeeWorkloadEntry {
+                    date,
+                    inquiry_id,
+                    calendar_item_id,
+                    title,
+                    category,
+                    clock_in,
+                    clock_out,
+                    actual_hours,
+                }
             })
             .collect())
     }

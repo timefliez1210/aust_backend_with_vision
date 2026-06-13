@@ -36,8 +36,14 @@ async fn main() -> Result<()> {
     let db = create_pool(&config.database.url, config.database.max_connections).await?;
     tracing::info!("Database pool created");
 
-    // Run migrations
-    sqlx::migrate!("./migrations").run(&db).await?;
+    // Run migrations. ignore_missing: 20260428000000_backfill_end_date.sql was
+    // back-dated (it references inquiries.end_date, which only exists from
+    // 20260601000000) and broke every fresh database. It was renamed to
+    // 20260611000000; prod still records the old version in _sqlx_migrations,
+    // which must not be treated as an error.
+    let mut migrator = sqlx::migrate!("./migrations");
+    migrator.set_ignore_missing(true);
+    migrator.run(&db).await?;
     tracing::info!("Migrations completed");
 
     // Create LLM provider

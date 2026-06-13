@@ -80,11 +80,6 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    fn test_db_url() -> String {
-        std::env::var("AUST__DATABASE__URL")
-            .unwrap_or_else(|_| "postgres://aust:aust_dev_password@localhost/aust_backend".into())
-    }
-
     fn test_tg_config() -> TelegramConfig {
         TelegramConfig {
             bot_token: "TEST_BOT_TOKEN".into(),
@@ -114,9 +109,8 @@ mod tests {
         (format!("http://127.0.0.1:{}", addr.port()), counter)
     }
 
-    #[tokio::test]
-    async fn reminder_check_fires_for_active_window_contact() {
-        let pool = sqlx::PgPool::connect(&test_db_url()).await.unwrap();
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn reminder_check_fires_for_active_window_contact(pool: sqlx::PgPool) {
         let (mock_url, call_count) = mock_telegram_server().await;
 
         // Insert a contact, then force `next_remind_at` into the past so the
@@ -161,9 +155,8 @@ mod tests {
             .unwrap();
     }
 
-    #[tokio::test]
-    async fn reminder_check_skips_already_handled() {
-        let pool = sqlx::PgPool::connect(&test_db_url()).await.unwrap();
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn reminder_check_skips_already_handled(pool: sqlx::PgPool) {
         let (mock_url, call_count) = mock_telegram_server().await;
 
         let input = CreateFlashContact {
@@ -187,9 +180,8 @@ mod tests {
             .unwrap();
     }
 
-    #[tokio::test]
-    async fn reminder_check_skips_any_time() {
-        let pool = sqlx::PgPool::connect(&test_db_url()).await.unwrap();
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn reminder_check_skips_any_time(pool: sqlx::PgPool) {
         let (mock_url, call_count) = mock_telegram_server().await;
 
         let input = CreateFlashContact {
