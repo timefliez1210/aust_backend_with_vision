@@ -130,7 +130,10 @@ export AUST__EMAIL__IMAP_PORT=993
 export AUST__EMAIL__USERNAME=staging@aust-umzuege.de
 export AUST__EMAIL__PASSWORD=staging-email-password
 export AUST__EMAIL__FROM_ADDRESS=staging@aust-umzuege.de
-export AUST__EMAIL__FROM_NAME="AUST Umzüge (Dev)"
+# No parentheses — they are RFC5322 comments and break lettre's Mailbox parser
+export AUST__EMAIL__FROM_NAME="AUST Umzüge Dev"
+# Mailpit has no STARTTLS — plaintext SMTP for local dev
+export AUST__EMAIL__SMTP_TLS=none
 
 export AUST__LLM__DEFAULT_PROVIDER=ollama
 export AUST__LLM__OLLAMA__BASE_URL=http://localhost:11434

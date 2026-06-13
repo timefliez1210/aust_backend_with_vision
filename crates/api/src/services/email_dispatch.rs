@@ -56,6 +56,7 @@ pub async fn send_offer_email(
     send_email(
         &email_config.smtp_host,
         email_config.smtp_port,
+        &email_config.smtp_tls,
         &email_config.username,
         &email_config.password,
         message,
@@ -115,6 +116,7 @@ pub async fn send_offer_email_custom(
     send_email(
         &email_config.smtp_host,
         email_config.smtp_port,
+        &email_config.smtp_tls,
         &email_config.username,
         &email_config.password,
         message,

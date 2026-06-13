@@ -64,6 +64,7 @@ pub fn test_config() -> Config {
             poll_interval_secs: 60,
             from_address: "test@aust-umzuege.de".to_string(),
             from_name: "AUST Test".to_string(),
+            smtp_tls: "starttls".to_string(),
         },
         llm: LlmConfig {
             default_provider: "mock".to_string(),

@@ -62,10 +62,15 @@ pub fn build_email_with_attachment(
         )
 }
 
-/// Send an email via SMTP (STARTTLS).
+/// Send an email via SMTP.
+///
+/// `smtp_tls` selects the transport security: `"none"` uses a plaintext
+/// connection (local dev/staging → Mailpit, which has no STARTTLS), anything
+/// else uses STARTTLS (production default).
 pub async fn send_email(
     smtp_host: &str,
     smtp_port: u16,
+    smtp_tls: &str,
     username: &str,
     password: &str,
     message: Message,
@@ -73,13 +78,21 @@ pub async fn send_email(
     use lettre::transport::smtp::authentication::Credentials;
     use lettre::{AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
 
-    let creds = Credentials::new(username.to_string(), password.to_string());
-
-    let mailer = AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(smtp_host)
-        .map_err(|e| anyhow::anyhow!("SMTP relay setup failed: {e}"))?
-        .port(smtp_port)
-        .credentials(creds)
-        .build();
+    // Plaintext mode targets Mailpit, which advertises no AUTH mechanisms —
+    // attaching credentials would fail with "No compatible authentication
+    // mechanism was found", so skip auth entirely there.
+    let mailer = if smtp_tls == "none" {
+        AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(smtp_host)
+            .port(smtp_port)
+            .build()
+    } else {
+        let creds = Credentials::new(username.to_string(), password.to_string());
+        AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(smtp_host)
+            .map_err(|e| anyhow::anyhow!("SMTP relay setup failed: {e}"))?
+            .port(smtp_port)
+            .credentials(creds)
+            .build()
+    };
 
     mailer
         .send(message)

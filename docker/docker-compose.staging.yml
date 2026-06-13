@@ -114,6 +114,9 @@ services:
       # Email — SMTP goes to Mailpit; inbound IMAP is disabled in staging
       AUST__EMAIL__SMTP_HOST: staging-mailpit
       AUST__EMAIL__SMTP_PORT: "1025"
+      # Mailpit speaks plaintext SMTP — without this the backend's STARTTLS
+      # handshake fails and no staging email ever arrives in Mailpit.
+      AUST__EMAIL__SMTP_TLS: "none"
       AUST__EMAIL__IMAP_HOST: imap.staging.invalid
       AUST__EMAIL__IMAP_PORT: "993"
       AUST__EMAIL__USERNAME: staging@aust-umzuege.de

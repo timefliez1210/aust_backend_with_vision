@@ -829,6 +829,7 @@ async fn send_invoice(
     crate::services::email::send_email(
         &state.config.email.smtp_host,
         state.config.email.smtp_port,
+        &state.config.email.smtp_tls,
         &state.config.email.username,
         &state.config.email.password,
         email,

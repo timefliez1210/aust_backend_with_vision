@@ -226,6 +226,7 @@ pub(super) async fn send_draft_email(
         send_email(
             &email_cfg.smtp_host,
             email_cfg.smtp_port,
+            &email_cfg.smtp_tls,
             &email_cfg.username,
             &email_cfg.password,
             message,
@@ -481,6 +482,7 @@ pub(crate) async fn send_plain_email(
     send_email(
         &email_config.smtp_host,
         email_config.smtp_port,
+        &email_config.smtp_tls,
         &email_config.username,
         &email_config.password,
         message,

@@ -87,6 +87,14 @@ pub struct EmailConfig {
     pub from_address: String,
     /// SMTP "From" display name shown to recipients.
     pub from_name: String,
+    /// SMTP TLS mode: `"starttls"` (default, production) or `"none"` —
+    /// plaintext for local dev/staging where Mailpit does not advertise STARTTLS.
+    #[serde(default = "default_smtp_tls")]
+    pub smtp_tls: String,
+}
+
+fn default_smtp_tls() -> String {
+    "starttls".to_string()
 }
 
 /// LLM provider selection and per-provider credentials.

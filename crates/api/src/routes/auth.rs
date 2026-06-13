@@ -405,6 +405,7 @@ async fn reset_password_request(
         let _ = crate::services::email::send_email(
             &state.config.email.smtp_host,
             state.config.email.smtp_port,
+            &state.config.email.smtp_tls,
             &state.config.email.username,
             &state.config.email.password,
             crate::services::email::build_plain_email(
