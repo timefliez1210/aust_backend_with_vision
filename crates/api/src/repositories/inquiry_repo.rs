@@ -721,7 +721,11 @@ pub(crate) struct EmployeeAssignmentSnapshotRow {
 /// Fetch employee assignments for an inquiry (inquiry builder projection with employee_ clock fields).
 ///
 /// **Caller**: `inquiry_builder::build_inquiry_response`
-/// **Why**: Canonical inquiry detail includes employee assignments.
+/// **Why**: Canonical inquiry detail includes employee assignments. Returns ONE row per
+/// `(employee, job_date)` so multi-day inquiries expose every scheduled day — the admin
+/// `EmployeeAssignmentPanel` groups these rows by `job_date` to render the per-day view and
+/// derive `day_count`. (A previous `job_date = scheduled_date` filter silently collapsed
+/// multi-day inquiries to day 1, hiding days 2..N that were stored and assigned.)
 pub(crate) async fn fetch_employee_assignments_snapshot(
     pool: &PgPool,
     inquiry_id: Uuid,
@@ -739,6 +743,10 @@ pub(crate) async fn fetch_employee_assignments_snapshot(
                          THEN (EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0
                                - COALESCE(ie.break_minutes, 0) / 60.0)::float8
                          ELSE NULL END) AS actual_hours,
+               -- `employee_clock_*` is the worker's self-reported punch: purely informational,
+               -- NOT declarative. `actual_hours` above is derived ONLY from the admin clock
+               -- columns; employee self-clock is surfaced separately (employee_actual_hours)
+               -- and intentionally never folded into the authoritative hours. Do not COALESCE.
                ie.employee_clock_in,
                ie.employee_clock_out,
                CASE WHEN ie.employee_clock_out IS NOT NULL AND ie.employee_clock_in IS NOT NULL
@@ -754,8 +762,7 @@ pub(crate) async fn fetch_employee_assignments_snapshot(
         FROM inquiry_employees ie
         JOIN employees e ON ie.employee_id = e.id
         WHERE ie.inquiry_id = $1
-          AND ie.job_date = (SELECT COALESCE(scheduled_date, created_at::date) FROM inquiries WHERE id = $1)
-        ORDER BY e.last_name, e.first_name
+        ORDER BY ie.job_date, e.last_name, e.first_name
         "#,
     )
     .bind(inquiry_id)

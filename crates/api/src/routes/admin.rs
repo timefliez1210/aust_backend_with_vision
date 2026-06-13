@@ -464,9 +464,12 @@ async fn list_employees(
 /// `201 Created` with the new `Employee` JSON.
 async fn create_employee(
     State(state): State<Arc<AppState>>,
-    Extension(_claims): Extension<TokenClaims>,
+    Extension(claims): Extension<TokenClaims>,
     Json(body): Json<aust_core::models::CreateEmployee>,
 ) -> Result<(axum::http::StatusCode, Json<serde_json::Value>), ApiError> {
+    // Personnel management is admin-only (matches delete_employee). Buerokraft shares
+    // the admin JWT but must not create/modify staff records.
+    require_admin(&claims)?;
     let target = body.monthly_hours_target.unwrap_or(160.0);
     let id = uuid::Uuid::now_v7();
 
@@ -539,6 +542,9 @@ async fn update_employee(
     Path(id): Path<Uuid>,
     Json(body): Json<aust_core::models::UpdateEmployee>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // Personnel management is admin-only (matches delete_employee).
+    require_admin(&claims)?;
+
     // Verify exists
     if !employee_repo::exists(&state.db, id).await? {
         return Err(ApiError::NotFound("Mitarbeiter nicht gefunden".into()));
@@ -900,10 +906,12 @@ fn doc_content_type(key: &str) -> &'static str {
 /// `200 OK` with updated employee JSON on success.
 async fn upload_employee_document(
     State(state): State<Arc<AppState>>,
-    Extension(_claims): Extension<TokenClaims>,
+    Extension(claims): Extension<TokenClaims>,
     Path((id, doc_type)): Path<(Uuid, String)>,
     mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // Employee documents are sensitive PII (Arbeitsvertrag, Steuerformulare) — admin-only.
+    require_admin(&claims)?;
     let col = resolve_doc_column(&doc_type)
         .ok_or_else(|| ApiError::BadRequest("Unbekannter Dokumenttyp".into()))?;
 
@@ -968,9 +976,11 @@ async fn upload_employee_document(
 /// Raw file bytes with appropriate `Content-Type` and `Content-Disposition: attachment` header.
 async fn download_employee_document(
     State(state): State<Arc<AppState>>,
-    Extension(_claims): Extension<TokenClaims>,
+    Extension(claims): Extension<TokenClaims>,
     Path((id, doc_type)): Path<(Uuid, String)>,
 ) -> Result<Response, ApiError> {
+    // Employee documents are sensitive PII (Arbeitsvertrag, Steuerformulare) — admin-only.
+    require_admin(&claims)?;
     let col = resolve_doc_column(&doc_type)
         .ok_or_else(|| ApiError::BadRequest("Unbekannter Dokumenttyp".into()))?;
 
@@ -1010,9 +1020,11 @@ async fn download_employee_document(
 /// `200 OK` with updated employee JSON.
 async fn delete_employee_document(
     State(state): State<Arc<AppState>>,
-    Extension(_claims): Extension<TokenClaims>,
+    Extension(claims): Extension<TokenClaims>,
     Path((id, doc_type)): Path<(Uuid, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // Employee documents are sensitive PII (Arbeitsvertrag, Steuerformulare) — admin-only.
+    require_admin(&claims)?;
     let col = resolve_doc_column(&doc_type)
         .ok_or_else(|| ApiError::BadRequest("Unbekannter Dokumenttyp".into()))?;
 

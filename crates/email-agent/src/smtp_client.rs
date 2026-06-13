@@ -22,9 +22,10 @@ impl SmtpClient {
         to: &str,
         subject: &str,
         body: &str,
-        _in_reply_to: Option<&str>,
+        in_reply_to: Option<&str>,
     ) -> Result<String, EmailError> {
-        debug!("Sending email to {to}, subject: {subject}");
+        // Do not log `to` — it is customer PII (AGENTS.md). Subject is non-PII.
+        debug!("Sending email, subject: {subject}");
 
         let from_mailbox: Mailbox = format!(
             "{} <{}>",
@@ -37,10 +38,22 @@ impl SmtpClient {
             .parse()
             .map_err(|e| EmailError::Smtp(format!("Invalid to address: {e}")))?;
 
-        let message = Message::builder()
+        let mut builder = Message::builder()
             .from(from_mailbox)
             .to(to_mailbox)
-            .subject(subject)
+            .subject(subject);
+
+        // Thread the reply: set In-Reply-To + References to the parent message's
+        // RFC Message-ID so the customer's mail client groups this into the existing
+        // conversation instead of opening a new thread. Skipped when there is no
+        // parent (e.g. a fresh outbound mail).
+        if let Some(parent_id) = in_reply_to.filter(|s| !s.is_empty()) {
+            builder = builder
+                .in_reply_to(parent_id.to_string())
+                .references(parent_id.to_string());
+        }
+
+        let message = builder
             .header(ContentType::TEXT_PLAIN)
             .body(body.to_string())
             .map_err(|e| EmailError::Smtp(format!("Failed to build message: {e}")))?;

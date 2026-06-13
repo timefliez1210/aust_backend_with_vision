@@ -473,7 +473,7 @@ impl EmailProcessor {
                     .await;
                 }
                 Err(e) => {
-                    error!("Failed to generate response for {customer_email}: {e}");
+                    error!("Failed to generate response (thread {thread_id:?}): {e}");
                     let tg = self.telegram.lock().await;
                     tg.send_status_message(&format!(
                         "Fehler bei Antwort-Generierung für {customer_email}: {e}"
@@ -1042,7 +1042,10 @@ impl EmailProcessor {
             .await
         {
             Ok(status) => {
-                info!("Email sent to {}: {status}", draft.customer_email);
+                info!(
+                    "Email sent (thread {:?}, msg {:?}): {status}",
+                    draft.thread_id, draft.db_message_id
+                );
 
                 // Update draft status to 'sent' in DB (or insert if no draft was stored)
                 if let Some(msg_id) = draft.db_message_id {
@@ -1068,7 +1071,7 @@ impl EmailProcessor {
                 tg.notify_sent(&draft.customer_email, &draft.subject).await;
             }
             Err(e) => {
-                error!("Failed to send email to {}: {e}", draft.customer_email);
+                error!("Failed to send email (thread {:?}): {e}", draft.thread_id);
                 let tg = self.telegram.lock().await;
                 tg.send_status_message(&format!(
                     "FEHLER: E-Mail an {} konnte nicht gesendet werden: {e}",

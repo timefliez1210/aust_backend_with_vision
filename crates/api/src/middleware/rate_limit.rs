@@ -120,7 +120,7 @@ pub async fn apply_rate_limit(
     let ip = extract_client_ip(&request);
 
     if !limiter.check(ip).await {
-        tracing::warn!(client_ip = %ip, "Rate limit exceeded on auth endpoint");
+        tracing::warn!(client_ip = %ip, "Rate limit exceeded on rate-limited endpoint");
         return (
             StatusCode::TOO_MANY_REQUESTS,
             Json(json!({

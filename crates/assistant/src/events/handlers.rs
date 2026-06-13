@@ -81,22 +81,32 @@ pub async fn handle_offer_drafted(
     //   - `approval_owner IS NULL`    → pre-migration offer; treat as 'legacy'.
     //   - offer_id missing / DB error → conservative fallback: skip (don't double-post).
     let offer_id_str = payload["offer_id"].as_str().unwrap_or("");
-    let agent_owns = if offer_id_str.is_empty() {
-        false
+
+    // Resolve routing decision AND display data in one query. The emitter
+    // (offer_pipeline) only puts offer_id + inquiry_id on the payload, so the
+    // customer name and brutto price MUST come from the DB here — otherwise the
+    // message read "Angebot fertig für Unbekannt: 0.00 € brutto" (H3 regression).
+    // offers.price_cents is the brutto total; customers.name is the display name.
+    let offer_row: Option<(Option<String>, i64, Option<String>)> = if offer_id_str.is_empty() {
+        None
     } else if let Ok(offer_id) = offer_id_str.parse::<uuid::Uuid>() {
-        let row: Option<(Option<String>,)> = sqlx::query_as(
-            "SELECT approval_owner FROM offers WHERE id = $1"
+        sqlx::query_as(
+            "SELECT o.approval_owner, o.price_cents, c.name \
+             FROM offers o \
+             JOIN inquiries i ON i.id = o.inquiry_id \
+             LEFT JOIN customers c ON c.id = i.customer_id \
+             WHERE o.id = $1",
         )
         .bind(offer_id)
         .fetch_optional(pool)
         .await
         .ok()
-        .flatten();
-
-        matches!(row, Some((Some(ref s),)) if s == "agent")
+        .flatten()
     } else {
-        false
+        None
     };
+
+    let agent_owns = matches!(offer_row, Some((Some(ref s), _, _)) if s == "agent");
 
     if !agent_owns {
         info!(event_id = %event.id, "offer.drafted: approval_owner != 'agent' — legacy flow handles it");
@@ -108,10 +118,24 @@ pub async fn handle_offer_drafted(
         return Ok(());
     };
 
-    let name = payload["customer_name"].as_str().unwrap_or("Unbekannt");
-    let brutto_cents = payload["brutto_cents"].as_i64().unwrap_or(0);
+    // Prefer DB-resolved values; fall back to the payload so a future enriched
+    // emitter still works, and finally to safe defaults.
+    let (db_brutto_cents, db_name) = match &offer_row {
+        Some((_, price, name)) => (*price, name.clone()),
+        None => (0, None),
+    };
+    let name = payload["customer_name"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or(db_name)
+        .unwrap_or_else(|| "Unbekannt".to_string());
+    let brutto_cents = payload["brutto_cents"]
+        .as_i64()
+        .filter(|c| *c != 0)
+        .unwrap_or(db_brutto_cents);
     let brutto = brutto_cents as f64 / 100.0;
-    let offer_id = payload["offer_id"].as_str().unwrap_or("?");
+    let offer_id = if offer_id_str.is_empty() { "?" } else { offer_id_str };
 
     // B4: previous text told Alex to tap "/approve <id>" / "/deny <id>" — but
     // no such command parser existed and no inline buttons were attached, so

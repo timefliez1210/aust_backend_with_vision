@@ -27,7 +27,21 @@ pub struct FlashContactRequest {
 }
 
 pub fn router() -> Router<Arc<AppState>> {
-    Router::new().route("/flash-contact", post(create_flash_contact))
+    // Public + unauthenticated, and every call fires an immediate Telegram ping to Alex.
+    // Rate-limit per client IP (10 req/60s) so it can't be used to spam him. Uses its own
+    // limiter instance (not the shared auth bucket) so the two limits stay independent.
+    let limiter = Arc::new(crate::middleware::RateLimiter::new(
+        10,
+        std::time::Duration::from_secs(60),
+    ));
+    Router::new()
+        .route("/flash-contact", post(create_flash_contact))
+        .layer(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let limiter = limiter.clone();
+                async move { crate::middleware::apply_rate_limit(limiter, req, next).await }
+            },
+        ))
 }
 
 async fn create_flash_contact(

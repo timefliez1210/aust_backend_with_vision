@@ -344,19 +344,27 @@ async fn create_invoice(
         tx.commit().await?;
 
         // Emit invoice.issued for both partial invoices (non-fatal).
+        // The handler reads customer_name + brutto_cents straight from the payload, so
+        // include them here (the brutto split sums exactly: first + final == offer_brutto).
         {
             let emitter = state.events.clone();
+            let customer_name = invoice_display_name(&invoice_context);
+            let first_brutto = (offer_brutto as f64 * percent as f64 / 100.0).round() as i64;
             let p1 = serde_json::json!({
                 "invoice_id": first_id,
                 "inquiry_id": inquiry_id,
                 "invoice_number": first_num,
                 "invoice_type": "partial_first",
+                "customer_name": customer_name,
+                "brutto_cents": first_brutto,
             });
             let p2 = serde_json::json!({
                 "invoice_id": final_id,
                 "inquiry_id": inquiry_id,
                 "invoice_number": final_num,
                 "invoice_type": "partial_final",
+                "customer_name": customer_name,
+                "brutto_cents": offer_brutto - first_brutto,
             });
             let agg1 = format!("invoice:{first_id}");
             let agg2 = format!("invoice:{final_id}");
@@ -411,7 +419,8 @@ async fn create_invoice(
 
         invoice_repo::insert_full(&state.db, inv_id, inquiry_id, &invoice_num, offer_netto, &s3_key, now).await?;
 
-        // Emit invoice.issued domain event (non-fatal).
+        // Emit invoice.issued domain event (non-fatal). Include customer_name +
+        // brutto_cents so the handler's Telegram notification is populated.
         {
             let emitter = state.events.clone();
             let payload = serde_json::json!({
@@ -419,6 +428,8 @@ async fn create_invoice(
                 "inquiry_id": inquiry_id,
                 "invoice_number": invoice_num,
                 "invoice_type": "full",
+                "customer_name": invoice_display_name(&invoice_context),
+                "brutto_cents": offer_brutto,
             });
             let aggregate = format!("invoice:{inv_id}");
             tokio::spawn(async move {
@@ -448,6 +459,13 @@ pub struct UpdateInvoiceNumberRequest {
 /// got a too-low / colliding number). This lets him set the correct number on the
 /// invoice, regenerates the PDF so it shows that number, and nudges the
 /// `invoice_number_seq` forward so the next generated number won't collide again.
+///
+/// **Design decision — intentionally mutable (do not "fix").** GoBD/§146 AO immutability
+/// applies to invoices that have actually been *issued to the customer*. In this system the
+/// generated number/PDF is an internal draft until Alex sends it; the desync this repairs
+/// happens precisely because the authoritative invoice was sent *outside* the system. Locking
+/// the field after generation would strand those records with a wrong, un-correctable number.
+/// A Storno+Neu reversal workflow is the correct long-term answer but is out of scope here.
 ///
 /// # Errors
 /// - 400 if the new number is empty or already used by another invoice
@@ -940,6 +958,20 @@ async fn load_invoice_context(
     })
 }
 
+/// Customer display name for invoices: "First Last", falling back to the stored
+/// `name`, then email, then "Kunde". Shared by the XLSX builder and the
+/// `invoice.issued` event payload so the Telegram notification shows the same name.
+fn invoice_display_name(ctx: &InvoiceContext) -> String {
+    match (ctx.customer.first_name.as_deref(), ctx.customer.last_name.as_deref()) {
+        (Some(f), Some(l)) => format!("{f} {l}"),
+        _ => ctx
+            .customer
+            .name
+            .clone()
+            .unwrap_or_else(|| ctx.customer.email.clone().unwrap_or_else(|| "Kunde".to_string())),
+    }
+}
+
 /// Build an `InvoiceData` struct from a loaded `InvoiceContext` and line items.
 ///
 /// **Why**: Centralises the conversion from domain objects to the XLSX generator's
@@ -953,10 +985,7 @@ fn build_invoice_data_from_items(
     invoice_date: chrono::NaiveDate,
     line_items: Vec<InvoiceLineItem>,
 ) -> InvoiceData {
-    let customer_name = match (ctx.customer.first_name.as_deref(), ctx.customer.last_name.as_deref()) {
-        (Some(f), Some(l)) => format!("{f} {l}"),
-        _ => ctx.customer.name.clone().unwrap_or_else(|| ctx.customer.email.clone().unwrap_or_else(|| "Kunde".to_string())),
-    };
+    let customer_name = invoice_display_name(ctx);
 
     InvoiceData {
         invoice_number: invoice_number.to_string(),
@@ -1360,31 +1389,32 @@ fn build_invoice_response(row: InvoiceRow, offer_netto_cents: i64) -> InvoiceRes
         .unwrap_or_default();
 
     let extra_netto: i64 = extra_services.iter().map(|e| e.price_cents).sum();
+    let extra_brutto = (extra_netto as f64 * 1.19).round() as i64;
     let offer_brutto = (offer_netto_cents as f64 * 1.19).round() as i64;
 
-    let (base_netto, total_netto) = match row.invoice_type.as_str() {
+    // Derive brutto from the SAME partial split the creation path / PDF use: first =
+    // round(offer_brutto * pct), final = the remainder. This guarantees first_brutto +
+    // final_brutto == offer_brutto to the cent. Independently rounding total_netto * 1.19
+    // (the previous approach) could drift ±1ct away from the generated PDF total.
+    let (total_netto, total_brutto) = match row.invoice_type.as_str() {
         "partial_first" => {
             let pct = row.partial_percent.unwrap_or(0) as f64;
             let first_brutto = (offer_brutto as f64 * pct / 100.0).round() as i64;
-            let n = (first_brutto as f64 / 1.19).round() as i64;
-            (n, n) // no extras on partial_first
+            let first_netto = (first_brutto as f64 / 1.19).round() as i64;
+            (first_netto, first_brutto) // no extras on partial_first
         }
         "partial_final" => {
-            // Mirror creation math: first_netto derived from first_brutto, final = offer - first
             let pct = row.partial_percent.unwrap_or(0) as f64;
             let first_brutto = (offer_brutto as f64 * pct / 100.0).round() as i64;
             let first_netto = (first_brutto as f64 / 1.19).round() as i64;
-            let n = offer_netto_cents - first_netto;
-            (n, n + extra_netto)
+            let final_netto = offer_netto_cents - first_netto;
+            (final_netto + extra_netto, (offer_brutto - first_brutto) + extra_brutto)
         }
         _ => {
             // full
-            (offer_netto_cents, offer_netto_cents + extra_netto)
+            (offer_netto_cents + extra_netto, offer_brutto + extra_brutto)
         }
     };
-
-    let _ = base_netto; // used indirectly via total_netto
-    let total_brutto = (total_netto as f64 * 1.19).round() as i64;
 
     InvoiceResponse {
         id: row.id,
