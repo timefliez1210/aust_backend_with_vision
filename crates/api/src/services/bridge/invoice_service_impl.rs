@@ -156,9 +156,17 @@ impl InvoiceService for InvoiceServiceImpl {
             .await
             .map_err(|e| ServiceError::External(anyhow::anyhow!("Storage upload failed: {e}")))?;
 
-        invoice_repo::insert_full(&self.pool, inv_id, inquiry_id, &invoice_num, &s3_key, now)
-            .await
-            .map_err(super::map_sqlx)?;
+        invoice_repo::insert_full(
+            &self.pool,
+            inv_id,
+            inquiry_id,
+            &invoice_num,
+            offer.price_cents,
+            &s3_key,
+            now,
+        )
+        .await
+        .map_err(super::map_sqlx)?;
 
         Ok(InvoiceSummary {
             id: inv_id,

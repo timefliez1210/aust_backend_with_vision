@@ -29,6 +29,9 @@ pub(crate) struct InvoiceRow {
     pub payment_method: Option<String>,
     pub notes: Option<String>,
     pub due_date: Option<chrono::NaiveDate>,
+    /// Base netto amount captured at creation (offer price or manual price).
+    /// NULL on pre-migration rows — callers fall back to the active offer.
+    pub base_netto_cents: Option<i64>,
 }
 
 /// Flat projection for Rechnungsausgangsbuch — one row per invoice with
@@ -81,7 +84,7 @@ pub(crate) async fn list_by_inquiry(
         "SELECT id, inquiry_id, invoice_number, invoice_type, partial_group_id,
                 partial_percent, status, extra_services, pdf_s3_key, sent_at, paid_at, created_at,
                 deposit_percent, deposit_invoice_id,
-                payment_method, notes, due_date
+                payment_method, notes, due_date, base_netto_cents
          FROM invoices WHERE inquiry_id = $1 ORDER BY created_at",
     )
     .bind(inquiry_id)
@@ -174,13 +177,14 @@ pub(crate) async fn insert_partial_first(
     invoice_number: &str,
     group_id: Uuid,
     percent: i32,
+    base_netto_cents: i64,
     pdf_s3_key: &str,
     created_at: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO invoices (id, inquiry_id, invoice_number, invoice_type,
-            partial_group_id, partial_percent, deposit_percent, status, extra_services, pdf_s3_key, created_at)
-         VALUES ($1,$2,$3,'partial_first',$4,$5,$5::smallint,'ready','[]',$6,$7)",
+            partial_group_id, partial_percent, deposit_percent, status, extra_services, pdf_s3_key, created_at, base_netto_cents)
+         VALUES ($1,$2,$3,'partial_first',$4,$5,$5::smallint,'ready','[]',$6,$7,$8)",
     )
     .bind(id)
     .bind(inquiry_id)
@@ -189,6 +193,7 @@ pub(crate) async fn insert_partial_first(
     .bind(percent)
     .bind(pdf_s3_key)
     .bind(created_at)
+    .bind(base_netto_cents)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -210,13 +215,14 @@ pub(crate) async fn insert_partial_final(
     group_id: Uuid,
     percent: i32,
     first_id: Uuid,
+    base_netto_cents: i64,
     pdf_s3_key: &str,
     created_at: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO invoices (id, inquiry_id, invoice_number, invoice_type,
-            partial_group_id, partial_percent, deposit_invoice_id, status, extra_services, pdf_s3_key, created_at)
-         VALUES ($1,$2,$3,'partial_final',$4,$5,$6,'draft','[]',$7,$8)",
+            partial_group_id, partial_percent, deposit_invoice_id, status, extra_services, pdf_s3_key, created_at, base_netto_cents)
+         VALUES ($1,$2,$3,'partial_final',$4,$5,$6,'draft','[]',$7,$8,$9)",
     )
     .bind(id)
     .bind(inquiry_id)
@@ -226,6 +232,7 @@ pub(crate) async fn insert_partial_final(
     .bind(first_id)
     .bind(pdf_s3_key)
     .bind(created_at)
+    .bind(base_netto_cents)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -274,19 +281,21 @@ pub(crate) async fn insert_full(
     id: Uuid,
     inquiry_id: Uuid,
     invoice_number: &str,
+    base_netto_cents: i64,
     pdf_s3_key: &str,
     created_at: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO invoices (id, inquiry_id, invoice_number, invoice_type,
-            status, extra_services, pdf_s3_key, created_at)
-         VALUES ($1,$2,$3,'full','ready','[]',$4,$5)",
+            status, extra_services, pdf_s3_key, created_at, base_netto_cents)
+         VALUES ($1,$2,$3,'full','ready','[]',$4,$5,$6)",
     )
     .bind(id)
     .bind(inquiry_id)
     .bind(invoice_number)
     .bind(pdf_s3_key)
     .bind(created_at)
+    .bind(base_netto_cents)
     .execute(pool)
     .await?;
     Ok(())
@@ -304,7 +313,7 @@ pub(crate) async fn fetch_by_id(
         "SELECT id, inquiry_id, invoice_number, invoice_type, partial_group_id,
                 partial_percent, status, extra_services, pdf_s3_key, sent_at, paid_at, created_at,
                 deposit_percent, deposit_invoice_id,
-                payment_method, notes, due_date
+                payment_method, notes, due_date, base_netto_cents
          FROM invoices WHERE id = $1",
     )
     .bind(inv_id)
@@ -325,7 +334,7 @@ pub(crate) async fn fetch_by_id_and_inquiry(
         "SELECT id, inquiry_id, invoice_number, invoice_type, partial_group_id,
                 partial_percent, status, extra_services, pdf_s3_key, sent_at, paid_at, created_at,
                 deposit_percent, deposit_invoice_id,
-                payment_method, notes, due_date
+                payment_method, notes, due_date, base_netto_cents
          FROM invoices WHERE id = $1 AND inquiry_id = $2",
     )
     .bind(inv_id)

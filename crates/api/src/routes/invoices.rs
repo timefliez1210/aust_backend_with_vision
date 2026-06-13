@@ -336,10 +336,10 @@ async fn create_invoice(
         // Insert both rows atomically so a partial failure can't leave an orphaned first row
         let mut tx = state.db.begin().await?;
         invoice_repo::insert_partial_first(
-            &mut tx, first_id, inquiry_id, &first_num, group_id, percent as i32, &first_key, now,
+            &mut tx, first_id, inquiry_id, &first_num, group_id, percent as i32, offer_netto, &first_key, now,
         ).await?;
         invoice_repo::insert_partial_final(
-            &mut tx, final_id, inquiry_id, &final_num, group_id, percent as i32, first_id, &final_key, now,
+            &mut tx, final_id, inquiry_id, &final_num, group_id, percent as i32, first_id, offer_netto, &final_key, now,
         ).await?;
         tx.commit().await?;
 
@@ -409,7 +409,7 @@ async fn create_invoice(
         let pdf = generate_pdf_bytes(&xlsx).await;
         let s3_key = upload_invoice_pdf(&*state.storage, inv_id, &pdf).await?;
 
-        invoice_repo::insert_full(&state.db, inv_id, inquiry_id, &invoice_num, &s3_key, now).await?;
+        invoice_repo::insert_full(&state.db, inv_id, inquiry_id, &invoice_num, offer_netto, &s3_key, now).await?;
 
         // Emit invoice.issued domain event (non-fatal).
         {
@@ -645,7 +645,8 @@ async fn update_invoice(
         invoice_repo::update_extra_services(&state.db, inv_id, &extra_services_json).await?;
 
         // Regenerate PDF with updated extras
-        let invoice_context = load_invoice_context(&state.db, inquiry_id, None).await?;
+        // Stored base amount keeps manual-price invoices (no active offer) editable.
+        let invoice_context = load_invoice_context(&state.db, inquiry_id, row.base_netto_cents).await?;
         let today = now.date_naive();
 
         let inv_type = match row.invoice_type.as_str() {
@@ -1218,7 +1219,8 @@ async fn regenerate_invoice_pdf(
     // Load invoice context. No manual price fallback here — the offer price (or its
     // absence) is already reflected in the invoice's stored amounts, and we cannot
     // safely invent a price.
-    let ctx = load_invoice_context(&state.db, row.inquiry_id, None).await?;
+    // Stored base amount keeps manual-price invoices (no active offer) regenerable.
+    let ctx = load_invoice_context(&state.db, row.inquiry_id, row.base_netto_cents).await?;
     let today = Utc::now().date_naive();
 
     // Parse existing extras to preserve them across regeneration.
@@ -1333,6 +1335,9 @@ async fn upload_invoice_pdf(
 
 /// Build an `InvoiceResponse` from a DB row plus the offer netto for amount calculation.
 fn build_invoice_response(row: InvoiceRow, offer_netto_cents: i64) -> InvoiceResponse {
+    // The base captured at creation wins — for manual-price invoices the
+    // active-offer fallback is 0 and would zero out every total.
+    let offer_netto_cents = row.base_netto_cents.unwrap_or(offer_netto_cents);
     let extra_services: Vec<ExtraServiceRequest> = row
         .extra_services
         .as_array()
