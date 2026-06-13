@@ -396,9 +396,10 @@ struct JobDetail {
     notes: Option<String>,
     // Admin note visible to all employees on this job
     employee_notes: Option<String>,
-    // Employee self-reported times (editable via PATCH /jobs/{id}/clock)
-    employee_clock_in: Option<NaiveTime>,
-    employee_clock_out: Option<NaiveTime>,
+    // Employee self-reported times (editable via PATCH /jobs/{id}/clock).
+    // RFC3339 timestamps — the worker UI converts to local HH:MM for display.
+    employee_clock_in: Option<chrono::DateTime<chrono::Utc>>,
+    employee_clock_out: Option<chrono::DateTime<chrono::Utc>>,
     employee_actual_hours: Option<f64>,
     // Team
     colleague_names: Vec<String>,
@@ -507,18 +508,24 @@ async fn patch_employee_clock(
     Path(inquiry_id): Path<Uuid>,
     Json(body): Json<ClockBody>,
 ) -> Result<StatusCode, ApiError> {
-    // Parse a time string — accepts HH:MM, HH:MM:SS, or ISO 8601 datetime (time portion extracted).
-    let parse_time = |s: Option<String>| -> Result<Option<NaiveTime>, ApiError> {
+    // The job date anchors lenient bare-time input (HH:MM / HH:MM:SS).
+    let job_date = employee_repo::fetch_job_inquiry(&state.db, inquiry_id)
+        .await?
+        .and_then(|r| r.job_date)
+        .unwrap_or_else(|| Utc::now().date_naive());
+
+    // Parse a time string — accepts ISO 8601 datetime (preferred, sent by the
+    // worker UI) or bare HH:MM / HH:MM:SS combined with the job date (UTC).
+    let parse_time = |s: Option<String>| -> Result<Option<DateTime<Utc>>, ApiError> {
         match s {
             None => Ok(None),
             Some(ref v) if v.is_empty() => Ok(None),
             Some(v) => {
-                // Try HH:MM:SS first, then HH:MM, then extract from ISO datetime
-                if let Ok(t) = v.parse::<NaiveTime>() {
-                    return Ok(Some(t));
-                }
                 if let Ok(dt) = v.parse::<DateTime<Utc>>() {
-                    return Ok(Some(dt.time()));
+                    return Ok(Some(dt));
+                }
+                if let Ok(t) = v.parse::<NaiveTime>() {
+                    return Ok(Some(job_date.and_time(t).and_utc()));
                 }
                 Err(ApiError::Validation(format!("Ungültiges Zeitformat: {v}")))
             }

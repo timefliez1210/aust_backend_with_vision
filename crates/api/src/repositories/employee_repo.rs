@@ -372,8 +372,8 @@ pub(crate) async fn fetch_item_colleague_names(
 #[derive(FromRow)]
 pub(crate) struct AssignmentRow {
     pub notes: Option<String>,
-    pub employee_clock_in: Option<NaiveTime>,
-    pub employee_clock_out: Option<NaiveTime>,
+    pub employee_clock_in: Option<chrono::DateTime<chrono::Utc>>,
+    pub employee_clock_out: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Fetch assignment details for a specific employee-inquiry pair.
@@ -388,8 +388,8 @@ pub(crate) async fn fetch_assignment(
     sqlx::query_as(
         r#"
         SELECT ie.notes,
-               ie.clock_in AS employee_clock_in,
-               ie.clock_out AS employee_clock_out
+               ie.employee_clock_in,
+               ie.employee_clock_out
         FROM inquiry_employees ie
         WHERE ie.inquiry_id = $1 AND ie.employee_id = $2
         ORDER BY ie.job_date ASC
@@ -470,16 +470,18 @@ pub(crate) async fn update_clock_times(
     pool: &PgPool,
     inquiry_id: Uuid,
     employee_id: Uuid,
-    clock_in: Option<NaiveTime>,
-    clock_out: Option<NaiveTime>,
+    clock_in: Option<chrono::DateTime<chrono::Utc>>,
+    clock_out: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<u64, sqlx::Error> {
-    // Only update the primary day (day_number = 1) to avoid overwriting
-    // clock times across all days of a multi-day inquiry.
+    // Writes the EMPLOYEE self-report columns (migration 20260322) — never the
+    // admin-set clock_in/clock_out, which are shown side-by-side for
+    // discrepancy checking. Only the primary day of a multi-day inquiry is
+    // updated to avoid overwriting times across all days.
     let result = sqlx::query(
         r#"
         UPDATE inquiry_employees
-        SET clock_in  = $1,
-            clock_out = $2
+        SET employee_clock_in  = $1,
+            employee_clock_out = $2
         WHERE inquiry_id = $3
           AND employee_id = $4
           AND job_date = (SELECT COALESCE(scheduled_date, created_at::date) FROM inquiries WHERE id = $3)
