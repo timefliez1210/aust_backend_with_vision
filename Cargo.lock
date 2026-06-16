@@ -306,6 +306,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "chrono",
+ "chrono-tz",
  "hex",
  "hyper 1.10.0",
  "jsonwebtoken",

@@ -17,6 +17,7 @@ pub mod invoices;
 pub mod offers;
 pub(crate) mod shared;
 pub mod submissions;
+pub mod vehicles;
 
 use crate::AppState;
 use axum::{routing::post, Router};

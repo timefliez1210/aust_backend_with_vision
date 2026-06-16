@@ -55,6 +55,7 @@ pub fn create_router(state: AppState) -> Router {
         .nest("/admin", routes::admin::router())
         .nest("/admin/agent-activity", routes::agent_activity::router())
         .nest("/admin/calendar-items", routes::calendar_items::router())
+        .nest("/admin/vehicles", routes::vehicles::router())
         .nest("/auth", routes::auth::protected_router())
         .route_layer(axum::middleware::from_fn_with_state(
             shared_state.clone(),

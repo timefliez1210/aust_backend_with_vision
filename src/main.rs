@@ -196,6 +196,23 @@ async fn main() -> Result<()> {
     });
     tracing::info!("Flash contact reminder task started");
 
+    // Periodic vehicle reminders: ping Alex on TÜV/Ölwechsel/etc. as the due date
+    // nears (21/14/7 days, then daily through the final week and while overdue).
+    let vehicle_reminder_db = state.db.clone();
+    let vehicle_reminder_tg = state.config.telegram.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60)); // every 1 min
+        loop {
+            interval.tick().await;
+            if let Err(e) = aust_api::services::vehicle_reminder_service::run_reminder_check(
+                &vehicle_reminder_db, &vehicle_reminder_tg,
+            ).await {
+                tracing::warn!("Vehicle reminder check failed: {e}");
+            }
+        }
+    });
+    tracing::info!("Vehicle reminder task started");
+
     // ── Assistant event consumer ───────────────────────────────────────────────
     // Build the TelegramNotifier (concrete reqwest-backed impl) and spawn the
     // AssistantEventConsumer that drives event handlers (inquiry.created,

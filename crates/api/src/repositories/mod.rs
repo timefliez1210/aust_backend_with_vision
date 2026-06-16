@@ -21,6 +21,7 @@ pub(crate) mod offer_repo;
 pub(crate) mod review_repo;
 pub(crate) mod settings_repo;
 pub(crate) mod invoice_reminder_repo;
+pub(crate) mod vehicle_repo;
 
 // Re-export row types that are used across multiple modules.
 pub(crate) use address_repo::AddressRow;
