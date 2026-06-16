@@ -375,6 +375,7 @@ pub(crate) async fn fetch_item_colleague_names(
 /// Assignment row for job detail.
 #[derive(FromRow)]
 pub(crate) struct AssignmentRow {
+    pub job_date: Option<NaiveDate>,
     pub notes: Option<String>,
     pub employee_clock_in: Option<chrono::DateTime<chrono::Utc>>,
     pub employee_clock_out: Option<chrono::DateTime<chrono::Utc>>,
@@ -384,24 +385,32 @@ pub(crate) struct AssignmentRow {
 ///
 /// **Caller**: `employee::get_job_detail`
 /// **Why**: Verifies the employee is assigned and returns their assignment data.
+///          When `date` is given, the specific day of a multi-day inquiry is
+///          selected so the detail page reflects the day the employee tapped in
+///          the schedule (which lists one row per `inquiry_employees.job_date`).
+///          When `date` is `None`, falls back to the earliest assigned day.
 pub(crate) async fn fetch_assignment(
     pool: &PgPool,
     inquiry_id: Uuid,
     employee_id: Uuid,
+    date: Option<NaiveDate>,
 ) -> Result<Option<AssignmentRow>, sqlx::Error> {
     sqlx::query_as(
         r#"
-        SELECT ie.notes,
+        SELECT ie.job_date,
+               ie.notes,
                ie.employee_clock_in,
                ie.employee_clock_out
         FROM inquiry_employees ie
         WHERE ie.inquiry_id = $1 AND ie.employee_id = $2
+          AND ($3::date IS NULL OR ie.job_date = $3)
         ORDER BY ie.job_date ASC
         LIMIT 1
         "#,
     )
     .bind(inquiry_id)
     .bind(employee_id)
+    .bind(date)
     .fetch_optional(pool)
     .await
 }
@@ -476,11 +485,14 @@ pub(crate) async fn update_clock_times(
     employee_id: Uuid,
     clock_in: Option<chrono::DateTime<chrono::Utc>>,
     clock_out: Option<chrono::DateTime<chrono::Utc>>,
+    date: Option<NaiveDate>,
 ) -> Result<u64, sqlx::Error> {
     // Writes the EMPLOYEE self-report columns (migration 20260322) — never the
     // admin-set clock_in/clock_out, which are shown side-by-side for
-    // discrepancy checking. Only the primary day of a multi-day inquiry is
-    // updated to avoid overwriting times across all days.
+    // discrepancy checking. Updates exactly one day: the `date` the employee is
+    // viewing (passed through from the schedule), or — when absent — the
+    // inquiry's primary day, so times are never overwritten across all days of a
+    // multi-day inquiry.
     let result = sqlx::query(
         r#"
         UPDATE inquiry_employees
@@ -488,13 +500,14 @@ pub(crate) async fn update_clock_times(
             employee_clock_out = $2
         WHERE inquiry_id = $3
           AND employee_id = $4
-          AND job_date = (SELECT COALESCE(scheduled_date, created_at::date) FROM inquiries WHERE id = $3)
+          AND job_date = COALESCE($5, (SELECT COALESCE(scheduled_date, created_at::date) FROM inquiries WHERE id = $3))
         "#,
     )
     .bind(clock_in)
     .bind(clock_out)
     .bind(inquiry_id)
     .bind(employee_id)
+    .bind(date)
     .execute(pool)
     .await?;
     Ok(result.rows_affected())

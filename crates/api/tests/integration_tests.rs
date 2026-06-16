@@ -271,6 +271,75 @@ async fn clock_times_target_day_one_only(pool: PgPool) {
 }
 
 // ============================================================================
+// Schedule→detail day scoping: the tapped day (?date=) — not the inquiry's
+// primary scheduled_date — must drive the clock write for a multi-day inquiry.
+// Regression: tapping the 15th in the schedule opened/wrote the 5th.
+// Mirrors the day-scoped SQL in employee_repo::update_clock_times.
+// ============================================================================
+#[sqlx::test(migrations = "../../migrations")]
+async fn clock_times_target_tapped_day_not_primary(pool: PgPool) {
+    let customer_id = test_helpers::insert_test_customer(&pool).await;
+    let origin_id =
+        test_helpers::insert_test_address(&pool, "Musterstr. 1", "Hildesheim", "31134", None, None).await;
+    let dest_id =
+        test_helpers::insert_test_address(&pool, "Zielstr. 5", "Hannover", "30159", None, None).await;
+
+    let inquiry_id = test_helpers::insert_test_inquiry_full(
+        &pool, customer_id, origin_id, dest_id, "estimated", "foto", Some("privatumzug"),
+    ).await;
+
+    let primary = chrono::NaiveDate::from_ymd_opt(2026, 6, 5).unwrap();
+    let tapped = chrono::NaiveDate::from_ymd_opt(2026, 6, 15).unwrap();
+
+    // The inquiry's primary day is the 5th; the employee is also assigned the 15th.
+    sqlx::query("UPDATE inquiries SET scheduled_date = $1 WHERE id = $2")
+        .bind(primary)
+        .bind(inquiry_id)
+        .execute(&pool)
+        .await
+        .expect("set scheduled_date");
+
+    let emp_id = test_helpers::insert_test_employee(&pool, "Anna", "Schmidt").await;
+    test_helpers::insert_test_inquiry_employee(&pool, inquiry_id, emp_id, primary, 8.0).await;
+    test_helpers::insert_test_inquiry_employee(&pool, inquiry_id, emp_id, tapped, 8.0).await;
+
+    // Day-scoped write with date = the 15th (COALESCE($5, primary) → the 15th).
+    let clock_in = chrono::Utc::now() - chrono::Duration::hours(4);
+    let result = sqlx::query(
+        r#"
+        UPDATE inquiry_employees
+        SET employee_clock_in = $1
+        WHERE inquiry_id = $3
+          AND employee_id = $4
+          AND job_date = COALESCE($5, (SELECT COALESCE(scheduled_date, created_at::date) FROM inquiries WHERE id = $3))
+        "#,
+    )
+    .bind(clock_in)
+    .bind(None::<chrono::DateTime<chrono::Utc>>) // $2 unused clock_out placeholder
+    .bind(inquiry_id)
+    .bind(emp_id)
+    .bind(Some(tapped))
+    .execute(&pool)
+    .await
+    .expect("day-scoped clock update");
+    assert_eq!(result.rows_affected(), 1, "only the tapped day must be written");
+
+    let primary_clock: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+        "SELECT employee_clock_in FROM inquiry_employees WHERE inquiry_id = $1 AND job_date = $2 AND employee_id = $3",
+    )
+    .bind(inquiry_id).bind(primary).bind(emp_id)
+    .fetch_one(&pool).await.expect("primary clock");
+    assert!(primary_clock.is_none(), "the primary day (5th) must stay untouched");
+
+    let tapped_clock: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+        "SELECT employee_clock_in FROM inquiry_employees WHERE inquiry_id = $1 AND job_date = $2 AND employee_id = $3",
+    )
+    .bind(inquiry_id).bind(tapped).bind(emp_id)
+    .fetch_one(&pool).await.expect("tapped clock");
+    assert!(tapped_clock.is_some(), "the tapped day (15th) must be written");
+}
+
+// ============================================================================
 // MED-3: Delete inquiry with active bookings must fail
 // ============================================================================
 #[sqlx::test(migrations = "../../migrations")]

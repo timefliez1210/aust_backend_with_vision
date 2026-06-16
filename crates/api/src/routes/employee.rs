@@ -228,6 +228,16 @@ struct MonthQuery {
     month: Option<String>,
 }
 
+/// Optional `?date=YYYY-MM-DD` selecting one day of a multi-day inquiry.
+///
+/// The schedule lists one entry per assigned `inquiry_employees.job_date`, so
+/// the job-detail and clock endpoints take the tapped day to stay in sync —
+/// without it they would always resolve to the inquiry's primary day.
+#[derive(Debug, Deserialize)]
+struct DateQuery {
+    date: Option<NaiveDate>,
+}
+
 #[derive(Debug, Serialize)]
 struct ScheduleJob {
     /// `"job"` for moving inquiries, `"item"` for internal calendar items.
@@ -422,9 +432,11 @@ async fn get_job_detail(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<EmployeeClaims>,
     Path(inquiry_id): Path<Uuid>,
+    Query(query): Query<DateQuery>,
 ) -> Result<Json<JobDetail>, ApiError> {
-    // Verify assignment + fetch assignment fields (including employee self-reported times)
-    let assign = employee_repo::fetch_assignment(&state.db, inquiry_id, claims.employee_id)
+    // Verify assignment + fetch assignment fields (including employee self-reported times).
+    // `date` selects the tapped day of a multi-day inquiry; without it the earliest day wins.
+    let assign = employee_repo::fetch_assignment(&state.db, inquiry_id, claims.employee_id, query.date)
         .await?
         .ok_or_else(|| ApiError::NotFound("Einsatz nicht gefunden oder keine Berechtigung".into()))?;
 
@@ -456,7 +468,10 @@ async fn get_job_detail(
 
     Ok(Json(JobDetail {
         inquiry_id,
-        job_date: row.job_date,
+        // The assigned day (per-employee, per-day) is authoritative and matches
+        // the schedule list. Fall back to the inquiry's scheduled date only for
+        // legacy assignments whose job_date is null.
+        job_date: assign.job_date.or(row.job_date),
         status: row.status,
         origin_street: row.origin_street,
         origin_city: row.origin_city,
@@ -506,13 +521,18 @@ async fn patch_employee_clock(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<EmployeeClaims>,
     Path(inquiry_id): Path<Uuid>,
+    Query(query): Query<DateQuery>,
     Json(body): Json<ClockBody>,
 ) -> Result<StatusCode, ApiError> {
-    // The job date anchors lenient bare-time input (HH:MM / HH:MM:SS).
-    let job_date = employee_repo::fetch_job_inquiry(&state.db, inquiry_id)
-        .await?
-        .and_then(|r| r.job_date)
-        .unwrap_or_else(|| Utc::now().date_naive());
+    // The job date anchors lenient bare-time input (HH:MM / HH:MM:SS). Prefer the
+    // day the employee is viewing; fall back to the inquiry's scheduled date.
+    let job_date = match query.date {
+        Some(d) => d,
+        None => employee_repo::fetch_job_inquiry(&state.db, inquiry_id)
+            .await?
+            .and_then(|r| r.job_date)
+            .unwrap_or_else(|| Utc::now().date_naive()),
+    };
 
     // Parse a time string — accepts ISO 8601 datetime (preferred, sent by the
     // worker UI) or bare HH:MM / HH:MM:SS combined with the job date (UTC).
@@ -535,7 +555,7 @@ async fn patch_employee_clock(
     let clock_in = parse_time(body.employee_clock_in)?;
     let clock_out = parse_time(body.employee_clock_out)?;
 
-    let rows_affected = employee_repo::update_clock_times(&state.db, inquiry_id, claims.employee_id, clock_in, clock_out).await?;
+    let rows_affected = employee_repo::update_clock_times(&state.db, inquiry_id, claims.employee_id, clock_in, clock_out, query.date).await?;
 
     if rows_affected == 0 {
         return Err(ApiError::NotFound(
