@@ -234,7 +234,7 @@ pub(crate) async fn notify_telegram_error(config: &TelegramConfig, message: &str
 /// - `chat_id` — admin Telegram chat ID
 /// - `text` — message text (plain text, no Markdown parsing)
 pub(crate) async fn send_telegram_message(client: &Client, bot_token: &str, chat_id: i64, text: &str) {
-    let api_url = format!("https://api.telegram.org/bot{bot_token}/sendMessage");
+    let api_url = format!("{}/bot{bot_token}/sendMessage", telegram_api_base());
     let payload = serde_json::json!({
         "chat_id": chat_id,
         "text": text,
@@ -242,6 +242,43 @@ pub(crate) async fn send_telegram_message(client: &Client, bot_token: &str, chat
 
     if let Err(e) = client.post(&api_url).json(&payload).send().await {
         error!("Failed to send Telegram message: {e}");
+    }
+}
+
+/// Base URL for the Telegram Bot API.
+///
+/// Defaults to the real `https://api.telegram.org`; overridable via
+/// `AUST_TELEGRAM_API_BASE` so tests can point it at a mock server.
+pub(crate) fn telegram_api_base() -> String {
+    std::env::var("AUST_TELEGRAM_API_BASE")
+        .unwrap_or_else(|_| "https://api.telegram.org".to_string())
+}
+
+/// Send a plain-text notification to the admin chat (own client, never panics).
+///
+/// **Caller**: ad-hoc notifications outside the offer pipeline (e.g. a worker
+/// logging their hours). Mirrors `send_telegram_message` but builds its own
+/// client so callers without one can fire-and-forget.
+pub(crate) async fn send_admin_message(config: &TelegramConfig, text: &str) {
+    send_admin_message_with_base(config, &telegram_api_base(), text).await;
+}
+
+/// Like `send_admin_message` but with an explicit base URL (tests pass a mock).
+pub(crate) async fn send_admin_message_with_base(config: &TelegramConfig, base: &str, text: &str) {
+    let client = match Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            error!("Failed to build Telegram client: {e}");
+            return;
+        }
+    };
+    let url = format!("{base}/bot{}/sendMessage", config.bot_token);
+    let payload = serde_json::json!({ "chat_id": config.admin_chat_id, "text": text });
+    if let Err(e) = client.post(&url).json(&payload).send().await {
+        error!("Failed to send Telegram admin message: {e}");
     }
 }
 

@@ -38,6 +38,7 @@ pub fn protected_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/me", get(get_profile))
         .route("/schedule", get(get_schedule))
+        .route("/pending-hours", get(get_pending_hours))
         .route("/jobs/{id}", get(get_job_detail))
         .route("/jobs/{id}/clock", axum::routing::patch(patch_employee_clock))
         .route("/items/{id}", get(get_item_detail))
@@ -377,6 +378,23 @@ async fn get_schedule(
     Ok(Json(entries))
 }
 
+/// `GET /employee/pending-hours` — past assignments the worker still owes hours for.
+///
+/// **Caller**: Worker portal blocking modal.
+/// **Why**: Workers have no running hours record; instead, any assignment whose day
+///          has passed and that they have not logged is surfaced as a mandatory
+///          modal. Returns moving jobs and Termine, oldest first.
+async fn get_pending_hours(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<EmployeeClaims>,
+) -> Result<Json<Vec<employee_repo::PendingHoursRow>>, ApiError> {
+    let today = Utc::now()
+        .with_timezone(&chrono_tz::Europe::Berlin)
+        .date_naive();
+    let rows = employee_repo::fetch_pending_hours(&state.db, claims.employee_id, today).await?;
+    Ok(Json(rows))
+}
+
 // ---------------------------------------------------------------------------
 // Protected: Job Detail
 // ---------------------------------------------------------------------------
@@ -559,7 +577,63 @@ async fn patch_employee_clock(
         ));
     }
 
+    // A complete log (start + end) notifies the office via Telegram.
+    if let (Some(ci), Some(co)) = (clock_in, clock_out) {
+        let ctx = employee_repo::fetch_job_log_notify_ctx(&state.db, claims.employee_id, inquiry_id)
+            .await
+            .ok()
+            .flatten();
+        notify_hours_logged(&state, ctx, true, ci, co, break_minutes).await;
+    }
+
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Build and send the "worker logged hours" Telegram notification to the office.
+///
+/// Fire-and-forget: a Telegram failure must never fail the worker's save.
+async fn notify_hours_logged(
+    state: &AppState,
+    ctx: Option<employee_repo::HoursLogNotifyCtx>,
+    is_job: bool,
+    clock_in: DateTime<Utc>,
+    clock_out: DateTime<Utc>,
+    break_minutes: Option<i32>,
+) {
+    let Some(ctx) = ctx else { return };
+    let name = format!("{} {}", ctx.first_name, ctx.last_name);
+    let label = ctx.job_label.unwrap_or_else(|| "—".into());
+    let text = format_hours_log_message(&name, &label, is_job, clock_in, clock_out, break_minutes);
+    crate::services::telegram_service::send_admin_message(&state.config.telegram, &text).await;
+}
+
+/// Build the German "worker logged hours" message for the office.
+///
+/// Pure (no I/O) so it can be unit-tested. Times render in Europe/Berlin.
+fn format_hours_log_message(
+    employee_name: &str,
+    job_label: &str,
+    is_job: bool,
+    clock_in: DateTime<Utc>,
+    clock_out: DateTime<Utc>,
+    break_minutes: Option<i32>,
+) -> String {
+    let break_secs = break_minutes.unwrap_or(0).max(0) as i64 * 60;
+    let hours = ((clock_out - clock_in).num_seconds() - break_secs).max(0) as f64 / 3600.0;
+
+    let tz = chrono_tz::Europe::Berlin;
+    let start = clock_in.with_timezone(&tz).format("%H:%M");
+    let end = clock_out.with_timezone(&tz).format("%H:%M");
+    let break_part = match break_minutes.unwrap_or(0) {
+        0 => String::new(),
+        m => format!(", Pause {m} Min"),
+    };
+    let subject = if is_job {
+        format!("den Auftrag von {job_label}")
+    } else {
+        format!("den Termin „{job_label}“")
+    };
+    format!("🕒 {employee_name} hat Stunden erfasst: {hours:.1} h ({start}–{end}{break_part}) für {subject}.")
 }
 
 /// Parse a clock time string for the employee self-report endpoints.
@@ -702,6 +776,15 @@ async fn patch_item_clock(
         return Err(ApiError::NotFound(
             "Termin nicht gefunden oder keine Berechtigung".into(),
         ));
+    }
+
+    // A complete log (start + end) notifies the office via Telegram.
+    if let (Some(ci), Some(co)) = (clock_in, clock_out) {
+        let ctx = employee_repo::fetch_item_log_notify_ctx(&state.db, claims.employee_id, calendar_item_id)
+            .await
+            .ok()
+            .flatten();
+        notify_hours_logged(&state, ctx, false, ci, co, break_minutes).await;
     }
 
     Ok(StatusCode::NO_CONTENT)
@@ -882,5 +965,79 @@ async fn fetch_estimation_items(
         .collect();
 
     Ok(items)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    // 2026-06-15 is in CEST (UTC+2): a UTC h:m renders as (h+2):m in Berlin.
+    fn dt(h: u32, m: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 6, 15, h, m, 0).unwrap()
+    }
+
+    #[test]
+    fn formats_job_hours_message_with_names_break_and_berlin_times() {
+        // 06:00–14:30 UTC = 08:00–16:30 Berlin; 8.5 h gross − 30 min break = 8.0 h.
+        let msg = format_hours_log_message(
+            "Max Helfer",
+            "Familie Muster",
+            true,
+            dt(6, 0),
+            dt(14, 30),
+            Some(30),
+        );
+        assert!(msg.contains("Max Helfer"), "{msg}");
+        assert!(msg.contains("hat Stunden erfasst"), "{msg}");
+        assert!(msg.contains("8.0 h"), "{msg}");
+        assert!(msg.contains("den Auftrag von Familie Muster"), "{msg}");
+        assert!(msg.contains("08:00"), "{msg}");
+        assert!(msg.contains("16:30"), "{msg}");
+        assert!(msg.contains("Pause 30 Min"), "{msg}");
+    }
+
+    #[test]
+    fn formats_termin_message_without_break() {
+        let msg =
+            format_hours_log_message("Anna Klein", "Lagerumzug", false, dt(6, 0), dt(10, 0), None);
+        assert!(msg.contains("Anna Klein"), "{msg}");
+        assert!(msg.contains("den Termin „Lagerumzug“"), "{msg}");
+        assert!(msg.contains("4.0 h"), "{msg}");
+        assert!(!msg.contains("Pause"), "{msg}");
+    }
+
+    /// The notification actually POSTs to the (overridable) Telegram endpoint.
+    #[tokio::test]
+    async fn send_admin_message_hits_the_endpoint() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c2 = counter.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = listener.accept().await {
+                c2.fetch_add(1, Ordering::SeqCst);
+                let _ = s
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n{\"ok\":true}")
+                    .await;
+            }
+        });
+
+        let base = format!("http://127.0.0.1:{}", addr.port());
+        let cfg = aust_core::config::TelegramConfig {
+            bot_token: "TEST_BOT_TOKEN".into(),
+            admin_chat_id: 42,
+            flash_contact_bot_token: "TEST_FLASH".into(),
+        };
+        crate::services::telegram_service::send_admin_message_with_base(&cfg, &base, "🕒 hallo")
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
 }
 

@@ -221,6 +221,9 @@ pub(crate) async fn fetch_schedule_jobs(
         WHERE ie.employee_id = $1
           AND ie.job_date BETWEEN $2 AND $3
           AND i.status NOT IN ('cancelled', 'rejected', 'expired')
+          -- Once the worker has fully logged their own hours, the job leaves
+          -- their tab (they have no running record; the office keeps it).
+          AND (ie.employee_clock_in IS NULL OR ie.employee_clock_out IS NULL)
         ORDER BY ie.job_date ASC
         "#,
     )
@@ -274,6 +277,8 @@ pub(crate) async fn fetch_schedule_items(
         WHERE cie.employee_id = $1
           AND cie.job_date BETWEEN $2 AND $3
           AND ci.status NOT IN ('cancelled')
+          -- Drop fully-logged Termine from the worker's tab (see fetch_schedule_jobs).
+          AND (cie.employee_clock_in IS NULL OR cie.employee_clock_out IS NULL)
         ORDER BY cie.job_date ASC
         "#,
     )
@@ -281,6 +286,141 @@ pub(crate) async fn fetch_schedule_items(
     .bind(from_date)
     .bind(to_date)
     .fetch_all(pool)
+    .await
+}
+
+/// A past assignment for which the employee still owes their hours.
+#[derive(FromRow, serde::Serialize)]
+pub(crate) struct PendingHoursRow {
+    pub entry_type: String,
+    pub inquiry_id: Option<Uuid>,
+    pub calendar_item_id: Option<Uuid>,
+    pub job_date: NaiveDate,
+    /// Calendar item title (Termine only).
+    pub title: Option<String>,
+    /// Customer name (moving jobs only).
+    pub customer_name: Option<String>,
+    pub origin_city: Option<String>,
+    pub destination_city: Option<String>,
+    /// Free-text location (Termine only).
+    pub location: Option<String>,
+    pub start_time: Option<NaiveTime>,
+}
+
+/// Fetch every past assignment (moving job or Termin) for which the employee has
+/// not yet fully logged their own hours.
+///
+/// **Caller**: `employee::get_pending_hours`
+/// **Why**: Backs the blocking "log your hours" modal. "Past" = `job_date` strictly
+///          before `today` (the day-of job is still in progress, so not yet due).
+///          Spans all months, not just the current one.
+pub(crate) async fn fetch_pending_hours(
+    pool: &PgPool,
+    employee_id: Uuid,
+    today: NaiveDate,
+) -> Result<Vec<PendingHoursRow>, sqlx::Error> {
+    sqlx::query_as(
+        r#"
+        SELECT
+            'job'              AS entry_type,
+            ie.inquiry_id      AS inquiry_id,
+            NULL::uuid         AS calendar_item_id,
+            ie.job_date        AS job_date,
+            NULL::text         AS title,
+            COALESCE(c.first_name || ' ' || c.last_name, c.name) AS customer_name,
+            oa.city            AS origin_city,
+            da.city            AS destination_city,
+            NULL::text         AS location,
+            i.start_time       AS start_time
+        FROM inquiry_employees ie
+        JOIN inquiries  i ON ie.inquiry_id = i.id
+        JOIN customers  c ON i.customer_id = c.id
+        LEFT JOIN addresses oa ON i.origin_address_id      = oa.id
+        LEFT JOIN addresses da ON i.destination_address_id = da.id
+        WHERE ie.employee_id = $1
+          AND ie.job_date < $2
+          AND (ie.employee_clock_in IS NULL OR ie.employee_clock_out IS NULL)
+          AND i.status NOT IN ('cancelled', 'rejected', 'expired')
+
+        UNION ALL
+
+        SELECT
+            'item'                 AS entry_type,
+            NULL::uuid             AS inquiry_id,
+            cie.calendar_item_id   AS calendar_item_id,
+            cie.job_date           AS job_date,
+            ci.title               AS title,
+            NULL::text             AS customer_name,
+            NULL::text             AS origin_city,
+            NULL::text             AS destination_city,
+            ci.location            AS location,
+            ci.start_time          AS start_time
+        FROM calendar_item_employees cie
+        JOIN calendar_items ci ON ci.id = cie.calendar_item_id
+        WHERE cie.employee_id = $1
+          AND cie.job_date < $2
+          AND (cie.employee_clock_in IS NULL OR cie.employee_clock_out IS NULL)
+          AND ci.status NOT IN ('cancelled')
+
+        ORDER BY job_date ASC
+        "#,
+    )
+    .bind(employee_id)
+    .bind(today)
+    .fetch_all(pool)
+    .await
+}
+
+/// Context for the "worker logged hours" Telegram notification.
+#[derive(FromRow)]
+pub(crate) struct HoursLogNotifyCtx {
+    pub first_name: String,
+    pub last_name: String,
+    /// Customer name (jobs) or Termin title (items) — the human label of the job.
+    pub job_label: Option<String>,
+}
+
+/// Fetch the employee name + customer name for a moving job, for the log notification.
+pub(crate) async fn fetch_job_log_notify_ctx(
+    pool: &PgPool,
+    employee_id: Uuid,
+    inquiry_id: Uuid,
+) -> Result<Option<HoursLogNotifyCtx>, sqlx::Error> {
+    sqlx::query_as(
+        r#"
+        SELECT e.first_name,
+               e.last_name,
+               (SELECT COALESCE(c.first_name || ' ' || c.last_name, c.name)
+                  FROM inquiries i JOIN customers c ON i.customer_id = c.id
+                 WHERE i.id = $2) AS job_label
+        FROM employees e
+        WHERE e.id = $1
+        "#,
+    )
+    .bind(employee_id)
+    .bind(inquiry_id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Fetch the employee name + Termin title for a calendar item, for the log notification.
+pub(crate) async fn fetch_item_log_notify_ctx(
+    pool: &PgPool,
+    employee_id: Uuid,
+    calendar_item_id: Uuid,
+) -> Result<Option<HoursLogNotifyCtx>, sqlx::Error> {
+    sqlx::query_as(
+        r#"
+        SELECT e.first_name,
+               e.last_name,
+               (SELECT ci.title FROM calendar_items ci WHERE ci.id = $2) AS job_label
+        FROM employees e
+        WHERE e.id = $1
+        "#,
+    )
+    .bind(employee_id)
+    .bind(calendar_item_id)
+    .fetch_optional(pool)
     .await
 }
 

@@ -51,8 +51,9 @@ const ROUTE = 'Teststr. 1, 31134 Hildesheim → Zielweg 9, 30159 Hannover';
 const DESCRIPTION = 'Klavier im Wohnzimmer, 2. OG ohne Aufzug. Beginn 08:30.';
 
 function jobDate(): string {
+  // Today (not a past day) so the overdue-hours modal does not block the schedule.
   const n = new Date();
-  return `${n.getFullYear()}-${String(n.getMonth() + 1).padStart(2, '0')}-15`;
+  return `${n.getFullYear()}-${String(n.getMonth() + 1).padStart(2, '0')}-${String(n.getDate()).padStart(2, '0')}`;
 }
 
 test.beforeAll(async () => {
