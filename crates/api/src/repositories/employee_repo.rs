@@ -7,6 +7,16 @@ use uuid::Uuid;
 
 use crate::ApiError;
 
+/// Earliest `job_date` for which workers are forced to log overdue hours.
+///
+/// The forced-hours modal shipped 2026-06-21 as a one-time clearance. Without a
+/// floor it would also demand hours for March/April/May — months that are now
+/// closed and irrelevant. We only enforce June 2026 onwards.
+pub(crate) const PENDING_HOURS_CUTOFF: NaiveDate = match NaiveDate::from_ymd_opt(2026, 6, 1) {
+    Some(d) => d,
+    None => unreachable!(),
+};
+
 // ---------------------------------------------------------------------------
 // Employee OTP / Session
 // ---------------------------------------------------------------------------
@@ -312,8 +322,10 @@ pub(crate) struct PendingHoursRow {
 ///
 /// **Caller**: `employee::get_pending_hours`
 /// **Why**: Backs the blocking "log your hours" modal. "Past" = `job_date` strictly
-///          before `today` (the day-of job is still in progress, so not yet due).
-///          Spans all months, not just the current one.
+///          before `today` (the day-of job is still in progress, so not yet due)
+///          and on/after [`PENDING_HOURS_CUTOFF`] (June 2026 — closed months like
+///          March–May are not retroactively enforced). Spans all months from the
+///          cutoff onward, not just the current one.
 pub(crate) async fn fetch_pending_hours(
     pool: &PgPool,
     employee_id: Uuid,
@@ -339,6 +351,7 @@ pub(crate) async fn fetch_pending_hours(
         LEFT JOIN addresses da ON i.destination_address_id = da.id
         WHERE ie.employee_id = $1
           AND ie.job_date < $2
+          AND ie.job_date >= $3
           AND (ie.employee_clock_in IS NULL OR ie.employee_clock_out IS NULL)
           AND i.status NOT IN ('cancelled', 'rejected', 'expired')
 
@@ -359,6 +372,7 @@ pub(crate) async fn fetch_pending_hours(
         JOIN calendar_items ci ON ci.id = cie.calendar_item_id
         WHERE cie.employee_id = $1
           AND cie.job_date < $2
+          AND cie.job_date >= $3
           AND (cie.employee_clock_in IS NULL OR cie.employee_clock_out IS NULL)
           AND ci.status NOT IN ('cancelled')
 
@@ -367,6 +381,7 @@ pub(crate) async fn fetch_pending_hours(
     )
     .bind(employee_id)
     .bind(today)
+    .bind(PENDING_HOURS_CUTOFF)
     .fetch_all(pool)
     .await
 }
