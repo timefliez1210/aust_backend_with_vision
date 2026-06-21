@@ -658,6 +658,7 @@ async fn employee_hours_summary(
                 "actual_hours": r.actual_hours,
                 "employee_clock_in": r.employee_clock_in,
                 "employee_clock_out": r.employee_clock_out,
+                "employee_break_minutes": r.employee_break_minutes,
                 "status": r.inquiry_status,
             })
         })
@@ -683,6 +684,7 @@ async fn employee_hours_summary(
                 "actual_hours": r.actual_hours,
                 "employee_clock_in": r.employee_clock_in,
                 "employee_clock_out": r.employee_clock_out,
+                "employee_break_minutes": r.employee_break_minutes,
                 "status": r.status,
             })
         })

@@ -379,6 +379,7 @@ pub(crate) struct AssignmentRow {
     pub notes: Option<String>,
     pub employee_clock_in: Option<chrono::DateTime<chrono::Utc>>,
     pub employee_clock_out: Option<chrono::DateTime<chrono::Utc>>,
+    pub employee_break_minutes: Option<i32>,
 }
 
 /// Fetch assignment details for a specific employee-inquiry pair.
@@ -400,7 +401,8 @@ pub(crate) async fn fetch_assignment(
         SELECT ie.job_date,
                ie.notes,
                ie.employee_clock_in,
-               ie.employee_clock_out
+               ie.employee_clock_out,
+               ie.employee_break_minutes
         FROM inquiry_employees ie
         WHERE ie.inquiry_id = $1 AND ie.employee_id = $2
           AND ($3::date IS NULL OR ie.job_date = $3)
@@ -419,6 +421,8 @@ pub(crate) async fn fetch_assignment(
 #[derive(FromRow)]
 pub(crate) struct JobInquiryRow {
     pub job_date: Option<NaiveDate>,
+    /// Planned start time of the move (workers see this; the end time is not shown).
+    pub start_time: Option<NaiveTime>,
     pub status: String,
     pub estimated_volume_m3: Option<f64>,
     pub origin_street: Option<String>,
@@ -448,6 +452,7 @@ pub(crate) async fn fetch_job_inquiry(
         r#"
         SELECT
             i.scheduled_date AS job_date,
+            i.start_time,
             i.status,
             i.estimated_volume_m3,
             oa.street      AS origin_street,
@@ -485,27 +490,156 @@ pub(crate) async fn update_clock_times(
     employee_id: Uuid,
     clock_in: Option<chrono::DateTime<chrono::Utc>>,
     clock_out: Option<chrono::DateTime<chrono::Utc>>,
+    break_minutes: Option<i32>,
     date: Option<NaiveDate>,
 ) -> Result<u64, sqlx::Error> {
-    // Writes the EMPLOYEE self-report columns (migration 20260322) — never the
-    // admin-set clock_in/clock_out, which are shown side-by-side for
-    // discrepancy checking. Updates exactly one day: the `date` the employee is
-    // viewing (passed through from the schedule), or — when absent — the
-    // inquiry's primary day, so times are never overwritten across all days of a
-    // multi-day inquiry.
+    // Writes the EMPLOYEE self-report columns (migrations 20260322 / 20260620) —
+    // never the admin-set clock_in/clock_out/break_minutes, which are shown
+    // side-by-side for discrepancy checking. Updates exactly one day: the `date`
+    // the employee is viewing (passed through from the schedule), or — when
+    // absent — the inquiry's primary day, so times are never overwritten across
+    // all days of a multi-day inquiry.
     let result = sqlx::query(
         r#"
         UPDATE inquiry_employees
-        SET employee_clock_in  = $1,
-            employee_clock_out = $2
-        WHERE inquiry_id = $3
-          AND employee_id = $4
-          AND job_date = COALESCE($5, (SELECT COALESCE(scheduled_date, created_at::date) FROM inquiries WHERE id = $3))
+        SET employee_clock_in      = $1,
+            employee_clock_out     = $2,
+            employee_break_minutes = $3
+        WHERE inquiry_id = $4
+          AND employee_id = $5
+          AND job_date = COALESCE($6, (SELECT COALESCE(scheduled_date, created_at::date) FROM inquiries WHERE id = $4))
         "#,
     )
     .bind(clock_in)
     .bind(clock_out)
+    .bind(break_minutes)
     .bind(inquiry_id)
+    .bind(employee_id)
+    .bind(date)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+// ---------------------------------------------------------------------------
+// Calendar item (Termin) detail — worker portal
+// ---------------------------------------------------------------------------
+
+/// Assignment row for a calendar item (Termin), mirroring `AssignmentRow`.
+#[derive(FromRow)]
+pub(crate) struct ItemAssignmentRow {
+    pub job_date: Option<NaiveDate>,
+    pub notes: Option<String>,
+    pub employee_clock_in: Option<DateTime<Utc>>,
+    pub employee_clock_out: Option<DateTime<Utc>>,
+    pub employee_break_minutes: Option<i32>,
+}
+
+/// Verify a calendar-item assignment and return the assignment fields.
+///
+/// **Caller**: `employee::get_item_detail`
+/// **Why**: Mirrors [`fetch_assignment`] for calendar items (Termine). `date`
+///          selects the tapped day of a multi-day Termin; without it the
+///          earliest assigned day wins.
+pub(crate) async fn fetch_item_assignment(
+    pool: &PgPool,
+    calendar_item_id: Uuid,
+    employee_id: Uuid,
+    date: Option<NaiveDate>,
+) -> Result<Option<ItemAssignmentRow>, sqlx::Error> {
+    sqlx::query_as(
+        r#"
+        SELECT cie.job_date,
+               cie.notes,
+               cie.employee_clock_in,
+               cie.employee_clock_out,
+               cie.employee_break_minutes
+        FROM calendar_item_employees cie
+        WHERE cie.calendar_item_id = $1 AND cie.employee_id = $2
+          AND ($3::date IS NULL OR cie.job_date = $3)
+        ORDER BY cie.job_date ASC
+        LIMIT 1
+        "#,
+    )
+    .bind(calendar_item_id)
+    .bind(employee_id)
+    .bind(date)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Calendar-item detail row (no financial data).
+#[derive(FromRow)]
+pub(crate) struct ItemDetailRow {
+    pub scheduled_date: Option<NaiveDate>,
+    pub status: String,
+    pub title: String,
+    pub category: String,
+    pub location: Option<String>,
+    pub description: Option<String>,
+    pub start_time: Option<NaiveTime>,
+    pub end_time: Option<NaiveTime>,
+    pub employee_notes: Option<String>,
+}
+
+/// Fetch a calendar item's logistics detail for the worker portal.
+///
+/// **Caller**: `employee::get_item_detail`
+/// **Why**: Termine carry their own title/description/location/time rather than
+///          structured move addresses, so they need a dedicated fetch.
+pub(crate) async fn fetch_item_detail(
+    pool: &PgPool,
+    calendar_item_id: Uuid,
+) -> Result<Option<ItemDetailRow>, sqlx::Error> {
+    sqlx::query_as(
+        r#"
+        SELECT ci.scheduled_date,
+               ci.status,
+               ci.title,
+               ci.category,
+               ci.location,
+               ci.description,
+               ci.start_time,
+               ci.end_time,
+               ci.employee_notes
+        FROM calendar_items ci
+        WHERE ci.id = $1
+        "#,
+    )
+    .bind(calendar_item_id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Update employee self-reported clock times on a calendar-item assignment.
+///
+/// **Caller**: `employee::patch_item_clock`
+/// **Why**: Mirrors [`update_clock_times`] for Termine — writes the EMPLOYEE
+///          self-report columns (migration 20260322), scoped to one day.
+pub(crate) async fn update_item_clock_times(
+    pool: &PgPool,
+    calendar_item_id: Uuid,
+    employee_id: Uuid,
+    clock_in: Option<DateTime<Utc>>,
+    clock_out: Option<DateTime<Utc>>,
+    break_minutes: Option<i32>,
+    date: Option<NaiveDate>,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        r#"
+        UPDATE calendar_item_employees
+        SET employee_clock_in      = $1,
+            employee_clock_out     = $2,
+            employee_break_minutes = $3
+        WHERE calendar_item_id = $4
+          AND employee_id = $5
+          AND job_date = COALESCE($6, (SELECT scheduled_date FROM calendar_items WHERE id = $4))
+        "#,
+    )
+    .bind(clock_in)
+    .bind(clock_out)
+    .bind(break_minutes)
+    .bind(calendar_item_id)
     .bind(employee_id)
     .bind(date)
     .execute(pool)
@@ -972,6 +1106,7 @@ pub(crate) struct AdminHoursRow {
     pub actual_hours: Option<f64>,
     pub employee_clock_in: Option<chrono::DateTime<chrono::Utc>>,
     pub employee_clock_out: Option<chrono::DateTime<chrono::Utc>>,
+    pub employee_break_minutes: Option<i32>,
     pub inquiry_status: String,
 }
 
@@ -1004,6 +1139,7 @@ pub(crate) async fn fetch_admin_hours(
                          ELSE NULL END) AS actual_hours,
                ie.employee_clock_in,
                ie.employee_clock_out,
+               ie.employee_break_minutes,
                i.status AS inquiry_status
         FROM inquiry_employees ie
         JOIN inquiries i ON ie.inquiry_id = i.id
@@ -1039,6 +1175,7 @@ pub(crate) struct AdminCalendarItemHoursRow {
     pub actual_hours: Option<f64>,
     pub employee_clock_in: Option<chrono::DateTime<chrono::Utc>>,
     pub employee_clock_out: Option<chrono::DateTime<chrono::Utc>>,
+    pub employee_break_minutes: Option<i32>,
     pub status: String,
 }
 
@@ -1071,6 +1208,7 @@ pub(crate) async fn fetch_admin_calendar_item_hours(
                          ELSE NULL END) AS actual_hours,
                cie.employee_clock_in,
                cie.employee_clock_out,
+               cie.employee_break_minutes,
                ci.status
         FROM calendar_item_employees cie
         JOIN calendar_items ci ON ci.id = cie.calendar_item_id
