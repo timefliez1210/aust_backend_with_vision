@@ -1,6 +1,9 @@
 # Generated files
 /target/
 
+# Playwright e2e deps (installed locally)
+tests/e2e/node_modules/
+
 # Environment files
 .env
 .env.local
@@ -49,3 +52,4 @@ TODO.md
 app/
 test_pdfs/
 AUDIT.md
+tests/e2e/test-results/

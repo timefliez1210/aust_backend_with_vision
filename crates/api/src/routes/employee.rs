@@ -40,6 +40,8 @@ pub fn protected_router() -> Router<Arc<AppState>> {
         .route("/schedule", get(get_schedule))
         .route("/jobs/{id}", get(get_job_detail))
         .route("/jobs/{id}/clock", axum::routing::patch(patch_employee_clock))
+        .route("/items/{id}", get(get_item_detail))
+        .route("/items/{id}/clock", axum::routing::patch(patch_item_clock))
         .route("/hours", get(get_hours))
 }
 
@@ -383,6 +385,9 @@ async fn get_schedule(
 struct JobDetail {
     inquiry_id: Uuid,
     job_date: Option<NaiveDate>,
+    // Planned start time of the move (HH:MM:SS). Workers need to know when to
+    // start; the end time is intentionally not exposed.
+    start_time: Option<NaiveTime>,
     status: String,
     // Origin
     origin_street: Option<String>,
@@ -410,6 +415,8 @@ struct JobDetail {
     // RFC3339 timestamps — the worker UI converts to local HH:MM for display.
     employee_clock_in: Option<chrono::DateTime<chrono::Utc>>,
     employee_clock_out: Option<chrono::DateTime<chrono::Utc>>,
+    // Self-reported break (minutes); already subtracted from employee_actual_hours.
+    employee_break_minutes: Option<i32>,
     employee_actual_hours: Option<f64>,
     // Team
     colleague_names: Vec<String>,
@@ -448,7 +455,8 @@ async fn get_job_detail(
     // Compute employee actual hours from their self-reported times
     let employee_actual_hours = match (assign.employee_clock_in, assign.employee_clock_out) {
         (Some(ci), Some(co)) => {
-            let secs = (co - ci).num_seconds();
+            let break_secs = assign.employee_break_minutes.unwrap_or(0).max(0) as i64 * 60;
+            let secs = (co - ci).num_seconds() - break_secs;
             if secs > 0 {
                 Some(secs as f64 / 3600.0)
             } else {
@@ -472,6 +480,7 @@ async fn get_job_detail(
         // the schedule list. Fall back to the inquiry's scheduled date only for
         // legacy assignments whose job_date is null.
         job_date: assign.job_date.or(row.job_date),
+        start_time: row.start_time,
         status: row.status,
         origin_street: row.origin_street,
         origin_city: row.origin_city,
@@ -491,6 +500,7 @@ async fn get_job_detail(
         employee_notes: row.employee_notes,
         employee_clock_in: assign.employee_clock_in,
         employee_clock_out: assign.employee_clock_out,
+        employee_break_minutes: assign.employee_break_minutes,
         employee_actual_hours,
         colleague_names,
     }))
@@ -504,6 +514,9 @@ async fn get_job_detail(
 struct ClockBody {
     employee_clock_in: Option<String>,
     employee_clock_out: Option<String>,
+    /// Self-reported break in minutes (informational; admin's break stays authoritative).
+    #[serde(default)]
+    employee_break_minutes: Option<i32>,
 }
 
 /// `PATCH /employee/jobs/{id}/clock` — employee submits their own clock-in/out.
@@ -534,32 +547,160 @@ async fn patch_employee_clock(
             .unwrap_or_else(|| Utc::now().date_naive()),
     };
 
-    // Parse a time string — accepts ISO 8601 datetime (preferred, sent by the
-    // worker UI) or bare HH:MM / HH:MM:SS combined with the job date (UTC).
-    let parse_time = |s: Option<String>| -> Result<Option<DateTime<Utc>>, ApiError> {
-        match s {
-            None => Ok(None),
-            Some(ref v) if v.is_empty() => Ok(None),
-            Some(v) => {
-                if let Ok(dt) = v.parse::<DateTime<Utc>>() {
-                    return Ok(Some(dt));
-                }
-                if let Ok(t) = v.parse::<NaiveTime>() {
-                    return Ok(Some(job_date.and_time(t).and_utc()));
-                }
-                Err(ApiError::Validation(format!("Ungültiges Zeitformat: {v}")))
-            }
-        }
-    };
+    let clock_in = parse_clock_time(body.employee_clock_in, job_date)?;
+    let clock_out = parse_clock_time(body.employee_clock_out, job_date)?;
+    let break_minutes = body.employee_break_minutes.map(|m| m.max(0));
 
-    let clock_in = parse_time(body.employee_clock_in)?;
-    let clock_out = parse_time(body.employee_clock_out)?;
-
-    let rows_affected = employee_repo::update_clock_times(&state.db, inquiry_id, claims.employee_id, clock_in, clock_out, query.date).await?;
+    let rows_affected = employee_repo::update_clock_times(&state.db, inquiry_id, claims.employee_id, clock_in, clock_out, break_minutes, query.date).await?;
 
     if rows_affected == 0 {
         return Err(ApiError::NotFound(
             "Einsatz nicht gefunden oder keine Berechtigung".into(),
+        ));
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Parse a clock time string for the employee self-report endpoints.
+///
+/// Accepts an ISO 8601 datetime (preferred, sent by the worker UI) or a bare
+/// `HH:MM` / `HH:MM:SS` combined with `day` (interpreted as UTC). Empty/None → None.
+fn parse_clock_time(s: Option<String>, day: NaiveDate) -> Result<Option<DateTime<Utc>>, ApiError> {
+    match s {
+        None => Ok(None),
+        Some(ref v) if v.is_empty() => Ok(None),
+        Some(v) => {
+            if let Ok(dt) = v.parse::<DateTime<Utc>>() {
+                return Ok(Some(dt));
+            }
+            if let Ok(t) = v.parse::<NaiveTime>() {
+                return Ok(Some(day.and_time(t).and_utc()));
+            }
+            Err(ApiError::Validation(format!("Ungültiges Zeitformat: {v}")))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Protected: Calendar item (Termin) detail
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+struct CalendarItemDetail {
+    calendar_item_id: Uuid,
+    job_date: Option<NaiveDate>,
+    status: String,
+    title: String,
+    category: String,
+    location: Option<String>,
+    description: Option<String>,
+    // Planned start/end time (HH:MM:SS) — this is the "start time" workers need.
+    start_time: Option<NaiveTime>,
+    end_time: Option<NaiveTime>,
+    // Per-assignment note + admin note visible to all assigned employees.
+    notes: Option<String>,
+    employee_notes: Option<String>,
+    // Employee self-reported times (editable via PATCH /items/{id}/clock).
+    employee_clock_in: Option<DateTime<Utc>>,
+    employee_clock_out: Option<DateTime<Utc>>,
+    employee_break_minutes: Option<i32>,
+    employee_actual_hours: Option<f64>,
+    colleague_names: Vec<String>,
+}
+
+/// `GET /employee/items/{id}` — full detail for one assigned calendar item (Termin).
+///
+/// **Caller**: Worker portal Termin detail page.
+/// **Why**: Termine (training, maintenance, and moves scheduled on the calendar)
+///          must be openable in the worker portal just like inquiry jobs, so the
+///          assigned employee can read the title, time, location, description and
+///          notes. Verifies the requesting employee is actually assigned.
+async fn get_item_detail(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<EmployeeClaims>,
+    Path(calendar_item_id): Path<Uuid>,
+    Query(query): Query<DateQuery>,
+) -> Result<Json<CalendarItemDetail>, ApiError> {
+    // Verify assignment + fetch assignment fields (incl. employee self-reported times).
+    let assign = employee_repo::fetch_item_assignment(&state.db, calendar_item_id, claims.employee_id, query.date)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Termin nicht gefunden oder keine Berechtigung".into()))?;
+
+    let row = employee_repo::fetch_item_detail(&state.db, calendar_item_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Termin nicht gefunden".into()))?;
+
+    let employee_actual_hours = match (assign.employee_clock_in, assign.employee_clock_out) {
+        (Some(ci), Some(co)) => {
+            let break_secs = assign.employee_break_minutes.unwrap_or(0).max(0) as i64 * 60;
+            let secs = (co - ci).num_seconds() - break_secs;
+            if secs > 0 {
+                Some(secs as f64 / 3600.0)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+
+    let colleague_map =
+        fetch_item_colleague_names(&state.db, &[calendar_item_id], claims.employee_id).await?;
+    let colleague_names = colleague_map.get(&calendar_item_id).cloned().unwrap_or_default();
+
+    Ok(Json(CalendarItemDetail {
+        calendar_item_id,
+        // The assigned day (per-employee, per-day) is authoritative; fall back to
+        // the item's scheduled date for legacy assignments with a null job_date.
+        job_date: assign.job_date.or(row.scheduled_date),
+        status: row.status,
+        title: row.title,
+        category: row.category,
+        location: row.location,
+        description: row.description,
+        start_time: row.start_time,
+        end_time: row.end_time,
+        notes: assign.notes,
+        employee_notes: row.employee_notes,
+        employee_clock_in: assign.employee_clock_in,
+        employee_clock_out: assign.employee_clock_out,
+        employee_break_minutes: assign.employee_break_minutes,
+        employee_actual_hours,
+        colleague_names,
+    }))
+}
+
+/// `PATCH /employee/items/{id}/clock` — employee submits their own clock-in/out for a Termin.
+///
+/// **Caller**: Worker portal Termin detail page (post-job time logging).
+/// **Why**: Mirrors the inquiry-job clock endpoint so movers can log their actual
+///          times on Termine too (these feed the monthly hours summary).
+async fn patch_item_clock(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<EmployeeClaims>,
+    Path(calendar_item_id): Path<Uuid>,
+    Query(query): Query<DateQuery>,
+    Json(body): Json<ClockBody>,
+) -> Result<StatusCode, ApiError> {
+    // The job date anchors lenient bare-time input. Prefer the day the employee is
+    // viewing; fall back to the item's scheduled date.
+    let job_date = match query.date {
+        Some(d) => d,
+        None => employee_repo::fetch_item_detail(&state.db, calendar_item_id)
+            .await?
+            .and_then(|r| r.scheduled_date)
+            .unwrap_or_else(|| Utc::now().date_naive()),
+    };
+
+    let clock_in = parse_clock_time(body.employee_clock_in, job_date)?;
+    let clock_out = parse_clock_time(body.employee_clock_out, job_date)?;
+    let break_minutes = body.employee_break_minutes.map(|m| m.max(0));
+
+    let rows_affected = employee_repo::update_item_clock_times(&state.db, calendar_item_id, claims.employee_id, clock_in, clock_out, break_minutes, query.date).await?;
+
+    if rows_affected == 0 {
+        return Err(ApiError::NotFound(
+            "Termin nicht gefunden oder keine Berechtigung".into(),
         ));
     }
 
@@ -716,10 +857,15 @@ async fn fetch_estimation_items(
         return Ok(vec![]);
     };
 
-    // Items are stored under result_data.items as an array
+    // Items live either under `result_data.items` (vision pipeline) or as a bare
+    // top-level array (admin item editor, `PUT /inquiries/{id}/items`). Accept both
+    // so an admin-edited furniture list is visible to the worker.
     let items_arr = match data.get("items").and_then(|v| v.as_array()) {
         Some(arr) => arr.clone(),
-        None => return Ok(vec![]),
+        None => match data.as_array() {
+            Some(arr) => arr.clone(),
+            None => return Ok(vec![]),
+        },
     };
 
     let items = items_arr

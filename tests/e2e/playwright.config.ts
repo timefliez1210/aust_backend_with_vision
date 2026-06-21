@@ -19,7 +19,16 @@ export default defineConfig({
   projects: [
     {
       name: 'chromium',
-      use: { ...devices['Desktop Chrome'] },
+      // Use the system-installed Chrome so dev/CI boxes without the Playwright
+      // browser bundle (`npx playwright install`) can still run the suite.
+      use: { ...devices['Desktop Chrome'], channel: 'chrome' },
+    },
+    {
+      // The worker portal is a phone-first app. This project emulates a real
+      // touch device so taps go through tap() (pointer/touch), not a mouse
+      // click — the exact difference that reveals the dead Termin-card bug.
+      name: 'mobile',
+      use: { ...devices['Pixel 5'], channel: 'chrome' },
     },
   ],
 });

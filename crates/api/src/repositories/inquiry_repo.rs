@@ -750,7 +750,7 @@ pub(crate) async fn fetch_employee_assignments_snapshot(
                ie.employee_clock_in,
                ie.employee_clock_out,
                CASE WHEN ie.employee_clock_out IS NOT NULL AND ie.employee_clock_in IS NOT NULL
-                    THEN EXTRACT(EPOCH FROM (ie.employee_clock_out - ie.employee_clock_in)) / 3600.0
+                    THEN (EXTRACT(EPOCH FROM (ie.employee_clock_out - ie.employee_clock_in)) / 3600.0)::float8
                     ELSE NULL END AS employee_actual_hours,
                ie.notes,
                ie.job_date,
