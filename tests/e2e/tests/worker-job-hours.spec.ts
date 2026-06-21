@@ -59,7 +59,8 @@ test.beforeAll(async () => {
   token = await adminToken(api);
 
   const now = new Date();
-  jobDate = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-15`;
+  // Today (not a past day) so the overdue-hours modal does not block the schedule.
+  jobDate = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
 
   customerId = (await createCustomer(api, token)).id;
   const emp = await createEmployee(api, token);
@@ -153,13 +154,11 @@ test('worker enters loose phone-keypad times (8.15 / bare 17 / 45) — they norm
   // etc. Regression: only an exact "HH:MM" was accepted, so these were silently
   // dropped and "Zeiten speichern" looked like it did nothing.
   await injectWorkerAuth(page, session);
-  await page.goto(`${FRONT}/worker/schedule`);
+  // The first test logged this job, so it has correctly left the schedule tab —
+  // open the detail directly to re-log with loose-format input.
+  await page.goto(`${FRONT}/worker/jobs/${inquiryId}?date=${jobDate}`);
   await page.waitForLoadState('networkidle');
-
-  const card = page.locator('button.job-card', { hasText: 'Hildesheim' });
-  await expect(card).toBeVisible();
-  await card.tap();
-  await page.waitForURL(/\/worker\/jobs\//, { timeout: 10_000 });
+  await expect(page.getByLabel('Beginn')).toBeVisible();
 
   // type the way a mover actually types
   await page.getByLabel('Beginn').fill('8.15');
