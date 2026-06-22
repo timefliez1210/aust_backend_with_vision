@@ -84,7 +84,6 @@ async fn main() -> Result<()> {
     let (offer_tx, offer_rx) = tokio::sync::mpsc::unbounded_channel();
 
     // Create email processor
-    let llm_for_email = llm.clone();
     let email_config = config.email.clone();
     let telegram_config = config.telegram.clone();
     let db_for_email = db.clone();
@@ -103,6 +102,9 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| ("http://localhost:11434".to_string(), None));
         std::sync::Arc::new(OllamaAssistantLlm::new(base_url, api_key))
     };
+    // Email auto-replies are generated through Josie's LLM (same resilient
+    // `/api/chat` path), not the generic provider — see EmailResponder.
+    let llm_for_email = assistant_llm.clone();
     let tool_registry = std::sync::Arc::new(ToolRegistry::new());
     let soul: std::sync::Arc<Soul> = {
         let soul_path = std::path::Path::new("SOUL.md");

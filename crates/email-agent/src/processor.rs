@@ -4,7 +4,7 @@ use crate::{EmailParser, EmailResponder, EmailResponse, ImapClient, SmtpClient};
 use aust_core::config::{EmailConfig, TelegramConfig};
 use chrono::Datelike;
 use aust_core::models::{MovingInquiry, ParsedEmail};
-use aust_llm_providers::LlmProvider;
+use aust_assistant::llm::AssistantLlmProvider;
 use chrono::NaiveDate;
 use sqlx::PgPool;
 use std::collections::HashMap;
@@ -70,7 +70,7 @@ impl EmailProcessor {
     pub fn new(
         email_config: EmailConfig,
         telegram_config: TelegramConfig,
-        llm: Arc<dyn LlmProvider>,
+        llm: Arc<dyn AssistantLlmProvider>,
         db: PgPool,
         default_capacity: i32,
         alternatives_count: usize,

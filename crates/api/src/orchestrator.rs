@@ -147,7 +147,7 @@ pub async fn run_offer_event_handler(
                 )
                 .await;
             }
-            ApprovalDecision::AssistantText { chat_id, text, .. } => {
+            ApprovalDecision::AssistantText { chat_id, text, reply_to_text, .. } => {
                 // Check if this chat is bound to the assistant. If so, delegate to the bridge.
                 // If unbound, the EditInstructions variant (emitted in parallel) covers legacy flow.
                 match aust_assistant::bindings::resolve(&state.db, chat_id).await {
@@ -159,6 +159,7 @@ pub async fn run_offer_event_handler(
                             bot_token,
                             chat_id,
                             &text,
+                            reply_to_text.as_deref(),
                             state.assistant_llm.clone(),
                             &state.tool_registry,
                             &state.soul,
@@ -212,6 +213,7 @@ pub async fn run_offer_event_handler(
                 kind,
                 mime_type,
                 caption,
+                reply_to_text,
                 ..
             } => {
                 match aust_assistant::bindings::resolve(&state.db, chat_id).await {
@@ -226,6 +228,7 @@ pub async fn run_offer_event_handler(
                             &kind,
                             mime_type.as_deref(),
                             caption.as_deref(),
+                            reply_to_text.as_deref(),
                             state.assistant_llm.clone(),
                             &state.tool_registry,
                             &state.soul,

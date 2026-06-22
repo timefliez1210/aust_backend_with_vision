@@ -33,12 +33,14 @@ use super::telegram_output;
 /// Returns `true` if the message was handled by the agent (the caller should
 /// not route it further). Returns `false` if the chat is unbound and the
 /// message should fall through to the legacy orchestrator.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_text_message(
     pool: &PgPool,
     client: &Client,
     bot_token: &str,
     chat_id: i64,
     text: &str,
+    reply_to_text: Option<&str>,
     llm: Arc<dyn AssistantLlmProvider>,
     registry: &ToolRegistry,
     soul: &Soul,
@@ -53,12 +55,13 @@ pub async fn handle_text_message(
         Ok(_) => {}
     }
 
-    info!(chat_id, "Agent handling text message");
+    info!(chat_id, has_quote = reply_to_text.is_some(), "Agent handling text message");
 
     let input = Input {
         text: text.to_string(),
         chat_id,
         images: Vec::new(),
+        quoted_text: reply_to_text.map(|s| s.to_string()),
     };
 
     match driver::process_turn(pool, llm, registry, soul, services, input).await {
@@ -115,6 +118,7 @@ pub async fn handle_media_message(
     kind: &str,
     mime_type: Option<&str>,
     caption: Option<&str>,
+    reply_to_text: Option<&str>,
     llm: Arc<dyn AssistantLlmProvider>,
     registry: &ToolRegistry,
     soul: &Soul,
@@ -148,7 +152,7 @@ pub async fn handle_media_message(
                 .to_string()
         });
 
-    let input = Input { text, chat_id, images };
+    let input = Input { text, chat_id, images, quoted_text: reply_to_text.map(|s| s.to_string()) };
 
     match driver::process_turn(pool, llm, registry, soul, services, input).await {
         Ok(result) => {
