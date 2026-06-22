@@ -1,16 +1,22 @@
 use crate::calendar::AvailabilityResult;
 use crate::EmailError;
 use aust_core::models::{InquirySource, MissingField, MovingInquiry};
-use aust_llm_providers::{LlmMessage, LlmProvider};
+use aust_assistant::llm::{AssistantLlmProvider, ModelTier};
+use aust_llm_providers::LlmMessage;
 use std::sync::Arc;
 use tracing::{debug, info};
 
 pub struct EmailResponder {
-    llm: Arc<dyn LlmProvider>,
+    /// Email replies are generated through the assistant's LLM (Josie's model
+    /// path) rather than the generic provider. That path issues every `/api/chat`
+    /// request through a retrying client with a generous timeout, which avoids the
+    /// "Network error: error sending request" failures the old non-retrying,
+    /// 60 s `LlmProvider::complete()` path produced on Ollama Cloud.
+    llm: Arc<dyn AssistantLlmProvider>,
 }
 
 impl EmailResponder {
-    pub fn new(llm: Arc<dyn LlmProvider>) -> Self {
+    pub fn new(llm: Arc<dyn AssistantLlmProvider>) -> Self {
         Self { llm }
     }
 
@@ -134,7 +140,7 @@ Regeln:
 
         let response = self
             .llm
-            .complete(&messages)
+            .chat(ModelTier::Main, &messages)
             .await
             .map_err(|e| EmailError::Llm(e.to_string()))?;
 
@@ -223,7 +229,7 @@ Regeln:
 
         let response = self
             .llm
-            .complete(&messages)
+            .chat(ModelTier::Main, &messages)
             .await
             .map_err(|e| EmailError::Llm(e.to_string()))?;
 
@@ -265,7 +271,7 @@ Antworte NUR mit dem JSON-Objekt, ohne Erklärungen. Setze fehlende Felder auf n
 
         let response = self
             .llm
-            .complete(&messages)
+            .chat(ModelTier::Main, &messages)
             .await
             .map_err(|e| EmailError::Llm(e.to_string()))?;
 

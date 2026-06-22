@@ -393,6 +393,7 @@ dependencies = [
  "anyhow",
  "async-imap",
  "async-trait",
+ "aust-assistant",
  "aust-core",
  "aust-llm-providers",
  "chrono",

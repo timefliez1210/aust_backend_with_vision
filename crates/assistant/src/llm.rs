@@ -9,9 +9,8 @@
 //! go through this facade rather than directly referencing the LLM provider.
 
 use async_trait::async_trait;
-use aust_llm_providers::{LlmMessage, LlmProvider, OllamaProvider};
+use aust_llm_providers::LlmMessage;
 use serde_json::Value;
-use std::sync::Arc;
 
 use crate::error::{AssistantError, Result};
 
@@ -75,10 +74,16 @@ pub trait AssistantLlmProvider: Send + Sync {
 }
 
 /// Production implementation backed by two Ollama Cloud endpoints.
+///
+/// Every chat operation — plain completion (`chat`), tool-calling
+/// (`chat_with_tools`) and embeddings — goes through the single retrying HTTP
+/// path (`post_json_with_retry`). There is deliberately no fallback to
+/// `OllamaProvider::complete()`: that path is non-retrying with a fixed 60 s
+/// timeout, which is the failure mode behind the email auto-responder's
+/// "Network error: error sending request for url (…/api/chat)" — a long
+/// generation on Ollama Cloud whose idle connection gets killed mid-flight.
 pub struct OllamaAssistantLlm {
-    main: Arc<dyn LlmProvider>,
-    cheap: Arc<dyn LlmProvider>,
-    /// Ollama base URL for the raw embedding endpoint.
+    /// Ollama base URL for the raw `/api/chat` and `/api/embeddings` endpoints.
     base_url: String,
     /// API key for the raw `/api/chat` (tool-calling) and `/api/embeddings` requests.
     /// Ollama Cloud requires `Authorization: Bearer <key>`; without it requests 401.
@@ -87,46 +92,21 @@ pub struct OllamaAssistantLlm {
 }
 
 impl OllamaAssistantLlm {
-    /// Construct from explicit base URL. Both tiers use the same Ollama instance
-    /// but different model names.
+    /// Construct from explicit base URL. Both tiers hit the same Ollama instance
+    /// but select a different model name per [`ModelTier`].
     pub fn new(base_url: impl Into<String>, api_key: Option<String>) -> Self {
         let url = base_url.into();
-        let main: Arc<dyn LlmProvider> = match &api_key {
-            Some(k) if !k.is_empty() => Arc::new(OllamaProvider::with_api_key(
-                url.clone(),
-                "kimi-k2.6".to_string(),
-                k.clone(),
-            )),
-            _ => Arc::new(OllamaProvider::new(url.clone(), "kimi-k2.6".to_string())),
-        };
-        let cheap: Arc<dyn LlmProvider> = match &api_key {
-            Some(k) if !k.is_empty() => Arc::new(OllamaProvider::with_api_key(
-                url.clone(),
-                "deepseek-v4-flash".to_string(),
-                k.clone(),
-            )),
-            _ => Arc::new(OllamaProvider::new(
-                url.clone(),
-                "deepseek-v4-flash".to_string(),
-            )),
-        };
+        // Generous per-request ceiling: conversational/email generations on the
+        // Main tier can run well past the old 60 s. Embeddings still return in
+        // milliseconds — the timeout is a cap, not a wait — so one client is fine.
         let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
+            .timeout(std::time::Duration::from_secs(180))
             .build()
             .expect("reqwest client");
         Self {
-            main,
-            cheap,
             base_url: url,
             api_key: api_key.filter(|k| !k.is_empty()),
             http,
-        }
-    }
-
-    fn provider(&self, tier: ModelTier) -> &dyn LlmProvider {
-        match tier {
-            ModelTier::Main => self.main.as_ref(),
-            ModelTier::Cheap => self.cheap.as_ref(),
         }
     }
 
@@ -184,36 +164,20 @@ impl OllamaAssistantLlm {
         Err(last_err
             .unwrap_or_else(|| AssistantError::Internal("request failed".to_string())))
     }
-}
 
-#[async_trait]
-impl AssistantLlmProvider for OllamaAssistantLlm {
-    async fn chat(&self, tier: ModelTier, messages: &[LlmMessage]) -> Result<String> {
-        self.provider(tier)
-            .complete(messages)
-            .await
-            .map_err(AssistantError::Llm)
-    }
-
-    /// Tool-calling via the Ollama `/api/chat` endpoint with `tools` parameter.
-    ///
-    /// The base `LlmProvider` trait does not expose tool-calling, so we issue a
-    /// raw HTTP request here and parse the response ourselves.
-    async fn chat_with_tools(
+    /// Core `/api/chat` request shared by `chat` and `chat_with_tools`. Builds the
+    /// Ollama body (forwarding any base64 images), attaches `tools` when non-empty,
+    /// posts through the retrying client and parses the response into either tool
+    /// calls or plain text.
+    async fn chat_core(
         &self,
         tier: ModelTier,
         messages: &[LlmMessage],
         tools: &[ToolSchema],
     ) -> Result<ChatResponse> {
-        if tools.is_empty() {
-            let text = self.chat(tier, messages).await?;
-            return Ok(ChatResponse::Text(text));
-        }
-
         let model = self.model_name(tier);
         let url = format!("{}/api/chat", self.base_url);
 
-        // Build Ollama chat request with tools array.
         let ollama_messages: Vec<Value> = messages
             .iter()
             .map(|m| {
@@ -234,50 +198,74 @@ impl AssistantLlmProvider for OllamaAssistantLlm {
             })
             .collect();
 
-        let ollama_tools: Vec<Value> = tools
-            .iter()
-            .map(|t| {
-                serde_json::json!({
-                    "type": "function",
-                    "function": {
-                        "name": t.name,
-                        "description": t.description,
-                        "parameters": t.parameters,
-                    }
-                })
-            })
-            .collect();
-
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": model,
             "messages": ollama_messages,
-            "tools": ollama_tools,
             "stream": false,
         });
+        if !tools.is_empty() {
+            let ollama_tools: Vec<Value> = tools
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.parameters,
+                        }
+                    })
+                })
+                .collect();
+            body["tools"] = serde_json::json!(ollama_tools);
+        }
 
         let json = self.post_json_with_retry(&url, &body).await?;
 
         // Parse Ollama response: either tool_calls or content.
         let message = &json["message"];
-        if let Some(calls) = message["tool_calls"].as_array() {
-            if !calls.is_empty() {
-                let tool_calls: Vec<ToolCall> = calls
-                    .iter()
-                    .filter_map(|c| {
-                        let name = c["function"]["name"].as_str()?.to_string();
-                        let arguments = c["function"]["arguments"].clone();
-                        Some(ToolCall { name, arguments })
-                    })
-                    .collect();
-                return Ok(ChatResponse::ToolCalls(tool_calls));
-            }
+        if let Some(calls) = message["tool_calls"].as_array()
+            && !calls.is_empty()
+        {
+            let tool_calls: Vec<ToolCall> = calls
+                .iter()
+                .filter_map(|c| {
+                    let name = c["function"]["name"].as_str()?.to_string();
+                    let arguments = c["function"]["arguments"].clone();
+                    Some(ToolCall { name, arguments })
+                })
+                .collect();
+            return Ok(ChatResponse::ToolCalls(tool_calls));
         }
 
-        let text = message["content"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
+        let text = message["content"].as_str().unwrap_or_default().to_string();
         Ok(ChatResponse::Text(text))
+    }
+}
+
+#[async_trait]
+impl AssistantLlmProvider for OllamaAssistantLlm {
+    async fn chat(&self, tier: ModelTier, messages: &[LlmMessage]) -> Result<String> {
+        match self.chat_core(tier, messages, &[]).await? {
+            ChatResponse::Text(t) => Ok(t),
+            // No tools were offered, so the model has nothing valid to call; treat
+            // an unexpected tool-call response as empty text rather than erroring.
+            ChatResponse::ToolCalls(_) => Ok(String::new()),
+        }
+    }
+
+    /// Tool-calling via the Ollama `/api/chat` endpoint with `tools` parameter.
+    ///
+    /// The base `LlmProvider` trait does not expose tool-calling, so we issue a
+    /// raw HTTP request here (through the shared retrying path) and parse the
+    /// response ourselves.
+    async fn chat_with_tools(
+        &self,
+        tier: ModelTier,
+        messages: &[LlmMessage],
+        tools: &[ToolSchema],
+    ) -> Result<ChatResponse> {
+        self.chat_core(tier, messages, tools).await
     }
 
     /// Call the Ollama `/api/embeddings` endpoint with `embeddinggemma:300m`.
