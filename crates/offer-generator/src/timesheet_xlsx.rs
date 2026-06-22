@@ -125,17 +125,22 @@ pub fn generate_timesheet_xlsx(data: &TimesheetData) -> Result<Vec<u8>, OfferErr
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Returns the effective hours for an entry:
-/// computed from clock_in/clock_out if both times present,
-/// otherwise falls back to the pre-computed actual_hours.
+/// Returns the effective hours for an entry.
+///
+/// Prefers the pre-computed `actual_hours` (already break-adjusted and, for
+/// payroll exports, the paid value) and only derives from clock_in/clock_out
+/// when no hours were supplied.
 fn effective_hours(e: &TimesheetEntry) -> Option<f64> {
+    if let Some(h) = e.actual_hours {
+        return Some(h);
+    }
     if let (Some(ci), Some(co)) = (e.clock_in, e.clock_out) {
         let secs = (co - ci).num_seconds();
         if secs > 0 {
             return Some(secs as f64 / 3600.0);
         }
     }
-    e.actual_hours
+    None
 }
 
 /// Formats a NaiveTime as "HH:MM".
@@ -224,7 +229,6 @@ fn build_sheet_xml(
             num_cell("E9", overtime)
         ),
     ));
-
     // Column headers (row 11)
     rows.push(row(
         11,

@@ -1380,6 +1380,257 @@ pub(crate) async fn fetch_admin_calendar_item_hours(
     .await
 }
 
+// ---------------------------------------------------------------------------
+// Payroll hour adjustments (Stundenkonto override layer)
+// ---------------------------------------------------------------------------
+
+/// One persisted payroll adjustment, keyed by source id + `job_date`.
+///
+/// A separate override layer over the recorded worked hours — see migration
+/// `20260622000000_hours_adjustments.sql`. NULL `paid_*` fields mean "no
+/// override; fall back to the recorded worked time".
+#[derive(Debug, FromRow)]
+pub(crate) struct HoursAdjustmentRow {
+    pub entry_type: String,
+    pub inquiry_id: Option<Uuid>,
+    pub calendar_item_id: Option<Uuid>,
+    pub job_date: NaiveDate,
+    pub deactivated: bool,
+    pub paid_clock_in: Option<NaiveTime>,
+    pub paid_clock_out: Option<NaiveTime>,
+    pub paid_break_minutes: Option<i32>,
+}
+
+/// One incoming adjustment to upsert from the admin payroll edit mode.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(crate) struct HoursAdjustmentInput {
+    pub entry_type: String,
+    #[serde(default)]
+    pub inquiry_id: Option<Uuid>,
+    #[serde(default)]
+    pub calendar_item_id: Option<Uuid>,
+    pub job_date: NaiveDate,
+    #[serde(default)]
+    pub deactivated: bool,
+    #[serde(default)]
+    pub paid_clock_in: Option<NaiveTime>,
+    #[serde(default)]
+    pub paid_clock_out: Option<NaiveTime>,
+    #[serde(default)]
+    pub paid_break_minutes: Option<i32>,
+}
+
+impl HoursAdjustmentInput {
+    /// True when this row carries no actual override (default day): not
+    /// deactivated and no paid_* set. Such rows are deleted rather than stored.
+    fn is_noop(&self) -> bool {
+        !self.deactivated
+            && self.paid_clock_in.is_none()
+            && self.paid_clock_out.is_none()
+            && self.paid_break_minutes.is_none()
+    }
+}
+
+/// Fetch all payroll adjustments for one employee overlapping a date range.
+///
+/// **Caller**: `admin::employee_hours_summary`, `admin::employee_hours_export`
+/// **Why**: Apply the payroll override layer on top of recorded worked hours.
+pub(crate) async fn fetch_hours_adjustments(
+    pool: &PgPool,
+    employee_id: Uuid,
+    from_date: NaiveDate,
+    to_date: NaiveDate,
+) -> Result<Vec<HoursAdjustmentRow>, sqlx::Error> {
+    sqlx::query_as(
+        r#"
+        SELECT entry_type,
+               inquiry_id,
+               calendar_item_id,
+               job_date,
+               deactivated,
+               paid_clock_in,
+               paid_clock_out,
+               paid_break_minutes
+        FROM hours_adjustments
+        WHERE employee_id = $1
+          AND job_date BETWEEN $2 AND $3
+        "#,
+    )
+    .bind(employee_id)
+    .bind(from_date)
+    .bind(to_date)
+    .fetch_all(pool)
+    .await
+}
+
+/// Replace one employee's payroll adjustments for a month with the given set.
+///
+/// **Caller**: `admin::put_employee_hours_adjustments`
+/// **Why**: Persists the payroll edit-mode overrides on save. No-op rows
+/// (default day) are deleted so the table only holds genuine overrides.
+///
+/// Runs in a transaction: deletes every adjustment in the month range, then
+/// inserts the non-no-op rows. This keeps deactivations/edits and their
+/// removals consistent with what the UI submitted.
+pub(crate) async fn upsert_hours_adjustments(
+    pool: &PgPool,
+    employee_id: Uuid,
+    from_date: NaiveDate,
+    to_date: NaiveDate,
+    rows: &[HoursAdjustmentInput],
+) -> Result<(), ApiError> {
+    let mut tx = pool.begin().await?;
+
+    sqlx::query(
+        "DELETE FROM hours_adjustments WHERE employee_id = $1 AND job_date BETWEEN $2 AND $3",
+    )
+    .bind(employee_id)
+    .bind(from_date)
+    .bind(to_date)
+    .execute(&mut *tx)
+    .await?;
+
+    for r in rows.iter().filter(|r| !r.is_noop()) {
+        // Normalise the source FKs to match entry_type (defends the CHECK).
+        let (inquiry_id, calendar_item_id) = match r.entry_type.as_str() {
+            "inquiry" => (r.inquiry_id, None),
+            "calendar_item" => (None, r.calendar_item_id),
+            other => {
+                return Err(ApiError::BadRequest(format!(
+                    "Ungueltiger entry_type: {other}"
+                )))
+            }
+        };
+        if inquiry_id.is_none() && calendar_item_id.is_none() {
+            return Err(ApiError::BadRequest(
+                "Adjustment ohne Quelle (inquiry_id/calendar_item_id)".into(),
+            ));
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO hours_adjustments
+                (employee_id, entry_type, inquiry_id, calendar_item_id, job_date,
+                 deactivated, paid_clock_in, paid_clock_out, paid_break_minutes)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            "#,
+        )
+        .bind(employee_id)
+        .bind(&r.entry_type)
+        .bind(inquiry_id)
+        .bind(calendar_item_id)
+        .bind(r.job_date)
+        .bind(r.deactivated)
+        .bind(r.paid_clock_in)
+        .bind(r.paid_clock_out)
+        .bind(r.paid_break_minutes)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    tx.commit().await?;
+    Ok(())
+}
+
+/// **Destructive**: bake the month's payroll overrides into the recorded data,
+/// then discard the override layer.
+///
+/// **Caller**: `admin::cleanup_hours_adjustments` ("Stundenkonto säubern").
+/// **Why**: Once Alex has sorted out a month, this makes it permanent:
+/// - a **deactivated** day → the employee is removed from that assignment-day
+///   (the `inquiry_employees` / `calendar_item_employees` row is deleted);
+/// - an **adjusted** day (paid times set) → the recorded `clock_in`/`clock_out`/
+///   `break_minutes` are overwritten with the paid values and `actual_hours` is
+///   reset to NULL so it re-derives from the new times;
+/// - finally every `hours_adjustments` row in the month is deleted.
+///
+/// All in one transaction. After this the recorded hours equal the paid hours
+/// and the Stundenkonto for the month is zero. This cannot be undone.
+pub(crate) async fn cleanup_hours_adjustments(
+    pool: &PgPool,
+    employee_id: Uuid,
+    from_date: NaiveDate,
+    to_date: NaiveDate,
+) -> Result<(), ApiError> {
+    let adjustments = fetch_hours_adjustments(pool, employee_id, from_date, to_date).await?;
+
+    let mut tx = pool.begin().await?;
+
+    for a in &adjustments {
+        match a.entry_type.as_str() {
+            "inquiry" => {
+                let Some(inquiry_id) = a.inquiry_id else { continue };
+                if a.deactivated {
+                    sqlx::query(
+                        "DELETE FROM inquiry_employees
+                         WHERE inquiry_id = $1 AND employee_id = $2 AND job_date = $3",
+                    )
+                    .bind(inquiry_id)
+                    .bind(employee_id)
+                    .bind(a.job_date)
+                    .execute(&mut *tx)
+                    .await?;
+                } else if a.paid_clock_in.is_some() && a.paid_clock_out.is_some() {
+                    sqlx::query(
+                        "UPDATE inquiry_employees
+                         SET clock_in = $4, clock_out = $5, break_minutes = $6, actual_hours = NULL
+                         WHERE inquiry_id = $1 AND employee_id = $2 AND job_date = $3",
+                    )
+                    .bind(inquiry_id)
+                    .bind(employee_id)
+                    .bind(a.job_date)
+                    .bind(a.paid_clock_in)
+                    .bind(a.paid_clock_out)
+                    .bind(a.paid_break_minutes.unwrap_or(0))
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
+            "calendar_item" => {
+                let Some(calendar_item_id) = a.calendar_item_id else { continue };
+                if a.deactivated {
+                    sqlx::query(
+                        "DELETE FROM calendar_item_employees
+                         WHERE calendar_item_id = $1 AND employee_id = $2 AND job_date = $3",
+                    )
+                    .bind(calendar_item_id)
+                    .bind(employee_id)
+                    .bind(a.job_date)
+                    .execute(&mut *tx)
+                    .await?;
+                } else if a.paid_clock_in.is_some() && a.paid_clock_out.is_some() {
+                    sqlx::query(
+                        "UPDATE calendar_item_employees
+                         SET clock_in = $4, clock_out = $5, break_minutes = $6, actual_hours = NULL
+                         WHERE calendar_item_id = $1 AND employee_id = $2 AND job_date = $3",
+                    )
+                    .bind(calendar_item_id)
+                    .bind(employee_id)
+                    .bind(a.job_date)
+                    .bind(a.paid_clock_in)
+                    .bind(a.paid_clock_out)
+                    .bind(a.paid_break_minutes.unwrap_or(0))
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    sqlx::query(
+        "DELETE FROM hours_adjustments WHERE employee_id = $1 AND job_date BETWEEN $2 AND $3",
+    )
+    .bind(employee_id)
+    .bind(from_date)
+    .bind(to_date)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Update employee document key in DB.
 ///
 /// **Caller**: `admin::upload_employee_document`
