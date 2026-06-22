@@ -51,6 +51,9 @@ pub struct TimesheetData {
     pub month_label: String,
     /// Monthly target hours from the employee record.
     pub target_hours: f64,
+    /// Hours moved to the Stundenkonto this month (worked − paid). Surplus the
+    /// employee accrues toward holidays/boni; shown as its own summary line.
+    pub hour_account: f64,
     /// All assignment entries for the month (unsorted; sorted internally).
     pub entries: Vec<TimesheetEntry>,
 }
@@ -125,17 +128,22 @@ pub fn generate_timesheet_xlsx(data: &TimesheetData) -> Result<Vec<u8>, OfferErr
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Returns the effective hours for an entry:
-/// computed from clock_in/clock_out if both times present,
-/// otherwise falls back to the pre-computed actual_hours.
+/// Returns the effective hours for an entry.
+///
+/// Prefers the pre-computed `actual_hours` (already break-adjusted and, for
+/// payroll exports, the paid value) and only derives from clock_in/clock_out
+/// when no hours were supplied.
 fn effective_hours(e: &TimesheetEntry) -> Option<f64> {
+    if let Some(h) = e.actual_hours {
+        return Some(h);
+    }
     if let (Some(ci), Some(co)) = (e.clock_in, e.clock_out) {
         let secs = (co - ci).num_seconds();
         if secs > 0 {
             return Some(secs as f64 / 3600.0);
         }
     }
-    e.actual_hours
+    None
 }
 
 /// Formats a NaiveTime as "HH:MM".
@@ -222,6 +230,15 @@ fn build_sheet_xml(
             str_cell("B9", "Monat:", false),
             str_cell("C9", &data.month_label, false),
             num_cell("E9", overtime)
+        ),
+    ));
+    // Stundenkonto: surplus (worked − paid) credited toward holidays/boni.
+    rows.push(row(
+        10,
+        &format!(
+            "{}{}",
+            str_cell("D10", "Stundenkonto", false),
+            num_cell("E10", data.hour_account)
         ),
     ));
 

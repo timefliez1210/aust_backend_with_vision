@@ -49,6 +49,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/employees/{id}", get(get_employee).patch(update_employee))
         .route("/employees/{id}/delete", post(delete_employee))
         .route("/employees/{id}/hours", get(employee_hours_summary))
+        .route("/employees/{id}/hours/adjustments", put(put_employee_hours_adjustments))
         .route("/employees/{id}/hours/export", get(employee_hours_export))
         .route(
             "/employees/{id}/documents/{doc_type}",
@@ -636,13 +637,25 @@ async fn employee_hours_summary(
     // Also fetch calendar item assignments for this employee in the same month.
     let item_rows = employee_repo::fetch_admin_calendar_item_hours(&state.db, id, from_date, to_date).await?;
 
-    let mut actual_sum = 0.0_f64;
+    // Payroll override layer: deactivations + paid-time adjustments per day.
+    let adjustments = employee_repo::fetch_hours_adjustments(&state.db, id, from_date, to_date).await?;
+    let adj_map = build_adjustment_map(&adjustments);
+
+    let mut worked_sum = 0.0_f64;
+    let mut paid_sum = 0.0_f64;
+    let mut all_days_confirmed = true;
 
     let assignments: Vec<serde_json::Value> = rows
         .into_iter()
         .map(|r| {
-            if let Some(av) = r.actual_hours {
-                actual_sum += av;
+            let worked = r.actual_hours;
+            let adj = r.booking_date
+                .and_then(|d| adj_map.get(&adjustment_key("inquiry", r.inquiry_id, d)));
+            let paid = paid_hours_for(worked, adj.copied());
+            worked_sum += worked.unwrap_or(0.0);
+            paid_sum += paid.unwrap_or(0.0);
+            if r.clock_in.is_none() || r.clock_out.is_none() {
+                all_days_confirmed = false;
             }
             serde_json::json!({
                 "inquiry_id": r.inquiry_id,
@@ -656,6 +669,12 @@ async fn employee_hours_summary(
                 "clock_out": r.clock_out,
                 "break_minutes": r.break_minutes,
                 "actual_hours": r.actual_hours,
+                "worked_hours": worked,
+                "paid_hours": paid,
+                "deactivated": adj.map(|a| a.deactivated).unwrap_or(false),
+                "paid_clock_in": adj.and_then(|a| a.paid_clock_in),
+                "paid_clock_out": adj.and_then(|a| a.paid_clock_out),
+                "paid_break_minutes": adj.and_then(|a| a.paid_break_minutes),
                 "employee_clock_in": r.employee_clock_in,
                 "employee_clock_out": r.employee_clock_out,
                 "employee_break_minutes": r.employee_break_minutes,
@@ -667,8 +686,14 @@ async fn employee_hours_summary(
     let calendar_items: Vec<serde_json::Value> = item_rows
         .into_iter()
         .map(|r| {
-            if let Some(av) = r.actual_hours {
-                actual_sum += av;
+            let worked = r.actual_hours;
+            let adj = r.scheduled_date
+                .and_then(|d| adj_map.get(&adjustment_key("calendar_item", r.calendar_item_id, d)));
+            let paid = paid_hours_for(worked, adj.copied());
+            worked_sum += worked.unwrap_or(0.0);
+            paid_sum += paid.unwrap_or(0.0);
+            if r.clock_in.is_none() || r.clock_out.is_none() {
+                all_days_confirmed = false;
             }
             serde_json::json!({
                 "calendar_item_id": r.calendar_item_id,
@@ -682,6 +707,12 @@ async fn employee_hours_summary(
                 "clock_out": r.clock_out,
                 "break_minutes": r.break_minutes,
                 "actual_hours": r.actual_hours,
+                "worked_hours": worked,
+                "paid_hours": paid,
+                "deactivated": adj.map(|a| a.deactivated).unwrap_or(false),
+                "paid_clock_in": adj.and_then(|a| a.paid_clock_in),
+                "paid_clock_out": adj.and_then(|a| a.paid_clock_out),
+                "paid_break_minutes": adj.and_then(|a| a.paid_break_minutes),
                 "employee_clock_in": r.employee_clock_in,
                 "employee_clock_out": r.employee_clock_out,
                 "employee_break_minutes": r.employee_break_minutes,
@@ -690,15 +721,127 @@ async fn employee_hours_summary(
         })
         .collect();
 
+    // No days at all ⇒ nothing to confirm ⇒ edit mode stays disabled.
+    if assignments.is_empty() && calendar_items.is_empty() {
+        all_days_confirmed = false;
+    }
+
     Ok(Json(serde_json::json!({
         "from": from_date.to_string(),
         "to": to_date.to_string(),
         "target_hours": target,
-        "actual_hours": actual_sum,
+        // `actual_hours` retains its historical meaning (paid-out total) so the
+        // existing summary card and progress bar reflect what gets exported.
+        "actual_hours": paid_sum,
+        "worked_total": worked_sum,
+        "paid_total": paid_sum,
+        "hour_account": worked_sum - paid_sum,
+        "all_days_confirmed": all_days_confirmed,
         "assignment_count": assignments.len() + calendar_items.len(),
         "assignments": assignments,
         "calendar_items": calendar_items,
     })))
+}
+
+/// Composite key matching an assignment-day to its payroll adjustment.
+fn adjustment_key(kind: &str, source_id: Uuid, date: NaiveDate) -> (String, Uuid, NaiveDate) {
+    (kind.to_string(), source_id, date)
+}
+
+/// Build a lookup from (kind, source_id, date) → adjustment row.
+fn build_adjustment_map(
+    rows: &[employee_repo::HoursAdjustmentRow],
+) -> std::collections::HashMap<(String, Uuid, NaiveDate), &employee_repo::HoursAdjustmentRow> {
+    let mut map = std::collections::HashMap::new();
+    for r in rows {
+        let source_id = match r.entry_type.as_str() {
+            "inquiry" => r.inquiry_id,
+            "calendar_item" => r.calendar_item_id,
+            _ => None,
+        };
+        if let Some(id) = source_id {
+            map.insert(adjustment_key(&r.entry_type, id, r.job_date), r);
+        }
+    }
+    map
+}
+
+/// Effective PAID hours for a day, applying the payroll override.
+///
+/// - `deactivated` → 0
+/// - `paid_clock_in` & `paid_clock_out` set → derived (minus paid break, clamped ≥0)
+/// - else → the recorded worked hours (no override)
+fn paid_hours_for(
+    worked: Option<f64>,
+    adj: Option<&employee_repo::HoursAdjustmentRow>,
+) -> Option<f64> {
+    match adj {
+        Some(a) if a.deactivated => Some(0.0),
+        Some(a) => {
+            if let (Some(ci), Some(co)) = (a.paid_clock_in, a.paid_clock_out) {
+                let secs =
+                    (co - ci).num_seconds() - (a.paid_break_minutes.unwrap_or(0) as i64) * 60;
+                Some((secs.max(0) as f64) / 3600.0)
+            } else {
+                worked
+            }
+        }
+        None => worked,
+    }
+}
+
+/// Resolve the (clock_in, clock_out, actual_hours) a timesheet row should export
+/// for a non-deactivated day, applying any paid-time override.
+///
+/// When the day has a paid-time override, export those times and let the
+/// generator derive hours from them. Otherwise export the recorded values.
+fn paid_export_fields(
+    recorded_in: Option<chrono::NaiveTime>,
+    recorded_out: Option<chrono::NaiveTime>,
+    recorded_hours: Option<f64>,
+    adj: Option<&employee_repo::HoursAdjustmentRow>,
+) -> (Option<chrono::NaiveTime>, Option<chrono::NaiveTime>, Option<f64>) {
+    // Authoritative paid hours (break-adjusted). The generator prefers
+    // `actual_hours` over deriving from the displayed clock cells.
+    let paid = paid_hours_for(recorded_hours, adj);
+    if let Some(a) = adj {
+        if let (Some(ci), Some(co)) = (a.paid_clock_in, a.paid_clock_out) {
+            return (Some(ci), Some(co), paid);
+        }
+    }
+    (recorded_in, recorded_out, paid)
+}
+
+/// `PUT /api/v1/admin/employees/{id}/hours/adjustments?month=YYYY-MM` — Save
+/// payroll edit-mode overrides for one month.
+///
+/// **Caller**: Admin employee detail page "Speichern & Beenden" in edit mode.
+/// **Why**: Persists the per-day deactivations and paid-time adjustments without
+/// touching the recorded worked hours. Replaces the whole month's override set.
+async fn put_employee_hours_adjustments(
+    State(state): State<Arc<AppState>>,
+    Extension(_claims): Extension<TokenClaims>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+    Json(body): Json<Vec<employee_repo::HoursAdjustmentInput>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let month_str = query
+        .get("month")
+        .cloned()
+        .unwrap_or_else(|| Utc::now().format("%Y-%m").to_string());
+    let (from_date, to_date) = parse_month_range(&month_str)
+        .ok_or_else(|| ApiError::BadRequest("Ungueltiges Monatsformat. Erwartet: YYYY-MM".into()))?;
+
+    // Guard: every submitted day must fall within the addressed month.
+    if body.iter().any(|r| r.job_date < from_date || r.job_date > to_date) {
+        return Err(ApiError::BadRequest(
+            "Anpassung ausserhalb des angegebenen Monats".into(),
+        ));
+    }
+
+    employee_repo::upsert_hours_adjustments(&state.db, id, from_date, to_date, &body).await?;
+
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 /// `GET /api/v1/admin/employees/{id}/hours/export?month=YYYY-MM` — Download Stundenzettel XLSX.
@@ -739,28 +882,41 @@ async fn employee_hours_export(
     let inq_rows = employee_repo::fetch_admin_hours(&state.db, id, from_date, to_date).await?;
     let item_rows = employee_repo::fetch_admin_calendar_item_hours(&state.db, id, from_date, to_date).await?;
 
-    // Merge inquiry assignments and calendar item assignments into a flat entry list
+    // Payroll override layer: deactivations + paid-time adjustments per day.
+    let adjustments = employee_repo::fetch_hours_adjustments(&state.db, id, from_date, to_date).await?;
+    let adj_map = build_adjustment_map(&adjustments);
+
+    // Merge inquiry + calendar item assignments into a flat entry list, applying
+    // the payroll override: deactivated days are dropped, adjusted days export
+    // their paid times/hours. `hour_account` = Σ worked − Σ paid.
     let mut entries: Vec<TimesheetEntry> = Vec::new();
+    let mut worked_sum = 0.0_f64;
+    let mut paid_sum = 0.0_f64;
     for r in &inq_rows {
         if let Some(date) = r.booking_date {
-            entries.push(TimesheetEntry {
-                date,
-                clock_in: r.clock_in,
-                clock_out: r.clock_out,
-                actual_hours: r.actual_hours,
-            });
+            let adj = adj_map.get(&adjustment_key("inquiry", r.inquiry_id, date));
+            worked_sum += r.actual_hours.unwrap_or(0.0);
+            paid_sum += paid_hours_for(r.actual_hours, adj.copied()).unwrap_or(0.0);
+            if adj.map(|a| a.deactivated).unwrap_or(false) {
+                continue;
+            }
+            let (clock_in, clock_out, actual_hours) = paid_export_fields(r.clock_in, r.clock_out, r.actual_hours, adj.copied());
+            entries.push(TimesheetEntry { date, clock_in, clock_out, actual_hours });
         }
     }
     for r in &item_rows {
         if let Some(date) = r.scheduled_date {
-            entries.push(TimesheetEntry {
-                date,
-                clock_in: r.clock_in,
-                clock_out: r.clock_out,
-                actual_hours: r.actual_hours,
-            });
+            let adj = adj_map.get(&adjustment_key("calendar_item", r.calendar_item_id, date));
+            worked_sum += r.actual_hours.unwrap_or(0.0);
+            paid_sum += paid_hours_for(r.actual_hours, adj.copied()).unwrap_or(0.0);
+            if adj.map(|a| a.deactivated).unwrap_or(false) {
+                continue;
+            }
+            let (clock_in, clock_out, actual_hours) = paid_export_fields(r.clock_in, r.clock_out, r.actual_hours, adj.copied());
+            entries.push(TimesheetEntry { date, clock_in, clock_out, actual_hours });
         }
     }
+    let hour_account = worked_sum - paid_sum;
 
     // Format month label: "YYYY-MM" → "MM.YYYY"
     let month_parts: Vec<&str> = month_str.splitn(2, '-').collect();
@@ -775,6 +931,7 @@ async fn employee_hours_export(
         last_name: emp.last_name.clone(),
         month_label,
         target_hours: target,
+        hour_account,
         entries,
     })
     .map_err(|e| ApiError::Internal(format!("Timesheet XLSX generation failed: {e}")))?;
