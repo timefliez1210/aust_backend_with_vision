@@ -888,15 +888,11 @@ async fn employee_hours_export(
 
     // Merge inquiry + calendar item assignments into a flat entry list, applying
     // the payroll override: deactivated days are dropped, adjusted days export
-    // their paid times/hours. `hour_account` = Σ worked − Σ paid.
+    // their paid times/hours.
     let mut entries: Vec<TimesheetEntry> = Vec::new();
-    let mut worked_sum = 0.0_f64;
-    let mut paid_sum = 0.0_f64;
     for r in &inq_rows {
         if let Some(date) = r.booking_date {
             let adj = adj_map.get(&adjustment_key("inquiry", r.inquiry_id, date));
-            worked_sum += r.actual_hours.unwrap_or(0.0);
-            paid_sum += paid_hours_for(r.actual_hours, adj.copied()).unwrap_or(0.0);
             if adj.map(|a| a.deactivated).unwrap_or(false) {
                 continue;
             }
@@ -907,8 +903,6 @@ async fn employee_hours_export(
     for r in &item_rows {
         if let Some(date) = r.scheduled_date {
             let adj = adj_map.get(&adjustment_key("calendar_item", r.calendar_item_id, date));
-            worked_sum += r.actual_hours.unwrap_or(0.0);
-            paid_sum += paid_hours_for(r.actual_hours, adj.copied()).unwrap_or(0.0);
             if adj.map(|a| a.deactivated).unwrap_or(false) {
                 continue;
             }
@@ -916,7 +910,6 @@ async fn employee_hours_export(
             entries.push(TimesheetEntry { date, clock_in, clock_out, actual_hours });
         }
     }
-    let hour_account = worked_sum - paid_sum;
 
     // Format month label: "YYYY-MM" → "MM.YYYY"
     let month_parts: Vec<&str> = month_str.splitn(2, '-').collect();
@@ -931,7 +924,6 @@ async fn employee_hours_export(
         last_name: emp.last_name.clone(),
         month_label,
         target_hours: target,
-        hour_account,
         entries,
     })
     .map_err(|e| ApiError::Internal(format!("Timesheet XLSX generation failed: {e}")))?;

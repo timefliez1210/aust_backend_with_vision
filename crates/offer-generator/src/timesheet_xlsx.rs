@@ -51,9 +51,6 @@ pub struct TimesheetData {
     pub month_label: String,
     /// Monthly target hours from the employee record.
     pub target_hours: f64,
-    /// Hours moved to the Stundenkonto this month (worked − paid). Surplus the
-    /// employee accrues toward holidays/boni; shown as its own summary line.
-    pub hour_account: f64,
     /// All assignment entries for the month (unsorted; sorted internally).
     pub entries: Vec<TimesheetEntry>,
 }
@@ -232,16 +229,6 @@ fn build_sheet_xml(
             num_cell("E9", overtime)
         ),
     ));
-    // Stundenkonto: surplus (worked − paid) credited toward holidays/boni.
-    rows.push(row(
-        10,
-        &format!(
-            "{}{}",
-            str_cell("D10", "Stundenkonto", false),
-            num_cell("E10", data.hour_account)
-        ),
-    ));
-
     // Column headers (row 11)
     rows.push(row(
         11,
