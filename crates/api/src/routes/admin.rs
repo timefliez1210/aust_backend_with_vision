@@ -50,6 +50,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/employees/{id}/delete", post(delete_employee))
         .route("/employees/{id}/hours", get(employee_hours_summary))
         .route("/employees/{id}/hours/adjustments", put(put_employee_hours_adjustments))
+        .route("/employees/{id}/hours/cleanup", post(cleanup_hours_adjustments))
         .route("/employees/{id}/hours/export", get(employee_hours_export))
         .route(
             "/employees/{id}/documents/{doc_type}",
@@ -840,6 +841,32 @@ async fn put_employee_hours_adjustments(
     }
 
     employee_repo::upsert_hours_adjustments(&state.db, id, from_date, to_date, &body).await?;
+
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// `POST /api/v1/admin/employees/{id}/hours/cleanup?month=YYYY-MM` — **Destructive**
+/// "Stundenkonto säubern": finalize the month's payroll overrides.
+///
+/// **Caller**: Admin employee detail page "Stundenkonto säubern" button.
+/// **Why**: Bakes the sorted-out month into the recorded data — deactivated days
+/// drop the employee's assignment, adjusted days overwrite the recorded clock
+/// times with the paid values — then discards the override layer. Permanent and
+/// irreversible; the recorded hours become the paid hours.
+async fn cleanup_hours_adjustments(
+    State(state): State<Arc<AppState>>,
+    Extension(_claims): Extension<TokenClaims>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let month_str = query
+        .get("month")
+        .cloned()
+        .unwrap_or_else(|| Utc::now().format("%Y-%m").to_string());
+    let (from_date, to_date) = parse_month_range(&month_str)
+        .ok_or_else(|| ApiError::BadRequest("Ungueltiges Monatsformat. Erwartet: YYYY-MM".into()))?;
+
+    employee_repo::cleanup_hours_adjustments(&state.db, id, from_date, to_date).await?;
 
     Ok(Json(serde_json::json!({ "ok": true })))
 }

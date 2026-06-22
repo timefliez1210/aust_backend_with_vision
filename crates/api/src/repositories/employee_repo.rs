@@ -1532,6 +1532,105 @@ pub(crate) async fn upsert_hours_adjustments(
     Ok(())
 }
 
+/// **Destructive**: bake the month's payroll overrides into the recorded data,
+/// then discard the override layer.
+///
+/// **Caller**: `admin::cleanup_hours_adjustments` ("Stundenkonto säubern").
+/// **Why**: Once Alex has sorted out a month, this makes it permanent:
+/// - a **deactivated** day → the employee is removed from that assignment-day
+///   (the `inquiry_employees` / `calendar_item_employees` row is deleted);
+/// - an **adjusted** day (paid times set) → the recorded `clock_in`/`clock_out`/
+///   `break_minutes` are overwritten with the paid values and `actual_hours` is
+///   reset to NULL so it re-derives from the new times;
+/// - finally every `hours_adjustments` row in the month is deleted.
+///
+/// All in one transaction. After this the recorded hours equal the paid hours
+/// and the Stundenkonto for the month is zero. This cannot be undone.
+pub(crate) async fn cleanup_hours_adjustments(
+    pool: &PgPool,
+    employee_id: Uuid,
+    from_date: NaiveDate,
+    to_date: NaiveDate,
+) -> Result<(), ApiError> {
+    let adjustments = fetch_hours_adjustments(pool, employee_id, from_date, to_date).await?;
+
+    let mut tx = pool.begin().await?;
+
+    for a in &adjustments {
+        match a.entry_type.as_str() {
+            "inquiry" => {
+                let Some(inquiry_id) = a.inquiry_id else { continue };
+                if a.deactivated {
+                    sqlx::query(
+                        "DELETE FROM inquiry_employees
+                         WHERE inquiry_id = $1 AND employee_id = $2 AND job_date = $3",
+                    )
+                    .bind(inquiry_id)
+                    .bind(employee_id)
+                    .bind(a.job_date)
+                    .execute(&mut *tx)
+                    .await?;
+                } else if a.paid_clock_in.is_some() && a.paid_clock_out.is_some() {
+                    sqlx::query(
+                        "UPDATE inquiry_employees
+                         SET clock_in = $4, clock_out = $5, break_minutes = $6, actual_hours = NULL
+                         WHERE inquiry_id = $1 AND employee_id = $2 AND job_date = $3",
+                    )
+                    .bind(inquiry_id)
+                    .bind(employee_id)
+                    .bind(a.job_date)
+                    .bind(a.paid_clock_in)
+                    .bind(a.paid_clock_out)
+                    .bind(a.paid_break_minutes.unwrap_or(0))
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
+            "calendar_item" => {
+                let Some(calendar_item_id) = a.calendar_item_id else { continue };
+                if a.deactivated {
+                    sqlx::query(
+                        "DELETE FROM calendar_item_employees
+                         WHERE calendar_item_id = $1 AND employee_id = $2 AND job_date = $3",
+                    )
+                    .bind(calendar_item_id)
+                    .bind(employee_id)
+                    .bind(a.job_date)
+                    .execute(&mut *tx)
+                    .await?;
+                } else if a.paid_clock_in.is_some() && a.paid_clock_out.is_some() {
+                    sqlx::query(
+                        "UPDATE calendar_item_employees
+                         SET clock_in = $4, clock_out = $5, break_minutes = $6, actual_hours = NULL
+                         WHERE calendar_item_id = $1 AND employee_id = $2 AND job_date = $3",
+                    )
+                    .bind(calendar_item_id)
+                    .bind(employee_id)
+                    .bind(a.job_date)
+                    .bind(a.paid_clock_in)
+                    .bind(a.paid_clock_out)
+                    .bind(a.paid_break_minutes.unwrap_or(0))
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    sqlx::query(
+        "DELETE FROM hours_adjustments WHERE employee_id = $1 AND job_date BETWEEN $2 AND $3",
+    )
+    .bind(employee_id)
+    .bind(from_date)
+    .bind(to_date)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Update employee document key in DB.
 ///
 /// **Caller**: `admin::upload_employee_document`
