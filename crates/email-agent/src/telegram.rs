@@ -63,6 +63,10 @@ pub enum ApprovalDecision {
         text: String,
         message_id: i64,
         from_user_id: Option<i64>,
+        /// Text of the message Alex replied to / quoted, when this message is a
+        /// Telegram reply. Carries the referent (e.g. a bot notification with an
+        /// inquiry/customer ID) the assistant needs to resolve "diese Anfrage".
+        reply_to_text: Option<String>,
     },
     /// A `pa:<uuid>:<action>` callback from an assistant-bound chat.
     AssistantCallback {
@@ -86,6 +90,9 @@ pub enum ApprovalDecision {
         caption: Option<String>,
         message_id: i64,
         from_user_id: Option<i64>,
+        /// Text of the message Alex replied to / quoted, when the media is sent
+        /// as a Telegram reply. See `AssistantText::reply_to_text`.
+        reply_to_text: Option<String>,
     },
 }
 
@@ -278,6 +285,7 @@ impl TelegramBot {
                                     text: text.clone(),
                                     message_id: message.message_id,
                                     from_user_id: message.from.as_ref().map(|u| u.id),
+                                    reply_to_text: message.quoted_text(),
                                 },
                             });
                         }
@@ -296,6 +304,7 @@ impl TelegramBot {
                                     text: text.clone(),
                                     message_id: message.message_id,
                                     from_user_id: message.from.as_ref().map(|u| u.id),
+                                    reply_to_text: message.quoted_text(),
                                 },
                             });
                         }
@@ -332,6 +341,7 @@ impl TelegramBot {
                             caption: message.caption.clone(),
                             message_id: message.message_id,
                             from_user_id: message.from.as_ref().map(|u| u.id),
+                            reply_to_text: message.quoted_text(),
                         },
                     });
                 }
@@ -698,16 +708,83 @@ mod tests {
             text: "Hallo".to_string(),
             message_id: 99,
             from_user_id: Some(7),
+            reply_to_text: Some("Neue Anfrage von Frederike".to_string()),
         };
         match d {
-            ApprovalDecision::AssistantText { chat_id, text, message_id, from_user_id } => {
+            ApprovalDecision::AssistantText { chat_id, text, message_id, from_user_id, reply_to_text } => {
                 assert_eq!(chat_id, 42);
                 assert_eq!(text, "Hallo");
                 assert_eq!(message_id, 99);
                 assert_eq!(from_user_id, Some(7));
+                assert_eq!(reply_to_text.as_deref(), Some("Neue Anfrage von Frederike"));
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn quoted_text_prefers_partial_quote_then_reply_body() {
+        // Partial quote (Bot API 7.0+) wins when present.
+        let with_quote = TgMessage {
+            message_id: 1,
+            chat: TgChat { id: 1 },
+            text: Some("setze eine Erinnerung".to_string()),
+            from: None,
+            photo: None,
+            document: None,
+            caption: None,
+            reply_to_message: Some(Box::new(TgMessage {
+                message_id: 0,
+                chat: TgChat { id: 1 },
+                text: Some("voller Benachrichtigungstext".to_string()),
+                from: None,
+                photo: None,
+                document: None,
+                caption: None,
+                reply_to_message: None,
+                quote: None,
+            })),
+            quote: Some(TgQuote { text: Some("Anfrage 1234".to_string()) }),
+        };
+        assert_eq!(with_quote.quoted_text().as_deref(), Some("Anfrage 1234"));
+
+        // Falls back to the replied-to message body when there is no partial quote.
+        let reply_only = TgMessage {
+            message_id: 1,
+            chat: TgChat { id: 1 },
+            text: Some("setze eine Erinnerung".to_string()),
+            from: None,
+            photo: None,
+            document: None,
+            caption: None,
+            reply_to_message: Some(Box::new(TgMessage {
+                message_id: 0,
+                chat: TgChat { id: 1 },
+                text: Some("Neue Anfrage von Frederike".to_string()),
+                from: None,
+                photo: None,
+                document: None,
+                caption: None,
+                reply_to_message: None,
+                quote: None,
+            })),
+            quote: None,
+        };
+        assert_eq!(reply_only.quoted_text().as_deref(), Some("Neue Anfrage von Frederike"));
+
+        // No reply at all → None.
+        let plain = TgMessage {
+            message_id: 1,
+            chat: TgChat { id: 1 },
+            text: Some("hallo".to_string()),
+            from: None,
+            photo: None,
+            document: None,
+            caption: None,
+            reply_to_message: None,
+            quote: None,
+        };
+        assert_eq!(plain.quoted_text(), None);
     }
 
     #[test]
@@ -787,6 +864,44 @@ struct TgMessage {
     /// Caption text typed alongside a photo/document.
     #[serde(default)]
     caption: Option<String>,
+    /// The message this one replies to. When Alex replies to (quotes) a bot
+    /// notification and asks the assistant to act ("Erinnerung für diese Anfrage
+    /// setzen"), the referent — including any inquiry/customer IDs — lives here.
+    /// Boxed because `TgMessage` would otherwise be infinitely sized.
+    #[serde(default)]
+    reply_to_message: Option<Box<TgMessage>>,
+    /// Bot API 7.0+ partial quote: the specific span of the replied-to message
+    /// that Telegram highlights. Preferred over the full `reply_to_message` text
+    /// when present, since it is exactly what Alex pointed at.
+    #[serde(default)]
+    quote: Option<TgQuote>,
+}
+
+impl TgMessage {
+    /// The text Alex quoted/replied to, if any. Prefers the highlighted partial
+    /// quote (Bot API 7.0+), then falls back to the full replied-to message's
+    /// text or caption.
+    fn quoted_text(&self) -> Option<String> {
+        if let Some(q) = self.quote.as_ref()
+            && let Some(t) = q.text.as_ref()
+            && !t.trim().is_empty()
+        {
+            return Some(t.clone());
+        }
+        let replied = self.reply_to_message.as_ref()?;
+        replied
+            .text
+            .as_ref()
+            .or(replied.caption.as_ref())
+            .filter(|t| !t.trim().is_empty())
+            .cloned()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct TgQuote {
+    #[serde(default)]
+    text: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

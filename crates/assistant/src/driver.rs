@@ -2,7 +2,7 @@
 //!
 //! This is the main entry point for processing a Telegram message:
 //!
-//! 1. Receive normalised `Input { text, chat_id, images }`
+//! 1. Receive normalised `Input { text, chat_id, images, quoted_text }`
 //! 2. Resolve binding → role (reject unbound chats)
 //! 3. Load / create session
 //! 4. Assemble prompt (SOUL + memory bundle + tools preamble + history + user message)
@@ -41,6 +41,12 @@ pub struct Input {
     /// rasterized PDF pages. Empty for plain text messages. Forwarded to the
     /// vision-capable model on the first user turn.
     pub images: Vec<String>,
+    /// Text of the message Alex replied to / quoted in Telegram, when this turn
+    /// is a reply. Carries the referent — e.g. a bot notification holding the
+    /// inquiry/customer ID — that the bare `text` ("Erinnerung für diese Anfrage
+    /// setzen") leaves implicit. Folded into the user turn, the retrieval query,
+    /// and the grounding set so the assistant resolves the *correct* entity.
+    pub quoted_text: Option<String>,
 }
 
 /// The result of processing one input turn.
@@ -87,11 +93,25 @@ pub async fn process_turn(
     let mut session = session::load_or_create(pool, input.chat_id).await?;
     let session_id = session.id;
 
+    // When this turn is a Telegram reply, the quoted message holds the referent
+    // (often a bot notification with the inquiry/customer ID). Render it as a
+    // labelled block so the model — and the retrieval/grounding steps below —
+    // resolve "diese Anfrage" to the entity Alex actually pointed at, instead of
+    // guessing a different customer (the Frederike mis-reminder).
+    let quoted_block = input.quoted_text.as_deref().map(|q| {
+        format!("[Zitierte Nachricht, auf die sich der Nutzer bezieht]\n{q}\n[Ende Zitat]")
+    });
+
     // Step 3: Assemble memory bundle using the session's accumulated entity scopes (S4).
     // `active_scopes` grows as tools reference entity IDs (inquiry_id, customer_id, etc.)
-    // and is persisted across Telegram message turns via the session row.
+    // and is persisted across Telegram message turns via the session row. The quoted
+    // message is folded into the retrieval query so its IDs/names drive recall too.
     let scope_refs: Vec<&str> = session.active_scopes.iter().map(String::as_str).collect();
-    let bundle = retrieval::assemble_bundle(pool, llm.as_ref(), &input.text, &scope_refs)
+    let retrieval_query = match quoted_block.as_deref() {
+        Some(q) => format!("{q}\n{}", input.text),
+        None => input.text.clone(),
+    };
+    let bundle = retrieval::assemble_bundle(pool, llm.as_ref(), &retrieval_query, &scope_refs)
         .await
         .unwrap_or_default();
     debug!(load_log = ?bundle.load_log, "Memory bundle assembled");
@@ -110,7 +130,12 @@ pub async fn process_turn(
     // reply that is NOT in this set is fabricated (the model claiming an action it
     // never took), and we refuse to relay it. See `extract_uuid_shapes`.
     let mut grounded_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for src in [input.text.as_str(), ctx_text.as_str(), memory_context.as_str()] {
+    for src in [
+        input.text.as_str(),
+        quoted_block.as_deref().unwrap_or(""),
+        ctx_text.as_str(),
+        memory_context.as_str(),
+    ] {
         grounded_ids.extend(extract_uuid_shapes(src));
     }
     let mut grounding_corrections = 0usize;
@@ -128,13 +153,20 @@ pub async fn process_turn(
         ));
     }
 
+    // Prepend the quoted message (if any) so the model sees exactly what Alex
+    // replied to before his instruction.
+    let user_turn_text = match quoted_block.as_deref() {
+        Some(q) => format!("{q}\n\n{}", input.text),
+        None => input.text.clone(),
+    };
+
     if input.images.is_empty() {
-        messages.push(aust_llm_providers::LlmMessage::user(input.text.clone()));
+        messages.push(aust_llm_providers::LlmMessage::user(user_turn_text));
     } else {
         // Vision turn: attach the photos / rasterized PDF pages to the user message.
         info!(chat_id = input.chat_id, image_count = input.images.len(), "Turn carries images");
         messages.push(aust_llm_providers::LlmMessage::user_with_images(
-            input.text.clone(),
+            user_turn_text,
             input.images.clone(),
         ));
     }
