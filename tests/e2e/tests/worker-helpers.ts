@@ -72,6 +72,34 @@ export async function createTerminWithEmployee(
   return item.id;
 }
 
+/** Assign an additional employee to an existing calendar Termin. */
+export async function assignTerminEmployee(req: APIRequestContext, token: string, itemId: string, employeeId: string): Promise<void> {
+  await ok(req, 'post', `/api/v1/admin/calendar-items/${itemId}/employees`, {
+    token,
+    data: { employee_id: employeeId },
+  });
+}
+
+/** Admin-side seeding of a Termin assignment's clock times for one employee on one day. */
+export async function setTerminHours(
+  req: APIRequestContext,
+  token: string,
+  itemId: string,
+  employeeId: string,
+  dayDate: string,
+  times: { clock_in: string; clock_out: string; break_minutes: number }
+): Promise<void> {
+  await ok(req, 'patch', `/api/v1/admin/calendar-items/${itemId}/employees/${employeeId}`, {
+    token,
+    data: {
+      clock_in: times.clock_in,
+      clock_out: times.clock_out,
+      break_minutes: times.break_minutes,
+      day_date: dayDate,
+    },
+  });
+}
+
 export async function deleteTermin(req: APIRequestContext, token: string, id: string): Promise<void> {
   await ok(req, 'delete', `/api/v1/admin/calendar-items/${id}`, { token }).catch(() => {});
 }
@@ -130,6 +158,30 @@ export async function setInquiryItems(
 /** Assign an employee to the inquiry (crew on the move). */
 export async function assignInquiryEmployee(req: APIRequestContext, token: string, inquiryId: string, employeeId: string, notes: string): Promise<void> {
   await ok(req, 'post', `/api/v1/inquiries/${inquiryId}/employees`, { token, data: { employee_id: employeeId, notes } });
+}
+
+/**
+ * Admin-side seeding of a single assignment day's clock times (worked hours).
+ * Mirrors the admin inquiry detail inline edit (`PATCH .../employees/{emp}`),
+ * scoping to one `job_date` so multi-day inquiries get per-day hours.
+ */
+export async function setAssignmentHours(
+  req: APIRequestContext,
+  token: string,
+  inquiryId: string,
+  employeeId: string,
+  dayDate: string,
+  times: { clock_in: string; clock_out: string; break_minutes: number }
+): Promise<void> {
+  await ok(req, 'patch', `/api/v1/inquiries/${inquiryId}/employees/${employeeId}`, {
+    token,
+    data: {
+      clock_in: times.clock_in,
+      clock_out: times.clock_out,
+      break_minutes: times.break_minutes,
+      day_date: dayDate,
+    },
+  });
 }
 
 export async function deleteInquiry(req: APIRequestContext, token: string, id: string): Promise<void> {

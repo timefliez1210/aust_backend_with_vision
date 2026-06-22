@@ -19,3 +19,4 @@ Moving company automation: inquiry → estimation → offer → scheduling → i
 - [crates/volume-estimator/AGENTS.md](crates/volume-estimator/AGENTS.md) — Vision client
 - [frontend/AGENTS.md](frontend/AGENTS.md) — SvelteKit admin dashboard
 - [services/vision/AGENTS.md](services/vision/AGENTS.md) — Python ML pipeline
+- [tests/e2e/AGENTS.md](tests/e2e/AGENTS.md) — Playwright end-to-end suite (`scripts/staging.sh`)
