@@ -7,6 +7,7 @@ mod processor;
 mod responder;
 mod smtp_client;
 mod telegram;
+mod text;
 
 pub use error::EmailError;
 pub use imap_client::ImapClient;

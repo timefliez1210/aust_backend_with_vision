@@ -145,7 +145,7 @@ impl TelegramBot {
     ) -> Result<DraftMessage, EmailError> {
         // Truncate body for Telegram (max 4096 chars)
         let display_body = if body.len() > 3000 {
-            format!("{}...\n\n[Text gekürzt]", &body[..3000])
+            format!("{}...\n\n[Text gekürzt]", crate::text::truncate_on_char_boundary(body, 3000))
         } else {
             body.to_string()
         };
@@ -269,7 +269,7 @@ impl TelegramBot {
                             debug!(
                                 "Received text from admin (chat {}): {}",
                                 message.chat.id,
-                                &text[..text.len().min(80)]
+                                crate::text::truncate_on_char_boundary(&text, 80)
                             );
                             // Emit EditInstructions for the legacy offer-edit flow AND
                             // AssistantText so the orchestrator can route to the agent if
@@ -295,7 +295,7 @@ impl TelegramBot {
                             debug!(
                                 "Received text from non-admin chat {}: {}",
                                 message.chat.id,
-                                &text[..text.len().min(80)]
+                                crate::text::truncate_on_char_boundary(&text, 80)
                             );
                             responses.push(ApprovalResponse {
                                 draft_id: "assistant_text".to_string(),
@@ -638,7 +638,7 @@ impl TelegramBot {
     /// Notify admin about an incoming email.
     pub async fn notify_new_email(&self, from: &str, subject: &str, preview: &str) {
         let preview_short = if preview.len() > 200 {
-            format!("{}...", &preview[..200])
+            format!("{}...", crate::text::truncate_on_char_boundary(preview, 200))
         } else {
             preview.to_string()
         };

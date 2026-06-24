@@ -220,7 +220,7 @@ Regeln:
              Bitte überarbeite den Entwurf entsprechend."
         );
 
-        debug!("Revising draft via LLM: {}", &admin_instructions[..admin_instructions.len().min(80)]);
+        debug!("Revising draft via LLM: {}", crate::text::truncate_on_char_boundary(&admin_instructions, 80));
 
         let messages = vec![
             LlmMessage::system(system_prompt.to_string()),

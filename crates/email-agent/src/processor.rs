@@ -323,7 +323,7 @@ impl EmailProcessor {
             tg.notify_new_email(
                 &customer_email,
                 &email.subject,
-                &email.body_text[..email.body_text.len().min(300)],
+                crate::text::truncate_on_char_boundary(&email.body_text, 300),
             )
             .await;
         }
@@ -798,7 +798,7 @@ impl EmailProcessor {
         info!(
             "Revising draft {} with instructions: {}",
             draft.draft_id,
-            &instructions[..instructions.len().min(80)]
+            crate::text::truncate_on_char_boundary(&instructions, 80)
         );
 
         // Show "working on it" feedback
