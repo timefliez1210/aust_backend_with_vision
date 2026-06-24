@@ -94,6 +94,7 @@ pub(super) struct CustomerDetailResponse {
     company_name: Option<String>,
     billing_address_id: Option<Uuid>,
     billing_address: Option<AddressSnapshot>,
+    notes: Option<String>,
     created_at: DateTime<Utc>,
     quotes: Vec<CustomerQuote>,
     offers: Vec<CustomerOffer>,
@@ -212,6 +213,7 @@ pub(super) async fn get_customer(
         company_name: repo_customer.company_name,
         billing_address_id: repo_customer.billing_address_id,
         billing_address,
+        notes: repo_customer.notes,
         created_at: repo_customer.created_at,
         quotes,
         offers,
@@ -229,6 +231,8 @@ pub(super) struct UpdateCustomerRequest {
     email: Option<String>,
     customer_type: Option<String>,
     company_name: Option<String>,
+    /// Free-form internal notes (Absprachen, letzte Anpassungen, Anrufbelästigungen).
+    notes: Option<String>,
     /// Inline billing address — if provided, creates an address record and sets billing_address_id.
     /// If both billing_address and billing_address_id are provided, billing_address_id takes priority.
     billing_address: Option<super::inquiries::AddressInput>,
@@ -317,6 +321,7 @@ pub(super) async fn update_customer(
         request.phone.as_deref(), email_update,
         customer_type, request.company_name.as_deref(),
         billing_address_id,
+        request.notes.as_deref(),
     )
     .await
     .map_err(|e| {
