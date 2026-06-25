@@ -234,14 +234,14 @@ pub fn generate_offer_xlsx(data: &OfferData) -> Result<Vec<u8>, OfferError> {
         .map_err(|e| OfferError::Template(format!("Failed to read template ZIP: {e}")))?;
 
     // Build modifications
-    let (cell_mods, hidden_rows, unhidden_rows) = build_cell_modifications(data);
+    let (cell_mods, hidden_rows, unhidden_rows, row_heights) = build_cell_modifications(data);
 
     // Read and modify sheet1.xml
     let sheet1_xml = read_zip_entry(&mut template_zip, "xl/worksheets/sheet1.xml")?;
     let sheet1_str = String::from_utf8(sheet1_xml)
         .map_err(|e| OfferError::Template(format!("sheet1.xml is not valid UTF-8: {e}")))?;
     let mut modified_sheet1 =
-        apply_modifications(&sheet1_str, &cell_mods, &hidden_rows, &unhidden_rows);
+        apply_modifications(&sheet1_str, &cell_mods, &hidden_rows, &unhidden_rows, &row_heights);
 
     // Remove hyperlinks section — we want plain text, not clickable links
     modified_sheet1 = strip_hyperlinks(&modified_sheet1);
@@ -358,10 +358,34 @@ fn address_block_cell(cell: &str, street: &str, city: &str, floor: &str) -> (Str
     (cell.to_string(), CellValue::StyledText(block, "44"))
 }
 
+/// Excel column-width units of the merged address cells, used to estimate when a
+/// long line wraps to a second line. Origin = A(18.86)+B(5.71); destination =
+/// F(12.86)+G(16). Excel's width unit is ≈ one digit glyph, which is a slightly
+/// conservative (i.e. erring taller) proxy for proportional address text.
+const ADDR_WIDTH_ORIGIN: f64 = 24.5;
+const ADDR_WIDTH_DEST: f64 = 28.8;
+/// Point height of one text line in the address block (matches template row 26).
+const ADDR_LINE_HEIGHT: f64 = 15.0;
+
+/// Estimate how many rendered lines the stacked street/city/floor block needs in
+/// a column `col_width` units wide, counting an extra line whenever a single
+/// field is long enough to wrap. Always at least 1.
+fn address_block_lines(street: &str, city: &str, floor: &str, col_width: f64) -> u32 {
+    let cpl = col_width.max(1.0);
+    [street, city, floor]
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| ((s.chars().count() as f64 / cpl).ceil() as u32).max(1))
+        .sum::<u32>()
+        .max(1)
+}
+
 fn build_cell_modifications(
     data: &OfferData,
-) -> (Vec<(String, CellValue)>, Vec<u32>, Vec<u32>) {
+) -> (Vec<(String, CellValue)>, Vec<u32>, Vec<u32>, Vec<(u32, f64)>) {
     let mut mods = Vec::new();
+    let mut row_heights: Vec<(u32, f64)> = Vec::new();
 
     // Customer address block
     // Address block: for business, A8=company A9=attention; for private, A8=salutation A9=name
@@ -424,6 +448,24 @@ fn build_cell_modifications(
     for cell in ["A27", "A28", "F27", "F28"] {
         mods.push((cell.into(), CellValue::Text(String::new())));
     }
+    // A26/F26 are *merged* cells (A26:B26, F26:G26). Excel/LibreOffice never
+    // auto-grow a row to fit wrapped text in a merged cell, so a 2–3 line
+    // address overflowed downward through the hidden rows 27/28 and collided
+    // with the orange "Umzugspauschale" banner at row 29. Size row 26 explicitly
+    // from whichever side needs the most lines.
+    let origin_lines = address_block_lines(
+        &data.origin_street,
+        &data.origin_city,
+        &data.origin_floor_info,
+        ADDR_WIDTH_ORIGIN,
+    );
+    let dest_lines = address_block_lines(
+        &data.dest_street,
+        &data.dest_city,
+        &data.dest_floor_info,
+        ADDR_WIDTH_DEST,
+    );
+    row_heights.push((26, origin_lines.max(dest_lines) as f64 * ADDR_LINE_HEIGHT));
     // The template carries hidden mirror formulas I9:I12/L9:L12 (=A25..A28 /
     // =F25..F28) outside the print area. With the multi-line A26/F26 block,
     // I10/L10 would render three lines tall and blow up letter-address row 10
@@ -556,7 +598,7 @@ fn build_cell_modifications(
     // (rows 43+ were shifted down by 8 to make room for 8 extra line-item slots).
     mods.push(("G52".into(), CellValue::StyledFormula("SUM(G31:G50)".into(), "72")));
 
-    (mods, hidden_rows, unhidden_rows)
+    (mods, hidden_rows, unhidden_rows, row_heights)
 }
 
 // ---------------------------------------------------------------------------
@@ -577,6 +619,7 @@ fn build_cell_modifications(
 /// - `hidden_rows` — row numbers to add `hidden="true"` to
 /// - `unhidden_rows` — row numbers to set `hidden="false"` on (overrides any
 ///   pre-existing hidden flag from the template)
+/// - `row_heights` — `(row, points)` pairs to pin with `customHeight="true"`
 ///
 /// # Returns
 /// Modified XML string ready to be written back into the output ZIP.
@@ -585,6 +628,7 @@ fn apply_modifications(
     cell_mods: &[(String, CellValue)],
     hidden_rows: &[u32],
     unhidden_rows: &[u32],
+    row_heights: &[(u32, f64)],
 ) -> String {
     let mut result = xml.to_string();
 
@@ -603,7 +647,12 @@ fn apply_modifications(
         result = unhide_row(&result, row_num);
     }
 
-    // 4. Strip cached values from formula cells so LibreOffice must recalculate.
+    // 4. Pin explicit row heights (merged cells don't auto-fit wrapped text).
+    for &(row_num, height) in row_heights {
+        result = set_row_height(&result, row_num, height);
+    }
+
+    // 5. Strip cached values from formula cells so LibreOffice must recalculate.
     //    Template has stale <v> values that won't match our new inputs.
     result = strip_formula_cached_values(&result);
 
@@ -911,6 +960,51 @@ pub fn unhide_row(xml: &str, row_num: u32) -> String {
                 result.push_str(&xml[abs_h + r#"hidden="true""#.len()..]);
                 return result;
             }
+        }
+    }
+    xml.to_string()
+}
+
+/// Set or replace a single `name="value"` attribute inside a single XML start-tag
+/// string. Matches with a leading space (` name="`) so it never collides with a
+/// longer attribute that ends in the same letters (e.g. `ht` vs `customHeight`).
+/// Appends the attribute before the caller re-attaches `>` if it is absent.
+fn set_tag_attr(tag: &str, name: &str, val: &str) -> String {
+    let needle = format!(r#" {name}="#);
+    if let Some(start) = tag.find(&needle) {
+        let val_start = start + needle.len() + 1; // skip the opening quote
+        if let Some(rel_end) = tag[val_start..].find('"') {
+            let val_end = val_start + rel_end;
+            return format!("{}{}{}", &tag[..val_start], val, &tag[val_end..]);
+        }
+    }
+    format!(r#"{tag} {name}="{val}""#)
+}
+
+/// Pin an explicit height (in points) on the `<row>` element for `row_num`,
+/// forcing `customHeight="true"` so LibreOffice honours it.
+///
+/// **Why**: The origin/destination address blocks live in *merged* cells
+/// (A26:B26, F26:G26). Excel/LibreOffice never auto-grow a row's height to fit
+/// wrapped text in a merged cell, so a 2–3 line address overflowed downward
+/// through the hidden rows 27/28 and collided with the orange "Umzugspauschale"
+/// banner at row 29. Sizing the row from the line count fixes the overlap.
+///
+/// # Returns
+/// Modified XML string. Returns the original unchanged if the row is not found.
+pub fn set_row_height(xml: &str, row_num: u32, height: f64) -> String {
+    let row_r = format!(r#"<row r="{row_num}""#);
+    if let Some(pos) = xml.find(&row_r) {
+        if let Some(gt_offset) = xml[pos..].find('>') {
+            let gt_pos = pos + gt_offset;
+            let mut tag = xml[pos..gt_pos].to_string();
+            tag = set_tag_attr(&tag, "ht", &format!("{height}"));
+            tag = set_tag_attr(&tag, "customHeight", "true");
+            let mut result = String::with_capacity(xml.len());
+            result.push_str(&xml[..pos]);
+            result.push_str(&tag);
+            result.push_str(&xml[gt_pos..]);
+            return result;
         }
     }
     xml.to_string()
@@ -1635,6 +1729,43 @@ mod tests {
         assert_eq!(format_number(30.0), "30");
         assert_eq!(format_number(51.29), "51.29");
         assert_eq!(format_number(2.1), "2.1");
+    }
+
+    #[test]
+    fn test_address_block_lines() {
+        // Short street + city, no floor → 2 lines.
+        assert_eq!(
+            address_block_lines("Lerchenweg 1", "31061 Aifeld", "", ADDR_WIDTH_ORIGIN),
+            2
+        );
+        // Street + city + floor → 3 lines.
+        assert_eq!(
+            address_block_lines("Lerchenweg 1", "31061 Aifeld", "3. Stock", ADDR_WIDTH_ORIGIN),
+            3
+        );
+        // A long street wraps to 2 lines on its own → 1 (wrapped street) + city.
+        let long = "Friedrich-Ebert-Straße 123a"; // > 24 chars
+        assert_eq!(address_block_lines(long, "12345 Musterstadt", "", ADDR_WIDTH_ORIGIN), 3);
+        // Never zero.
+        assert_eq!(address_block_lines("", "", "", ADDR_WIDTH_ORIGIN), 1);
+    }
+
+    #[test]
+    fn test_set_row_height_replaces_existing_attrs() {
+        let xml = r#"<row r="26" customFormat="false" ht="15" hidden="false" customHeight="false" outlineLevel="0" collapsed="false"><c r="A26"/></row>"#;
+        let out = set_row_height(xml, 26, 45.0);
+        assert!(out.contains(r#"ht="45""#), "ht not set: {out}");
+        assert!(out.contains(r#"customHeight="true""#), "customHeight not set: {out}");
+        // Must not have clobbered the neighbouring customFormat attribute.
+        assert!(out.contains(r#"customFormat="false""#));
+        // The ` ht="` match must not have touched the `customHeight` attribute name.
+        assert!(out.contains("customHeight="));
+    }
+
+    #[test]
+    fn test_set_row_height_missing_row_is_noop() {
+        let xml = r#"<row r="99" ht="15"></row>"#;
+        assert_eq!(set_row_height(xml, 26, 45.0), xml);
     }
 
     #[test]
