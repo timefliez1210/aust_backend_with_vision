@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use crate::error::Result;
 use crate::roles::Role;
 use super::{
-    parse_str, parse_uuid, pending_confirmation, Safety, Tool, ToolCtx,
+    parse_date, parse_str, parse_time_opt, parse_uuid, pending_confirmation, Safety, Tool, ToolCtx,
 };
 
 // ── CreateInquiry ─────────────────────────────────────────────────────────────
@@ -85,6 +85,54 @@ impl Tool for CreateInquiry {
         };
         let resp = ctx.services.inquiries.create_inquiry(new).await?;
         Ok(serde_json::to_value(&resp)?)
+    }
+}
+
+// ── CreateInquiryAppointment ──────────────────────────────────────────────────
+
+/// Attach a lightweight appointment (e.g. a Besichtigung) to an inquiry on its
+/// own date — separate from the actual move, and not crew/hours tracked.
+pub struct CreateInquiryAppointment;
+
+#[async_trait]
+impl Tool for CreateInquiryAppointment {
+    fn name(&self) -> &'static str { "create_inquiry_appointment" }
+    fn description(&self) -> &'static str {
+        "Legt einen leichten Zusatztermin zu einer bestehenden Anfrage an — typischerweise eine BESICHTIGUNG vor dem eigentlichen Umzug, an einem eigenen (nicht zwingend benachbarten) Datum. Kein Umzugstag: keine Crew-/Stundenerfassung, höchstens ein optionaler Mitarbeiter. Der Umzug selbst wird NICHT verändert. Für das erstmalige Einplanen des Umzugs stattdessen schedule_inquiry nutzen. Nur für Inhaber."
+    }
+    fn params_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "inquiry_id":     { "type": "string", "format": "uuid" },
+                "scheduled_date": { "type": "string", "format": "date" },
+                "kind":           { "type": "string", "description": "Art des Termins, Standard 'besichtigung'." },
+                "start_time":     { "type": "string", "description": "Uhrzeit HH:MM" },
+                "end_time":       { "type": "string", "description": "Uhrzeit HH:MM" },
+                "assignee_id":    { "type": "string", "format": "uuid", "description": "Optionaler einzelner Mitarbeiter für den Termin." },
+                "notes":          { "type": "string" }
+            },
+            "required": ["inquiry_id", "scheduled_date"]
+        })
+    }
+    fn safety(&self) -> Safety { Safety::Write }
+    fn min_role(&self) -> Role { Role::Owner }
+
+    async fn execute(&self, ctx: &ToolCtx, args: &Value) -> Result<Value> {
+        let inquiry_id = parse_uuid(args, "inquiry_id", self.name())?;
+        let scheduled_date = parse_date(args, "scheduled_date", self.name())?;
+        let kind = args["kind"].as_str();
+        let start_time = parse_time_opt(args["start_time"].as_str());
+        let end_time = parse_time_opt(args["end_time"].as_str());
+        let assignee_id = args["assignee_id"].as_str().and_then(|s| s.parse().ok());
+        let notes = args["notes"].as_str();
+
+        let appt = ctx
+            .services
+            .inquiries
+            .create_appointment(inquiry_id, kind, scheduled_date, start_time, end_time, assignee_id, notes)
+            .await?;
+        Ok(serde_json::to_value(&appt)?)
     }
 }
 

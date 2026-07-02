@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::error::ServiceError;
-use crate::models::{CustomerSnapshot, InquiryListItem, InquiryResponse, Services};
+use crate::models::{
+    AppointmentSnapshot, CustomerSnapshot, InquiryListItem, InquiryResponse, Services,
+};
 
 // ── Shared lightweight DTOs ───────────────────────────────────────────────────
 
@@ -541,6 +543,21 @@ pub trait InquiryService: Send + Sync {
 
     /// Cancel an inquiry.
     async fn cancel_inquiry(&self, id: Uuid, reason: &str) -> Result<(), ServiceError>;
+
+    /// Create a lightweight appointment (e.g. a Besichtigung) linked to an
+    /// inquiry on its own, possibly non-consecutive, date. Not crew/hours
+    /// tracked — carries at most one optional assignee.
+    #[allow(clippy::too_many_arguments)]
+    async fn create_appointment(
+        &self,
+        inquiry_id: Uuid,
+        kind: Option<&str>,
+        scheduled_date: NaiveDate,
+        start_time: Option<NaiveTime>,
+        end_time: Option<NaiveTime>,
+        assignee_id: Option<Uuid>,
+        notes: Option<&str>,
+    ) -> Result<AppointmentSnapshot, ServiceError>;
 }
 
 // ── Offer ─────────────────────────────────────────────────────────────────────

@@ -1,14 +1,16 @@
 //! Bridge impl for `InquiryService`.
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{NaiveDate, NaiveTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use aust_core::models::{InquiryListItem, InquiryResponse, InquiryStatus, Services};
+use aust_core::models::{
+    AppointmentSnapshot, InquiryListItem, InquiryResponse, InquiryStatus, Services,
+};
 use aust_core::services::{InquiryService, NewAddress, NewInquiry, ServiceError};
 
-use crate::repositories::{address_repo, inquiry_repo};
+use crate::repositories::{address_repo, inquiry_appointment_repo, inquiry_repo};
 use crate::services::inquiry_builder;
 use crate::ApiError;
 
@@ -317,5 +319,46 @@ impl InquiryService for InquiryServiceImpl {
     async fn cancel_inquiry(&self, id: Uuid, reason: &str) -> Result<(), ServiceError> {
         self.update_status(id, "cancelled", Some(reason)).await?;
         Ok(())
+    }
+
+    async fn create_appointment(
+        &self,
+        inquiry_id: Uuid,
+        kind: Option<&str>,
+        scheduled_date: NaiveDate,
+        start_time: Option<NaiveTime>,
+        end_time: Option<NaiveTime>,
+        assignee_id: Option<Uuid>,
+        notes: Option<&str>,
+    ) -> Result<AppointmentSnapshot, ServiceError> {
+        if !inquiry_repo::exists(&self.pool, inquiry_id)
+            .await
+            .map_err(super::map_sqlx)?
+        {
+            return Err(ServiceError::NotFound(format!(
+                "Anfrage {inquiry_id} nicht gefunden"
+            )));
+        }
+
+        let input = inquiry_appointment_repo::AppointmentInput {
+            kind,
+            scheduled_date: Some(scheduled_date),
+            start_time: Some(start_time),
+            end_time: Some(end_time),
+            assignee_id: Some(assignee_id),
+            notes: Some(notes),
+            ..Default::default()
+        };
+        let new_id = inquiry_appointment_repo::create(&self.pool, inquiry_id, &input)
+            .await
+            .map_err(super::map_sqlx)?;
+
+        let row = inquiry_appointment_repo::fetch_one(&self.pool, inquiry_id, new_id)
+            .await
+            .map_err(super::map_sqlx)?
+            .ok_or_else(|| {
+                ServiceError::Db(anyhow::anyhow!("Termin nach dem Anlegen nicht gefunden"))
+            })?;
+        Ok(inquiry_builder::appointment_snapshot(row))
     }
 }

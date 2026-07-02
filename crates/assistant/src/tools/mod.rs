@@ -129,6 +129,7 @@ impl ToolRegistry {
         registry.register(Box::new(inquiries::SetInquiryServices));
         registry.register(Box::new(inquiries::RequestInfoFromCustomer));
         registry.register(Box::new(inquiries::CancelInquiry));
+        registry.register(Box::new(inquiries::CreateInquiryAppointment));
 
         // Offers
         registry.register(Box::new(offers::PreviewOffer));

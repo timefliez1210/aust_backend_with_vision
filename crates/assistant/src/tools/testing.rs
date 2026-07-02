@@ -116,6 +116,34 @@ impl InquiryService for MockInquiryService {
     async fn cancel_inquiry(&self, _id: Uuid, _reason: &str) -> Result<(), ServiceError> {
         Ok(())
     }
+
+    async fn create_appointment(
+        &self,
+        inquiry_id: Uuid,
+        kind: Option<&str>,
+        scheduled_date: chrono::NaiveDate,
+        start_time: Option<chrono::NaiveTime>,
+        end_time: Option<chrono::NaiveTime>,
+        assignee_id: Option<Uuid>,
+        notes: Option<&str>,
+    ) -> Result<aust_core::models::AppointmentSnapshot, ServiceError> {
+        if inquiry_id != self.inquiry_id {
+            return Err(ServiceError::NotFound(format!("inquiry {inquiry_id}")));
+        }
+        Ok(aust_core::models::AppointmentSnapshot {
+            id: Uuid::now_v7(),
+            kind: kind.unwrap_or("besichtigung").to_string(),
+            scheduled_date,
+            start_time,
+            end_time,
+            assignee_id,
+            assignee_name: None,
+            location: None,
+            notes: notes.map(str::to_string),
+            status: "scheduled".to_string(),
+            created_at: Utc::now(),
+        })
+    }
 }
 
 // ── Offer mock ────────────────────────────────────────────────────────────────
