@@ -57,8 +57,14 @@ pub async fn handle_inquiry_created(
     let from = payload["from_address"].as_str().unwrap_or("?");
     let to = payload["to_address"].as_str().unwrap_or("?");
 
+    // Proactively offer a Besichtigung on every email inquiry (product decision):
+    // a pre-move on-site survey is common, so Josie nudges Alex here. On "ja, am
+    // <Datum>" she grounds the inquiry via her lookup tools and calls
+    // create_inquiry_appointment — the visit is a separate, non-consecutive date,
+    // not part of the move itself.
     let msg = format!(
-        "📥 Neue Anfrage von {name}, {volume:.1} m³, {from} → {to}. Ich rechne."
+        "📥 Neue Anfrage von {name}, {volume:.1} m³, {from} → {to}. Ich rechne.\n\n\
+         Soll ich vorab eine Besichtigung eintragen? Sag mir einfach das Wunschdatum, dann lege ich sie an."
     );
     let _ = notifier.post(chat_id, msg).await;
     Ok(())
