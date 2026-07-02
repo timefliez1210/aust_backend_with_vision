@@ -42,6 +42,10 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/emails/messages/{id}/discard", post(admin_emails::discard_draft_email))
         .route("/emails/{id}/reply", post(admin_emails::reply_to_thread))
         .route("/emails/compose", post(admin_emails::compose_email))
+        .route(
+            "/emails/messages/{id}/attachments/{idx}",
+            get(admin_emails::download_message_attachment),
+        )
         .route("/users", get(list_users))
         .route("/users/{id}/delete", post(delete_user))
         .route("/orders", get(list_orders))
@@ -69,6 +73,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/invoice-reminders", get(list_invoice_reminders))
         .route("/invoice-reminders/{id}/action", post(invoice_reminder_action))
         .route("/rechnungsausgangsbuch", get(rechnungsausgangsbuch))
+        .route("/rechnungsausgangsbuch/{id}/payment-method", patch(update_payment_method))
         .route("/flash-contacts", get(list_flash_contacts))
         .route("/flash-contacts/{id}/handle", post(handle_flash_contact))
         .route("/settings", get(get_settings))
@@ -1597,7 +1602,7 @@ async fn download_feedback_attachment(
 ///
 /// # Returns
 /// MIME type string; falls back to `"application/octet-stream"` for unknowns.
-fn mime_from_ext(ext: &str) -> &'static str {
+pub(crate) fn mime_from_ext(ext: &str) -> &'static str {
     match ext {
         "png"  => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
@@ -2019,6 +2024,27 @@ async fn rechnungsausgangsbuch(
         .collect();
 
     Ok(Json(items))
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdatePaymentMethodRequest {
+    payment_method: Option<String>,
+}
+
+/// `PATCH /api/v1/admin/rechnungsausgangsbuch/{id}/payment-method` — Set an invoice's payment method.
+///
+/// **Caller**: Admin Rechnungsausgangsbuch page — Zahlungsart cell editor.
+/// **Why**: `payment_method` had no write path; Alex could only ever see "—".
+async fn update_payment_method(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<TokenClaims>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<UpdatePaymentMethodRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&claims)?;
+    let payment_method = body.payment_method.as_deref().filter(|s| !s.trim().is_empty());
+    invoice_repo::update_payment_method(&state.db, id, payment_method).await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 // ── Flash contacts (admin) ─────────────────────────────────────────────────

@@ -126,6 +126,8 @@ async fn main() -> Result<()> {
         }
     };
 
+    let storage_for_email = storage.clone();
+
     // Create app state
     let state = AppState::new(
         config.clone(),
@@ -146,6 +148,7 @@ async fn main() -> Result<()> {
             telegram_config,
             llm_for_email,
             db_for_email,
+            storage_for_email,
             cal_default_capacity,
             cal_alternatives_count,
             cal_search_window_days,

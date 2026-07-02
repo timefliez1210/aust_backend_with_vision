@@ -889,6 +889,8 @@ struct InvoiceContext {
     customer: CustomerRow,
     billing_street: String,
     billing_city: String,
+    service_street: String,
+    service_city: String,
     moving_date: Option<chrono::NaiveDate>,
 }
 
@@ -949,11 +951,38 @@ async fn load_invoice_context(
         })
         .unwrap_or_default();
 
+    // Load origin (service) address for the Auftragsort line (A27).
+    // When billing address differs from the move location, the invoice must show
+    // the service location here, not the billing address.
+    let origin_addr_id = invoice_repo::fetch_origin_address_id(db, inquiry_id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let origin = address_repo::fetch_optional(db, origin_addr_id).await?;
+    let service_street = origin
+        .as_ref()
+        .map(|a| {
+            match a.house_number.as_deref() {
+                Some(hn) if !hn.is_empty() => format!("{} {}", a.street, hn),
+                _ => a.street.clone(),
+            }
+        })
+        .unwrap_or_default();
+    let service_city = origin
+        .as_ref()
+        .map(|a| {
+            let postal = a.postal_code.as_deref().unwrap_or("");
+            let city = a.city.as_str();
+            if postal.is_empty() { city.to_string() } else { format!("{postal} {city}") }
+        })
+        .unwrap_or_default();
+
     Ok(InvoiceContext {
         offer,
         customer,
         billing_street,
         billing_city,
+        service_street,
+        service_city,
         moving_date,
     })
 }
@@ -998,6 +1027,8 @@ fn build_invoice_data_from_items(
         attention_line: Some(ctx.customer.attention_line()).filter(|s| !s.is_empty()),
         billing_street: ctx.billing_street.clone(),
         billing_city: ctx.billing_city.clone(),
+        service_street: ctx.service_street.clone(),
+        service_city: ctx.service_city.clone(),
         offer_number: ctx.offer.offer_number.clone().unwrap_or_default(),
         salutation: ctx.customer.formal_greeting(),
         line_items,

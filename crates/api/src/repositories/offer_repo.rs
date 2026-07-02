@@ -89,8 +89,10 @@ pub(crate) fn build_offer_filename(offer_number: &str, last_name: &str, ext: &st
 
 /// Fetch the active offer's ID and PDF storage key for PDF download.
 ///
-/// **Caller**: `get_inquiry_pdf`
-/// **Why**: Downloads the latest active offer's PDF from S3.
+/// **Caller**: `get_inquiry_pdf`, `admin_emails::fetch_offer_pdf_filename`
+/// **Why**: Downloads the latest active offer's PDF from S3. Excludes `'superseded'`
+/// explicitly (not just via `ORDER BY created_at DESC LIMIT 1`) so correctness doesn't
+/// depend on a superseded row never having a later timestamp than its replacement.
 pub(crate) async fn fetch_active_pdf_key(
     pool: &PgPool,
     inquiry_id: Uuid,
@@ -98,7 +100,7 @@ pub(crate) async fn fetch_active_pdf_key(
     let row: Option<(Uuid, Option<String>)> = sqlx::query_as(
         r#"
         SELECT id, pdf_storage_key FROM offers
-        WHERE inquiry_id = $1 AND status NOT IN ('rejected', 'cancelled')
+        WHERE inquiry_id = $1 AND status NOT IN ('rejected', 'cancelled', 'superseded')
         ORDER BY created_at DESC LIMIT 1
         "#,
     )

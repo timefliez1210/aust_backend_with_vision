@@ -457,6 +457,26 @@ pub async fn insert_test_address_full(
     id
 }
 
+/// Test-only wrapper around the crate-private `inquiry_repo::update_fields`,
+/// exposed so integration tests can exercise the real reschedule code path
+/// (including the stranded-job_date cleanup) without duplicating its SQL.
+pub async fn update_inquiry_scheduled_date(
+    pool: &PgPool,
+    id: uuid::Uuid,
+    scheduled_date: chrono::NaiveDate,
+    end_date: Option<chrono::NaiveDate>,
+) -> Result<(), sqlx::Error> {
+    crate::repositories::inquiry_repo::update_fields(
+        pool, id,
+        None, None, None, None, None, None, None, None,
+        Some(scheduled_date),
+        None, None, None, None, None, None, None, None,
+        Some(end_date),
+        None,
+        chrono::Utc::now(),
+    ).await
+}
+
 /// Insert a test inquiry with full fields and return its ID.
 pub async fn insert_test_inquiry_full(
     pool: &PgPool,

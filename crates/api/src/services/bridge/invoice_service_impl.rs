@@ -120,6 +120,8 @@ impl InvoiceService for InvoiceServiceImpl {
             attention_line: Some(customer.attention_line()).filter(|s| !s.is_empty()),
             billing_street: String::new(),
             billing_city: String::new(),
+            service_street: String::new(),
+            service_city: String::new(),
             offer_number: kva_nr.to_string(),
             salutation: customer.formal_greeting(),
             line_items,

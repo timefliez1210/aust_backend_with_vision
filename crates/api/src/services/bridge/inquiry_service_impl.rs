@@ -93,7 +93,18 @@ impl InquiryService for InquiryServiceImpl {
             Utc::now(),
         )
         .await
-        .map_err(super::map_sqlx)?;
+        .map_err(|e| {
+            // An invalid service_type hits the inquiries_service_type_check CHECK
+            // constraint. Surface a clear German message instead of a raw DB error.
+            if let sqlx::Error::Database(ref db_err) = e
+                && db_err.constraint() == Some("inquiries_service_type_check") {
+                    return ServiceError::Validation(
+                        "Ungültiger service_type. Erlaubt: privatumzug, firmenumzug, seniorenumzug, \
+                         umzugshelfer, montage, haushaltsaufloesung, entruempelung, lagerung.".into(),
+                    );
+                }
+            super::map_sqlx(e)
+        })?;
 
         tx.commit().await.map_err(super::map_sqlx)?;
 

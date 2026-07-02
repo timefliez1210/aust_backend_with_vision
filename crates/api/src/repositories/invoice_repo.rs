@@ -413,6 +413,24 @@ pub(crate) async fn update_invoice_number(
     Ok(())
 }
 
+/// Set (or clear) an invoice's payment method.
+///
+/// **Caller**: `admin::update_payment_method` (Rechnungsausgangsbuch editor)
+/// **Why**: `payment_method` is captured after the fact (Alex notes how the customer
+/// actually paid), so it has no set path at invoice creation time.
+pub(crate) async fn update_payment_method(
+    pool: &PgPool,
+    inv_id: Uuid,
+    payment_method: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE invoices SET payment_method = $1 WHERE id = $2")
+        .bind(payment_method)
+        .bind(inv_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Move `invoice_number_seq` forward so the next generated number is `> seq`.
 ///
 /// **Caller**: `invoices::update_invoice_number`
@@ -580,6 +598,22 @@ pub(crate) async fn resolve_billing_address_id(
     .fetch_optional(pool)
     .await
     .map(|opt: Option<Option<Uuid>>| opt.flatten())
+}
+
+/// Fetch the origin (service) address ID for an inquiry.
+///
+/// **Caller**: `invoices::load_invoice_context` — determines the Auftragsort.
+/// **Why**: The Auftragsort on the invoice (A27) is where the service is performed
+/// (origin address), which may differ from the billing address (Rechnungsadresse).
+pub(crate) async fn fetch_origin_address_id(
+    pool: &PgPool,
+    inquiry_id: Uuid,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    sqlx::query_scalar("SELECT origin_address_id FROM inquiries WHERE id = $1")
+        .bind(inquiry_id)
+        .fetch_optional(pool)
+        .await
+        .map(|opt: Option<Option<Uuid>>| opt.flatten())
 }
 
 /// Fetch the latest offer netto price for an inquiry.

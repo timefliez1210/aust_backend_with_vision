@@ -62,6 +62,8 @@ fn make_invoice_data(line_items: Vec<InvoiceLineItem>, invoice_type: InvoiceType
         attention_line: None,
         billing_street: "Goslarsche Landstr. 6".into(),
         billing_city: "31135 Hildesheim".into(),
+        service_street: String::new(),
+        service_city: String::new(),
         offer_number: "2026-0042".into(),
         salutation: "Sehr geehrter Herr Lindenthal,".into(),
         line_items,
@@ -204,6 +206,8 @@ fn test_legacy_path_base_netto_plus_extras() {
         attention_line: None,
         billing_street: String::new(),
         billing_city: String::new(),
+        service_street: String::new(),
+        service_city: String::new(),
         offer_number: "2026-0042".into(),
         salutation: "Sehr geehrte Damen und Herren,".into(),
         line_items: vec![], // empty → triggers legacy path

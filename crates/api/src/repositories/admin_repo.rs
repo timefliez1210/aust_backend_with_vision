@@ -791,6 +791,7 @@ pub(crate) struct EmailMessageItem {
     pub body_text: Option<String>,
     pub llm_generated: bool,
     pub status: String,
+    pub attachment_keys: Vec<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -801,7 +802,7 @@ pub(crate) async fn fetch_thread_messages(
 ) -> Result<Vec<EmailMessageItem>, sqlx::Error> {
     sqlx::query_as(
         r#"
-        SELECT id, direction, from_address, to_address, subject, body_text, llm_generated, status, created_at
+        SELECT id, direction, from_address, to_address, subject, body_text, llm_generated, status, attachment_keys, created_at
         FROM email_messages
         WHERE thread_id = $1 AND status != 'discarded'
         ORDER BY created_at ASC
@@ -813,6 +814,15 @@ pub(crate) async fn fetch_thread_messages(
 }
 
 /// Fetch draft email with customer email and optional offer PDF.
+///
+/// **Why LATERAL, not a plain JOIN**: a plain `LEFT JOIN offers o ON o.inquiry_id = ...
+/// AND o.status NOT IN ('rejected', 'cancelled')` can match more than one offer row once
+/// `commit_offer_draft` has superseded an old offer and inserted a new one — both rows
+/// pass that filter, `fetch_optional` then takes whichever Postgres returns first with
+/// no ordering, so the PDF actually attached to the sent email could silently be the
+/// stale, superseded one. The LATERAL subquery mirrors `offer_repo::fetch_active_pdf_key`
+/// (excludes 'superseded' too, orders by `created_at DESC LIMIT 1`) so at most one —
+/// the current — offer is ever joined in.
 pub(crate) async fn fetch_draft_for_send(
     pool: &PgPool,
     message_id: Uuid,
@@ -824,8 +834,14 @@ pub(crate) async fn fetch_draft_for_send(
         FROM email_messages em
         JOIN email_threads et ON em.thread_id = et.id
         JOIN customers c ON et.customer_id = c.id
-        LEFT JOIN offers o ON o.inquiry_id = et.inquiry_id
-            AND o.status NOT IN ('rejected', 'cancelled')
+        LEFT JOIN LATERAL (
+            SELECT id, pdf_storage_key
+            FROM offers
+            WHERE offers.inquiry_id = et.inquiry_id
+              AND offers.status NOT IN ('rejected', 'cancelled', 'superseded')
+            ORDER BY offers.created_at DESC
+            LIMIT 1
+        ) o ON true
         WHERE em.id = $1 AND em.status = 'draft'
         "#,
     )
@@ -874,6 +890,19 @@ pub(crate) async fn mark_message_sent(
         .execute(pool)
         .await?;
     Ok(())
+}
+
+/// Fetch the attachment keys stored for a single email message.
+pub(crate) async fn fetch_message_attachment_keys(
+    pool: &PgPool,
+    message_id: Uuid,
+) -> Result<Option<Vec<String>>, sqlx::Error> {
+    let row: Option<(Vec<String>,)> =
+        sqlx::query_as("SELECT attachment_keys FROM email_messages WHERE id = $1")
+            .bind(message_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|(keys,)| keys))
 }
 
 /// Discard a draft email message.

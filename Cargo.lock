@@ -396,6 +396,7 @@ dependencies = [
  "aust-assistant",
  "aust-core",
  "aust-llm-providers",
+ "aust-storage",
  "chrono",
  "futures",
  "lettre",

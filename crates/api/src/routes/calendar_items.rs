@@ -423,7 +423,34 @@ async fn update_item(
     q = q.bind(Utc::now()); // updated_at
     q = q.bind(id);         // WHERE id
 
-    q.execute(&state.db).await?;
+    let mut tx = state.db.begin().await?;
+    q.execute(&mut *tx).await?;
+
+    // Reschedule guard: assignment rows anchored to a job_date outside the
+    // *new* [scheduled_date, end_date] window are stranded leftovers from the
+    // old schedule (2026-06-11 review finding #4 / feedback report 70bccd4f —
+    // moving a Termin's date left the old day's row behind with no way to
+    // remove it). Only prune rows with no recorded work — clock data is
+    // historical fact and must survive a reschedule, same guard as
+    // set_inquiry_crew.
+    if body.scheduled_date.is_some() || update_end_date {
+        sqlx::query(
+            r#"
+            DELETE FROM calendar_item_employees cie
+            USING calendar_items c
+            WHERE cie.calendar_item_id = c.id
+              AND c.id = $1
+              AND cie.clock_in IS NULL AND cie.clock_out IS NULL AND cie.actual_hours IS NULL
+              AND (cie.job_date < c.scheduled_date
+                   OR cie.job_date > COALESCE(c.end_date, c.scheduled_date))
+            "#,
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    tx.commit().await?;
     Ok(Json(calendar_item_repo::fetch_item_row(&state.db, id).await?))
 }
 

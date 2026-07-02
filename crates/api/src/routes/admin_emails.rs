@@ -1,5 +1,7 @@
 use axum::{
     extract::{Path, Query, State},
+    http::header,
+    response::Response,
     Extension, Json,
 };
 use chrono::{DateTime, Utc};
@@ -9,7 +11,8 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use aust_core::models::TokenClaims;
-use crate::repositories::admin_repo;
+use crate::repositories::{admin_repo, offer_repo};
+use crate::routes::admin::mime_from_ext;
 use crate::{ApiError, AppState};
 
 // --- Email Threads ---
@@ -96,6 +99,13 @@ pub(super) struct EmailThreadDetail {
     customer_name: Option<String>,
     inquiry_id: Option<Uuid>,
     subject: Option<String>,
+    /// Filename of the active offer's PDF, if the thread's inquiry has one.
+    ///
+    /// **Why**: `send_draft_email` silently attaches this PDF to outbound
+    /// drafts in the thread (see below). Admins had no way to see *before*
+    /// sending that an attachment would go out — this surfaces it in the UI
+    /// so a draft that says "please find attached..." actually shows one.
+    offer_pdf_filename: Option<String>,
     created_at: DateTime<Utc>,
 }
 
@@ -109,6 +119,7 @@ pub(super) struct EmailMessageItem {
     body_text: Option<String>,
     llm_generated: bool,
     status: String,
+    attachment_keys: Vec<String>,
     created_at: DateTime<Utc>,
 }
 
@@ -136,10 +147,16 @@ pub(super) async fn get_email_thread(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("E-Mail-Thread {id} nicht gefunden")))?;
 
+    let offer_pdf_filename = match repo_thread.inquiry_id {
+        Some(inquiry_id) => fetch_offer_pdf_filename(&state.db, inquiry_id).await?,
+        None => None,
+    };
+
     let thread = EmailThreadDetail {
         id: repo_thread.id, customer_id: repo_thread.customer_id,
         customer_email: repo_thread.customer_email, customer_name: repo_thread.customer_name,
-        inquiry_id: repo_thread.inquiry_id, subject: repo_thread.subject, created_at: repo_thread.created_at,
+        inquiry_id: repo_thread.inquiry_id, subject: repo_thread.subject,
+        offer_pdf_filename, created_at: repo_thread.created_at,
     };
 
     let repo_messages = admin_repo::fetch_thread_messages(&state.db, id).await?;
@@ -148,7 +165,8 @@ pub(super) async fn get_email_thread(
         .map(|m| EmailMessageItem {
             id: m.id, direction: m.direction, from_address: m.from_address,
             to_address: m.to_address, subject: m.subject, body_text: m.body_text,
-            llm_generated: m.llm_generated, status: m.status, created_at: m.created_at,
+            llm_generated: m.llm_generated, status: m.status,
+            attachment_keys: m.attachment_keys, created_at: m.created_at,
         })
         .collect();
 
@@ -445,6 +463,82 @@ pub(super) async fn compose_email(
             "message_id": message_id,
         })),
     ))
+}
+
+/// Resolve the display filename of an inquiry's active offer PDF, if one was generated.
+///
+/// **Caller**: `get_email_thread`
+/// **Why**: Mirrors the PDF lookup `send_draft_email` already does at send-time
+/// (`offer_repo::fetch_active_pdf_key` + `fetch_offer_filename_parts` +
+/// `build_offer_filename`), so the thread view can show the same attachment
+/// before the admin hits "Senden" instead of only after.
+async fn fetch_offer_pdf_filename(
+    pool: &sqlx::PgPool,
+    inquiry_id: Uuid,
+) -> Result<Option<String>, ApiError> {
+    let Some((offer_id, Some(_storage_key))) =
+        offer_repo::fetch_active_pdf_key(pool, inquiry_id).await?
+    else {
+        return Ok(None);
+    };
+
+    let filename = match offer_repo::fetch_offer_filename_parts(pool, offer_id).await? {
+        Some((offer_num, last_name)) => offer_repo::build_offer_filename(&offer_num, &last_name, "pdf"),
+        None => format!("Angebot-{offer_id}.pdf"),
+    };
+    Ok(Some(filename))
+}
+
+/// `GET /api/v1/admin/emails/messages/{id}/attachments/{idx}` — Download one attachment
+/// of an email message by index (admin only).
+///
+/// **Caller**: Admin email thread detail view — attachment preview/download links.
+/// **Why**: Mirrors `download_feedback_attachment` (`routes/admin.rs`) — proxies the
+/// attachment from S3 with the correct content-disposition header rather than exposing
+/// bucket URLs to the frontend.
+///
+/// # Path Parameters
+/// - `id`  — email_message UUID
+/// - `idx` — zero-based attachment index
+///
+/// # Returns
+/// Binary response with `Content-Disposition: attachment` header, or `404`.
+pub(super) async fn download_message_attachment(
+    State(state): State<Arc<AppState>>,
+    Extension(_claims): Extension<TokenClaims>,
+    Path((id, idx)): Path<(Uuid, usize)>,
+) -> Result<Response, ApiError> {
+    let keys = admin_repo::fetch_message_attachment_keys(&state.db, id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Nachricht nicht gefunden.".into()))?;
+
+    let key = keys
+        .get(idx)
+        .ok_or_else(|| ApiError::NotFound("Anhang nicht gefunden.".into()))?;
+
+    let data = state.storage.download(key).await.map_err(|e| match e {
+        aust_storage::StorageError::NotFound(_) => {
+            tracing::warn!("Email attachment not found in storage: {key}");
+            ApiError::NotFound("Anhang nicht gefunden.".into())
+        }
+        _ => {
+            tracing::error!("S3 download for email attachment {key}: {e}");
+            ApiError::NotFound("Anhang konnte nicht abgerufen werden.".into())
+        }
+    })?;
+
+    let filename = key.rsplit('/').next().unwrap_or("attachment");
+    let ext = filename.rsplit('.').next().unwrap_or("bin");
+    let ct = mime_from_ext(ext);
+
+    Ok(Response::builder()
+        .header(header::CONTENT_TYPE, ct)
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{filename}\""),
+        )
+        .body(axum::body::Body::from(data))
+        .unwrap())
 }
 
 /// Send a plain-text email via SMTP using the configured outbound email credentials.

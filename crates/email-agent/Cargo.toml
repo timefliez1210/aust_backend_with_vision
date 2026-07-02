@@ -9,6 +9,7 @@ license.workspace = true
 aust-core = { workspace = true }
 aust-llm-providers = { workspace = true }
 aust-assistant = { workspace = true }
+aust-storage = { workspace = true }
 
 tokio = { workspace = true }
 lettre = { workspace = true }

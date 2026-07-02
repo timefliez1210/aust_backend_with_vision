@@ -36,7 +36,14 @@ impl Tool for CreateInquiry {
             "type": "object",
             "properties": {
                 "customer_id":          { "type": "string", "format": "uuid" },
-                "service_type":         { "type": "string", "description": "z.B. umzug, montage, entrümpelung" },
+                "service_type":         {
+                    "type": "string",
+                    "enum": [
+                        "privatumzug", "firmenumzug", "seniorenumzug", "umzugshelfer",
+                        "montage", "haushaltsaufloesung", "entruempelung", "lagerung"
+                    ],
+                    "description": "Art der Anfrage. Für einen normalen Privatumzug 'privatumzug' verwenden."
+                },
                 "scheduled_date":       { "type": "string", "format": "date" },
                 "estimated_volume_m3":  { "type": "number", "minimum": 0 },
                 "notes":                { "type": "string" },

@@ -94,6 +94,12 @@ pub struct InvoiceData {
     pub billing_street: String,
     /// Billing postal code + city, e.g. `"31135 Hildesheim"` (A11).
     pub billing_city: String,
+    /// Service location (Auftragsort) street + house number (A27).
+    /// Defaults to billing address when empty (most moves: service = billing).
+    pub service_street: String,
+    /// Service location (Auftragsort) postal code + city (A27).
+    /// Defaults to billing city when empty.
+    pub service_city: String,
     /// Offer number used in line item descriptions, e.g. `"2026-0042"`.
     pub offer_number: String,
     /// Formal salutation line, e.g. `"Sehr geehrter Herr Müller,"`.
@@ -353,9 +359,22 @@ fn build_cell_modifications(
     ));
 
     // ── Auftragsort (A27) ──────────────────────────────────────────────────
+    // Auftragsort = place of service (origin address), NOT the billing address.
+    // Fall back to billing address when service address is not set (common case:
+    // most customers are billed at the same address as the move).
+    let service_street = if data.service_street.is_empty() {
+        billing_street.clone()
+    } else {
+        data.service_street.clone()
+    };
+    let service_city = if data.service_city.is_empty() {
+        billing_city.clone()
+    } else {
+        data.service_city.clone()
+    };
     mods.push((
         "A27".into(),
-        CellValue::Text(format!("Auftragsort: {}, {}", billing_street, billing_city)),
+        CellValue::Text(format!("Auftragsort: {}, {}", service_street, service_city)),
     ));
 
     // ── Line items (rows 31–37, columns A-D) ──────────────────────────────
@@ -687,6 +706,8 @@ mod tests {
             attention_line: None,
             billing_street: "Musterstraße 1".into(),
             billing_city: "31135 Hildesheim".into(),
+            service_street: String::new(),
+            service_city: String::new(),
             offer_number: "2026-0042".into(),
             salutation: "Sehr geehrter Herr Mustermann,".into(),
             line_items: vec![
@@ -744,6 +765,8 @@ mod tests {
             attention_line: None,
             billing_street: "Bahnhofstr. 5".into(),
             billing_city: "30159 Hannover".into(),
+            service_street: String::new(),
+            service_city: String::new(),
             offer_number: "2026-0010".into(),
             salutation: "Sehr geehrte Frau Musterfrau,".into(),
             line_items: vec![InvoiceLineItem {
@@ -776,6 +799,8 @@ mod tests {
             attention_line: None,
             billing_street: "Altgasse 7".into(),
             billing_city: "12345 Altstadt".into(),
+            service_street: String::new(),
+            service_city: String::new(),
             offer_number: "2025-0099".into(),
             salutation: "Sehr geehrte Damen und Herren,".into(),
             line_items: vec![], // empty → triggers legacy path
@@ -822,6 +847,8 @@ mod tests {
             attention_line: None,
             billing_street: "Kirchweg 6".into(),
             billing_city: "31162 Bad Salzdetfurth".into(),
+            service_street: String::new(),
+            service_city: String::new(),
             offer_number: "2026-0006".into(),
             salutation: "Sehr geehrter Herr Karge,".into(),
             line_items: vec![

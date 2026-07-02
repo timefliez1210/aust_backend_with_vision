@@ -338,6 +338,7 @@ pub(crate) async fn update_fields(
     has_pauschale: Option<bool>,
     now: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
     sqlx::query(
         r#"
         UPDATE inquiries SET
@@ -392,8 +393,33 @@ pub(crate) async fn update_fields(
     .bind(end_date.flatten())               // $21: value (None = NULL)
     .bind(has_pauschale)                     // $22
     .bind(stop_address_id.is_some())        // $23: update stop_address_id?
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+
+    // Reschedule guard: assignment rows anchored to a job_date outside the
+    // *new* [scheduled_date, end_date] window are stranded leftovers from the
+    // old schedule (2026-06-11 review finding #4 / feedback report 70bccd4f —
+    // moving a job's date left the old day's row behind with no way to remove
+    // it). Only prune rows with no recorded work — clock data is historical
+    // fact and must survive a reschedule, same guard as set_inquiry_crew.
+    if scheduled_date.is_some() || end_date.is_some() {
+        sqlx::query(
+            r#"
+            DELETE FROM inquiry_employees ie
+            USING inquiries i
+            WHERE ie.inquiry_id = i.id
+              AND i.id = $1
+              AND ie.clock_in IS NULL AND ie.clock_out IS NULL AND ie.actual_hours IS NULL
+              AND (ie.job_date < i.scheduled_date
+                   OR ie.job_date > COALESCE(i.end_date, i.scheduled_date))
+            "#,
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    tx.commit().await?;
     Ok(())
 }
 

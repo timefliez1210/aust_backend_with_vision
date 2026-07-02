@@ -5,6 +5,7 @@ use aust_core::config::{EmailConfig, TelegramConfig};
 use chrono::Datelike;
 use aust_core::models::{MovingInquiry, ParsedEmail};
 use aust_assistant::llm::AssistantLlmProvider;
+use aust_storage::StorageProvider;
 use chrono::NaiveDate;
 use sqlx::PgPool;
 use std::collections::HashMap;
@@ -38,6 +39,7 @@ struct PendingCapacityRequest {
 /// Orchestrates: IMAP polling → parsing → LLM draft → Telegram approval → SMTP send.
 pub struct EmailProcessor {
     db: PgPool,
+    storage: Arc<dyn StorageProvider>,
     imap: ImapClient,
     smtp: SmtpClient,
     telegram: Arc<Mutex<TelegramBot>>,
@@ -67,11 +69,14 @@ pub struct EmailProcessor {
 }
 
 impl EmailProcessor {
+    // constructor — one param per external dependency/config the processor needs
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         email_config: EmailConfig,
         telegram_config: TelegramConfig,
         llm: Arc<dyn AssistantLlmProvider>,
         db: PgPool,
+        storage: Arc<dyn StorageProvider>,
         default_capacity: i32,
         alternatives_count: usize,
         search_window_days: i64,
@@ -86,6 +91,7 @@ impl EmailProcessor {
 
         Self {
             db,
+            storage,
             imap,
             smtp,
             telegram: Arc::new(Mutex::new(telegram)),
@@ -214,6 +220,41 @@ impl EmailProcessor {
         }
     }
 
+    /// Upload an inbound email's MIME attachments to object storage.
+    ///
+    /// **Caller**: `store_inbound_email`
+    /// **Why**: Attachments are only ever held in memory during IMAP parsing
+    /// (`ParsedEmail::attachments`); without this they're discarded once the
+    /// message row is written, and the admin dashboard has nothing to link to.
+    /// Upload failures are logged and skipped rather than aborting the whole
+    /// email — a missing attachment shouldn't lose the message text too.
+    async fn store_attachments(
+        &self,
+        thread_id: Uuid,
+        message_id: Uuid,
+        attachments: &[aust_core::models::EmailAttachment],
+    ) -> Vec<String> {
+        let mut keys = Vec::with_capacity(attachments.len());
+        for (idx, att) in attachments.iter().enumerate() {
+            let ext = att
+                .filename
+                .rsplit('.')
+                .next()
+                .filter(|e| e.len() <= 5 && !e.is_empty())
+                .unwrap_or("bin");
+            let key = format!("emails/{thread_id}/{message_id}/{idx}.{ext}");
+            match self
+                .storage
+                .upload(&key, att.data.clone().into(), &att.content_type)
+                .await
+            {
+                Ok(_) => keys.push(key),
+                Err(e) => warn!("Failed to upload email attachment {key}: {e}"),
+            }
+        }
+        keys
+    }
+
     /// Store an inbound email message in the database.
     // repository fn — args mirror DB columns for inbound_emails table
     #[allow(clippy::too_many_arguments)]
@@ -226,6 +267,7 @@ impl EmailProcessor {
         body_text: &str,
         body_html: Option<&str>,
         message_id: &str,
+        attachments: &[aust_core::models::EmailAttachment],
     ) {
         let msg_id = if message_id.is_empty() {
             None
@@ -233,13 +275,16 @@ impl EmailProcessor {
             Some(message_id)
         };
 
+        let db_id = Uuid::now_v7();
+        let attachment_keys = self.store_attachments(thread_id, db_id, attachments).await;
+
         if let Err(e) = sqlx::query(
             r#"
-            INSERT INTO email_messages (id, thread_id, direction, from_address, to_address, subject, body_text, body_html, message_id, llm_generated, created_at)
-            VALUES ($1, $2, 'inbound', $3, $4, $5, $6, $7, $8, false, NOW())
+            INSERT INTO email_messages (id, thread_id, direction, from_address, to_address, subject, body_text, body_html, message_id, llm_generated, attachment_keys, created_at)
+            VALUES ($1, $2, 'inbound', $3, $4, $5, $6, $7, $8, false, $9, NOW())
             "#,
         )
-        .bind(Uuid::now_v7())
+        .bind(db_id)
         .bind(thread_id)
         .bind(from_address)
         .bind(to_address)
@@ -247,6 +292,7 @@ impl EmailProcessor {
         .bind(body_text)
         .bind(body_html)
         .bind(msg_id)
+        .bind(&attachment_keys)
         .execute(&self.db)
         .await
         {
@@ -422,6 +468,7 @@ impl EmailProcessor {
                 &email.body_text,
                 email.body_html.as_deref(),
                 &email.message_id,
+                &email.attachments,
             )
             .await;
         }

@@ -808,3 +808,129 @@ async fn all_valid_inquiry_statuses_accepted(pool: PgPool) {
         assert!(result.is_ok(), "status '{}' must be accepted by CHECK constraint", status);
     }
 }
+
+// ============================================================================
+// Feedback 70bccd4f: rescheduling an inquiry stranded the old job_date's
+// inquiry_employees row (visible as an un-removable "Tag 1" in the multi-day
+// panel). update_fields must now prune assignment rows left outside the new
+// [scheduled_date, end_date] window, but never touch rows with recorded work.
+// ============================================================================
+#[sqlx::test(migrations = "../../migrations")]
+async fn reschedule_prunes_stranded_job_date(pool: PgPool) {
+    let customer_id = test_helpers::insert_test_customer(&pool).await;
+    let origin_id = test_helpers::insert_test_address(&pool, "Musterstr. 1", "Hildesheim", "31134", None, None).await;
+    let dest_id = test_helpers::insert_test_address(&pool, "Zielstr. 5", "Hannover", "30159", None, None).await;
+    let inquiry_id = test_helpers::insert_test_inquiry_full(
+        &pool, customer_id, origin_id, dest_id, "accepted", "termin", None,
+    ).await;
+    let emp_id = test_helpers::insert_test_employee(&pool, "Max", "Mustermann").await;
+
+    let old_date = chrono::NaiveDate::from_ymd_opt(2026, 6, 25).unwrap();
+    let new_date = chrono::NaiveDate::from_ymd_opt(2026, 7, 2).unwrap();
+    sqlx::query("UPDATE inquiries SET scheduled_date = $1 WHERE id = $2")
+        .bind(old_date)
+        .bind(inquiry_id)
+        .execute(&pool)
+        .await
+        .expect("seed scheduled_date");
+    test_helpers::insert_test_inquiry_employee(&pool, inquiry_id, emp_id, old_date, 8.0).await;
+
+    // Reschedule to the new date — this is exactly the "Datum" field save.
+    test_helpers::update_inquiry_scheduled_date(&pool, inquiry_id, new_date, None)
+        .await
+        .expect("update scheduled_date");
+
+    let remaining: Vec<chrono::NaiveDate> =
+        sqlx::query_scalar("SELECT job_date FROM inquiry_employees WHERE inquiry_id = $1")
+            .bind(inquiry_id)
+            .fetch_all(&pool)
+            .await
+            .expect("fetch job_dates");
+    assert!(
+        !remaining.contains(&old_date),
+        "stale job_date {old_date} must be pruned after reschedule, found: {remaining:?}"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn reschedule_preserves_rows_with_recorded_hours(pool: PgPool) {
+    let customer_id = test_helpers::insert_test_customer(&pool).await;
+    let origin_id = test_helpers::insert_test_address(&pool, "Musterstr. 1", "Hildesheim", "31134", None, None).await;
+    let dest_id = test_helpers::insert_test_address(&pool, "Zielstr. 5", "Hannover", "30159", None, None).await;
+    let inquiry_id = test_helpers::insert_test_inquiry_full(
+        &pool, customer_id, origin_id, dest_id, "completed", "termin", None,
+    ).await;
+    let emp_id = test_helpers::insert_test_employee(&pool, "Erika", "Musterfrau").await;
+
+    let old_date = chrono::NaiveDate::from_ymd_opt(2026, 6, 25).unwrap();
+    let new_date = chrono::NaiveDate::from_ymd_opt(2026, 7, 2).unwrap();
+    sqlx::query("UPDATE inquiries SET scheduled_date = $1 WHERE id = $2")
+        .bind(old_date)
+        .bind(inquiry_id)
+        .execute(&pool)
+        .await
+        .expect("seed scheduled_date");
+    test_helpers::insert_test_inquiry_employee(&pool, inquiry_id, emp_id, old_date, 8.0).await;
+    sqlx::query("UPDATE inquiry_employees SET actual_hours = 8.0 WHERE inquiry_id = $1 AND job_date = $2")
+        .bind(inquiry_id)
+        .bind(old_date)
+        .execute(&pool)
+        .await
+        .expect("seed actual_hours");
+
+    test_helpers::update_inquiry_scheduled_date(&pool, inquiry_id, new_date, None)
+        .await
+        .expect("update scheduled_date");
+
+    let remaining: Vec<chrono::NaiveDate> =
+        sqlx::query_scalar("SELECT job_date FROM inquiry_employees WHERE inquiry_id = $1")
+            .bind(inquiry_id)
+            .fetch_all(&pool)
+            .await
+            .expect("fetch job_dates");
+    assert!(
+        remaining.contains(&old_date),
+        "job_date {old_date} carries recorded actual_hours and must survive reschedule, found: {remaining:?}"
+    );
+}
+
+// Same stranded-row bug, but rescheduling *earlier*. On a single-day inquiry
+// (end_date NULL) the prune window is [scheduled_date, scheduled_date]; a NULL
+// end_date must not be read as an open-ended upper bound, or the old (now later)
+// job_date row survives as an un-removable ghost.
+#[sqlx::test(migrations = "../../migrations")]
+async fn reschedule_earlier_prunes_stranded_job_date(pool: PgPool) {
+    let customer_id = test_helpers::insert_test_customer(&pool).await;
+    let origin_id = test_helpers::insert_test_address(&pool, "Musterstr. 1", "Hildesheim", "31134", None, None).await;
+    let dest_id = test_helpers::insert_test_address(&pool, "Zielstr. 5", "Hannover", "30159", None, None).await;
+    let inquiry_id = test_helpers::insert_test_inquiry_full(
+        &pool, customer_id, origin_id, dest_id, "accepted", "termin", None,
+    ).await;
+    let emp_id = test_helpers::insert_test_employee(&pool, "Max", "Mustermann").await;
+
+    let old_date = chrono::NaiveDate::from_ymd_opt(2026, 7, 2).unwrap();
+    let new_date = chrono::NaiveDate::from_ymd_opt(2026, 6, 25).unwrap();
+    sqlx::query("UPDATE inquiries SET scheduled_date = $1 WHERE id = $2")
+        .bind(old_date)
+        .bind(inquiry_id)
+        .execute(&pool)
+        .await
+        .expect("seed scheduled_date");
+    test_helpers::insert_test_inquiry_employee(&pool, inquiry_id, emp_id, old_date, 8.0).await;
+
+    // Reschedule to an *earlier* date.
+    test_helpers::update_inquiry_scheduled_date(&pool, inquiry_id, new_date, None)
+        .await
+        .expect("update scheduled_date");
+
+    let remaining: Vec<chrono::NaiveDate> =
+        sqlx::query_scalar("SELECT job_date FROM inquiry_employees WHERE inquiry_id = $1")
+            .bind(inquiry_id)
+            .fetch_all(&pool)
+            .await
+            .expect("fetch job_dates");
+    assert!(
+        !remaining.contains(&old_date),
+        "stale job_date {old_date} must be pruned after rescheduling earlier, found: {remaining:?}"
+    );
+}

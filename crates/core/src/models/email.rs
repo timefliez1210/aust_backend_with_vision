@@ -54,6 +54,9 @@ pub struct EmailMessage {
     pub message_id: Option<String>,
     /// `true` when the body was written by the LLM rather than a human.
     pub llm_generated: bool,
+    /// S3 storage keys of MIME attachments carried by this message, in the
+    /// order they appeared in the original email. Empty for most messages.
+    pub attachment_keys: Vec<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -73,6 +76,8 @@ pub struct CreateEmailMessage {
     pub message_id: Option<String>,
     /// Set to `true` when the body was produced by the LLM responder.
     pub llm_generated: bool,
+    /// S3 storage keys of MIME attachments already uploaded by the caller.
+    pub attachment_keys: Vec<String>,
 }
 
 /// A structured representation of a raw email fetched from IMAP.
