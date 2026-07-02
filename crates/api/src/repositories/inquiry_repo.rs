@@ -339,6 +339,20 @@ pub(crate) async fn update_fields(
     now: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
+
+    // Capture the pre-update start date so a reschedule can translate the crew
+    // by the same delta the job moves (see the assignment shift below).
+    let old_scheduled_date: Option<NaiveDate> = if scheduled_date.is_some() {
+        let row: Option<Option<NaiveDate>> =
+            sqlx::query_scalar("SELECT scheduled_date FROM inquiries WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        row.flatten()
+    } else {
+        None
+    };
+
     sqlx::query(
         r#"
         UPDATE inquiries SET
@@ -396,27 +410,91 @@ pub(crate) async fn update_fields(
     .execute(&mut *tx)
     .await?;
 
-    // Reschedule guard: assignment rows anchored to a job_date outside the
-    // *new* [scheduled_date, end_date] window are stranded leftovers from the
-    // old schedule (2026-06-11 review finding #4 / feedback report 70bccd4f —
-    // moving a job's date left the old day's row behind with no way to remove
-    // it). Only prune rows with no recorded work — clock data is historical
-    // fact and must survive a reschedule, same guard as set_inquiry_crew.
-    if scheduled_date.is_some() || end_date.is_some() {
-        sqlx::query(
-            r#"
-            DELETE FROM inquiry_employees ie
-            USING inquiries i
-            WHERE ie.inquiry_id = i.id
-              AND i.id = $1
-              AND ie.clock_in IS NULL AND ie.clock_out IS NULL AND ie.actual_hours IS NULL
-              AND (ie.job_date < i.scheduled_date
-                   OR ie.job_date > COALESCE(i.end_date, i.scheduled_date))
-            "#,
-        )
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
+    // Reschedule: the crew must travel with the job when its date moves
+    // (feedback report 70bccd4f / 2026-06-11 review finding #4). Moving
+    // `scheduled_date` translates the whole window — the UPDATE above shifts
+    // `end_date` by the same delta — so we shift every assignment row that has
+    // no recorded work by that same delta and the crew lands on the
+    // corresponding new day. (The earlier fix merely deleted the stranded old
+    // row, which cleaned up the ghost but silently dropped the assignment.)
+    //
+    // Done as stash → delete → re-insert in three separate statements, not one
+    // data-modifying CTE: a CTE's sub-statements share one snapshot and can't
+    // see each other's effects, so a small overlapping shift (e.g. a 2-day job
+    // moved by 1 day: Mon,Tue → Tue,Wed) would trip the
+    // (inquiry_id, employee_id, job_date) unique index. Separate statements
+    // each see the prior one's effect. A shifted row landing outside the new
+    // window (only possible when end_date was also edited explicitly) is
+    // dropped; a collision with a surviving recorded-work row is skipped
+    // (ON CONFLICT). Recorded work (clock_in/out or actual_hours) is historical
+    // fact: it never moves and is never deleted.
+    match (scheduled_date, old_scheduled_date) {
+        (Some(new_sd), Some(old_sd)) if new_sd != old_sd => {
+            sqlx::query(
+                r#"
+                CREATE TEMP TABLE _moved_crew ON COMMIT DROP AS
+                SELECT id, inquiry_id, employee_id, job_date,
+                       planned_hours, notes, start_time, end_time, break_minutes
+                FROM inquiry_employees
+                WHERE inquiry_id = $1
+                  AND clock_in IS NULL AND clock_out IS NULL AND actual_hours IS NULL
+                "#,
+            )
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                r#"
+                DELETE FROM inquiry_employees
+                WHERE inquiry_id = $1
+                  AND clock_in IS NULL AND clock_out IS NULL AND actual_hours IS NULL
+                "#,
+            )
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                r#"
+                INSERT INTO inquiry_employees
+                    (id, inquiry_id, employee_id, job_date,
+                     planned_hours, notes, start_time, end_time, break_minutes)
+                SELECT m.id, m.inquiry_id, m.employee_id,
+                       m.job_date + ($2::date - $3::date),
+                       m.planned_hours, m.notes, m.start_time, m.end_time, m.break_minutes
+                FROM _moved_crew m
+                JOIN inquiries i ON i.id = m.inquiry_id
+                WHERE m.job_date + ($2::date - $3::date)
+                      BETWEEN i.scheduled_date AND COALESCE(i.end_date, i.scheduled_date)
+                ON CONFLICT (inquiry_id, employee_id, job_date) DO NOTHING
+                "#,
+            )
+            .bind(id)
+            .bind(new_sd)
+            .bind(old_sd)
+            .execute(&mut *tx)
+            .await?;
+        }
+        // Only the end date changed (window resized without moving the start),
+        // or the start was set for the first time: keep in-window crew, drop
+        // no-work rows now outside the window. Recorded work is untouched.
+        _ if scheduled_date.is_some() || end_date.is_some() => {
+            sqlx::query(
+                r#"
+                DELETE FROM inquiry_employees ie
+                USING inquiries i
+                WHERE ie.inquiry_id = i.id AND i.id = $1
+                  AND ie.clock_in IS NULL AND ie.clock_out IS NULL AND ie.actual_hours IS NULL
+                  AND (ie.job_date < i.scheduled_date
+                       OR ie.job_date > COALESCE(i.end_date, i.scheduled_date))
+                "#,
+            )
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        _ => {}
     }
 
     tx.commit().await?;

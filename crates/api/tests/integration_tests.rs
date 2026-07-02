@@ -812,11 +812,12 @@ async fn all_valid_inquiry_statuses_accepted(pool: PgPool) {
 // ============================================================================
 // Feedback 70bccd4f: rescheduling an inquiry stranded the old job_date's
 // inquiry_employees row (visible as an un-removable "Tag 1" in the multi-day
-// panel). update_fields must now prune assignment rows left outside the new
-// [scheduled_date, end_date] window, but never touch rows with recorded work.
+// panel). The crew must now *travel with the job*: update_fields shifts
+// assignment rows by the same delta the job moves, leaving no ghost on the old
+// day and no gap on the new one, while never touching rows with recorded work.
 // ============================================================================
 #[sqlx::test(migrations = "../../migrations")]
-async fn reschedule_prunes_stranded_job_date(pool: PgPool) {
+async fn reschedule_moves_crew_forward(pool: PgPool) {
     let customer_id = test_helpers::insert_test_customer(&pool).await;
     let origin_id = test_helpers::insert_test_address(&pool, "Musterstr. 1", "Hildesheim", "31134", None, None).await;
     let dest_id = test_helpers::insert_test_address(&pool, "Zielstr. 5", "Hannover", "30159", None, None).await;
@@ -846,9 +847,10 @@ async fn reschedule_prunes_stranded_job_date(pool: PgPool) {
             .fetch_all(&pool)
             .await
             .expect("fetch job_dates");
-    assert!(
-        !remaining.contains(&old_date),
-        "stale job_date {old_date} must be pruned after reschedule, found: {remaining:?}"
+    assert_eq!(
+        remaining,
+        vec![new_date],
+        "crew must follow the job to {new_date} (no ghost on {old_date}, no gap on the new day), found: {remaining:?}"
     );
 }
 
@@ -894,12 +896,12 @@ async fn reschedule_preserves_rows_with_recorded_hours(pool: PgPool) {
     );
 }
 
-// Same stranded-row bug, but rescheduling *earlier*. On a single-day inquiry
-// (end_date NULL) the prune window is [scheduled_date, scheduled_date]; a NULL
-// end_date must not be read as an open-ended upper bound, or the old (now later)
-// job_date row survives as an un-removable ghost.
+// Same move, rescheduling *earlier*. On a single-day inquiry (end_date NULL) the
+// window is [scheduled_date, scheduled_date]; a NULL end_date must not be read as
+// an open-ended upper bound, or the crew fails to move and the old (now later)
+// row survives as an un-removable ghost.
 #[sqlx::test(migrations = "../../migrations")]
-async fn reschedule_earlier_prunes_stranded_job_date(pool: PgPool) {
+async fn reschedule_moves_crew_earlier(pool: PgPool) {
     let customer_id = test_helpers::insert_test_customer(&pool).await;
     let origin_id = test_helpers::insert_test_address(&pool, "Musterstr. 1", "Hildesheim", "31134", None, None).await;
     let dest_id = test_helpers::insert_test_address(&pool, "Zielstr. 5", "Hannover", "30159", None, None).await;
@@ -929,8 +931,57 @@ async fn reschedule_earlier_prunes_stranded_job_date(pool: PgPool) {
             .fetch_all(&pool)
             .await
             .expect("fetch job_dates");
-    assert!(
-        !remaining.contains(&old_date),
-        "stale job_date {old_date} must be pruned after rescheduling earlier, found: {remaining:?}"
+    assert_eq!(
+        remaining,
+        vec![new_date],
+        "crew must follow the job to the earlier {new_date}, found: {remaining:?}"
+    );
+}
+
+// Multi-day translate with an *overlapping* shift: a 2-day job (Mon,Tue) moved
+// one day later becomes (Tue,Wed). The old Tue row's target (Wed) and the old
+// Mon row's target (Tue) overlap the still-present source rows, which is exactly
+// the case a single DELETE→INSERT CTE would fail on with a unique-constraint
+// violation. Both crew days must survive on the shifted dates.
+#[sqlx::test(migrations = "../../migrations")]
+async fn reschedule_moves_multiday_crew_overlapping(pool: PgPool) {
+    let customer_id = test_helpers::insert_test_customer(&pool).await;
+    let origin_id = test_helpers::insert_test_address(&pool, "Musterstr. 1", "Hildesheim", "31134", None, None).await;
+    let dest_id = test_helpers::insert_test_address(&pool, "Zielstr. 5", "Hannover", "30159", None, None).await;
+    let inquiry_id = test_helpers::insert_test_inquiry_full(
+        &pool, customer_id, origin_id, dest_id, "accepted", "termin", None,
+    ).await;
+    let emp_id = test_helpers::insert_test_employee(&pool, "Max", "Mustermann").await;
+
+    let day1 = chrono::NaiveDate::from_ymd_opt(2026, 6, 22).unwrap(); // Mon
+    let day2 = chrono::NaiveDate::from_ymd_opt(2026, 6, 23).unwrap(); // Tue
+    let new1 = chrono::NaiveDate::from_ymd_opt(2026, 6, 23).unwrap(); // Tue
+    let new2 = chrono::NaiveDate::from_ymd_opt(2026, 6, 24).unwrap(); // Wed
+    sqlx::query("UPDATE inquiries SET scheduled_date = $1, end_date = $2 WHERE id = $3")
+        .bind(day1)
+        .bind(day2)
+        .bind(inquiry_id)
+        .execute(&pool)
+        .await
+        .expect("seed 2-day window");
+    test_helpers::insert_test_inquiry_employee(&pool, inquiry_id, emp_id, day1, 8.0).await;
+    test_helpers::insert_test_inquiry_employee(&pool, inquiry_id, emp_id, day2, 8.0).await;
+
+    // Move the whole 2-day job one day later.
+    test_helpers::update_inquiry_scheduled_date(&pool, inquiry_id, new1, Some(new2))
+        .await
+        .expect("reschedule 2-day job");
+
+    let mut remaining: Vec<chrono::NaiveDate> =
+        sqlx::query_scalar("SELECT job_date FROM inquiry_employees WHERE inquiry_id = $1 ORDER BY job_date")
+            .bind(inquiry_id)
+            .fetch_all(&pool)
+            .await
+            .expect("fetch job_dates");
+    remaining.sort();
+    assert_eq!(
+        remaining,
+        vec![new1, new2],
+        "both crew days must shift to the new window with no unique-constraint failure, found: {remaining:?}"
     );
 }

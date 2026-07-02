@@ -424,30 +424,101 @@ async fn update_item(
     q = q.bind(id);         // WHERE id
 
     let mut tx = state.db.begin().await?;
+
+    // Capture the pre-update start date so a reschedule can translate the crew
+    // by the same delta the Termin moves (see the assignment shift below).
+    let old_scheduled_date: Option<NaiveDate> = if body.scheduled_date.is_some() {
+        let row: Option<Option<NaiveDate>> =
+            sqlx::query_scalar("SELECT scheduled_date FROM calendar_items WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        row.flatten()
+    } else {
+        None
+    };
+
     q.execute(&mut *tx).await?;
 
-    // Reschedule guard: assignment rows anchored to a job_date outside the
-    // *new* [scheduled_date, end_date] window are stranded leftovers from the
-    // old schedule (2026-06-11 review finding #4 / feedback report 70bccd4f —
-    // moving a Termin's date left the old day's row behind with no way to
-    // remove it). Only prune rows with no recorded work — clock data is
-    // historical fact and must survive a reschedule, same guard as
-    // set_inquiry_crew.
-    if body.scheduled_date.is_some() || update_end_date {
-        sqlx::query(
-            r#"
-            DELETE FROM calendar_item_employees cie
-            USING calendar_items c
-            WHERE cie.calendar_item_id = c.id
-              AND c.id = $1
-              AND cie.clock_in IS NULL AND cie.clock_out IS NULL AND cie.actual_hours IS NULL
-              AND (cie.job_date < c.scheduled_date
-                   OR cie.job_date > COALESCE(c.end_date, c.scheduled_date))
-            "#,
-        )
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
+    // Reschedule: the crew must travel with the Termin when its date moves
+    // (feedback report 70bccd4f / 2026-06-11 review finding #4). Shift every
+    // assignment row with no recorded work by the move delta so the crew lands
+    // on the corresponding new day, instead of being stranded on the old day
+    // (the earlier fix merely deleted the stranded row, dropping the crew).
+    //
+    // Stash → delete → re-insert in three separate statements, not one CTE: a
+    // CTE's sub-statements share one snapshot, so a small overlapping shift
+    // (2-day Termin moved by 1 day) would trip the
+    // (calendar_item_id, employee_id, job_date) unique index. A shifted row
+    // outside the new window is dropped; a collision with recorded work is
+    // skipped. Recorded work never moves and is never deleted. See the mirror
+    // in `inquiry_repo::update_fields`.
+    match (body.scheduled_date, old_scheduled_date) {
+        (Some(new_sd), Some(old_sd)) if new_sd != old_sd => {
+            sqlx::query(
+                r#"
+                CREATE TEMP TABLE _moved_cal_crew ON COMMIT DROP AS
+                SELECT id, calendar_item_id, employee_id, job_date,
+                       planned_hours, notes, start_time, end_time, break_minutes
+                FROM calendar_item_employees
+                WHERE calendar_item_id = $1
+                  AND clock_in IS NULL AND clock_out IS NULL AND actual_hours IS NULL
+                "#,
+            )
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                r#"
+                DELETE FROM calendar_item_employees
+                WHERE calendar_item_id = $1
+                  AND clock_in IS NULL AND clock_out IS NULL AND actual_hours IS NULL
+                "#,
+            )
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                r#"
+                INSERT INTO calendar_item_employees
+                    (id, calendar_item_id, employee_id, job_date,
+                     planned_hours, notes, start_time, end_time, break_minutes)
+                SELECT m.id, m.calendar_item_id, m.employee_id,
+                       m.job_date + ($2::date - $3::date),
+                       m.planned_hours, m.notes, m.start_time, m.end_time, m.break_minutes
+                FROM _moved_cal_crew m
+                JOIN calendar_items c ON c.id = m.calendar_item_id
+                WHERE m.job_date + ($2::date - $3::date)
+                      BETWEEN c.scheduled_date AND COALESCE(c.end_date, c.scheduled_date)
+                ON CONFLICT (calendar_item_id, employee_id, job_date) DO NOTHING
+                "#,
+            )
+            .bind(id)
+            .bind(new_sd)
+            .bind(old_sd)
+            .execute(&mut *tx)
+            .await?;
+        }
+        // Only the end date changed, or the start was set for the first time:
+        // keep in-window crew, drop no-work rows now outside the window.
+        _ if body.scheduled_date.is_some() || update_end_date => {
+            sqlx::query(
+                r#"
+                DELETE FROM calendar_item_employees cie
+                USING calendar_items c
+                WHERE cie.calendar_item_id = c.id AND c.id = $1
+                  AND cie.clock_in IS NULL AND cie.clock_out IS NULL AND cie.actual_hours IS NULL
+                  AND (cie.job_date < c.scheduled_date
+                       OR cie.job_date > COALESCE(c.end_date, c.scheduled_date))
+                "#,
+            )
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        _ => {}
     }
 
     tx.commit().await?;
