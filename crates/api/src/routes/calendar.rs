@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::repositories::calendar_repo;
+use crate::repositories::{calendar_repo, inquiry_appointment_repo};
 use crate::{ApiError, AppState};
 
 pub fn router() -> Router<Arc<AppState>> {
@@ -86,6 +86,23 @@ struct ScheduleCalendarItem {
     description: Option<String>,
 }
 
+/// A lightweight appointment (Besichtigung etc.) rendered on the calendar,
+/// linked back to its inquiry so it shows connected to the job.
+#[derive(Debug, Serialize)]
+struct ScheduleAppointment {
+    appointment_id: Uuid,
+    inquiry_id: Uuid,
+    kind: String,
+    customer_name: Option<String>,
+    start_time: Option<NaiveTime>,
+    end_time: Option<NaiveTime>,
+    assignee_name: Option<String>,
+    location: Option<String>,
+    notes: Option<String>,
+    status: String,
+    scheduled_date: NaiveDate,
+}
+
 #[derive(Debug, Serialize)]
 struct ScheduleEntry {
     date: NaiveDate,
@@ -95,6 +112,7 @@ struct ScheduleEntry {
     remaining: i32,
     inquiries: Vec<ScheduleInquiry>,
     calendar_items: Vec<ScheduleCalendarItem>,
+    appointments: Vec<ScheduleAppointment>,
 }
 
 #[derive(Debug, Serialize, Deserialize, FromRow)]
@@ -350,12 +368,35 @@ async fn get_schedule(
         });
     }
 
+    let appointment_rows =
+        inquiry_appointment_repo::fetch_for_schedule_range(&state.db, query.from, query.to)
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    let mut appointment_map: HashMap<NaiveDate, Vec<ScheduleAppointment>> = HashMap::new();
+    for r in appointment_rows {
+        appointment_map.entry(r.scheduled_date).or_default().push(ScheduleAppointment {
+            appointment_id: r.id,
+            inquiry_id: r.inquiry_id,
+            kind: r.kind,
+            customer_name: r.customer_name,
+            start_time: r.start_time,
+            end_time: r.end_time,
+            assignee_name: r.assignee_name,
+            location: r.location,
+            notes: r.notes,
+            status: r.status,
+            scheduled_date: r.scheduled_date,
+        });
+    }
+
     let mut entries = Vec::new();
     let mut current = query.from;
     while current <= query.to {
         let capacity = override_map.get(&current).copied().unwrap_or(default_capacity);
         let day_inquiries = inquiry_map.remove(&current).unwrap_or_default();
         let day_cal_items = cal_item_map.remove(&current).unwrap_or_default();
+        let day_appointments = appointment_map.remove(&current).unwrap_or_default();
         let booked = day_inquiries.len() as i32;
         let remaining = (capacity - booked).max(0);
 
@@ -367,6 +408,7 @@ async fn get_schedule(
             remaining,
             inquiries: day_inquiries,
             calendar_items: day_cal_items,
+            appointments: day_appointments,
         });
         current = current.succ_opt().unwrap();
     }

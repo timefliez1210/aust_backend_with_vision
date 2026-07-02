@@ -13,6 +13,7 @@ pub mod flash_contact;
 pub mod health;
 pub mod inquiries;
 pub mod inquiry_actions;
+pub mod inquiry_appointments;
 pub mod invoices;
 pub mod offers;
 pub(crate) mod shared;

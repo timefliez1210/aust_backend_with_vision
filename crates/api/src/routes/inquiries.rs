@@ -62,6 +62,7 @@ pub fn router() -> Router<Arc<AppState>> {
                 .delete(remove_assignment),
         )
         .route("/{id}/employees/{emp_id}/travel-expenses", get(generate_travel_expenses))
+        .merge(super::inquiry_appointments::router())
         .merge(super::invoices::router())
 }
 

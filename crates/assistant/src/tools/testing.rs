@@ -67,6 +67,7 @@ impl InquiryService for MockInquiryService {
             end_date: None,
             is_multi_day: false,
             has_pauschale: false,
+            appointments: vec![],
         })
     }
 

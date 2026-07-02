@@ -90,6 +90,36 @@ pub struct InquiryResponse {
     pub is_multi_day: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub has_pauschale: bool,
+    /// Lightweight appointments linked to this inquiry on their own (possibly
+    /// non-consecutive) dates — e.g. a Besichtigung before the move. Distinct
+    /// from the move's contiguous day range and from crew/hours tracking.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub appointments: Vec<AppointmentSnapshot>,
+}
+
+/// A single lightweight appointment attached to an inquiry (Besichtigung, etc.).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppointmentSnapshot {
+    pub id: Uuid,
+    /// Free-text kind, e.g. `"besichtigung"`. Default on creation.
+    pub kind: String,
+    pub scheduled_date: NaiveDate,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_time: Option<NaiveTime>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_time: Option<NaiveTime>,
+    /// Optional single assignee (the person doing the visit).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assignee_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assignee_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+    /// `scheduled` | `done` | `cancelled`.
+    pub status: String,
+    pub created_at: DateTime<Utc>,
 }
 
 /// Summary item for list endpoints.

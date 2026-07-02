@@ -7,13 +7,14 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use aust_core::models::{
-    AddressSnapshot, CustomerSnapshot, EmployeeAssignmentSnapshot, EstimationSnapshot,
-    InquiryListItem, InquiryResponse, InquiryStatus, ItemSnapshot,
+    AddressSnapshot, AppointmentSnapshot, CustomerSnapshot, EmployeeAssignmentSnapshot,
+    EstimationSnapshot, InquiryListItem, InquiryResponse, InquiryStatus, ItemSnapshot,
     LineItemSnapshot, OfferSnapshot, Services,
 };
 
 use crate::repositories::{
-    address_repo, customer_repo, estimation_repo, inquiry_repo, offer_repo,
+    address_repo, customer_repo, estimation_repo, inquiry_appointment_repo, inquiry_repo,
+    offer_repo,
 };
 use crate::services::offer_builder::{parse_detected_items, VolumeEstimationRow};
 use crate::types::resolve_billing_address_id;
@@ -271,6 +272,11 @@ pub async fn build_inquiry_response(
         })
         .collect();
 
+    // 6b. Fetch linked appointments (Besichtigung etc.) on their own dates.
+    let appointment_rows = inquiry_appointment_repo::list_for_inquiry(pool, inquiry_id).await?;
+    let appointments: Vec<AppointmentSnapshot> =
+        appointment_rows.into_iter().map(appointment_snapshot).collect();
+
     let end_date = row.end_date;
     let is_multi_day = end_date.is_some_and(|ed| row.scheduled_date.is_some_and(|sd| ed > sd));
 
@@ -326,6 +332,7 @@ pub async fn build_inquiry_response(
         end_date,
         is_multi_day,
         has_pauschale: row.has_pauschale,
+        appointments,
     })
 }
 
@@ -427,6 +434,27 @@ fn parse_quantity_prefix(name: &str, total_volume_m3: f64) -> (String, i64, f64)
             }
     }
     (name.to_string(), 1, total_volume_m3)
+}
+
+/// Map an appointment repo row to its API snapshot.
+///
+/// **Caller**: `build_inquiry_response`, `routes::inquiry_appointments`.
+pub fn appointment_snapshot(
+    a: inquiry_appointment_repo::AppointmentRow,
+) -> AppointmentSnapshot {
+    AppointmentSnapshot {
+        id: a.id,
+        kind: a.kind,
+        scheduled_date: a.scheduled_date,
+        start_time: a.start_time,
+        end_time: a.end_time,
+        assignee_id: a.assignee_id,
+        assignee_name: a.assignee_name,
+        location: a.location,
+        notes: a.notes,
+        status: a.status,
+        created_at: a.created_at,
+    }
 }
 
 /// Fetch an address row and convert to snapshot, if the ID is present.
