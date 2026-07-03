@@ -9,10 +9,15 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use aust_core::models::{AddressSnapshot, TokenClaims};
-use crate::repositories::{address_repo, admin_repo};
+use crate::repositories::{address_repo, admin_repo, customer_address_repo};
 use crate::{ApiError, AppState};
 
 use super::admin::require_admin;
+
+/// Trim an optional string, collapsing empty/whitespace-only values to `None`.
+fn trim_opt(v: Option<&str>) -> Option<&str> {
+    v.map(str::trim).filter(|s| !s.is_empty())
+}
 
 // --- Customers ---
 
@@ -99,6 +104,49 @@ pub(super) struct CustomerDetailResponse {
     quotes: Vec<CustomerQuote>,
     offers: Vec<CustomerOffer>,
     termine: Vec<CustomerTermin>,
+    /// The customer's reusable address book (known addresses), most-recent first.
+    addresses: Vec<CustomerAddressItem>,
+}
+
+/// A single known-address entry surfaced in the admin customer view and used to
+/// pre-fill the inquiry-create address picker.
+#[derive(Debug, Serialize)]
+pub(super) struct CustomerAddressItem {
+    id: Uuid,
+    street: String,
+    house_number: Option<String>,
+    postal_code: Option<String>,
+    city: String,
+    country: String,
+    floor: Option<String>,
+    elevator: Option<bool>,
+    parking_ban: bool,
+    latitude: Option<f64>,
+    longitude: Option<f64>,
+    label: Option<String>,
+    source: String,
+    last_used_at: DateTime<Utc>,
+}
+
+impl From<customer_address_repo::CustomerAddressRow> for CustomerAddressItem {
+    fn from(a: customer_address_repo::CustomerAddressRow) -> Self {
+        CustomerAddressItem {
+            id: a.id,
+            street: a.street,
+            house_number: a.house_number,
+            postal_code: a.postal_code,
+            city: a.city,
+            country: a.country,
+            floor: a.floor,
+            elevator: a.elevator,
+            parking_ban: a.parking_ban,
+            latitude: a.latitude,
+            longitude: a.longitude,
+            label: a.label,
+            source: a.source,
+            last_used_at: a.last_used_at,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -182,6 +230,12 @@ pub(super) async fn get_customer(
         })
         .collect();
 
+    let addresses: Vec<CustomerAddressItem> = customer_address_repo::list_for_customer(&state.db, id)
+        .await?
+        .into_iter()
+        .map(CustomerAddressItem::from)
+        .collect();
+
     let billing_address = if let Some(addr_id) = repo_customer.billing_address_id {
         address_repo::fetch_full(&state.db, addr_id).await?.map(|a| AddressSnapshot {
             id: a.id,
@@ -218,6 +272,7 @@ pub(super) async fn get_customer(
         quotes,
         offers,
         termine,
+        addresses,
     }))
 }
 
@@ -281,6 +336,20 @@ pub(super) async fn update_customer(
                 addr.parking_ban,
             )
             .await?;
+            // Harvest into the customer's address book (best-effort).
+            if let Err(e) = customer_address_repo::upsert(
+                &state.db, id, &street,
+                trim_opt(addr.house_number.as_deref()),
+                trim_opt(addr.postal_code.as_deref()),
+                &city, None,
+                trim_opt(addr.floor.as_deref()), addr.elevator,
+                addr.parking_ban.unwrap_or(false),
+                None, None, None, "manual", Utc::now(),
+            )
+            .await
+            {
+                tracing::warn!(customer_id = %id, error = %e, "failed to harvest billing address into customer book");
+            }
             Some(aid)
         } else {
             request.billing_address_id
@@ -442,6 +511,111 @@ pub(super) async fn delete_customer(
         return Err(ApiError::NotFound(format!("Kunde {id} nicht gefunden")));
     }
     tracing::info!(admin = %claims.sub, customer_id = %id, "Admin deleted customer");
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+// --- Customer address book ---
+
+/// `GET /api/v1/admin/customers/{id}/addresses` — List a customer's known addresses.
+///
+/// **Caller**: Admin dashboard customer view; inquiry-create address picker.
+/// **Why**: Standalone list endpoint (the detail response also embeds it) so the
+/// calendar/inquiry create flows can fetch a customer's book on demand.
+pub(super) async fn list_customer_addresses(
+    State(state): State<Arc<AppState>>,
+    Extension(_claims): Extension<TokenClaims>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Vec<CustomerAddressItem>>, ApiError> {
+    let addresses = customer_address_repo::list_for_customer(&state.db, id)
+        .await?
+        .into_iter()
+        .map(CustomerAddressItem::from)
+        .collect();
+    Ok(Json(addresses))
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct AddCustomerAddressRequest {
+    street: Option<String>,
+    house_number: Option<String>,
+    postal_code: Option<String>,
+    city: Option<String>,
+    country: Option<String>,
+    floor: Option<String>,
+    elevator: Option<bool>,
+    parking_ban: Option<bool>,
+    label: Option<String>,
+}
+
+/// `POST /api/v1/admin/customers/{id}/addresses` — Manually add a known address.
+///
+/// **Caller**: Admin dashboard "Adresse hinzufügen" form on the customer view.
+/// **Why**: Lets the admin record addresses (from old jobs, phone calls,
+/// correspondence) for customers that may have no inquiry yet. Dedup-aware:
+/// re-adding an existing address refreshes it instead of duplicating.
+pub(super) async fn add_customer_address(
+    State(state): State<Arc<AppState>>,
+    Extension(_claims): Extension<TokenClaims>,
+    Path(id): Path<Uuid>,
+    Json(request): Json<AddCustomerAddressRequest>,
+) -> Result<(axum::http::StatusCode, Json<CustomerAddressItem>), ApiError> {
+    // Customer must exist (FK would reject anyway, but give a clean 404).
+    if !crate::repositories::customer_repo::exists(&state.db, id).await? {
+        return Err(ApiError::NotFound(format!("Kunde {id} nicht gefunden")));
+    }
+
+    let street = trim_opt(request.street.as_deref());
+    let city = trim_opt(request.city.as_deref());
+    let (street, city) = match (street, city) {
+        (Some(s), Some(c)) => (s, c),
+        _ => return Err(ApiError::Validation("Straße und Ort sind erforderlich".into())),
+    };
+
+    let new_id = customer_address_repo::upsert(
+        &state.db,
+        id,
+        street,
+        trim_opt(request.house_number.as_deref()),
+        trim_opt(request.postal_code.as_deref()),
+        city,
+        trim_opt(request.country.as_deref()),
+        trim_opt(request.floor.as_deref()),
+        request.elevator,
+        request.parking_ban.unwrap_or(false),
+        None,
+        None,
+        trim_opt(request.label.as_deref()),
+        "manual",
+        Utc::now(),
+    )
+    .await?;
+
+    // Return the persisted row (upsert may have matched an existing entry).
+    let item = customer_address_repo::list_for_customer(&state.db, id)
+        .await?
+        .into_iter()
+        .find(|a| a.id == new_id)
+        .map(CustomerAddressItem::from)
+        .ok_or_else(|| ApiError::Internal("Adresse konnte nicht gespeichert werden".into()))?;
+
+    Ok((axum::http::StatusCode::CREATED, Json(item)))
+}
+
+/// `POST /api/v1/admin/customers/{id}/addresses/{addr_id}/delete` — Remove a
+/// known address from a customer's book.
+///
+/// **Caller**: Admin dashboard customer view.
+/// **Why**: Prune stale/incorrect addresses. Scoped to the customer so the
+/// address_id alone can't reach another customer's entry.
+pub(super) async fn delete_customer_address(
+    State(state): State<Arc<AppState>>,
+    Extension(_claims): Extension<TokenClaims>,
+    Path((id, addr_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let rows = customer_address_repo::delete(&state.db, id, addr_id).await?;
+    if rows == 0 {
+        return Err(ApiError::NotFound(format!("Adresse {addr_id} nicht gefunden")));
+    }
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 

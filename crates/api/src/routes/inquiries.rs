@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::repositories::{address_repo, calendar_repo, customer_repo, estimation_repo, inquiry_repo, offer_repo};
+use crate::repositories::{address_repo, calendar_repo, customer_address_repo, customer_repo, estimation_repo, inquiry_repo, offer_repo};
 use crate::routes::estimates::collect_estimation_s3_keys;
 use crate::routes::inquiry_actions::{
     assign_employee, generate_inquiry_offer, list_inquiry_employees, remove_assignment,
@@ -166,6 +166,49 @@ struct UpdateInquiryRequest {
 // Protected CRUD handlers
 // ---------------------------------------------------------------------------
 
+/// Trim an optional string, collapsing empty/whitespace-only values to `None`.
+fn trim_opt(v: Option<&str>) -> Option<&str> {
+    v.map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// Best-effort: record an inline address in the customer's reusable address book.
+///
+/// Failures are logged and swallowed — the address book is secondary to inquiry
+/// creation and must never fail the request. Empty inputs are skipped.
+async fn harvest_customer_address(
+    pool: &sqlx::PgPool,
+    customer_id: Uuid,
+    addr: &AddressInput,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    let street = addr.street.as_deref().unwrap_or("").trim();
+    let city = addr.city.as_deref().unwrap_or("").trim();
+    if street.is_empty() && city.is_empty() {
+        return;
+    }
+    if let Err(e) = customer_address_repo::upsert(
+        pool,
+        customer_id,
+        street,
+        trim_opt(addr.house_number.as_deref()),
+        trim_opt(addr.postal_code.as_deref()),
+        city,
+        None,
+        trim_opt(addr.floor.as_deref()),
+        addr.elevator,
+        addr.parking_ban.unwrap_or(false),
+        None,
+        None,
+        None,
+        "inquiry",
+        now,
+    )
+    .await
+    {
+        tracing::warn!(%customer_id, error = %e, "failed to harvest address into customer book");
+    }
+}
+
 /// `POST /api/v1/inquiries` -- Create a new inquiry from JSON body.
 ///
 /// **Caller**: Admin dashboard, external API consumers.
@@ -277,6 +320,19 @@ async fn create_inquiry(
     } else {
         request.billing_address_id
     };
+
+    // Harvest inline addresses into the customer's reusable address book (best-effort).
+    for addr in [
+        request.origin.as_ref(),
+        request.destination.as_ref(),
+        request.stop.as_ref(),
+        request.billing_address.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        harvest_customer_address(&state.db, request.customer_id, addr, now).await;
+    }
 
     let scheduled_date = request.scheduled_date.as_deref().and_then(|s| {
         chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
@@ -404,8 +460,7 @@ async fn update_inquiry(
             .map_err(|e| ApiError::Validation(format!("Ungueltiger Status: {e}")))?;
         if !current_status.can_transition_to(&target_status) {
             return Err(ApiError::Validation(format!(
-                "Statuswechsel von '{}' nach '{}' ist nicht erlaubt",
-                current_status, target_status
+                "Statuswechsel von '{current_status}' nach '{target_status}' ist nicht erlaubt"
             )));
         }
     }
@@ -802,7 +857,7 @@ async fn generate_travel_expenses(
         StatusCode::OK,
         [
             (header::CONTENT_TYPE, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet".to_string()),
-            (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{}\"", filename)),
+            (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{filename}\"")),
         ],
         xlsx_bytes,
     ))
