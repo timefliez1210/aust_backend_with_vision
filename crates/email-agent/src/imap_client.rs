@@ -136,7 +136,7 @@ impl ImapClient {
             .map_err(|e| EmailError::Imap(format!("Failed to select INBOX: {e}")))?;
 
         // Search for the message by Message-ID header
-        let query = format!("HEADER Message-ID \"{}\"", message_id);
+        let query = format!("HEADER Message-ID \"{message_id}\"");
         let results = session
             .search(&query)
             .await

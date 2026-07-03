@@ -47,8 +47,7 @@ fn multipart_body(
     for (field_name, bytes, filename, content_type) in files {
         body.extend_from_slice(
             format!(
-                "--{boundary}\r\nContent-Disposition: form-data; name=\"{field_name}\"; filename=\"{}\"\r\nContent-Type: {}\r\n\r\n",
-                filename, content_type
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"{field_name}\"; filename=\"{filename}\"\r\nContent-Type: {content_type}\r\n\r\n"
             )
             .as_bytes(),
         );

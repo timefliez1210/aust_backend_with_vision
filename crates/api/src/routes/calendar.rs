@@ -224,23 +224,6 @@ async fn find_nearest_available(
     Ok(results)
 }
 
-#[allow(dead_code)]
-fn row_to_assignment_response(r: calendar_repo::EmployeeAssignmentRow) -> EmployeeAssignmentResponse {
-    EmployeeAssignmentResponse {
-        employee_id: r.employee_id,
-        first_name: r.first_name,
-        last_name: r.last_name,
-        job_date: r.job_date,
-        notes: r.notes,
-        start_time: r.start_time,
-        end_time: r.end_time,
-        clock_in: r.clock_in,
-        clock_out: r.clock_out,
-        break_minutes: r.break_minutes,
-        actual_hours: r.actual_hours,
-    }
-}
-
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]

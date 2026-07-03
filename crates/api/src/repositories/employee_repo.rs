@@ -1665,8 +1665,7 @@ pub(crate) async fn fetch_document_key(
     col: &str,
 ) -> Result<Option<String>, sqlx::Error> {
     sqlx::query_scalar(&format!(
-        "SELECT {} FROM employees WHERE id = $1",
-        col
+        "SELECT {col} FROM employees WHERE id = $1"
     ))
     .bind(id)
     .fetch_optional(pool)
@@ -1706,7 +1705,7 @@ mod tests {
         // The fix removed the `_key` suffix from the format string.
         let col = "arbeitsvertrag_key";
         let expected = "SELECT arbeitsvertrag_key FROM employees WHERE id = $1";
-        let actual = format!("SELECT {} FROM employees WHERE id = $1", col);
+        let actual = format!("SELECT {col} FROM employees WHERE id = $1");
         assert_eq!(actual, expected, "fetch_document_key must not double _key suffix");
     }
 

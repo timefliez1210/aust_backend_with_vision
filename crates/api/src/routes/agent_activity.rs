@@ -433,7 +433,7 @@ mod tests {
             .await
             .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(v["items"].as_array().unwrap().len() >= 1);
+        assert!(!v["items"].as_array().unwrap().is_empty());
     }
 
     #[sqlx::test(migrations = "../../migrations")]

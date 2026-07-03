@@ -70,8 +70,7 @@ pub(crate) async fn create_processing(
     sqlx::query(
         &format!(
             "INSERT INTO volume_estimations (id, inquiry_id, method, status, source_data, created_at) \
-             VALUES ($1, $2, '{}', 'processing', '{{}}', NOW())",
-            method
+             VALUES ($1, $2, '{method}', 'processing', '{{}}', NOW())"
         ),
     )
     .bind(id)

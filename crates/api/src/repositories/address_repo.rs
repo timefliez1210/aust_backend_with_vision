@@ -8,8 +8,6 @@ use crate::ApiError;
 /// SQLx projection row for the `addresses` table used within offer generation.
 #[derive(Debug, FromRow)]
 pub(crate) struct AddressRow {
-    #[allow(dead_code)]
-    pub id: Uuid,
     pub street: String,
     #[sqlx(default)]
     pub house_number: Option<String>,
@@ -17,9 +15,6 @@ pub(crate) struct AddressRow {
     pub postal_code: Option<String>,
     pub floor: Option<String>,
     pub elevator: Option<bool>,
-    #[sqlx(default)]
-    #[allow(dead_code)]
-    pub parking_ban: bool,
 }
 
 /// Fetch a single address by primary key (offer-generation projection).
@@ -31,7 +26,7 @@ pub(crate) async fn fetch_by_id(
     address_id: Uuid,
 ) -> Result<Option<AddressRow>, ApiError> {
     let row = sqlx::query_as(
-        "SELECT id, street, house_number, city, postal_code, floor, elevator, parking_ban FROM addresses WHERE id = $1",
+        "SELECT street, house_number, city, postal_code, floor, elevator FROM addresses WHERE id = $1",
     )
     .bind(address_id)
     .fetch_optional(pool)

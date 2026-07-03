@@ -175,7 +175,7 @@ Regeln:
                 .unwrap_or_else(|| "-".to_string()),
             volume = inquiry
                 .volume_m3
-                .map(|v| format!("{:.1} m³", v))
+                .map(|v| format!("{v:.1} m³"))
                 .or_else(|| inquiry.items_list.as_ref().map(|_| "gemäß Gegenstandsliste".to_string()))
                 .or_else(|| {
                     if inquiry.has_photos {
@@ -220,7 +220,7 @@ Regeln:
              Bitte überarbeite den Entwurf entsprechend."
         );
 
-        debug!("Revising draft via LLM: {}", crate::text::truncate_on_char_boundary(&admin_instructions, 80));
+        debug!("Revising draft via LLM: {}", crate::text::truncate_on_char_boundary(admin_instructions, 80));
 
         let messages = vec![
             LlmMessage::system(system_prompt.to_string()),

@@ -427,9 +427,7 @@ mod tests {
             for target in &all {
                 assert!(
                     terminal.can_transition_to(target),
-                    "{:?} should be able to transition to {:?}",
-                    terminal,
-                    target,
+                    "{terminal:?} should be able to transition to {target:?}",
                 );
             }
         }
@@ -471,7 +469,7 @@ mod tests {
         for status in all {
             let json = serde_json::to_string(&status).unwrap();
             let deserialized: InquiryStatus = serde_json::from_str(&json).unwrap();
-            assert_eq!(deserialized, status, "roundtrip for {:?}", status);
+            assert_eq!(deserialized, status, "roundtrip for {status:?}");
         }
     }
 

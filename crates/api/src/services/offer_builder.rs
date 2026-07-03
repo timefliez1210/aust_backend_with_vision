@@ -25,12 +25,6 @@ use tracing::warn;
 #[derive(Debug, sqlx::FromRow)]
 pub(crate) struct VolumeEstimationRow {
     pub result_data: Option<serde_json::Value>,
-    #[allow(dead_code)]
-    pub source_data: Option<serde_json::Value>,
-    #[allow(dead_code)]
-    pub total_volume_m3: Option<f64>,
-    #[allow(dead_code)]
-    pub method: String,
 }
 
 /// Summary data for the Telegram caption — populated during offer generation.
@@ -169,12 +163,8 @@ pub(crate) async fn run_offer_computation(
     let repo_estimation = offer_repo::fetch_latest_estimation(db, inquiry_id)
         .await
         .map_err(ApiError::Database)?;
-    let estimation: Option<VolumeEstimationRow> = repo_estimation.map(|e| VolumeEstimationRow {
-        result_data: e.result_data,
-        source_data: e.source_data,
-        total_volume_m3: e.total_volume_m3,
-        method: e.method,
-    });
+    let estimation: Option<VolumeEstimationRow> =
+        repo_estimation.map(|e| VolumeEstimationRow { result_data: e.result_data });
 
     // 5. Parse detected items
     let detected_items = parse_detected_items(estimation.as_ref());
@@ -627,8 +617,6 @@ pub(crate) async fn build_offer_with_overrides(
             hours_estimated: Option<f64>,
             rate_per_hour_cents: Option<i64>,
             line_items_json: Option<serde_json::Value>,
-            #[allow(dead_code)]
-            fahrt_override_cents: Option<i32>,
         }
         let row = OfferRow {
             id: repo_row.id, inquiry_id: repo_row.inquiry_id, price_cents: repo_row.price_cents,
@@ -637,7 +625,7 @@ pub(crate) async fn build_offer_with_overrides(
             created_at: repo_row.created_at, sent_at: repo_row.sent_at,
             offer_number: repo_row.offer_number, persons: repo_row.persons,
             hours_estimated: repo_row.hours_estimated, rate_per_hour_cents: repo_row.rate_per_hour_cents,
-            line_items_json: repo_row.line_items_json, fahrt_override_cents: repo_row.fahrt_override_cents,
+            line_items_json: repo_row.line_items_json,
         };
         let status: OfferStatus = row.status.parse().unwrap_or_default();
         Offer {
@@ -1356,9 +1344,6 @@ mod tests {
     fn make_vol_est(result_data: serde_json::Value) -> VolumeEstimationRow {
         VolumeEstimationRow {
             result_data: Some(result_data),
-            source_data: None,
-            total_volume_m3: Some(10.0),
-            method: "depth_sensor".to_string(),
         }
     }
 
@@ -1478,12 +1463,7 @@ mod tests {
 
     #[test]
     fn parse_empty_result_data() {
-        let est = VolumeEstimationRow {
-            result_data: None,
-            source_data: None,
-            total_volume_m3: None,
-            method: "vision".to_string(),
-        };
+        let est = VolumeEstimationRow { result_data: None };
         let items = parse_detected_items(Some(&est));
         assert!(items.is_empty());
     }
@@ -1753,14 +1733,12 @@ mod tests {
     #[test]
     fn format_city_with_postal() {
         let addr = AddressRow {
-            id: uuid::Uuid::nil(),
             street: "Musterstr. 1".to_string(),
             city: "Hildesheim".to_string(),
             postal_code: Some("31134".to_string()),
             floor: None,
             elevator: None,
             house_number: None,
-            parking_ban: false,
         };
         assert_eq!(format_city(&addr), "31134 Hildesheim");
     }
@@ -1768,14 +1746,12 @@ mod tests {
     #[test]
     fn format_city_without_postal() {
         let addr = AddressRow {
-            id: uuid::Uuid::nil(),
             street: "Musterstr. 1".to_string(),
             city: "Hildesheim".to_string(),
             postal_code: None,
             floor: None,
             elevator: None,
             house_number: None,
-            parking_ban: false,
         };
         assert_eq!(format_city(&addr), "Hildesheim");
     }
@@ -1783,14 +1759,12 @@ mod tests {
     #[test]
     fn format_city_empty_postal() {
         let addr = AddressRow {
-            id: uuid::Uuid::nil(),
             street: "Musterstr. 1".to_string(),
             city: "Hildesheim".to_string(),
             postal_code: Some("".to_string()),
             floor: None,
             elevator: None,
             house_number: None,
-            parking_ban: false,
         };
         assert_eq!(format_city(&addr), " Hildesheim");
     }
@@ -1838,12 +1812,7 @@ mod tests {
         fn parse_detected_items_never_panics(val in proptest::arbitrary::any::<String>()) {
             // Create arbitrary JSON from the string (will usually fail to deserialize, but shouldn't panic)
             let json_val = serde_json::Value::String(val);
-            let est = VolumeEstimationRow {
-                result_data: Some(json_val),
-                source_data: None,
-                total_volume_m3: None,
-                method: "test".to_string(),
-            };
+            let est = VolumeEstimationRow { result_data: Some(json_val) };
             let _ = parse_detected_items(Some(&est));
         }
     }
@@ -1865,7 +1834,7 @@ mod tests {
     #[test]
     fn rate_explicit_wins_over_price() {
         // When both are set, explicit rate wins
-        let rate = calculate_rate_override(Some(100_00), Some(50.0), 2, 4.0, &[]);
+        let rate = calculate_rate_override(Some(10_000), Some(50.0), 2, 4.0, &[]);
         assert!((rate - 50.0).abs() < 0.001);
     }
 

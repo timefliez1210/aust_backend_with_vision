@@ -226,9 +226,6 @@ pub(crate) async fn fetch_approval_context(
 #[derive(Debug, FromRow)]
 pub(crate) struct VolumeEstimationRow {
     pub result_data: Option<serde_json::Value>,
-    pub source_data: Option<serde_json::Value>,
-    pub total_volume_m3: Option<f64>,
-    pub method: String,
 }
 
 /// Fetch the latest volume estimation for an inquiry (for offer generation).
@@ -241,7 +238,7 @@ pub(crate) async fn fetch_latest_estimation(
 ) -> Result<Option<VolumeEstimationRow>, sqlx::Error> {
     sqlx::query_as(
         r#"
-        SELECT result_data, source_data, total_volume_m3, method
+        SELECT result_data
         FROM volume_estimations
         WHERE inquiry_id = $1
         ORDER BY created_at DESC
@@ -270,7 +267,6 @@ pub(crate) struct OfferFullRow {
     pub hours_estimated: Option<f64>,
     pub rate_per_hour_cents: Option<i64>,
     pub line_items_json: Option<serde_json::Value>,
-    pub fahrt_override_cents: Option<i32>,
 }
 
 /// Update an existing offer and return the full row.
@@ -300,7 +296,7 @@ pub(crate) async fn update_returning(
         WHERE id = $9
         RETURNING id, inquiry_id, price_cents, currency, valid_until, pdf_storage_key, status,
                   created_at, sent_at, offer_number, persons, hours_estimated,
-                  rate_per_hour_cents, line_items_json, fahrt_override_cents
+                  rate_per_hour_cents, line_items_json
         "#,
     )
     .bind(price_cents)
@@ -345,7 +341,7 @@ pub(crate) async fn insert_returning(
                             fahrt_override_cents)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
         RETURNING id, inquiry_id, price_cents, currency, valid_until, pdf_storage_key, status, created_at, sent_at,
-                  offer_number, persons, hours_estimated, rate_per_hour_cents, line_items_json, fahrt_override_cents
+                  offer_number, persons, hours_estimated, rate_per_hour_cents, line_items_json
         "#,
     )
     .bind(id)

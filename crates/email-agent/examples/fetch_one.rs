@@ -1,8 +1,7 @@
 /// Fetch the most recent email (read or unread) and print it.
 /// Run with: cargo run -p aust-email-agent --example fetch_one
-use aust_core::config::EmailConfig;
 use futures::StreamExt;
-use mail_parser::{MessageParser, MimeHeaders};
+use mail_parser::MessageParser;
 use tokio::net::TcpStream;
 use tokio_native_tls::native_tls;
 use tokio_native_tls::TlsConnector;

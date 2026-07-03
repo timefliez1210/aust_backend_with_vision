@@ -452,8 +452,7 @@ async fn accept_inquiry(
 
     if !["draft", "sent"].contains(&offer_status.as_str()) {
         return Err(ApiError::BadRequest(format!(
-            "Angebot kann im Status '{}' nicht angenommen werden",
-            offer_status
+            "Angebot kann im Status '{offer_status}' nicht angenommen werden"
         )));
     }
 
@@ -510,8 +509,7 @@ async fn reject_inquiry(
 
     if !["draft", "sent"].contains(&offer_status.as_str()) {
         return Err(ApiError::BadRequest(format!(
-            "Angebot kann im Status '{}' nicht abgelehnt werden",
-            offer_status
+            "Angebot kann im Status '{offer_status}' nicht abgelehnt werden"
         )));
     }
 

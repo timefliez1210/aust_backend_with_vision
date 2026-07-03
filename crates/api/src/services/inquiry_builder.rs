@@ -112,9 +112,6 @@ pub async fn build_inquiry_response(
         // Parse detected items
         let vol_est = VolumeEstimationRow {
             result_data: e.result_data.clone(),
-            source_data: e.source_data.clone(),
-            total_volume_m3: e.total_volume_m3,
-            method: e.method.clone(),
         };
         let detected = parse_detected_items(Some(&vol_est));
         let raw_items: Vec<serde_json::Value> = e

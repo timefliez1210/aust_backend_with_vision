@@ -34,6 +34,14 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/customers", get(admin_customers::list_customers).post(admin_customers::create_customer))
         .route("/customers/{id}", get(admin_customers::get_customer).patch(admin_customers::update_customer))
         .route("/customers/{id}/delete", post(admin_customers::delete_customer))
+        .route(
+            "/customers/{id}/addresses",
+            get(admin_customers::list_customer_addresses).post(admin_customers::add_customer_address),
+        )
+        .route(
+            "/customers/{id}/addresses/{addr_id}/delete",
+            post(admin_customers::delete_customer_address),
+        )
         .route("/addresses/{id}", patch(admin_customers::update_address))
         .route("/emails", get(admin_emails::list_email_threads))
         .route("/emails/{id}", get(admin_emails::get_email_thread))
@@ -1132,7 +1140,7 @@ async fn upload_employee_document(
     let data = file_bytes.ok_or_else(|| ApiError::BadRequest("Kein Dateifeld gefunden".into()))?;
 
     // Upload to S3
-    let key = format!("employees/{}/{}.{}", id, doc_type, file_ext);
+    let key = format!("employees/{id}/{doc_type}.{file_ext}");
     state.storage.upload(&key, data, &content_type_str).await.map_err(|e| {
         tracing::error!("S3 upload error for employee document: {e}");
         ApiError::Internal("Datei-Upload fehlgeschlagen".into())
@@ -1184,7 +1192,7 @@ async fn download_employee_document(
         .header(header::CONTENT_TYPE, ct)
         .header(
             header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{}\"", filename),
+            format!("attachment; filename=\"{filename}\""),
         )
         .body(axum::body::Body::from(data))
         .unwrap())
@@ -1751,10 +1759,6 @@ fn build_dunning_email(name: &str, invoice_number: &str, label: &str, level: i32
          Bei Fragen stehen wir Ihnen gerne zur Verfügung.\n\n\
          Mit freundlichen Grüßen\n\
          Ihr Team von Aust Umzüge & Haushaltsauflösungen",
-        name = name,
-        label = label,
-        invoice_number = invoice_number,
-        urgency = urgency,
     )
 }
 
@@ -1887,15 +1891,13 @@ async fn create_review_request(
             let customer_name = customer.display_name();
             let subject = "Wie war Ihr Umzug? Wir freuen uns über Ihre Bewertung!";
             let body_text = format!(
-                "Guten Tag {name},\n\n\
+                "Guten Tag {customer_name},\n\n\
                  vielen Dank, dass Sie Aust Umzüge & Haushaltsauflösungen für Ihren Umzug gewählt haben.\n\n\
                  Wir würden uns sehr freuen, wenn Sie uns eine kurze Bewertung hinterlassen würden:\n\
-                 {url}\n\n\
+                 {GOOGLE_REVIEW_URL}\n\n\
                  Ihre Meinung hilft uns, unsere Dienstleistungen stetig zu verbessern.\n\n\
                  Mit freundlichen Grüßen\n\
                  Ihr Team von Aust Umzüge & Haushaltsauflösungen",
-                name = customer_name,
-                url = GOOGLE_REVIEW_URL,
             );
 
             admin_emails::send_plain_email(&state.config.email, customer_email, subject, &body_text)

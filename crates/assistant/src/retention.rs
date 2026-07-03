@@ -36,8 +36,6 @@ struct ActionRow {
 /// A pending_action row fetched just for its German summary text.
 #[derive(Debug, sqlx::FromRow)]
 struct PendingActionSummary {
-    #[allow(dead_code)]
-    id: Uuid,
     tool_name: String,
     status: String,
     /// Not a real DB column — derived in query via coalesce on proposed_args/final_args.
@@ -169,7 +167,7 @@ async fn summarize_important_action(pool: &PgPool, action: &ActionRow) -> Result
         // Alex-confirmed action — try to fetch the pending_action's tool_name and status.
         let pa: Option<PendingActionSummary> = sqlx::query_as(
             r#"
-            SELECT id, tool_name, status, proposed_args
+            SELECT tool_name, status, proposed_args
             FROM pending_actions
             WHERE id = $1
             "#,
@@ -466,7 +464,7 @@ mod tests {
         let tags_arr: Vec<String> = tags.iter().map(|s| s.to_string()).collect();
         // Build a 768-dim zero vector literal.
         let zeros = vec!["0"; 768].join(",");
-        let vec_literal = format!("[{}]", zeros);
+        let vec_literal = format!("[{zeros}]");
         sqlx::query(
             r#"
             INSERT INTO agent_episodes (id, summary, embedding, tags, refs, created_at)

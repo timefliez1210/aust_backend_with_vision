@@ -33,9 +33,6 @@ pub(crate) struct InquiryDbRow {
     pub recipient_id: Option<Uuid>,
     #[sqlx(default)]
     pub inquiry_billing_address_id: Option<Uuid>,
-    #[sqlx(default)]
-    #[allow(dead_code)]
-    pub custom_fields: serde_json::Value,
     pub notes: Option<String>,
     #[sqlx(default)]
     pub services: serde_json::Value,
@@ -85,7 +82,7 @@ pub(crate) async fn fetch_by_id(
         SELECT id, customer_id, origin_address_id, destination_address_id, stop_address_id,
                status, estimated_volume_m3, distance_km, preferred_date, scheduled_date,
                end_date, start_time, end_time, service_type, submission_mode, recipient_id,
-               billing_address_id AS inquiry_billing_address_id, custom_fields, notes,
+               billing_address_id AS inquiry_billing_address_id, notes,
                services, source, offer_sent_at, accepted_at, created_at, updated_at,
                has_pauschale
         FROM inquiries WHERE id = $1

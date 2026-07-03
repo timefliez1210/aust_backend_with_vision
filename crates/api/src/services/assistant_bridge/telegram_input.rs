@@ -47,12 +47,9 @@ pub async fn handle_text_message(
     services: aust_core::services::ServiceBundle,
 ) -> bool {
     // Check binding — only agent-bound chats are handled here.
-    match bindings::resolve(pool, chat_id).await {
-        Err(_) => {
-            // Unbound chat — fall through to legacy handler.
-            return false;
-        }
-        Ok(_) => {}
+    if bindings::resolve(pool, chat_id).await.is_err() {
+        // Unbound chat — fall through to legacy handler.
+        return false;
     }
 
     info!(chat_id, has_quote = reply_to_text.is_some(), "Agent handling text message");
@@ -188,6 +185,7 @@ pub async fn handle_media_message(
 ///
 /// Returns `true` if the callback was consumed. Returns `false` for unknown
 /// callback prefixes so they fall through to the legacy handler.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_callback_query(
     pool: &PgPool,
     client: &Client,
@@ -258,6 +256,7 @@ pub async fn handle_callback_query(
 
 // ── Resolution sub-handlers ───────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_confirm(
     pool: &PgPool,
     client: &Client,

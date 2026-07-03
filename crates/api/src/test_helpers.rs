@@ -159,7 +159,7 @@ pub fn generate_test_jwt() -> String {
 /// Insert a test customer and return its ID.
 pub async fn insert_test_customer(pool: &PgPool) -> uuid::Uuid {
     let id = uuid::Uuid::now_v7();
-    let email = format!("test-{}@example.com", id);
+    let email = format!("test-{id}@example.com");
     sqlx::query(
         "INSERT INTO customers (id, name, email, phone, created_at, updated_at)
          VALUES ($1, 'Test Kunde', $2, '+4915112345678', NOW(), NOW())",
@@ -410,7 +410,7 @@ pub async fn insert_test_inquiry_employee(
 /// Insert a test customer with a specific customer_type and return its ID.
 pub async fn insert_test_customer_with_type(pool: &PgPool, customer_type: &str, company_name: Option<&str>) -> uuid::Uuid {
     let id = uuid::Uuid::now_v7();
-    let email = format!("test-{}@example.com", id);
+    let email = format!("test-{id}@example.com");
     sqlx::query(
         "INSERT INTO customers (id, name, email, phone, customer_type, company_name, created_at, updated_at)
          VALUES ($1, 'Test Kunde', $2, '+4915112345678', $3, $4, NOW(), NOW())",

@@ -367,7 +367,7 @@ fn load_config() -> Result<Config> {
 
     let config = ConfigBuilder::<config::builder::DefaultState>::default()
         .add_source(File::with_name("config/default").required(false))
-        .add_source(File::with_name(&format!("config/{}", run_mode)).required(false))
+        .add_source(File::with_name(&format!("config/{run_mode}")).required(false))
         .add_source(Environment::with_prefix("AUST").separator("__"))
         .build()?;
 

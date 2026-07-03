@@ -2231,14 +2231,14 @@ mod tests {
     #[test]
     fn parse_bool_true_variants() {
         for v in &["true", "1", "yes", "ja", "True", "TRUE", "Ja", "  true  "] {
-            assert!(parse_bool_field(v), "expected true for {:?}", v);
+            assert!(parse_bool_field(v), "expected true for {v:?}");
         }
     }
 
     #[test]
     fn parse_bool_false_variants() {
         for v in &["false", "0", "no", "nein", "", "maybe"] {
-            assert!(!parse_bool_field(v), "expected false for {:?}", v);
+            assert!(!parse_bool_field(v), "expected false for {v:?}");
         }
     }
 
@@ -2298,7 +2298,7 @@ mod tests {
         ] {
             let s = m.as_str();
             let parsed: EstimationMethod = s.parse().unwrap();
-            assert_eq!(m, parsed, "roundtrip failed for {:?}", m);
+            assert_eq!(m, parsed, "roundtrip failed for {m:?}");
         }
     }
 

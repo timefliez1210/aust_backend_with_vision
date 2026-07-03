@@ -845,7 +845,7 @@ impl EmailProcessor {
         info!(
             "Revising draft {} with instructions: {}",
             draft.draft_id,
-            crate::text::truncate_on_char_boundary(&instructions, 80)
+            crate::text::truncate_on_char_boundary(instructions, 80)
         );
 
         // Show "working on it" feedback

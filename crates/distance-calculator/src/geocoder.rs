@@ -125,7 +125,7 @@ fn encode_uri_component(s: &str) -> String {
             } else {
                 c.encode_utf8(&mut [0; 4])
                     .bytes()
-                    .map(|b| format!("%{:02X}", b))
+                    .map(|b| format!("%{b:02X}"))
                     .collect()
             }
         })

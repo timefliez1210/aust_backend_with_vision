@@ -12,7 +12,6 @@ use crate::ApiError;
 /// and admin endpoints (detail, list).
 #[derive(Debug, FromRow)]
 pub(crate) struct CustomerRow {
-    #[allow(dead_code)]
     pub id: Uuid,
     pub email: Option<String>,
     pub name: Option<String>,

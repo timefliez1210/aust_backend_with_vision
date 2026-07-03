@@ -211,7 +211,7 @@ impl EmailParser {
             {
                 nachname
             } else {
-                format!("{} {}", vorname, nachname).trim().to_string()
+                format!("{vorname} {nachname}").trim().to_string()
             };
             if full.is_empty() { None } else { Some(full) }
         });
@@ -317,7 +317,7 @@ impl EmailParser {
             {
                 nachname
             } else {
-                format!("{} {}", vorname, nachname).trim().to_string()
+                format!("{vorname} {nachname}").trim().to_string()
             };
             Some(full)
         });
@@ -445,7 +445,7 @@ impl EmailParser {
             {
                 nachname
             } else {
-                format!("{} {}", vorname, nachname).trim().to_string()
+                format!("{vorname} {nachname}").trim().to_string()
             };
             if full.is_empty() { None } else { Some(full) }
         });

@@ -63,8 +63,7 @@ mod tests {
             let inquiry = Inquiry::from(row);
             assert_eq!(
                 inquiry.status, expected,
-                "status '{}' should map to {:?}",
-                status_str, expected
+                "status '{status_str}' should map to {expected:?}"
             );
         }
     }

@@ -27,6 +27,8 @@ async fn main() {
         from_name: std::env::var("AUST__EMAIL__FROM_NAME")
             .unwrap_or_else(|_| "AUST Umzüge".to_string()),
         poll_interval_secs: 60,
+        smtp_tls: std::env::var("AUST__EMAIL__SMTP_TLS")
+            .unwrap_or_else(|_| "starttls".to_string()),
     };
 
     let client = SmtpClient::new(config);

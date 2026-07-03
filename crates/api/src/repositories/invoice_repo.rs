@@ -8,7 +8,6 @@ use uuid::Uuid;
 
 /// Full projection of an invoice row.
 #[derive(Debug, FromRow)]
-#[allow(dead_code)]
 pub(crate) struct InvoiceRow {
     pub id: Uuid,
     pub inquiry_id: Uuid,
@@ -26,9 +25,6 @@ pub(crate) struct InvoiceRow {
     pub deposit_percent: Option<i16>,
     /// FK to the sibling `partial_first` invoice, stored on `partial_final`; NULL otherwise.
     pub deposit_invoice_id: Option<Uuid>,
-    pub payment_method: Option<String>,
-    pub notes: Option<String>,
-    pub due_date: Option<chrono::NaiveDate>,
     /// Base netto amount captured at creation (offer price or manual price).
     /// NULL on pre-migration rows — callers fall back to the active offer.
     pub base_netto_cents: Option<i64>,
@@ -37,19 +33,15 @@ pub(crate) struct InvoiceRow {
 /// Flat projection for Rechnungsausgangsbuch — one row per invoice with
 /// customer name, service date, and offer amounts.
 #[derive(Debug, FromRow)]
-#[allow(dead_code)]
 pub(crate) struct RechnungsausgangRow {
     pub id: Uuid,
     pub invoice_number: String,
-    pub invoice_type: String,
-    pub status: String,
     pub sent_at: Option<DateTime<Utc>>,
     pub paid_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub payment_method: Option<String>,
     pub notes: Option<String>,
     pub due_date: Option<chrono::NaiveDate>,
-    pub extra_services: serde_json::Value,
     /// Netto amount from the active offer in cents.
     pub offer_netto_cents: Option<i64>,
     /// Brutto = netto * 1.19
@@ -84,7 +76,7 @@ pub(crate) async fn list_by_inquiry(
         "SELECT id, inquiry_id, invoice_number, invoice_type, partial_group_id,
                 partial_percent, status, extra_services, pdf_s3_key, sent_at, paid_at, created_at,
                 deposit_percent, deposit_invoice_id,
-                payment_method, notes, due_date, base_netto_cents
+                base_netto_cents
          FROM invoices WHERE inquiry_id = $1 ORDER BY created_at",
     )
     .bind(inquiry_id)
@@ -313,7 +305,7 @@ pub(crate) async fn fetch_by_id(
         "SELECT id, inquiry_id, invoice_number, invoice_type, partial_group_id,
                 partial_percent, status, extra_services, pdf_s3_key, sent_at, paid_at, created_at,
                 deposit_percent, deposit_invoice_id,
-                payment_method, notes, due_date, base_netto_cents
+                base_netto_cents
          FROM invoices WHERE id = $1",
     )
     .bind(inv_id)
@@ -334,7 +326,7 @@ pub(crate) async fn fetch_by_id_and_inquiry(
         "SELECT id, inquiry_id, invoice_number, invoice_type, partial_group_id,
                 partial_percent, status, extra_services, pdf_s3_key, sent_at, paid_at, created_at,
                 deposit_percent, deposit_invoice_id,
-                payment_method, notes, due_date, base_netto_cents
+                base_netto_cents
          FROM invoices WHERE id = $1 AND inquiry_id = $2",
     )
     .bind(inv_id)
@@ -643,15 +635,12 @@ pub(crate) async fn list_for_rechnungsausgangsbuch(
         "SELECT
             inv.id,
             inv.invoice_number,
-            inv.invoice_type,
-            inv.status,
             inv.sent_at,
             inv.paid_at,
             inv.created_at,
             inv.payment_method,
             inv.notes,
             inv.due_date,
-            inv.extra_services,
             off.price_cents AS offer_netto_cents,
             (off.price_cents * 119 / 100) AS offer_brutto_cents,
             c.name AS customer_name,

@@ -304,8 +304,7 @@ pub(crate) async fn trigger_estimate(
         "vision" | "depth" | "video" => {
             // These methods need multipart image data — return guidance
             Err(ApiError::BadRequest(format!(
-                "Methode '{method}' erfordert Multipart-Upload. Verwenden Sie POST /api/v1/submit/photo oder POST /api/v1/submit/mobile.",
-                method = method
+                "Methode '{method}' erfordert Multipart-Upload. Verwenden Sie POST /api/v1/submit/photo oder POST /api/v1/submit/mobile."
             )))
         }
         _ => Err(ApiError::BadRequest(format!(
@@ -864,9 +863,9 @@ pub(crate) async fn retry_estimation(
             a.street
         };
         if !p.is_empty() {
-            format!("{}, {} {}", base, p, city)
+            format!("{base}, {p} {city}")
         } else {
-            format!("{}, {}", base, city)
+            format!("{base}, {city}")
         }
     });
 
@@ -880,9 +879,9 @@ pub(crate) async fn retry_estimation(
             a.street
         };
         if !p.is_empty() {
-            format!("{}, {} {}", base, p, city)
+            format!("{base}, {p} {city}")
         } else {
-            format!("{}, {}", base, city)
+            format!("{base}, {city}")
         }
     });
 

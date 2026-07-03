@@ -121,8 +121,7 @@ pub(crate) async fn send_offer_to_telegram(config: &TelegramConfig, generated: &
     }
 
     caption.push_str(&format!(
-        "\n\n*Preis:* {:.2} € brutto ({:.2} € netto)",
-        brutto, netto
+        "\n\n*Preis:* {brutto:.2} € brutto ({netto:.2} € netto)"
     ));
     caption.push_str(&format!(
         "\n{} Helfer × {:.0} Std × {:.2} €/Std",

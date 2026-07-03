@@ -26,6 +26,7 @@ async fn main() {
         poll_interval_secs: 60,
         from_address: "umzug@example.com".to_string(),
         from_name: "AUST Umzüge".to_string(),
+        smtp_tls: "starttls".to_string(),
     };
 
     let client = ImapClient::new(config);

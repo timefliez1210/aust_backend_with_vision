@@ -32,6 +32,7 @@ pub struct AppState {
 }
 
 impl AppState {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: Config,
         db: PgPool,

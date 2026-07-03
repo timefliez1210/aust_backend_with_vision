@@ -446,7 +446,7 @@ async fn inquiry_with_all_submission_modes(pool: PgPool) {
         .execute(&pool)
         .await;
 
-        assert!(result.is_ok(), "submission_mode='{}' must be accepted", mode);
+        assert!(result.is_ok(), "submission_mode='{mode}' must be accepted");
     }
 }
 
@@ -805,7 +805,7 @@ async fn all_valid_inquiry_statuses_accepted(pool: PgPool) {
         .execute(&pool)
         .await;
 
-        assert!(result.is_ok(), "status '{}' must be accepted by CHECK constraint", status);
+        assert!(result.is_ok(), "status '{status}' must be accepted by CHECK constraint");
     }
 }
 

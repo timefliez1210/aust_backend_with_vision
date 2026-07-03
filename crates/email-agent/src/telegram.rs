@@ -269,7 +269,7 @@ impl TelegramBot {
                             debug!(
                                 "Received text from admin (chat {}): {}",
                                 message.chat.id,
-                                crate::text::truncate_on_char_boundary(&text, 80)
+                                crate::text::truncate_on_char_boundary(text, 80)
                             );
                             // Emit EditInstructions for the legacy offer-edit flow AND
                             // AssistantText so the orchestrator can route to the agent if
@@ -295,7 +295,7 @@ impl TelegramBot {
                             debug!(
                                 "Received text from non-admin chat {}: {}",
                                 message.chat.id,
-                                crate::text::truncate_on_char_boundary(&text, 80)
+                                crate::text::truncate_on_char_boundary(text, 80)
                             );
                             responses.push(ApprovalResponse {
                                 draft_id: "assistant_text".to_string(),

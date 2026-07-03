@@ -18,11 +18,7 @@ pub(crate) struct UserRow {
 #[derive(Debug, FromRow)]
 pub(crate) struct ResetRow {
     pub id: Uuid,
-    #[allow(dead_code)]
-    pub user_id: Uuid,
     pub otp_hash: String,
-    #[allow(dead_code)]
-    pub expires_at: DateTime<Utc>,
 }
 
 /// Fetch a user by email (exact match).
@@ -192,7 +188,7 @@ pub(crate) async fn fetch_valid_reset(
 ) -> Result<Option<ResetRow>, sqlx::Error> {
     sqlx::query_as(
         r#"
-        SELECT id, user_id, otp_hash, expires_at
+        SELECT id, otp_hash
         FROM admin_password_resets
         WHERE user_id = $1 AND used_at IS NULL AND expires_at > now()
         ORDER BY created_at DESC
