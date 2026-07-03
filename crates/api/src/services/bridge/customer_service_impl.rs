@@ -1,16 +1,35 @@
 //! Bridge impl for `CustomerService`.
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use aust_core::models::{CustomerSnapshot, InquiryListItem};
 use aust_core::services::{CustomerPatch, CustomerService, NewCustomer, ServiceError};
 
-use crate::services::inquiry_builder;
-
 pub struct CustomerServiceImpl {
     pool: PgPool,
+}
+
+/// Row shape for the joined customer-inquiry-list query in `list_inquiries_for`.
+/// Mirrors `inquiry_repo::ListItemDbRow` (the admin list query row).
+#[derive(Debug, sqlx::FromRow)]
+struct CustomerInquiryListRow {
+    id: Uuid,
+    customer_name: Option<String>,
+    customer_email: Option<String>,
+    customer_salutation: Option<String>,
+    customer_type: Option<String>,
+    service_type: Option<String>,
+    origin_city: Option<String>,
+    destination_city: Option<String>,
+    volume_m3: Option<f64>,
+    distance_km: Option<f64>,
+    status: String,
+    has_offer: bool,
+    offer_status: Option<String>,
+    created_at: DateTime<Utc>,
 }
 
 impl CustomerServiceImpl {
@@ -195,36 +214,67 @@ impl CustomerService for CustomerServiceImpl {
         &self,
         customer_id: Uuid,
     ) -> Result<Vec<InquiryListItem>, ServiceError> {
-        let rows: Vec<(Uuid,)> = sqlx::query_as(
-            "SELECT id FROM inquiries WHERE customer_id = $1 ORDER BY created_at DESC LIMIT 50",
+        // Single joined query instead of N+1 `build_inquiry_response` calls (each of
+        // which issues ~10 sequential queries). Mirrors the join in
+        // `inquiry_repo::list_items` (the canonical admin list query) so field
+        // derivation stays consistent across both list endpoints.
+        let rows: Vec<CustomerInquiryListRow> = sqlx::query_as(
+            r#"
+            SELECT
+                i.id,
+                c.name AS customer_name,
+                c.email AS customer_email,
+                c.salutation AS customer_salutation,
+                c.customer_type,
+                i.service_type,
+                oa.city AS origin_city,
+                da.city AS destination_city,
+                i.estimated_volume_m3 AS volume_m3,
+                i.distance_km,
+                i.status,
+                EXISTS (
+                    SELECT 1 FROM offers
+                    WHERE inquiry_id = i.id AND status NOT IN ('rejected', 'cancelled')
+                ) AS has_offer,
+                (
+                    SELECT o2.status FROM offers o2
+                    WHERE o2.inquiry_id = i.id AND o2.status NOT IN ('rejected', 'cancelled')
+                    ORDER BY o2.created_at DESC LIMIT 1
+                ) AS offer_status,
+                i.created_at
+            FROM inquiries i
+            LEFT JOIN customers c ON i.customer_id = c.id
+            LEFT JOIN addresses oa ON i.origin_address_id = oa.id
+            LEFT JOIN addresses da ON i.destination_address_id = da.id
+            WHERE i.customer_id = $1
+            ORDER BY i.created_at DESC
+            LIMIT 50
+            "#,
         )
         .bind(customer_id)
         .fetch_all(&self.pool)
         .await
         .map_err(super::map_sqlx)?;
 
-        let mut out = Vec::with_capacity(rows.len());
-        for (id,) in rows {
-            if let Ok(resp) = inquiry_builder::build_inquiry_response(&self.pool, id).await {
-                out.push(InquiryListItem {
-                    id: resp.id,
-                    customer_name: resp.customer.as_ref().and_then(|c| c.name.clone()),
-                    customer_email: resp.customer.as_ref().and_then(|c| c.email.clone()),
-                    salutation: resp.customer.as_ref().and_then(|c| c.salutation.clone()),
-                    origin_city: resp.origin_address.as_ref().map(|a| a.city.clone()),
-                    destination_city: resp.destination_address.as_ref().map(|a| a.city.clone()),
-                    volume_m3: resp.volume_m3,
-                    distance_km: resp.distance_km,
-                    status: resp.status,
-                    has_offer: resp.offer.is_some(),
-                    offer_status: resp.offer.as_ref().map(|o| o.status.clone()),
-                    service_type: resp.service_type.clone(),
-                    customer_type: resp.customer.as_ref().and_then(|c| c.customer_type.clone()),
-                    created_at: resp.created_at,
-                });
-            }
-        }
-        Ok(out)
+        Ok(rows
+            .into_iter()
+            .map(|r| InquiryListItem {
+                id: r.id,
+                customer_name: r.customer_name,
+                customer_email: r.customer_email,
+                salutation: r.customer_salutation,
+                origin_city: r.origin_city,
+                destination_city: r.destination_city,
+                volume_m3: r.volume_m3,
+                distance_km: r.distance_km,
+                status: r.status.parse().unwrap_or_default(),
+                has_offer: r.has_offer,
+                offer_status: r.offer_status,
+                service_type: r.service_type,
+                customer_type: r.customer_type,
+                created_at: r.created_at,
+            })
+            .collect())
     }
 
     async fn update(
@@ -372,7 +422,7 @@ mod tests {
 
         // Seed a customer_session for merge_id.
         // (customer_otps are email-scoped, not customer_id FK, so not reassignable.)
-        let unique_token = format!("tok-{}", merge_id);
+        let unique_token = format!("tok-{merge_id}");
         sqlx::query("INSERT INTO customer_sessions (id, customer_id, token, expires_at) VALUES (gen_random_uuid(), $1, $2, NOW() + INTERVAL '1 day')")
             .bind(merge_id).bind(&unique_token).execute(&pool).await.expect("insert session");
 
