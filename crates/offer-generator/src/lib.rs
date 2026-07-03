@@ -6,6 +6,7 @@ mod pricing;
 mod timesheet_xlsx;
 mod travel_expense_xlsx;
 mod xlsx;
+mod zip_util;
 
 pub use error::OfferError;
 pub use invoice_xlsx::{generate_invoice_xlsx, ExtraService, InvoiceData, InvoiceLineItem, InvoiceType};

@@ -160,8 +160,8 @@ fn test_partial_final_with_deduction() {
 
 #[test]
 fn test_max_items_truncated() {
-    // Only 7 slots available (rows 31-37), excess items should be truncated
-    let items: Vec<InvoiceLineItem> = (1..=10)
+    // 20 slots available (rows 31-50), excess items should be truncated.
+    let items: Vec<InvoiceLineItem> = (1..=25)
         .map(|i| InvoiceLineItem {
             pos: i,
             description: format!("Service {i}"),
@@ -173,7 +173,7 @@ fn test_max_items_truncated() {
 
     let data = make_invoice_data(items, InvoiceType::Full);
     let result = generate_invoice_xlsx(&data);
-    assert!(result.is_ok(), "XLSX generation should succeed with 10 line items (truncated to 7)");
+    assert!(result.is_ok(), "XLSX generation should succeed with 25 line items (truncated to 20)");
 
     let bytes = result.unwrap();
     let reader = std::io::Cursor::new(bytes);
@@ -181,13 +181,13 @@ fn test_max_items_truncated() {
     let sheet = archive.by_name("xl/worksheets/sheet1.xml").expect("Should have sheet1.xml");
     let sheet_str = std::io::read_to_string(sheet).expect("Should read sheet1.xml");
 
-    // Verify first 7 items are present
-    for i in 1..=7 {
+    // Verify the first 20 items are present.
+    for i in 1..=20 {
         assert!(sheet_str.contains(&format!("Service {i}")), "Should contain 'Service {i}'");
     }
-    // Items 8 and beyond should be truncated
-    assert!(!sheet_str.contains("Service 8"), "Should NOT contain 'Service 8' (truncated)");
-    assert!(!sheet_str.contains("Service 10"), "Should NOT contain 'Service 10' (truncated)");
+    // Items 21 and beyond should be truncated.
+    assert!(!sheet_str.contains("Service 21"), "Should NOT contain 'Service 21' (truncated)");
+    assert!(!sheet_str.contains("Service 25"), "Should NOT contain 'Service 25' (truncated)");
 }
 
 #[test]
@@ -257,7 +257,7 @@ fn test_row_hiding_with_few_items() {
 
     // With 3 items, rows 34-37 should be hidden (only rows 31-33 are used)
     for row in 34..=37 {
-        let needle = format!("r=\"{}\"", row);
+        let needle = format!("r=\"{row}\"");
         assert!(
             sheet_str.contains(&needle)
                 && sheet_str.contains("hidden=\"true\""),

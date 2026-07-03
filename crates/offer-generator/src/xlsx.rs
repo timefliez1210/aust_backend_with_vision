@@ -5,9 +5,10 @@
 //! and re-ZIP. All drawings, media, styles, column widths, page setup, and
 //! merge cells are preserved bit-for-bit from the template.
 
+use crate::zip_util::{copy_zip_entries, map_io, map_zip, read_zip_entry, strip_hyperlink_rels, strip_hyperlinks};
 use crate::OfferError;
 use serde::{Deserialize, Serialize};
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Write};
 use zip::write::SimpleFileOptions;
 use zip::{ZipArchive, ZipWriter};
 
@@ -319,24 +320,6 @@ pub fn generate_offer_xlsx(data: &OfferData) -> Result<Vec<u8>, OfferError> {
 // Build cell modifications from OfferData
 // ---------------------------------------------------------------------------
 
-/// Build the complete list of cell value changes, rows to hide, and rows to show.
-///
-/// **Why**: Separates the "what to change" logic from the "how to change XML" logic.
-/// All domain knowledge about which cell holds which offer field lives here, not in
-/// the XML manipulation functions.
-///
-/// The function hides ALL template line-item rows (31-42) first, then writes items
-/// sequentially starting at row 31, un-hiding only the rows actually used. This
-/// ensures unused rows (and their preset values) never appear in the PDF.
-///
-/// # Parameters
-/// - `data` — the fully populated `OfferData` to read field values from
-///
-/// # Returns
-/// A tuple of:
-/// - `Vec<(String, CellValue)>` — `(cell_ref, value)` pairs to apply to `sheet1.xml`
-/// - `Vec<u32>` — row numbers to hide (all unused line-item rows)
-/// - `Vec<u32>` — row numbers to un-hide (only the rows that contain a line item)
 /// Build the cell write for a complete from/to address block (A26 / F26).
 ///
 /// Street, city and floor are stacked inside ONE cell with explicit line
@@ -381,9 +364,28 @@ fn address_block_lines(street: &str, city: &str, floor: &str, col_width: f64) ->
         .max(1)
 }
 
-fn build_cell_modifications(
-    data: &OfferData,
-) -> (Vec<(String, CellValue)>, Vec<u32>, Vec<u32>, Vec<(u32, f64)>) {
+/// `(cell_ref, value)` pairs, rows to hide, rows to un-hide, row heights to set.
+type CellModResult = (Vec<(String, CellValue)>, Vec<u32>, Vec<u32>, Vec<(u32, f64)>);
+
+/// Build the complete list of cell value changes, rows to hide, and rows to show.
+///
+/// **Why**: Separates the "what to change" logic from the "how to change XML" logic.
+/// All domain knowledge about which cell holds which offer field lives here, not in
+/// the XML manipulation functions.
+///
+/// The function hides ALL template line-item rows (31-42) first, then writes items
+/// sequentially starting at row 31, un-hiding only the rows actually used. This
+/// ensures unused rows (and their preset values) never appear in the PDF.
+///
+/// # Parameters
+/// - `data` — the fully populated `OfferData` to read field values from
+///
+/// # Returns
+/// A tuple of:
+/// - `Vec<(String, CellValue)>` — `(cell_ref, value)` pairs to apply to `sheet1.xml`
+/// - `Vec<u32>` — row numbers to hide (all unused line-item rows)
+/// - `Vec<u32>` — row numbers to un-hide (only the rows that contain a line item)
+fn build_cell_modifications(data: &OfferData) -> CellModResult {
     let mut mods = Vec::new();
     let mut row_heights: Vec<(u32, f64)> = Vec::new();
 
@@ -678,7 +680,7 @@ fn apply_modifications(
 /// A new `String` with the cell replaced. Returns the original string unchanged if
 /// the cell cannot be located or its boundaries cannot be parsed.
 pub fn set_cell_value(xml: &str, cell_ref: &str, value: &CellValue) -> String {
-    let ref_pattern = format!(r#"r="{}""#, cell_ref);
+    let ref_pattern = format!(r#"r="{cell_ref}""#);
 
     if let Some(attr_pos) = xml.find(&ref_pattern) {
         // Find the start of the <c element containing this attribute
@@ -778,7 +780,7 @@ fn find_cell_end(fragment: &str) -> Option<usize> {
 /// A complete, self-contained `<c>…</c>` XML string.
 fn build_cell_xml(cell_ref: &str, style: Option<&str>, value: &CellValue) -> String {
     let s_attr = match style {
-        Some(s) => format!(r#" s="{}""#, s),
+        Some(s) => format!(r#" s="{s}""#),
         None => String::new(),
     };
 
@@ -786,36 +788,32 @@ fn build_cell_xml(cell_ref: &str, style: Option<&str>, value: &CellValue) -> Str
         CellValue::Text(text) => {
             let escaped = xml_escape(text);
             format!(
-                r#"<c r="{}"{} t="inlineStr"><is><t>{}</t></is></c>"#,
-                cell_ref, s_attr, escaped
+                r#"<c r="{cell_ref}"{s_attr} t="inlineStr"><is><t>{escaped}</t></is></c>"#
             )
         }
         CellValue::StyledText(text, forced_style) => {
             let escaped = xml_escape(text);
             format!(
-                r#"<c r="{}" s="{}" t="inlineStr"><is><t>{}</t></is></c>"#,
-                cell_ref, forced_style, escaped
+                r#"<c r="{cell_ref}" s="{forced_style}" t="inlineStr"><is><t>{escaped}</t></is></c>"#
             )
         }
         CellValue::Number(n) => {
             // Format: avoid scientific notation, preserve full precision for
             // round-tripping through Excel's float64 parser.
             let formatted = format_number(*n);
-            format!(r#"<c r="{}"{} t="n"><v>{}</v></c>"#, cell_ref, s_attr, formatted)
+            format!(r#"<c r="{cell_ref}"{s_attr} t="n"><v>{formatted}</v></c>"#)
         }
         CellValue::StyledNumber(n, forced_style) => {
             // Like Number but always applies the given style, even when inserting new cells.
             let formatted = format_number(*n);
             format!(
-                r#"<c r="{}" s="{}" t="n"><v>{}</v></c>"#,
-                cell_ref, forced_style, formatted
+                r#"<c r="{cell_ref}" s="{forced_style}" t="n"><v>{formatted}</v></c>"#
             )
         }
         CellValue::StyledFormula(formula, forced_style) => {
             let escaped = xml_escape(formula);
             format!(
-                r#"<c r="{}" s="{}" t="n"><f>{}</f></c>"#,
-                cell_ref, forced_style, escaped
+                r#"<c r="{cell_ref}" s="{forced_style}" t="n"><f>{escaped}</f></c>"#
             )
         }
     }
@@ -841,7 +839,7 @@ fn build_cell_xml(cell_ref: &str, style: Option<&str>, value: &CellValue) -> Str
 /// unchanged if neither the row nor `<sheetData>` can be located.
 fn insert_cell(xml: &str, cell_ref: &str, value: &CellValue) -> String {
     let row_num = extract_row_number(cell_ref);
-    let row_pattern = format!(r#"r="{}""#, row_num);
+    let row_pattern = format!(r#"r="{row_num}""#);
 
     // Find the <row> element for this row number
     // We need to find <row r="N" specifically (not r="N1" or r="N2")
@@ -876,7 +874,7 @@ fn insert_cell(xml: &str, cell_ref: &str, value: &CellValue) -> String {
     // Row doesn't exist — create it inside <sheetData>
     if let Some(sd_end) = xml.find("</sheetData>") {
         let cell_xml = build_cell_xml(cell_ref, None, value);
-        let row_xml = format!(r#"<row r="{}">{}</row>"#, row_num, cell_xml);
+        let row_xml = format!(r#"<row r="{row_num}">{cell_xml}</row>"#);
         let mut result = String::with_capacity(xml.len() + row_xml.len());
         result.push_str(&xml[..sd_end]);
         result.push_str(&row_xml);
@@ -900,7 +898,7 @@ fn insert_cell(xml: &str, cell_ref: &str, value: &CellValue) -> String {
 /// # Returns
 /// Modified XML string. Returns the original if the row is not found.
 pub fn hide_row(xml: &str, row_num: u32) -> String {
-    let row_r = format!(r#"<row r="{}""#, row_num);
+    let row_r = format!(r#"<row r="{row_num}""#);
     if let Some(pos) = xml.find(&row_r) {
         let after = &xml[pos..];
         if let Some(gt_offset) = after.find('>') {
@@ -944,7 +942,7 @@ pub fn hide_row(xml: &str, row_num: u32) -> String {
 /// # Returns
 /// Modified XML string. Returns the original if the row is not found or already visible.
 pub fn unhide_row(xml: &str, row_num: u32) -> String {
-    let row_r = format!(r#"<row r="{}""#, row_num);
+    let row_r = format!(r#"<row r="{row_num}""#);
     if let Some(pos) = xml.find(&row_r) {
         let after = &xml[pos..];
         if let Some(gt_offset) = after.find('>') {
@@ -1251,7 +1249,7 @@ fn build_items_sheet_xml(items: &[DetectedItemRow]) -> String {
     xml.push_str(r#"<sheetPr><pageSetUpPr fitToPage="1"/></sheetPr>"#);
 
     let last_row = items.len() + 2; // header + items + total
-    xml.push_str(&format!(r#"<dimension ref="A1:D{}"/>"#, last_row));
+    xml.push_str(&format!(r#"<dimension ref="A1:D{last_row}"/>"#));
 
     // 4 columns: Nr, Gegenstand, Bezeichnung (DE), Volumen
     xml.push_str(r#"<cols>"#);
@@ -1294,7 +1292,7 @@ fn build_items_sheet_xml(items: &[DetectedItemRow]) -> String {
             .unwrap_or((1, &item.name));
         total_quantity += qty;
 
-        xml.push_str(&format!(r#"<row r="{}">"#, row));
+        xml.push_str(&format!(r#"<row r="{row}">"#));
 
         xml.push_str(&format!(
             r#"<c r="A{}" s="{}" t="n"><v>{}</v></c>"#,
@@ -1306,8 +1304,7 @@ fn build_items_sheet_xml(items: &[DetectedItemRow]) -> String {
         ));
 
         xml.push_str(&format!(
-            r#"<c r="C{}" s="{}" t="n"><v>{}</v></c>"#,
-            row, s_center, qty
+            r#"<c r="C{row}" s="{s_center}" t="n"><v>{qty}</v></c>"#
         ));
 
         xml.push_str(&format!(
@@ -1321,22 +1318,18 @@ fn build_items_sheet_xml(items: &[DetectedItemRow]) -> String {
 
     // Total row (orange background, bold white text)
     let total_row = items.len() + 2;
-    xml.push_str(&format!(r#"<row r="{}" ht="18">"#, total_row));
+    xml.push_str(&format!(r#"<row r="{total_row}" ht="18">"#));
     xml.push_str(&format!(
-        r#"<c r="A{}" s="80" t="inlineStr"><is><t></t></is></c>"#,
-        total_row
+        r#"<c r="A{total_row}" s="80" t="inlineStr"><is><t></t></is></c>"#
     ));
     xml.push_str(&format!(
-        r#"<c r="B{}" s="79" t="inlineStr"><is><t>Gesamt</t></is></c>"#,
-        total_row
+        r#"<c r="B{total_row}" s="79" t="inlineStr"><is><t>Gesamt</t></is></c>"#
     ));
     xml.push_str(&format!(
-        r#"<c r="C{}" s="80" t="n"><v>{}</v></c>"#,
-        total_row, total_quantity
+        r#"<c r="C{total_row}" s="80" t="n"><v>{total_quantity}</v></c>"#
     ));
     xml.push_str(&format!(
-        r#"<c r="D{}" s="80" t="inlineStr"><is><t>{:.2} m³</t></is></c>"#,
-        total_row, total_volume
+        r#"<c r="D{total_row}" s="80" t="inlineStr"><is><t>{total_volume:.2} m³</t></is></c>"#
     ));
     xml.push_str(r#"</row>"#);
 
@@ -1404,76 +1397,6 @@ fn add_sheet2_relationship(xml: &str) -> String {
     xml.to_string()
 }
 
-/// Remove the `<hyperlinks>…</hyperlinks>` section from `sheet1.xml`.
-///
-/// **Why**: The template was saved with email addresses formatted as clickable
-/// hyperlinks. When LibreOffice converts the file to PDF it renders those as
-/// blue underlined links. The offer document should display the customer's email
-/// as plain text matching the rest of the address block. Removing the
-/// `<hyperlinks>` block demotes those cells to plain inline strings.
-///
-/// The companion function `strip_hyperlink_rels` removes the corresponding
-/// relationship entries from `sheet1.xml.rels`.
-///
-/// # Parameters
-/// - `xml` — raw `sheet1.xml` content
-///
-/// # Returns
-/// Modified string with the entire `<hyperlinks>…</hyperlinks>` block removed.
-/// Returns the original if the block is not found.
-fn strip_hyperlinks(xml: &str) -> String {
-    if let Some(start) = xml.find("<hyperlinks>")
-        && let Some(end_tag) = xml[start..].find("</hyperlinks>") {
-            let abs_end = start + end_tag + "</hyperlinks>".len();
-            let mut result = String::with_capacity(xml.len());
-            result.push_str(&xml[..start]);
-            result.push_str(&xml[abs_end..]);
-            return result;
-        }
-    xml.to_string()
-}
-
-/// Remove all hyperlink `<Relationship>` entries from `xl/worksheets/_rels/sheet1.xml.rels`.
-///
-/// **Why**: Each hyperlink in the sheet has a corresponding relationship entry of
-/// type `…/hyperlink`. After removing the `<hyperlinks>` block from `sheet1.xml`,
-/// these relationship entries are orphaned and can cause validation warnings. The
-/// drawing relationship (for the company logo image) is preserved.
-///
-/// # Parameters
-/// - `xml` — raw `xl/worksheets/_rels/sheet1.xml.rels` content
-///
-/// # Returns
-/// Modified string with all `<Relationship>` elements containing `"hyperlink"` removed.
-fn strip_hyperlink_rels(xml: &str) -> String {
-    let mut result = String::with_capacity(xml.len());
-    let mut pos = 0;
-    while pos < xml.len() {
-        if let Some(rel_start) = xml[pos..].find("<Relationship ") {
-            let abs_start = pos + rel_start;
-            // Find the end of this element
-            if let Some(rel_end) = xml[abs_start..].find("/>") {
-                let abs_end = abs_start + rel_end + 2;
-                let fragment = &xml[abs_start..abs_end];
-                if fragment.contains("hyperlink") {
-                    // Skip this hyperlink relationship
-                    result.push_str(&xml[pos..abs_start]);
-                    pos = abs_end;
-                    continue;
-                }
-            }
-            // Not a hyperlink — keep it
-            let next = abs_start + "<Relationship ".len();
-            result.push_str(&xml[pos..next]);
-            pos = next;
-        } else {
-            result.push_str(&xml[pos..]);
-            break;
-        }
-    }
-    result
-}
-
 // ---------------------------------------------------------------------------
 // ZIP assembly
 // ---------------------------------------------------------------------------
@@ -1530,25 +1453,7 @@ fn assemble_xlsx(
     ];
 
     // Copy all template files, replacing modified ones
-    for i in 0..template_zip.len() {
-        let mut file = template_zip.by_index(i).map_err(|e| {
-            OfferError::Template(format!("Failed to read template entry {i}: {e}"))
-        })?;
-        let name = file.name().to_string();
-
-        if let Some((_, content)) = replacements.iter().find(|(n, _)| *n == name) {
-            writer.start_file(&name, options).map_err(map_zip)?;
-            writer.write_all(content.as_bytes()).map_err(map_io)?;
-        } else {
-            // Copy from template unchanged
-            let mut data = Vec::new();
-            file.read_to_end(&mut data).map_err(|e| {
-                OfferError::Template(format!("Failed to read template entry {name}: {e}"))
-            })?;
-            writer.start_file(&name, options).map_err(map_zip)?;
-            writer.write_all(&data).map_err(map_io)?;
-        }
-    }
+    copy_zip_entries(template_zip, &mut writer, options, &replacements, |_| false)?;
 
     // Add items sheet if present
     if let Some(items_xml) = items_sheet_xml {
@@ -1566,33 +1471,6 @@ fn assemble_xlsx(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Read a named entry from a `ZipArchive` into a `Vec<u8>`.
-///
-/// **Why**: Every XML file in the template ZIP must be extracted before it can be
-/// modified. This helper centralises the error mapping from `zip::ZipError` and
-/// `std::io::Error` to `OfferError::Template`.
-///
-/// # Parameters
-/// - `archive` — the open `ZipArchive` wrapping the template bytes
-/// - `name` — the ZIP entry path, e.g. `"xl/worksheets/sheet1.xml"`
-///
-/// # Returns
-/// Raw byte content of the ZIP entry.
-///
-/// # Errors
-/// - `OfferError::Template` if the entry does not exist in the archive
-/// - `OfferError::Template` if reading the entry fails
-fn read_zip_entry(archive: &mut ZipArchive<Cursor<&[u8]>>, name: &str) -> Result<Vec<u8>, OfferError> {
-    let mut file = archive.by_name(name).map_err(|e| {
-        OfferError::Template(format!("ZIP entry '{name}' not found: {e}"))
-    })?;
-    let mut data = Vec::new();
-    file.read_to_end(&mut data).map_err(|e| {
-        OfferError::Template(format!("Failed to read ZIP entry '{name}': {e}"))
-    })?;
-    Ok(data)
-}
-
 /// Extract the value of a named XML attribute from a tag fragment string.
 ///
 /// **Why**: Used by `set_cell_value` to preserve the existing `s="N"` style index
@@ -1608,7 +1486,7 @@ fn read_zip_entry(archive: &mut ZipArchive<Cursor<&[u8]>>, name: &str) -> Result
 /// # Returns
 /// `Some(value)` with the attribute's string value, or `None` if not found.
 pub fn extract_attribute(tag: &str, attr_name: &str) -> Option<String> {
-    let pattern = format!(r#"{}=""#, attr_name);
+    let pattern = format!(r#"{attr_name}=""#);
     if let Some(start) = tag.find(&pattern) {
         let value_start = start + pattern.len();
         if let Some(end) = tag[value_start..].find('"') {
@@ -1659,7 +1537,7 @@ pub fn format_number(n: f64) -> String {
     if n == n.floor() && n.abs() < 1e15 {
         format!("{}", n as i64)
     } else {
-        let s = format!("{}", n);
+        let s = format!("{n}");
         // Trim trailing zeros after decimal point to keep output compact
         if s.contains('.') {
             let s = s.trim_end_matches('0');
@@ -1690,22 +1568,6 @@ pub fn xml_escape(s: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
-}
-
-/// Map a `zip::result::ZipError` to `OfferError::Template`.
-///
-/// Used as a closure in `.map_err(map_zip)` calls when writing ZIP entries
-/// so the error type is consistent throughout `assemble_xlsx`.
-fn map_zip(e: zip::result::ZipError) -> OfferError {
-    OfferError::Template(format!("ZIP error: {e}"))
-}
-
-/// Map a `std::io::Error` to `OfferError::Template`.
-///
-/// Used as a closure in `.map_err(map_io)` calls when writing raw bytes
-/// into ZIP entries inside `assemble_xlsx`.
-fn map_io(e: std::io::Error) -> OfferError {
-    OfferError::Template(format!("IO error: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -2035,16 +1897,14 @@ mod tests {
         let g31_region = &xml[g31_pos..g31_pos + 200.min(xml.len() - g31_pos)];
         assert!(
             g31_region.contains("<v>75</v>"),
-            "G31 should contain flat_total value 75, got: {}",
-            g31_region
+            "G31 should contain flat_total value 75, got: {g31_region}"
         );
         // E31 should be styled text (blank), not a number
         let e31_pos = xml.find(r#"r="E31""#).unwrap();
         let e31_region = &xml[e31_pos..e31_pos + 200.min(xml.len() - e31_pos)];
         assert!(
             e31_region.contains("t=\"inlineStr\""),
-            "E31 should be inlineStr (blank) for flat_total item, got: {}",
-            e31_region
+            "E31 should be inlineStr (blank) for flat_total item, got: {e31_region}"
         );
     }
 
@@ -2066,16 +1926,14 @@ mod tests {
         let e31_region = &xml[e31_pos..e31_pos + 200.min(xml.len() - e31_pos)];
         assert!(
             e31_region.contains("<v>2</v>"),
-            "E31 should contain quantity 2, got: {}",
-            e31_region
+            "E31 should contain quantity 2, got: {e31_region}"
         );
         // F31 should have unit price 100
         let f31_pos = xml.find(r#"r="F31""#).unwrap();
         let f31_region = &xml[f31_pos..f31_pos + 200.min(xml.len() - f31_pos)];
         assert!(
             f31_region.contains("<v>100</v>"),
-            "F31 should contain unit_price 100, got: {}",
-            f31_region
+            "F31 should contain unit_price 100, got: {f31_region}"
         );
     }
 
@@ -2097,8 +1955,7 @@ mod tests {
         let g31_region = &xml[g31_pos..g31_pos + 200.min(xml.len() - g31_pos)];
         assert!(
             g31_region.contains("<v>0</v>"),
-            "G31 should contain flat_total value 0, got: {}",
-            g31_region
+            "G31 should contain flat_total value 0, got: {g31_region}"
         );
         // Should be a number cell (t="n"), not a formula
         assert!(
@@ -2135,8 +1992,7 @@ mod tests {
             .collect();
         assert!(
             names.iter().any(|n| n == "xl/worksheets/sheet2.xml"),
-            "sheet2.xml should exist when detected_items is non-empty, found: {:?}",
-            names
+            "sheet2.xml should exist when detected_items is non-empty, found: {names:?}"
         );
     }
 

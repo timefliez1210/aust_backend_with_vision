@@ -158,6 +158,7 @@ impl PricingEngine {
 ///
 /// # Examples
 /// ```
+/// # use aust_offer_generator::parse_floor;
 /// assert_eq!(parse_floor("Erdgeschoss"), 0);
 /// assert_eq!(parse_floor("Hochparterre"), 0);
 /// assert_eq!(parse_floor("3. Stock"), 3);

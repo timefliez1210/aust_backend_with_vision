@@ -17,10 +17,10 @@
 //! - **Auftragsort**:  A26
 //! - **Intro text**:   A27
 //! - **Table header**: Row 30 (Pos., Beschreibung, Menge, Einzelpreis, Gesamtpreis)
-//! - **Line items**:   rows 31–37 (A=pos, B=desc, C=qty, D=unit_price, E=formula D*C)
-//! - **Totals**:       Row 38 Nettosumme (E38=SUM(E31:E37)),
-//!   Row 39 zzgl. 19% MwSt. (E39=E38*19%),
-//!   Row 41 Rechnungsbetrag (E41=E38+E39)
+//! - **Line items**:   rows 31–50 (A=pos, B=desc, C=qty, D=unit_price, E=formula D*C)
+//! - **Totals**:       Row 51 Nettosumme (E51=SUM(E31:E50)),
+//!   Row 52 zzgl. 19% MwSt. (E52=E51*19%),
+//!   Row 54 Rechnungsbetrag (E54=E51+E52)
 //! - **Footer**:       Row 44 payment instruction, Row 47 "Mit freundlichen Grüßen",
 //!   Row 49 "Aust Umzüge & Haushaltsauflösungen"
 //!
@@ -37,10 +37,11 @@
 use crate::xlsx::{
     hide_row, set_cell_value, strip_formula_cached_values, unhide_row, CellValue,
 };
+use crate::zip_util::{copy_zip_entries, read_zip_entry, strip_hyperlink_rels, strip_hyperlinks};
 use crate::OfferError;
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
-use std::io::{Cursor, Read, Write};
+use std::io::Cursor;
 use zip::write::SimpleFileOptions;
 use zip::{ZipArchive, ZipWriter};
 
@@ -106,7 +107,7 @@ pub struct InvoiceData {
     pub salutation: String,
     /// Line items for the invoice — the single source of truth.
     /// Each item has pos, description, quantity, unit_price (EUR, may be negative for credits),
-    /// and optional remark. Maximum 7 items (rows 31–37).
+    /// and optional remark. Maximum 20 items (rows 31–50).
     pub line_items: Vec<InvoiceLineItem>,
 
     // ── Legacy fields (kept for backward compatibility during migration) ──
@@ -282,12 +283,12 @@ pub fn generate_invoice_xlsx(data: &InvoiceData) -> Result<Vec<u8>, OfferError> 
 /// - D: Einzelpreis (unit price, may be negative for credits)
 /// - E: Gesamt Netto (formula D*C, pre-baked in template)
 ///
-/// Totals block (rows 38–41):
-/// - C38 / E38: Nettosumme / SUM(E31:E37)
-/// - C39 / E39: zzgl. 19% MwSt. / E38*19%
-/// - C41 / E41: Rechnungsbetrag / E38+E39
+/// Totals block (rows 51–54):
+/// - E51: Nettosumme / SUM(E31:E50)
+/// - E52: zzgl. 19% MwSt. / E51*19%
+/// - E54: Rechnungsbetrag / E51+E52
 ///
-/// Footer (rows 44–49): already present as shared strings in the template.
+/// Footer: already present as shared strings in the template.
 fn build_cell_modifications(
     data: &InvoiceData,
 ) -> (Vec<(String, CellValue)>, Vec<u32>, Vec<u32>) {
@@ -374,10 +375,10 @@ fn build_cell_modifications(
     };
     mods.push((
         "A27".into(),
-        CellValue::Text(format!("Auftragsort: {}, {}", service_street, service_city)),
+        CellValue::Text(format!("Auftragsort: {service_street}, {service_city}")),
     ));
 
-    // ── Line items (rows 31–37, columns A-D) ──────────────────────────────
+    // ── Line items (rows 31–50, columns A-D) ──────────────────────────────
     // Column E formulas (D*C) are pre-baked in the template — do not touch.
     //
     // The template has alternating styles per row via style indices.
@@ -451,13 +452,13 @@ fn build_cell_modifications(
     // Remove unhidden rows from hidden list
     hidden_rows.retain(|r| !unhidden_rows.contains(r));
 
-    // ── Totals block (rows 38–41) ─────────────────────────────────────────
-    // C38 = "Nettosumme" (shared string, keep as-is)
-    // E38 = SUM(E31:E37) (formula, keep as-is)
-    // C39 = "zzgl. 19% MwSt." (shared string, keep as-is)
-    // E39 = E38*19% (formula, keep as-is)
-    // C41 = "Rechnungsbetrag" (shared string, keep as-is)
-    // E41 = E38+E39 (formula, keep as-is)
+    // ── Totals block (rows 51–54) ─────────────────────────────────────────
+    // "Nettosumme" (shared string, keep as-is)
+    // E51 = SUM(E31:E50) (formula, keep as-is)
+    // "zzgl. 19% MwSt." (shared string, keep as-is)
+    // E52 = E51*19% (formula, keep as-is)
+    // "Rechnungsbetrag" (shared string, keep as-is)
+    // E54 = E51+E52 (formula, keep as-is)
     //
     // All labels and formulas are pre-baked in the template. strip_formula_cached_values
     // will handle clearing stale caches so LibreOffice recalculates.
@@ -563,66 +564,15 @@ fn strip_rechnung_drawing(xml: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Hyperlink stripping
+// ZIP assembly
 // ---------------------------------------------------------------------------
-
-/// Remove the `<hyperlinks>` block from `sheet1.xml` so email addresses render
-/// as plain text rather than clickable hyperlinks.
-fn strip_hyperlinks(xml: &str) -> String {
-    if let Some(start) = xml.find("<hyperlinks>")
-        && let Some(end) = xml.find("</hyperlinks>") {
-            let mut result = String::with_capacity(xml.len());
-            result.push_str(&xml[..start]);
-            result.push_str(&xml[end + "</hyperlinks>".len()..]);
-            return result;
-        }
-    xml.to_string()
-}
-
-/// Remove hyperlink `<Relationship>` entries from `sheet1.xml.rels`, keeping
-/// the drawing relationship.
-fn strip_hyperlink_rels(rels_xml: &str) -> String {
-    let mut result = String::with_capacity(rels_xml.len());
-    let mut pos = 0;
-    while pos < rels_xml.len() {
-        if let Some(rel_start) = rels_xml[pos..].find("<Relationship ") {
-            let abs_start = pos + rel_start;
-            if let Some(rel_end) = rels_xml[abs_start..].find("/>") {
-                let abs_end = abs_start + rel_end + 2;
-                let rel_fragment = &rels_xml[abs_start..abs_end];
-                if rel_fragment.contains("hyperlink") {
-                    result.push_str(&rels_xml[pos..abs_start]);
-                    pos = abs_end;
-                    continue;
-                }
-            }
-        }
-        result.push_str(&rels_xml[pos..]);
-        break;
-    }
-    result
-}
-
-// ---------------------------------------------------------------------------
-// ZIP utilities
-// ---------------------------------------------------------------------------
-
-fn read_zip_entry(
-    zip: &mut ZipArchive<Cursor<&'static [u8]>>,
-    name: &str,
-) -> Result<Vec<u8>, OfferError> {
-    let mut entry = zip
-        .by_name(name)
-        .map_err(|e| OfferError::Template(format!("Entry '{name}' not found in template: {e}")))?;
-    let mut buf = Vec::new();
-    entry
-        .read_to_end(&mut buf)
-        .map_err(|e| OfferError::Template(format!("Failed to read '{name}': {e}")))?;
-    Ok(buf)
-}
+//
+// `strip_hyperlinks`, `strip_hyperlink_rels`, and `read_zip_entry` are shared
+// with `xlsx.rs` and `travel_expense_xlsx.rs` via `crate::zip_util` (see
+// `use` at the top of this file).
 
 fn assemble_invoice_xlsx(
-    template_zip: &mut ZipArchive<Cursor<&'static [u8]>>,
+    template_zip: &mut ZipArchive<Cursor<&[u8]>>,
     modified_sheet1: &str,
     modified_workbook: &str,
     modified_sheet1_rels: &str,
@@ -634,50 +584,13 @@ fn assemble_invoice_xlsx(
     let options = SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
 
-    for i in 0..template_zip.len() {
-        let mut entry = template_zip
-            .by_index(i)
-            .map_err(|e| OfferError::Template(format!("Failed to read ZIP entry {i}: {e}")))?;
-        let name = entry.name().to_string();
-
-        writer
-            .start_file(&name, options)
-            .map_err(|e| OfferError::Template(format!("Failed to start ZIP entry '{name}': {e}")))?;
-
-        match name.as_str() {
-            "xl/worksheets/sheet1.xml" => {
-                writer
-                    .write_all(modified_sheet1.as_bytes())
-                    .map_err(|e| OfferError::Template(format!("Failed to write sheet1.xml: {e}")))?;
-            }
-            "xl/workbook.xml" => {
-                writer
-                    .write_all(modified_workbook.as_bytes())
-                    .map_err(|e| OfferError::Template(format!("Failed to write workbook.xml: {e}")))?;
-            }
-            "xl/worksheets/_rels/sheet1.xml.rels" => {
-                writer
-                    .write_all(modified_sheet1_rels.as_bytes())
-                    .map_err(|e| {
-                        OfferError::Template(format!("Failed to write sheet1.xml.rels: {e}"))
-                    })?;
-            }
-            "xl/drawings/drawing1.xml" => {
-                writer
-                    .write_all(modified_drawing.as_bytes())
-                    .map_err(|e| OfferError::Template(format!("Failed to write drawing1.xml: {e}")))?;
-            }
-            _ => {
-                let mut content = Vec::new();
-                entry
-                    .read_to_end(&mut content)
-                    .map_err(|e| OfferError::Template(format!("Failed to read '{name}': {e}")))?;
-                writer
-                    .write_all(&content)
-                    .map_err(|e| OfferError::Template(format!("Failed to write '{name}': {e}")))?;
-            }
-        }
-    }
+    let replacements: Vec<(&str, &str)> = vec![
+        ("xl/worksheets/sheet1.xml", modified_sheet1),
+        ("xl/workbook.xml", modified_workbook),
+        ("xl/worksheets/_rels/sheet1.xml.rels", modified_sheet1_rels),
+        ("xl/drawings/drawing1.xml", modified_drawing),
+    ];
+    copy_zip_entries(template_zip, &mut writer, options, &replacements, |_| false)?;
 
     let finished = writer
         .finish()

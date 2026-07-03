@@ -3,7 +3,7 @@
 //! No template — builds a minimal valid XLSX ZIP directly from XML strings.
 //! Layout mirrors the existing manual template (Arbeitszeit NN.YY.xlsx):
 //!
-//! ```
+//! ```text
 //! B2  Mitarbeiterdetails          E4  Arbeitsstunden gesamt
 //! B3  {Name}                      E5  {total hours}
 //! B5  Vorgesetztendetails         E6  Reguläre Arbeitsstunden
@@ -169,12 +169,12 @@ fn str_cell(coord: &str, value: &str, bold: bool) -> String {
 
 /// Renders a numeric cell. Style 2 = 2-decimal-place number format.
 fn num_cell(coord: &str, value: f64) -> String {
-    format!(r#"<c r="{coord}" s="2"><v>{v:.4}</v></c>"#, coord = coord, v = value)
+    format!(r#"<c r="{coord}" s="2"><v>{value:.4}</v></c>"#)
 }
 
 /// Wraps a row of cell XML in a `<row>` element.
 fn row(r: usize, cells: &str) -> String {
-    format!(r#"<row r="{r}">{cells}</row>"#, r = r, cells = cells)
+    format!(r#"<row r="{r}">{cells}</row>"#)
 }
 
 // ---------------------------------------------------------------------------

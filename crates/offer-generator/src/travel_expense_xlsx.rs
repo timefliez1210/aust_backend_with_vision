@@ -2,12 +2,13 @@
 //!
 //! Fills the Reisekostenabrechnung template with trip data for a single employee.
 
-use std::io::{Cursor, Read, Write};
+use std::io::Cursor;
 use zip::ZipArchive;
 use chrono::Timelike;
 
 use crate::error::OfferError;
 use crate::xlsx::{set_cell_value, CellValue};
+use crate::zip_util::{copy_zip_entries, read_zip_entry};
 
 const TEMPLATE_BYTES: &[u8] = include_bytes!("../../../templates/reisekosten_template.xlsx");
 
@@ -209,16 +210,6 @@ pub fn generate_travel_expense_xlsx(data: &TravelExpenseData) -> Result<Vec<u8>,
     )
 }
 
-fn read_zip_entry(zip: &mut ZipArchive<Cursor<&[u8]>>, name: &str) -> Result<Vec<u8>, OfferError> {
-    let mut file = zip
-        .by_name(name)
-        .map_err(|e| OfferError::Template(format!("Missing {name} in template: {e}")))?;
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf)
-        .map_err(|e| OfferError::Template(format!("Failed to read {name}: {e}")))?;
-    Ok(buf)
-}
-
 /// Rewrite workbook.xml to contain exactly one sheet named "Reisekosten"
 /// with sheetId="1" and activeTab="0".
 fn fix_workbook_single_sheet(xml: &str) -> String {
@@ -244,11 +235,10 @@ fn fix_workbook_single_sheet(xml: &str) -> String {
         .unwrap_or("rId1");
 
     let replacement = format!(
-        r#"<sheet name="Reisekosten" sheetId="1" r:id="{}"/>"#,
-        rid
+        r#"<sheet name="Reisekosten" sheetId="1" r:id="{rid}"/>"#
     );
 
-    let mut result = format!("{}\n{}\n{}", before, replacement, after);
+    let mut result = format!("{before}\n{replacement}\n{after}");
 
     // Fix activeTab — any activeTab="N" where N > 0 should become "0"
     // (the first and now only sheet).
@@ -296,41 +286,19 @@ fn assemble_xlsx_single_sheet(
         let options = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated);
 
-        for i in 0..template_zip.len() {
-            let mut entry = template_zip
-                .by_index(i)
-                .map_err(|e| OfferError::Template(format!("Zip read error: {e}")))?;
-            let name = entry.name().to_string();
-
-            let mut buf = Vec::new();
-            std::io::copy(&mut entry, &mut buf)
-                .map_err(|e| OfferError::Template(format!("Zip copy error: {e}")))?;
-
-            // Skip extra worksheet XMLs and their rels
-            if name.starts_with("xl/worksheets/sheet") && name != "xl/worksheets/sheet1.xml" {
-                continue;
-            }
-            if name.starts_with("xl/worksheets/_rels/sheet")
-                && name != "xl/worksheets/_rels/sheet1.xml.rels"
-            {
-                continue;
-            }
-
-            let data: Vec<u8> = match name.as_str() {
-                "xl/worksheets/sheet1.xml" => sheet1_xml.as_bytes().to_vec(),
-                "xl/workbook.xml" => workbook_xml.as_bytes().to_vec(),
-                "[Content_Types].xml" => content_types_xml.as_bytes().to_vec(),
-                "xl/_rels/workbook.xml.rels" => rels_xml.as_bytes().to_vec(),
-                _ => buf,
-            };
-
-            out_zip
-                .start_file(&name, options)
-                .map_err(|e| OfferError::Template(format!("Zip start_file error: {e}")))?;
-            out_zip
-                .write_all(&data)
-                .map_err(|e| OfferError::Template(format!("Zip write error: {e}")))?;
-        }
+        let replacements: Vec<(&str, &str)> = vec![
+            ("xl/worksheets/sheet1.xml", sheet1_xml),
+            ("xl/workbook.xml", workbook_xml),
+            ("[Content_Types].xml", content_types_xml),
+            ("xl/_rels/workbook.xml.rels", rels_xml),
+        ];
+        // Drop extra worksheet XMLs and their rels — the output has one sheet only.
+        let skip = |name: &str| {
+            (name.starts_with("xl/worksheets/sheet") && name != "xl/worksheets/sheet1.xml")
+                || (name.starts_with("xl/worksheets/_rels/sheet")
+                    && name != "xl/worksheets/_rels/sheet1.xml.rels")
+        };
+        copy_zip_entries(template_zip, &mut out_zip, options, &replacements, skip)?;
 
         out_zip
             .finish()
