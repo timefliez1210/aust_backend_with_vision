@@ -28,6 +28,12 @@ pub(crate) struct InvoiceRow {
     /// Base netto amount captured at creation (offer price or manual price).
     /// NULL on pre-migration rows — callers fall back to the active offer.
     pub base_netto_cents: Option<i64>,
+    /// TRUE when Alex has taken over the line items by hand — the invoice is then
+    /// rendered from `line_items_json` and never recomputed from the offer.
+    pub is_manual: bool,
+    /// Hand-edited line items (array of `ManualLineItem`), present only for
+    /// manual invoices. NULL for offer-derived invoices.
+    pub line_items_json: Option<serde_json::Value>,
 }
 
 /// Flat projection for Rechnungsausgangsbuch — one row per invoice with
@@ -76,7 +82,7 @@ pub(crate) async fn list_by_inquiry(
         "SELECT id, inquiry_id, invoice_number, invoice_type, partial_group_id,
                 partial_percent, status, extra_services, pdf_s3_key, sent_at, paid_at, created_at,
                 deposit_percent, deposit_invoice_id,
-                base_netto_cents
+                base_netto_cents, is_manual, line_items_json
          FROM invoices WHERE inquiry_id = $1 ORDER BY created_at",
     )
     .bind(inquiry_id)
@@ -305,7 +311,7 @@ pub(crate) async fn fetch_by_id(
         "SELECT id, inquiry_id, invoice_number, invoice_type, partial_group_id,
                 partial_percent, status, extra_services, pdf_s3_key, sent_at, paid_at, created_at,
                 deposit_percent, deposit_invoice_id,
-                base_netto_cents
+                base_netto_cents, is_manual, line_items_json
          FROM invoices WHERE id = $1",
     )
     .bind(inv_id)
@@ -326,7 +332,7 @@ pub(crate) async fn fetch_by_id_and_inquiry(
         "SELECT id, inquiry_id, invoice_number, invoice_type, partial_group_id,
                 partial_percent, status, extra_services, pdf_s3_key, sent_at, paid_at, created_at,
                 deposit_percent, deposit_invoice_id,
-                base_netto_cents
+                base_netto_cents, is_manual, line_items_json
          FROM invoices WHERE id = $1 AND inquiry_id = $2",
     )
     .bind(inv_id)
@@ -473,6 +479,27 @@ pub(crate) async fn update_extra_services(
 ) -> Result<(), sqlx::Error> {
     sqlx::query("UPDATE invoices SET extra_services = $1 WHERE id = $2")
         .bind(extra_services)
+        .bind(inv_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Persist hand-edited line items and the manual flag on an invoice.
+///
+/// **Caller**: `invoices::update_invoice` (manual-line-items branch).
+/// **Why**: Makes `line_items_json` the stored source of truth so the invoice is
+/// rendered from these lines and the offer-derived rebuild is bypassed. Passing
+/// `is_manual = false` with `line_items = NULL` reverts to offer-derived mode.
+pub(crate) async fn update_line_items(
+    pool: &PgPool,
+    inv_id: Uuid,
+    line_items: Option<&serde_json::Value>,
+    is_manual: bool,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE invoices SET line_items_json = $1, is_manual = $2 WHERE id = $3")
+        .bind(line_items)
+        .bind(is_manual)
         .bind(inv_id)
         .execute(pool)
         .await?;

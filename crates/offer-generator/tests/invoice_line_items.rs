@@ -121,6 +121,41 @@ fn test_invoice_with_negative_line_item() {
 }
 
 #[test]
+fn test_manual_hours_line_item_renders_quantity_and_unit_price() {
+    // Business-customer invoice with worked hours itemised: "12,5 Std. à 45,00 €".
+    // The template's C=Menge / D=Einzelpreis / E=D*C columns must carry the raw
+    // decimal quantity and unit price so the PDF shows the hourly breakdown.
+    let items = vec![
+        InvoiceLineItem {
+            pos: 1,
+            description: "Umzugsarbeiten (Stundenabrechnung)".into(),
+            quantity: 12.5,
+            unit_price: 45.0,
+            remark: None,
+        },
+        InvoiceLineItem {
+            pos: 2,
+            description: "Anfahrtspauschale".into(),
+            quantity: 1.0,
+            unit_price: 80.0,
+            remark: None,
+        },
+    ];
+    let data = make_invoice_data(items, InvoiceType::Full);
+    let bytes = generate_invoice_xlsx(&data).expect("XLSX generation should succeed");
+    assert!(bytes.starts_with(b"PK"));
+
+    let reader = std::io::Cursor::new(bytes);
+    let mut archive = zip::ZipArchive::new(reader).expect("Should be valid ZIP");
+    let sheet = archive.by_name("xl/worksheets/sheet1.xml").expect("sheet1.xml");
+    let sheet_str = std::io::read_to_string(sheet).expect("read sheet1.xml");
+
+    // Decimal hours land in the Menge column (C31) and the netto rate in Einzelpreis (D31).
+    assert!(sheet_str.contains("12.5"), "Menge 12,5 should be written to the sheet");
+    assert!(sheet_str.contains(">45<"), "Einzelpreis 45,00 should be written to the sheet");
+}
+
+#[test]
 fn test_partial_first_invoice_single_line_item() {
     let items = vec![InvoiceLineItem {
         pos: 1,

@@ -88,6 +88,33 @@ pub struct UpdateInvoiceRequest {
     pub status: Option<String>,
     /// Replace the extra services list (only allowed on `full` and `partial_final`).
     pub extra_services: Option<Vec<ExtraServiceRequest>>,
+    /// Replace the invoice's line items with hand-edited ones (full invoices only).
+    /// Presence of this field switches the invoice into manual mode — the stored
+    /// items become the source of truth and the offer-derived rebuild is bypassed.
+    pub line_items: Option<Vec<ManualLineItem>>,
+    /// Set to `false` (with no `line_items`) to leave manual mode and revert to the
+    /// offer-derived invoice. Ignored otherwise.
+    pub is_manual: Option<bool>,
+}
+
+/// Maximum hand-edited line items per invoice — matches the 20 line-item rows in
+/// the XLSX template (`invoice_xlsx.rs` rows 31–50); extras beyond this are
+/// truncated by the generator, so we reject them up front with a clear error.
+const MAX_LINE_ITEMS: usize = 20;
+
+/// A single hand-edited invoice line item (manual mode).
+///
+/// `unit_price_cents` is **netto** (the XLSX template adds 19% MwSt on top),
+/// consistent with the rest of the invoice model. `quantity` is a real number so
+/// worked hours like `12.5` render as "12,5" in the Menge column.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ManualLineItem {
+    pub description: String,
+    pub quantity: f64,
+    /// Netto price per unit in cents.
+    pub unit_price_cents: i64,
+    #[serde(default)]
+    pub remark: Option<String>,
 }
 
 /// A single extra service as provided by the API caller.
@@ -109,7 +136,12 @@ pub struct InvoiceResponse {
     pub partial_percent: Option<i32>,
     pub status: String,
     pub extra_services: Vec<ExtraServiceRequest>,
-    /// Netto total (base + extras) in cents, for display.
+    /// TRUE when the invoice's line items are hand-edited (manual mode).
+    pub is_manual: bool,
+    /// Hand-edited line items, present only for manual invoices (empty otherwise).
+    /// Lets the frontend editor load the current lines.
+    pub line_items: Vec<ManualLineItem>,
+    /// Netto total (base + extras, or Σ manual line items) in cents, for display.
     pub total_netto_cents: i64,
     /// Brutto total (netto × 1.19) in cents, for display.
     pub total_brutto_cents: i64,
@@ -753,6 +785,48 @@ async fn update_invoice(
         invoice_repo::update_pdf_key(&state.db, inv_id, &new_key).await?;
     }
 
+    // Handle manual line-items update (full invoices only) + PDF regeneration.
+    // Presence of `line_items` switches the invoice into manual mode: the stored
+    // items become the source of truth and `regenerate_invoice_pdf` renders from
+    // them instead of recomputing from the offer.
+    if let Some(ref items) = req.line_items {
+        if row.invoice_type != "full" {
+            return Err(ApiError::BadRequest(
+                "Manuelle Rechnungspositionen sind nur bei vollständigen Rechnungen möglich".into(),
+            ));
+        }
+        if items.is_empty() {
+            return Err(ApiError::BadRequest(
+                "Mindestens eine Rechnungsposition ist erforderlich".into(),
+            ));
+        }
+        if items.len() > MAX_LINE_ITEMS {
+            return Err(ApiError::BadRequest(format!(
+                "Maximal {MAX_LINE_ITEMS} Rechnungspositionen möglich"
+            )));
+        }
+        for (i, it) in items.iter().enumerate() {
+            if it.description.trim().is_empty() {
+                return Err(ApiError::BadRequest(format!(
+                    "line_items[{i}].description darf nicht leer sein"
+                )));
+            }
+        }
+
+        let items_json = serde_json::to_value(items)
+            .map_err(|e| ApiError::Internal(format!("JSON error: {e}")))?;
+        invoice_repo::update_line_items(&state.db, inv_id, Some(&items_json), true).await?;
+
+        // Regenerate the PDF from the reloaded (now-manual) row.
+        let manual_row = fetch_invoice_row(&state.db, inv_id).await?;
+        regenerate_invoice_pdf(&state, &manual_row).await?;
+    } else if req.is_manual == Some(false) && row.is_manual {
+        // Leave manual mode: drop the stored items and rebuild from the offer.
+        invoice_repo::update_line_items(&state.db, inv_id, None, false).await?;
+        let reverted_row = fetch_invoice_row(&state.db, inv_id).await?;
+        regenerate_invoice_pdf(&state, &reverted_row).await?;
+    }
+
     let updated_row = fetch_invoice_row(&state.db, inv_id).await?;
     let offer_netto = get_offer_netto(&state.db, inquiry_id).await?;
     Ok(Json(build_invoice_response(updated_row, offer_netto)))
@@ -1044,6 +1118,29 @@ fn build_invoice_data_from_items(
     }
 }
 
+/// Parse a manual invoice's stored `line_items_json` into generator line items.
+///
+/// Returns an empty vec if the column is NULL or unparseable. Netto `unit_price_cents`
+/// is converted to the generator's EUR-f64 `unit_price` at this boundary; `pos` is
+/// assigned 1..N from array order.
+fn manual_line_items(row: &InvoiceRow) -> Vec<InvoiceLineItem> {
+    let Some(json) = row.line_items_json.as_ref() else {
+        return vec![];
+    };
+    let items: Vec<ManualLineItem> = serde_json::from_value(json.clone()).unwrap_or_default();
+    items
+        .into_iter()
+        .enumerate()
+        .map(|(i, it)| InvoiceLineItem {
+            pos: (i + 1) as u32,
+            description: it.description,
+            quantity: it.quantity,
+            unit_price: it.unit_price_cents as f64 / 100.0,
+            remark: it.remark,
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Final-invoice line-item helpers
 // ---------------------------------------------------------------------------
@@ -1289,6 +1386,25 @@ async fn regenerate_invoice_pdf(
     let ctx = load_invoice_context(&state.db, row.inquiry_id, row.base_netto_cents).await?;
     let today = Utc::now().date_naive();
 
+    // Manual invoices render from their stored line items — NEVER recomputed from
+    // the offer, which would clobber Alex's hand edits. This is the guard that makes
+    // the manual mode durable across self-heal and number-overwrite regenerations.
+    if row.is_manual {
+        let data = build_invoice_data_from_items(
+            &ctx,
+            InvoiceType::Full,
+            &row.invoice_number,
+            today,
+            manual_line_items(row),
+        );
+        let xlsx = generate_invoice_xlsx(&data)
+            .map_err(|e| ApiError::Internal(format!("Invoice XLSX error: {e}")))?;
+        let pdf = generate_pdf_bytes(&xlsx).await;
+        let new_key = upload_invoice_pdf(&*state.storage, row.id, &pdf).await?;
+        invoice_repo::update_pdf_key(&state.db, row.id, &new_key).await?;
+        return Ok(());
+    }
+
     // Parse existing extras to preserve them across regeneration.
     let extras: Vec<ExtraServiceRequest> = row
         .extra_services
@@ -1419,6 +1535,17 @@ fn build_invoice_response(row: InvoiceRow, offer_netto_cents: i64) -> InvoiceRes
         })
         .unwrap_or_default();
 
+    // Manual invoices carry their own line items and totals — independent of the
+    // offer/extras model used by offer-derived invoices.
+    let manual_items: Vec<ManualLineItem> = if row.is_manual {
+        row.line_items_json
+            .as_ref()
+            .and_then(|j| serde_json::from_value(j.clone()).ok())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
     let extra_netto: i64 = extra_services.iter().map(|e| e.price_cents).sum();
     let extra_brutto = (extra_netto as f64 * 1.19).round() as i64;
     let offer_brutto = (offer_netto_cents as f64 * 1.19).round() as i64;
@@ -1427,7 +1554,17 @@ fn build_invoice_response(row: InvoiceRow, offer_netto_cents: i64) -> InvoiceRes
     // round(offer_brutto * pct), final = the remainder. This guarantees first_brutto +
     // final_brutto == offer_brutto to the cent. Independently rounding total_netto * 1.19
     // (the previous approach) could drift ±1ct away from the generated PDF total.
-    let (total_netto, total_brutto) = match row.invoice_type.as_str() {
+    let (total_netto, total_brutto) = if row.is_manual {
+        // Sum the exact line products, then round once — mirrors the template's
+        // Nettosumme = SUM(Menge × Einzelpreis) → ×1.19 for brutto.
+        let netto: f64 = manual_items
+            .iter()
+            .map(|it| it.quantity * it.unit_price_cents as f64)
+            .sum();
+        let netto = netto.round() as i64;
+        (netto, (netto as f64 * 1.19).round() as i64)
+    } else {
+        match row.invoice_type.as_str() {
         "partial_first" => {
             let pct = row.partial_percent.unwrap_or(0) as f64;
             let first_brutto = (offer_brutto as f64 * pct / 100.0).round() as i64;
@@ -1445,6 +1582,7 @@ fn build_invoice_response(row: InvoiceRow, offer_netto_cents: i64) -> InvoiceRes
             // full
             (offer_netto_cents + extra_netto, offer_brutto + extra_brutto)
         }
+        }
     };
 
     InvoiceResponse {
@@ -1456,11 +1594,83 @@ fn build_invoice_response(row: InvoiceRow, offer_netto_cents: i64) -> InvoiceRes
         partial_percent: row.partial_percent,
         status: row.status,
         extra_services,
+        is_manual: row.is_manual,
+        line_items: manual_items,
         total_netto_cents: total_netto,
         total_brutto_cents: total_brutto,
         pdf_s3_key: row.pdf_s3_key,
         sent_at: row.sent_at,
         paid_at: row.paid_at,
         created_at: row.created_at,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use invoice_repo::InvoiceRow;
+
+    /// Build a manual `full` invoice row with the given stored line items.
+    fn manual_row(line_items_json: serde_json::Value) -> InvoiceRow {
+        InvoiceRow {
+            id: Uuid::now_v7(),
+            inquiry_id: Uuid::now_v7(),
+            invoice_number: "2026-0001".into(),
+            invoice_type: "full".into(),
+            partial_group_id: None,
+            partial_percent: None,
+            status: "draft".into(),
+            extra_services: serde_json::json!([]),
+            pdf_s3_key: None,
+            sent_at: None,
+            paid_at: None,
+            created_at: Utc::now(),
+            deposit_percent: None,
+            deposit_invoice_id: None,
+            // Deliberately non-zero: a manual invoice must IGNORE the offer/base and
+            // total straight from its line items, not from this value.
+            base_netto_cents: Some(999_999),
+            is_manual: true,
+            line_items_json: Some(line_items_json),
+        }
+    }
+
+    #[test]
+    fn manual_line_items_converts_cents_to_eur_and_assigns_positions() {
+        let row = manual_row(serde_json::json!([
+            { "description": "Umzugsarbeiten", "quantity": 12.5, "unit_price_cents": 4500 },
+            { "description": "Anfahrtspauschale", "quantity": 1.0, "unit_price_cents": 8000, "remark": "pauschal" },
+        ]));
+        let items = manual_line_items(&row);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].pos, 1);
+        assert_eq!(items[0].description, "Umzugsarbeiten");
+        assert_eq!(items[0].quantity, 12.5);
+        assert_eq!(items[0].unit_price, 45.0); // 4500 cents → 45,00 €
+        assert_eq!(items[1].pos, 2);
+        assert_eq!(items[1].unit_price, 80.0);
+        assert_eq!(items[1].remark.as_deref(), Some("pauschal"));
+    }
+
+    #[test]
+    fn manual_invoice_totals_sum_line_items_ignoring_offer() {
+        // 12,5 × 45,00 € = 562,50 €  +  1 × 80,00 € = 80,00 €  →  netto 642,50 €.
+        let row = manual_row(serde_json::json!([
+            { "description": "Umzugsarbeiten", "quantity": 12.5, "unit_price_cents": 4500 },
+            { "description": "Anfahrtspauschale", "quantity": 1.0, "unit_price_cents": 8000 },
+        ]));
+        // Pass a bogus offer netto — a manual invoice must not use it.
+        let resp = build_invoice_response(row, 123_456);
+        assert!(resp.is_manual);
+        assert_eq!(resp.line_items.len(), 2);
+        assert_eq!(resp.total_netto_cents, 64_250); // 642,50 €
+        assert_eq!(resp.total_brutto_cents, 76_458); // 642,50 × 1,19 = 764,575 → 764,58 €
+    }
+
+    #[test]
+    fn manual_line_items_empty_when_json_null() {
+        let mut row = manual_row(serde_json::json!([]));
+        row.line_items_json = None;
+        assert!(manual_line_items(&row).is_empty());
     }
 }
