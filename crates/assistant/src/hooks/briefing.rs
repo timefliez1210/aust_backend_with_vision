@@ -6,8 +6,10 @@
 //! - Pending offers (in `offer_ready` status)
 //! - Unhandled inbound emails
 //!
-//! The assembly is pure read-only: no writes, no LLM calls. The scheduler wires
-//! this into a morning cron job (not yet implemented — Phase 3).
+//! The assembly (`assemble`) is pure read-only: no writes, no LLM calls. The
+//! `run_briefing_tick` scheduler at the bottom of this file posts it to the owner
+//! chat at two fixed daily slots (07:00 + 15:00 Europe/Berlin), driven by a 60s
+//! loop in `src/main.rs`.
 
 use chrono::{NaiveDate, NaiveTime, Utc};
 use serde::Serialize;
@@ -71,10 +73,18 @@ pub struct Briefing {
 }
 
 impl Briefing {
-    /// Format the briefing as a Telegram-ready markdown string (German).
+    /// Format the briefing as a Telegram-ready markdown string (German),
+    /// defaulting to the morning greeting.
     pub fn to_telegram_text(&self) -> String {
+        self.to_telegram_text_with_greeting("☀️ *Guten Morgen!*")
+    }
+
+    /// Format the briefing with a caller-supplied greeting line prefix, so the
+    /// afternoon slot doesn't say "Guten Morgen". The date sentence and body are
+    /// identical across slots.
+    pub fn to_telegram_text_with_greeting(&self, greeting: &str) -> String {
         let mut lines = vec![format!(
-            "☀️ *Guten Morgen!* Hier ist die Zusammenfassung für den {}.",
+            "{greeting} Hier ist die Zusammenfassung für den {}.",
             self.briefing_date.format("%d.%m.%Y")
         )];
 
@@ -289,6 +299,105 @@ pub async fn assemble(pool: &PgPool) -> Result<Briefing> {
     Ok(briefing)
 }
 
+// ── Scheduled delivery ────────────────────────────────────────────────────────
+
+use chrono::Timelike;
+use chrono_tz::Europe::Berlin;
+use tracing::{info, warn};
+
+use crate::events::notifier::TelegramNotifier;
+
+/// The fixed daily slots at which the briefing is auto-posted, as
+/// `(Europe/Berlin hour, slot key)`. The slot key is persisted in
+/// `agent_briefing_log` and selects the greeting. Requested by Alex: 07:00 and
+/// 15:00 (feedback report 68ff999e).
+const BRIEFING_SLOTS: &[(u32, &str)] = &[(7, "morning"), (15, "afternoon")];
+
+/// How many hours after a slot's start we may still deliver it (catch-up after
+/// downtime). Kept below the 8h gap between slots so a missed morning briefing
+/// can never bleed into the afternoon window.
+const CATCHUP_HOURS: u32 = 3;
+
+/// Greeting prefix for each slot key.
+fn slot_greeting(slot: &str) -> &'static str {
+    match slot {
+        "afternoon" => "🌤️ *Nachmittags-Update.*",
+        _ => "☀️ *Guten Morgen!*",
+    }
+}
+
+/// Run one briefing tick: if a fixed daily slot is currently due and hasn't been
+/// delivered today, assemble the briefing and post it to the owner chat.
+///
+/// Driven every 60s by a `tokio::spawn` loop in `src/main.rs` — the same cadence
+/// as the reminder tick. Idempotency comes from claiming the `(slot_date, slot)`
+/// row in `agent_briefing_log`: only the tick that wins the `INSERT ... ON
+/// CONFLICT DO NOTHING` actually sends, so restarts and overlapping ticks never
+/// double-post. A failed send releases the claim so the next tick retries.
+pub async fn run_briefing_tick(pool: &PgPool, notifier: &dyn TelegramNotifier) -> Result<()> {
+    // Only nag if there's an owner chat to nag.
+    let owner: Option<(i64,)> =
+        sqlx::query_as("SELECT chat_id FROM telegram_chat_bindings WHERE role = 'owner' LIMIT 1")
+            .fetch_optional(pool)
+            .await?;
+    let Some((owner_chat,)) = owner else {
+        return Ok(());
+    };
+
+    let now_berlin = Utc::now().with_timezone(&Berlin);
+    let hour = now_berlin.hour();
+    let today = now_berlin.date_naive();
+
+    let Some((_, slot)) = BRIEFING_SLOTS
+        .iter()
+        .find(|(slot_hour, _)| hour >= *slot_hour && hour < slot_hour + CATCHUP_HOURS)
+    else {
+        return Ok(());
+    };
+
+    // Claim the slot atomically. If another tick (or a prior run today) already
+    // holds it, `fetch_optional` yields None and we do nothing.
+    let claimed: Option<(NaiveDate,)> = sqlx::query_as(
+        "INSERT INTO agent_briefing_log (slot_date, slot, chat_id) VALUES ($1, $2, $3) \
+         ON CONFLICT (slot_date, slot) DO NOTHING RETURNING slot_date",
+    )
+    .bind(today)
+    .bind(*slot)
+    .bind(owner_chat)
+    .fetch_optional(pool)
+    .await?;
+    if claimed.is_none() {
+        return Ok(());
+    }
+
+    // From here the slot is claimed. Any failure — assembling the briefing or
+    // posting it — must RELEASE the claim so the next tick retries rather than
+    // leaving the slot marked delivered when nothing reached Alex.
+    let deliver = async {
+        let briefing = assemble(pool).await?;
+        let body = briefing.to_telegram_text_with_greeting(slot_greeting(slot));
+        notifier.post(owner_chat, body).await?;
+        Ok::<(), crate::error::AssistantError>(())
+    };
+
+    match deliver.await {
+        Ok(()) => {
+            info!(slot = %slot, date = %today, "Daily briefing posted");
+            Ok(())
+        }
+        Err(e) => {
+            let _ =
+                sqlx::query("DELETE FROM agent_briefing_log WHERE slot_date = $1 AND slot = $2")
+                    .bind(today)
+                    .bind(*slot)
+                    .execute(pool)
+                    .await;
+            warn!("Daily briefing delivery failed, will retry: {e}");
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,6 +444,24 @@ mod tests {
         let text = briefing.to_telegram_text();
         assert!(text.contains("12026"));
         assert!(text.contains("überfällige"));
+    }
+
+    #[test]
+    fn afternoon_greeting_replaces_morning_header() {
+        let briefing = make_briefing();
+        let text = briefing.to_telegram_text_with_greeting(slot_greeting("afternoon"));
+        assert!(text.contains("Nachmittags-Update"));
+        assert!(!text.contains("Guten Morgen"));
+        // Body is unchanged across slots.
+        assert!(text.contains("Umzug Müller"));
+        assert!(text.contains("09.06.2026"));
+    }
+
+    #[test]
+    fn morning_slot_keeps_default_greeting() {
+        assert_eq!(slot_greeting("morning"), "☀️ *Guten Morgen!*");
+        // Unknown/legacy slot keys fall back to the morning greeting.
+        assert_eq!(slot_greeting("whatever"), "☀️ *Guten Morgen!*");
     }
 
     #[test]

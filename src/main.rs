@@ -312,6 +312,31 @@ async fn main() -> Result<()> {
         tracing::info!("Reminder tick started (60 s interval)");
     }
 
+    // ── Daily briefing tick ───────────────────────────────────────────────────
+    // Every 60s: post the daily briefing to the owner chat at the fixed slots
+    // (07:00 + 15:00 Europe/Berlin). Idempotent per (date, slot) via
+    // agent_briefing_log, so this cadence just polls whether a slot is due.
+    {
+        let briefing_pool = state.db.clone();
+        let briefing_notifier: Arc<dyn TelegramNotifier> =
+            Arc::new(TelegramNotifierImpl::new(config.telegram.bot_token.clone()));
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                if let Err(e) = aust_assistant::hooks::briefing::run_briefing_tick(
+                    &briefing_pool,
+                    briefing_notifier.as_ref(),
+                )
+                .await
+                {
+                    tracing::warn!("Daily briefing tick failed: {e}");
+                }
+            }
+        });
+        tracing::info!("Daily briefing tick started (60 s interval, slots 07:00 + 15:00)");
+    }
+
     // Create router and start server
     let app = create_router(state);
 

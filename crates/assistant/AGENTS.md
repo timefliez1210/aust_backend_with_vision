@@ -31,7 +31,7 @@ into the `aust-email-agent` Telegram poller.
 | `tools/meta.rs` | `Remember` (Write, Owner) — stores durable memories |
 | `hooks/post_action.rs` | Reflection hook: parses MemoryProposal, auto-stores if confidence ≥ 0.7 |
 | `hooks/consolidate.rs` | Nightly job: clusters episodes by tag, calls LLM, stores high-confidence patterns |
-| `hooks/briefing.rs` | Morning briefing assembler (calendar, invoices, offers, emails) |
+| `hooks/briefing.rs` | Daily briefing assembler + scheduler (`run_briefing_tick`): auto-posts to the owner chat at 07:00 + 15:00 Europe/Berlin, once per slot/day via the `agent_briefing_log` claim. Driven by a 60s loop in `src/main.rs`. |
 | `learning/features.rs` | `OfferFeatures` struct + extractor |
 | `learning/observations.rs` | Records offer adjustments to `offer_observations` |
 | `learning/predict.rs` | `OfferAdjustmentPredictor` trait + `NullPredictor` + `LinfaPredictor` stub |
