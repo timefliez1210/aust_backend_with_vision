@@ -194,10 +194,12 @@ impl ToolRegistry {
         registry.register(Box::new(invoices::CreateInvoice));
         registry.register(Box::new(invoices::UpdateInvoiceStatus));
         registry.register(Box::new(invoices::RecordPayment));
-        // SendInvoice / SendPaymentReminder unregistered until the invoice SMTP+PDF
-        // send path is exposed via InvoiceService — both are NotWired-only today.
-        // VoidInvoice stays: it executes a real status transition. Use admin panel
-        // for sending invoices/reminders until these are wired.
+        registry.register(Box::new(invoices::ListDueDunning));
+        registry.register(Box::new(invoices::SendPaymentReminder));
+        // SendInvoice stays unregistered until the invoice SMTP+PDF send path is
+        // exposed via InvoiceService — it is NotWired-only today. Use the admin panel
+        // to send an invoice. Dunning mail (SendPaymentReminder) does not need the PDF
+        // pipeline — it is a plain email — so it is wired.
         registry.register(Box::new(invoices::VoidInvoice));
 
         // Estimates
@@ -217,6 +219,8 @@ impl ToolRegistry {
 
         // Reviews
         registry.register(Box::new(reviews::ListReviews));
+        registry.register(Box::new(reviews::ListDueReviewRequests));
+        registry.register(Box::new(reviews::SendReviewRequest));
         registry.register(Box::new(reviews::ListFeedback));
         registry.register(Box::new(reviews::CreateFeedback));
         registry.register(Box::new(reviews::RespondToReview));

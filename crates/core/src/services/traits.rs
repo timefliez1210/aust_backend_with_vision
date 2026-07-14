@@ -140,8 +140,14 @@ pub struct CalendarItem {
     /// `"termin"` → a `calendar_items` row (use reassign_termin / delete /
     /// assign_employee with this id); `"auftrag"` → a moving job derived from
     /// an `inquiries` row (the id is an inquiry_id — use set_inquiry_crew /
-    /// schedule_inquiry, NOT the calendar_item tools).
+    /// schedule_inquiry, NOT the calendar_item tools); `"besichtigung"` → an
+    /// `inquiry_appointments` row (a light appointment hanging off an inquiry;
+    /// `inquiry_id` names its parent).
     pub kind: String,
+    /// Parent inquiry for `kind = "besichtigung"` rows; `None` for everything
+    /// else. Without it the assistant cannot tell which inquiry a Besichtigung
+    /// belongs to, and re-creates it as a standalone calendar_item.
+    pub inquiry_id: Option<Uuid>,
 }
 
 /// A lightweight email message summary.
@@ -476,6 +482,37 @@ pub struct InvoiceReminder {
     pub level: i32,
     pub sent_at: Option<chrono::DateTime<chrono::Utc>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// A dunning step that has come due: one sent-but-unpaid invoice, and which
+/// escalation level is owed on it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DueDunning {
+    /// The `invoice_reminders` row — this is what `send_dunning` takes.
+    pub reminder_id: Uuid,
+    pub invoice_id: Uuid,
+    pub inquiry_id: Uuid,
+    pub invoice_number: String,
+    /// 1, 2, or 3.
+    pub level: i32,
+    /// `"Zahlungserinnerung"` | `"1. Mahnung"` | `"2. Mahnung"`.
+    pub level_label: String,
+    pub remind_after: NaiveDate,
+    /// Days since it became due. 0 = today.
+    pub days_overdue: i64,
+    pub customer_name: Option<String>,
+    pub customer_email: Option<String>,
+}
+
+/// A deferred Bewertungsanfrage whose reminder date has arrived.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DueReviewRequest {
+    pub inquiry_id: Uuid,
+    pub remind_after: NaiveDate,
+    /// Days since it became due. 0 = today.
+    pub days_overdue: i64,
+    pub customer_name: Option<String>,
+    pub customer_email: Option<String>,
 }
 
 /// A full email record including body.
@@ -865,6 +902,25 @@ pub trait InvoiceService: Send + Sync {
         method: &str,
         ref_text: Option<&str>,
     ) -> Result<Uuid, ServiceError>;
+
+    /// Every dunning step that is due today or overdue, across all customers.
+    ///
+    /// This is the "wer schuldet uns Geld" list: sent invoices that haven't been
+    /// paid, each carrying the escalation level currently owed on it.
+    async fn list_due_dunning(&self) -> Result<Vec<DueDunning>, ServiceError>;
+
+    /// Sends the dunning email for a due step and advances the ladder.
+    ///
+    /// `reminder_id` is a [`DueDunning::reminder_id`]. Returns the level that was
+    /// sent and its label. Escalation stops after the 2. Mahnung.
+    async fn send_dunning(&self, reminder_id: Uuid) -> Result<(i32, String), ServiceError>;
+
+    /// Books an invoice as paid: sets `paid_at`, closes any open dunning step, and
+    /// settles the inquiry once its last invoice is in.
+    ///
+    /// Prefer this over `update_status(id, "paid")`, which only writes the status
+    /// column and would leave the dunning nag running.
+    async fn mark_paid(&self, invoice_id: Uuid) -> Result<(), ServiceError>;
 }
 
 // ── Employee ──────────────────────────────────────────────────────────────────
@@ -1004,6 +1060,23 @@ pub trait ReviewService: Send + Sync {
         id: Uuid,
         notes: Option<&str>,
     ) -> Result<(), ServiceError>;
+
+    /// Every deferred Bewertungsanfrage whose reminder date has arrived.
+    async fn list_due_review_requests(&self) -> Result<Vec<DueReviewRequest>, ServiceError>;
+
+    /// Decide what happens to an inquiry's Google-review request.
+    ///
+    /// `action` is `"now"` (send the mail), `"later"` (defer by `remind_after_days`,
+    /// default 3), or `"skip"` (never ask). Returns the resulting status. Idempotent
+    /// by inquiry — deciding again overwrites the previous decision.
+    ///
+    /// Returns `Validation` on an unknown action or a customer with no email.
+    async fn decide_review_request(
+        &self,
+        inquiry_id: Uuid,
+        action: &str,
+        remind_after_days: Option<u32>,
+    ) -> Result<String, ServiceError>;
 }
 
 // ── Metrics ───────────────────────────────────────────────────────────────────

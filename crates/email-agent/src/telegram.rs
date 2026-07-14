@@ -54,6 +54,10 @@ pub enum ApprovalDecision {
     OfferDeny(String),
     /// Free-text edit instructions for an offer (routed when no email draft is being edited)
     OfferEditText(String),
+    /// Admin approved a storage-rental ("Lagerung") monthly invoice — send it
+    StorageApprove(String),
+    /// Admin rejected a storage-rental monthly invoice
+    StorageReject(String),
     /// A complete inquiry is ready to become a quote + offer
     InquiryComplete(Box<aust_core::models::MovingInquiry>),
     /// Free-text message from a chat that may be bound to the assistant agent.
@@ -455,6 +459,22 @@ impl TelegramBot {
                 Some(ApprovalResponse {
                     draft_id,
                     decision: ApprovalDecision::OfferDeny(id),
+                })
+            }
+            "storage_approve" => {
+                self.send_status_message("✅ Lagerungsrechnung wird versendet...").await;
+                let id = draft_id.clone();
+                Some(ApprovalResponse {
+                    draft_id,
+                    decision: ApprovalDecision::StorageApprove(id),
+                })
+            }
+            "storage_reject" => {
+                self.send_status_message("❌ Lagerungsrechnung abgelehnt.").await;
+                let id = draft_id.clone();
+                Some(ApprovalResponse {
+                    draft_id,
+                    decision: ApprovalDecision::StorageReject(id),
                 })
             }
             _ => {

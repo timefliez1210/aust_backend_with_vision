@@ -91,14 +91,17 @@ pub(crate) async fn snooze(db: &PgPool, id: Uuid, remind_after: NaiveDate) -> Re
     Ok(())
 }
 
-/// Closes a reminder (admin marked the invoice as paid or dismissed).
+/// Closes any open reminder attached to an invoice, addressed by *invoice* id.
 ///
-/// **Caller**: `routes::admin::invoice_reminder_action` (action = "paid")
-pub(crate) async fn close(db: &PgPool, id: Uuid) -> Result<(), ApiError> {
+/// **Caller**: `services::billing_reminders::mark_invoice_paid` — the register's
+/// "Bezahlt" button knows the invoice, not the reminder. Without this a paid
+/// invoice would keep a pending dunning row and Josie would keep nagging about it.
+pub(crate) async fn close_for_invoice(db: &PgPool, invoice_id: Uuid) -> Result<(), ApiError> {
     sqlx::query(
-        "UPDATE invoice_reminders SET status = 'closed', updated_at = NOW() WHERE id = $1",
+        "UPDATE invoice_reminders SET status = 'closed', updated_at = NOW() \
+         WHERE invoice_id = $1 AND status <> 'closed'",
     )
-    .bind(id)
+    .bind(invoice_id)
     .execute(db)
     .await
     .map_err(ApiError::Database)?;

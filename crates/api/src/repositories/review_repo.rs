@@ -59,6 +59,22 @@ pub(crate) async fn upsert(
 // Read
 // ---------------------------------------------------------------------------
 
+/// Current review-request status for an inquiry, if one was ever recorded.
+///
+/// **Caller**: `services::billing_reminders::mark_invoice_paid`
+/// **Why**: The register only prompts for a review when the question is still open.
+/// Once Alex has answered it — sent, skipped, or deferred — re-asking on every
+/// payment would be noise.
+pub(crate) async fn status_for(db: &PgPool, inquiry_id: Uuid) -> Result<Option<String>, ApiError> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT status FROM review_requests WHERE inquiry_id = $1")
+            .bind(inquiry_id)
+            .fetch_optional(db)
+            .await
+            .map_err(ApiError::Database)?;
+    Ok(row.map(|(s,)| s))
+}
+
 /// Returns all pending review requests whose `remind_after` date is today or earlier.
 ///
 /// **Caller**: `routes::admin::list_review_reminders` (dashboard widget)

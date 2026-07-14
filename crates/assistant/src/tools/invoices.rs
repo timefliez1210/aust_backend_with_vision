@@ -223,6 +223,33 @@ impl Tool for SendInvoice {
     }
 }
 
+// ── ListDueDunning ────────────────────────────────────────────────────────────
+
+pub struct ListDueDunning;
+
+#[async_trait]
+impl Tool for ListDueDunning {
+    fn name(&self) -> &'static str { "list_due_dunning" }
+    fn description(&self) -> &'static str {
+        "Listet alle offenen Rechnungen, bei denen eine Zahlungserinnerung oder Mahnung fällig ist \
+         (versendet, aber nicht bezahlt). Nutze das für Fragen wie 'Wer schuldet uns noch Geld?', \
+         'Welche Mahnungen stehen an?' oder 'Gibt es offene Rechnungen?'. Liefert pro Eintrag die \
+         fällige Stufe (level_label: Zahlungserinnerung / 1. Mahnung / 2. Mahnung), die \
+         reminder_id für send_payment_reminder, Rechnungsnummer, Kunde und days_overdue."
+    }
+    fn params_schema(&self) -> Value {
+        json!({ "type": "object", "properties": {} })
+    }
+    fn safety(&self) -> Safety { Safety::Read }
+    fn min_role(&self) -> Role { Role::Owner }
+
+    async fn execute(&self, ctx: &ToolCtx, _args: &Value) -> Result<Value> {
+        let items = ctx.services.invoices.list_due_dunning().await?;
+        let count = items.len();
+        Ok(json!({ "dunning": items, "count": count }))
+    }
+}
+
 // ── SendPaymentReminder (Confirm) ─────────────────────────────────────────────
 
 pub struct SendPaymentReminder;
@@ -231,35 +258,45 @@ pub struct SendPaymentReminder;
 impl Tool for SendPaymentReminder {
     fn name(&self) -> &'static str { "send_payment_reminder" }
     fn description(&self) -> &'static str {
-        "Sendet eine Zahlungserinnerung (Stufe 1/2/3 in steigender Schärfe). Erfordert Bestätigung."
+        "Sendet die fällige Zahlungserinnerung bzw. Mahnung per E-Mail an den Kunden und schaltet \
+         die Mahnstufe eine Stufe weiter (Zahlungserinnerung → 1. Mahnung → 2. Mahnung, je 7 Tage). \
+         Die Stufe ergibt sich aus dem Mahnlauf — du wählst sie NICHT selbst. Die reminder_id kommt \
+         aus list_due_dunning. Erfordert Bestätigung."
     }
     fn params_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "invoice_id": { "type": "string", "format": "uuid" },
-                "level":      { "type": "integer", "minimum": 1, "maximum": 3 }
+                "reminder_id": {
+                    "type": "string",
+                    "format": "uuid",
+                    "description": "reminder_id aus list_due_dunning (NICHT die invoice_id)."
+                }
             },
-            "required": ["invoice_id", "level"]
+            "required": ["reminder_id"]
         })
     }
     fn safety(&self) -> Safety { Safety::Confirm }
     fn min_role(&self) -> Role { Role::Owner }
 
     fn summarize(&self, args: &Value) -> String {
-        let id = args["invoice_id"].as_str().unwrap_or("?");
-        let level = args["level"].as_i64().unwrap_or(1);
-        format!("Mahnung Stufe {level} für Rechnung {id} senden?")
+        let id = args["reminder_id"].as_str().unwrap_or("?");
+        format!("Fällige Mahnung/Zahlungserinnerung {id} per E-Mail an den Kunden senden?")
     }
 
     async fn execute(&self, ctx: &ToolCtx, args: &Value) -> Result<Value> {
-        let _id = parse_uuid(args, "invoice_id", self.name())?;
+        let id = parse_uuid(args, "reminder_id", self.name())?;
         if !ctx.confirmed {
             return Ok(pending_confirmation(self.name(), args, self.summarize(args)));
         }
-        Err(crate::error::AssistantError::NotWired(
-            "Mahnungsversand per E-Mail".to_string(),
-        ))
+        match ctx.services.invoices.send_dunning(id).await {
+            Ok((level, label)) => Ok(json!({ "ok": true, "level": level, "level_label": label })),
+            // No email on file / reminder already closed — Alex's problem to fix, not a crash.
+            Err(aust_core::services::ServiceError::Validation(msg)) => {
+                Ok(json!({ "ok": false, "message": msg }))
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 }
 
@@ -335,6 +372,35 @@ mod tests {
         assert!(r["invoice_number"].is_string());
     }
 
+    /// The "wer schuldet uns Geld" list carries the level label and the reminder_id
+    /// that send_payment_reminder needs — Josie must never have to guess either.
+    #[tokio::test]
+    async fn list_due_dunning_ok() {
+        let services = testing::mock_bundle(uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let r = ListDueDunning.execute(&ctx(services), &json!({})).await.unwrap();
+        assert_eq!(r["count"], json!(1));
+        let item = &r["dunning"][0];
+        assert_eq!(item["level_label"], json!("1. Mahnung"));
+        assert_eq!(item["invoice_number"], json!("2026-0042"));
+        assert!(item["reminder_id"].is_string());
+        assert_eq!(item["days_overdue"], json!(4));
+    }
+
+    /// Once confirmed it sends, and reports back which level actually went out —
+    /// the ladder decides that, not Josie.
+    #[tokio::test]
+    async fn send_payment_reminder_sends_when_confirmed() {
+        let services = testing::mock_bundle(uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let mut c = ctx(services);
+        c.confirmed = true;
+        let r = SendPaymentReminder
+            .execute(&c, &json!({ "reminder_id": uuid::Uuid::new_v4() }))
+            .await
+            .unwrap();
+        assert_eq!(r["ok"], json!(true));
+        assert_eq!(r["level_label"], json!("1. Mahnung"));
+    }
+
     #[tokio::test]
     async fn list_reminders_returns_count() {
         let services = testing::mock_bundle(uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
@@ -391,14 +457,16 @@ mod tests {
         assert_eq!(r["status"], json!("pending_confirmation"));
     }
 
+    /// A dunning mail goes to a customer, so an unconfirmed call must not send it.
     #[tokio::test]
     async fn send_payment_reminder_pending() {
         let services = testing::mock_bundle(uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
         let r = SendPaymentReminder
-            .execute(&ctx(services), &json!({ "invoice_id": uuid::Uuid::new_v4(), "level": 1 }))
+            .execute(&ctx(services), &json!({ "reminder_id": uuid::Uuid::new_v4() }))
             .await
             .unwrap();
         assert_eq!(r["status"], json!("pending_confirmation"));
+        assert_ne!(r["ok"], json!(true), "must not send before confirmation");
     }
 
     #[tokio::test]

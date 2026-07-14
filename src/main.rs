@@ -218,6 +218,30 @@ async fn main() -> Result<()> {
     });
     tracing::info!("Vehicle reminder task started");
 
+    // Storage-rental ("Lagerung") monthly billing: generate one invoice per active
+    // contract on/after its anniversary day, awaiting Telegram/dashboard approval.
+    // Hourly + the storage_invoices UNIQUE(contract, year, month) constraint =
+    // exactly-once per calendar month, with catch-up if a tick is missed.
+    let storage_billing_db = state.db.clone();
+    let storage_billing_storage = state.storage.clone();
+    let storage_billing_config = state.config.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(3600)); // hourly
+        loop {
+            interval.tick().await;
+            if let Err(e) = aust_api::services::storage_billing_service::run_billing_tick(
+                &storage_billing_db,
+                &storage_billing_storage,
+                &storage_billing_config,
+            )
+            .await
+            {
+                tracing::warn!("Storage billing tick failed: {e}");
+            }
+        }
+    });
+    tracing::info!("Storage billing task started");
+
     // ── Assistant event consumer ───────────────────────────────────────────────
     // Build the TelegramNotifier (concrete reqwest-backed impl) and spawn the
     // AssistantEventConsumer that drives event handlers (inquiry.created,

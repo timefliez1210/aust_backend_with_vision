@@ -15,6 +15,7 @@ pub use error::ServiceError;
 pub use traits::{
     AddressService, AddressPatch, AvailableSlot, CalendarItem, CalendarItemPatch, CalendarService,
     ComputedLineItem, CrewMember, CustomerPatch, CustomerService, DailyMetrics, DistanceResult,
+    DueDunning, DueReviewRequest,
     EmailDetail, EmailService, EmailSummary, EmployeePatch, EmployeeRecord, EmployeeSchedulePatch, EmployeeService,
     EmployeeWorkloadEntry, EstimationService, EstimationSummary, FeedbackRecord, InquiryService,
     InvoiceDetail, InvoiceReminder, InvoiceService, InvoiceSummary, MetricsService, NewAddress,

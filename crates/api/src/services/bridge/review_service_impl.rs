@@ -6,16 +6,20 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use aust_core::services::{
-    FeedbackRecord, ReviewRecord, ReviewService, ServiceError,
+    DueReviewRequest, FeedbackRecord, ReviewRecord, ReviewService, ServiceError,
 };
+
+use crate::services::billing_reminder_service;
 
 pub struct ReviewServiceImpl {
     pool: PgPool,
+    /// Needed to send the Google-review mail on Alex's say-so.
+    config: std::sync::Arc<aust_core::Config>,
 }
 
 impl ReviewServiceImpl {
-    pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+    pub fn new(pool: PgPool, config: std::sync::Arc<aust_core::Config>) -> Self {
+        Self { pool, config }
     }
 }
 
@@ -180,5 +184,39 @@ impl ReviewService for ReviewServiceImpl {
         .await
         .map_err(super::map_sqlx)?;
         Ok(())
+    }
+
+    async fn list_due_review_requests(&self) -> Result<Vec<DueReviewRequest>, ServiceError> {
+        let rows = billing_reminder_service::list_due_review_requests(&self.pool)
+            .await
+            .map_err(super::map_api)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| DueReviewRequest {
+                inquiry_id: r.inquiry_id,
+                remind_after: r.remind_after,
+                days_overdue: r.days_overdue,
+                customer_name: r.customer_name,
+                customer_email: r.customer_email,
+            })
+            .collect())
+    }
+
+    async fn decide_review_request(
+        &self,
+        inquiry_id: Uuid,
+        action: &str,
+        remind_after_days: Option<u32>,
+    ) -> Result<String, ServiceError> {
+        let outcome = billing_reminder_service::decide_review_request(
+            &self.pool,
+            &self.config.email,
+            inquiry_id,
+            action,
+            remind_after_days,
+        )
+        .await
+        .map_err(super::map_api)?;
+        Ok(outcome.status.to_string())
     }
 }

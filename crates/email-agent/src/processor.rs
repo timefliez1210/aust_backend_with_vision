@@ -714,6 +714,8 @@ impl EmailProcessor {
                 ApprovalDecision::OfferApprove(_)
                 | ApprovalDecision::OfferEdit(_)
                 | ApprovalDecision::OfferDeny(_)
+                | ApprovalDecision::StorageApprove(_)
+                | ApprovalDecision::StorageReject(_)
                 | ApprovalDecision::AssistantText { .. }
                 | ApprovalDecision::AssistantCallback { .. }
                 | ApprovalDecision::AssistantMedia { .. } => {

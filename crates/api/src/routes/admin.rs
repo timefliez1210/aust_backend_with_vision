@@ -14,8 +14,9 @@ use uuid::Uuid;
 
 use aust_core::models::TokenClaims;
 use aust_offer_generator::{convert_xlsx_to_pdf, generate_timesheet_xlsx, TimesheetData, TimesheetEntry};
-use crate::repositories::{admin_repo, employee_repo, feedback_repo, review_repo, invoice_reminder_repo, invoice_repo, settings_repo};
+use crate::repositories::{admin_repo, employee_repo, feedback_repo, review_repo, invoice_reminder_repo, invoice_repo, settings_repo, storage_repo};
 use crate::repositories::settings_repo::PricingSettings;
+use crate::services::billing_reminder_service;
 use aust_flash_contact;
 use crate::{ApiError, AppState};
 
@@ -82,6 +83,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/invoice-reminders/{id}/action", post(invoice_reminder_action))
         .route("/rechnungsausgangsbuch", get(rechnungsausgangsbuch))
         .route("/rechnungsausgangsbuch/{id}/payment-method", patch(update_payment_method))
+        .route("/rechnungsausgangsbuch/{id}/paid", post(mark_register_invoice_paid))
         .route("/flash-contacts", get(list_flash_contacts))
         .route("/flash-contacts/{id}/handle", post(handle_flash_contact))
         .route("/settings", get(get_settings))
@@ -1626,21 +1628,6 @@ pub(crate) fn mime_from_ext(ext: &str) -> &'static str {
 // Invoice reminders (dunning)
 // ---------------------------------------------------------------------------
 
-const DUNNING_LEVEL_LABEL: [&str; 3] = ["Zahlungserinnerung", "1. Mahnung", "2. Mahnung"];
-
-#[derive(Debug, Serialize)]
-struct InvoiceReminderItem {
-    id: Uuid,
-    invoice_id: Uuid,
-    inquiry_id: Uuid,
-    invoice_number: String,
-    level: i32,
-    level_label: &'static str,
-    remind_after: NaiveDate,
-    customer_name: Option<String>,
-    customer_email: Option<String>,
-}
-
 /// `GET /api/v1/admin/invoice-reminders` — List due payment reminders (admin only).
 ///
 /// **Caller**: Admin dashboard on load.
@@ -1649,23 +1636,10 @@ struct InvoiceReminderItem {
 async fn list_invoice_reminders(
     State(state): State<Arc<AppState>>,
     Extension(_claims): Extension<TokenClaims>,
-) -> Result<Json<Vec<InvoiceReminderItem>>, ApiError> {
-    let rows = invoice_reminder_repo::fetch_due(&state.db).await?;
-    let items = rows.into_iter().map(|r| {
-        let label_idx = ((r.level - 1) as usize).min(2);
-        InvoiceReminderItem {
-            id: r.id,
-            invoice_id: r.invoice_id,
-            inquiry_id: r.inquiry_id,
-            invoice_number: r.invoice_number,
-            level: r.level,
-            level_label: DUNNING_LEVEL_LABEL[label_idx],
-            remind_after: r.remind_after,
-            customer_name: r.customer_name,
-            customer_email: r.customer_email,
-        }
-    }).collect();
-    Ok(Json(items))
+) -> Result<Json<Vec<billing_reminder_service::DueInvoiceReminder>>, ApiError> {
+    Ok(Json(
+        billing_reminder_service::list_due_invoice_reminders(&state.db).await?,
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1698,68 +1672,39 @@ async fn invoice_reminder_action(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin(&claims)?;
 
-    let row = invoice_reminder_repo::fetch_one(&state.db, id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound("Erinnerung nicht gefunden".into()))?;
-
     match body.action.as_str() {
         "send" => {
-            let email = row.customer_email.as_deref()
-                .ok_or_else(|| ApiError::BadRequest("Kunde hat keine E-Mail-Adresse".into()))?;
-            let name = row.customer_name.as_deref().unwrap_or("Sehr geehrte Damen und Herren");
-            let label_idx = ((row.level - 1) as usize).min(2);
-            let label = DUNNING_LEVEL_LABEL[label_idx];
-            let subject = format!("{label}: Rechnung {}", row.invoice_number);
-            let body_text = build_dunning_email(name, &row.invoice_number, label, row.level);
-
-            admin_emails::send_plain_email(&state.config.email, email, &subject, &body_text)
-                .await
-                .map_err(|e| ApiError::Internal(format!("E-Mail-Versand fehlgeschlagen: {e}")))?;
-
-            let next = Utc::now().date_naive() + chrono::Days::new(7);
-            invoice_reminder_repo::advance(&state.db, id, next).await?;
-            Ok(Json(serde_json::json!({ "status": "sent", "level": row.level })))
+            let (level, _label) =
+                billing_reminder_service::send_dunning(&state.db, &state.config.email, id).await?;
+            Ok(Json(serde_json::json!({ "status": "sent", "level": level })))
         }
         "later" => {
             let days = body.snooze_days.unwrap_or(7);
-            let remind_after = Utc::now().date_naive() + chrono::Days::new(days as u64);
-            invoice_reminder_repo::snooze(&state.db, id, remind_after).await?;
-            Ok(Json(serde_json::json!({ "status": "snoozed", "remind_after": remind_after.to_string() })))
+            let remind_after =
+                billing_reminder_service::snooze_dunning(&state.db, id, days).await?;
+            Ok(Json(serde_json::json!({
+                "status": "snoozed",
+                "remind_after": remind_after.to_string()
+            })))
         }
         "paid" => {
-            // Mark invoice as paid (reuses invoice_repo)
-            use crate::repositories::invoice_repo;
-            let now = Utc::now();
-            invoice_repo::mark_paid(&state.db, row.invoice_id, now).await?;
-            // Check if all invoices for this inquiry are now paid
-            let unpaid = invoice_repo::count_unpaid(&state.db, row.inquiry_id).await?;
-            if unpaid == 0 {
-                invoice_repo::transition_inquiry_to_paid(&state.db, row.inquiry_id, now).await?;
-            }
-            invoice_reminder_repo::close(&state.db, id).await?;
-            Ok(Json(serde_json::json!({ "status": "paid" })))
+            let row = invoice_reminder_repo::fetch_one(&state.db, id)
+                .await?
+                .ok_or_else(|| ApiError::NotFound("Erinnerung nicht gefunden".into()))?;
+            let outcome = billing_reminder_service::mark_invoice_paid(
+                &state.db,
+                row.invoice_id,
+                Utc::now(),
+            )
+            .await?;
+            Ok(Json(serde_json::json!({
+                "status": "paid",
+                "review_prompt": outcome.review_prompt,
+                "inquiry_id": outcome.inquiry_id
+            })))
         }
         _ => Err(ApiError::BadRequest("Ungültige Aktion. Erlaubt: send, later, paid".into())),
     }
-}
-
-fn build_dunning_email(name: &str, invoice_number: &str, label: &str, level: i32) -> String {
-    let urgency = match level {
-        1 => "Möglicherweise ist die Zahlung in Bearbeitung — bitte prüfen Sie Ihre Unterlagen.",
-        2 => "Wir bitten Sie dringend, den ausstehenden Betrag umgehend zu begleichen.",
-        _ => "Dies ist unsere letzte Erinnerung vor weiteren rechtlichen Schritten.",
-    };
-    format!(
-        "Guten Tag {name},\n\n\
-         {label} für Rechnung {invoice_number}\n\n\
-         laut unseren Unterlagen ist die oben genannte Rechnung noch offen.\n\
-         {urgency}\n\n\
-         Sollten Sie die Zahlung bereits veranlasst haben, bitten wir Sie, \
-         diese E-Mail als gegenstandslos zu betrachten.\n\n\
-         Bei Fragen stehen wir Ihnen gerne zur Verfügung.\n\n\
-         Mit freundlichen Grüßen\n\
-         Ihr Team von Aust Umzüge & Haushaltsauflösungen",
-    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1843,11 +1788,6 @@ async fn morning_workflow(
 // Review requests
 // ---------------------------------------------------------------------------
 
-/// Google-review link sent to customers in the review request email.
-/// Direct write-a-review URL for Aust Umzüge & Haushaltsauflösungen.
-const GOOGLE_REVIEW_URL: &str =
-    "https://www.google.com/search?q=Aust+Umz%C3%BCge+%26+Haushaltsaufl%C3%B6sungen+Reviews";
-
 #[derive(Debug, Deserialize)]
 struct CreateReviewRequestBody {
     /// "now" — send immediately; "later" — schedule reminder; "skip" — do nothing.
@@ -1879,59 +1819,19 @@ async fn create_review_request(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin(&claims)?;
 
-    // Fetch customer linked to this inquiry
-    let customer = crate::repositories::customer_repo::fetch_by_inquiry_id(&state.db, id).await?;
+    let outcome = billing_reminder_service::decide_review_request(
+        &state.db,
+        &state.config.email,
+        id,
+        &body.action,
+        body.remind_after_days,
+    )
+    .await?;
 
-    match body.action.as_str() {
-        "now" => {
-            let customer_email = customer
-                .email
-                .as_deref()
-                .ok_or_else(|| ApiError::BadRequest("Kunde hat keine E-Mail-Adresse".into()))?;
-            let customer_name = customer.display_name();
-            let subject = "Wie war Ihr Umzug? Wir freuen uns über Ihre Bewertung!";
-            let body_text = format!(
-                "Guten Tag {customer_name},\n\n\
-                 vielen Dank, dass Sie Aust Umzüge & Haushaltsauflösungen für Ihren Umzug gewählt haben.\n\n\
-                 Wir würden uns sehr freuen, wenn Sie uns eine kurze Bewertung hinterlassen würden:\n\
-                 {GOOGLE_REVIEW_URL}\n\n\
-                 Ihre Meinung hilft uns, unsere Dienstleistungen stetig zu verbessern.\n\n\
-                 Mit freundlichen Grüßen\n\
-                 Ihr Team von Aust Umzüge & Haushaltsauflösungen",
-            );
-
-            admin_emails::send_plain_email(&state.config.email, customer_email, subject, &body_text)
-                .await
-                .map_err(|e| ApiError::Internal(format!("E-Mail-Versand fehlgeschlagen: {e}")))?;
-
-            review_repo::upsert(
-                &state.db, id, "sent", None, Some(Utc::now()),
-            ).await?;
-
-            Ok(Json(serde_json::json!({ "status": "sent" })))
-        }
-        "later" => {
-            let days = body.remind_after_days.unwrap_or(3);
-            let remind_after = Utc::now().date_naive() + chrono::Days::new(days as u64);
-            review_repo::upsert(&state.db, id, "pending", Some(remind_after), None).await?;
-            Ok(Json(serde_json::json!({ "status": "pending", "remind_after": remind_after.to_string() })))
-        }
-        "skip" => {
-            review_repo::upsert(&state.db, id, "skipped", None, None).await?;
-            Ok(Json(serde_json::json!({ "status": "skipped" })))
-        }
-        _ => Err(ApiError::BadRequest(
-            "Ungültige Aktion. Erlaubt: now, later, skip".into(),
-        )),
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct ReviewReminderItem {
-    inquiry_id: Uuid,
-    remind_after: NaiveDate,
-    customer_name: Option<String>,
-    customer_email: Option<String>,
+    Ok(Json(serde_json::json!({
+        "status": outcome.status,
+        "remind_after": outcome.remind_after.map(|d| d.to_string())
+    })))
 }
 
 /// `GET /api/v1/admin/review-reminders` — List overdue review request reminders.
@@ -1944,19 +1844,11 @@ struct ReviewReminderItem {
 async fn list_review_reminders(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<TokenClaims>,
-) -> Result<Json<Vec<ReviewReminderItem>>, ApiError> {
+) -> Result<Json<Vec<billing_reminder_service::DueReviewRequest>>, ApiError> {
     require_admin(&claims)?;
-    let rows = review_repo::fetch_pending_reminders(&state.db).await?;
-    let items = rows
-        .into_iter()
-        .map(|r| ReviewReminderItem {
-            inquiry_id: r.inquiry_id,
-            remind_after: r.remind_after,
-            customer_name: r.customer_name,
-            customer_email: r.customer_email,
-        })
-        .collect();
-    Ok(Json(items))
+    Ok(Json(
+        billing_reminder_service::list_due_review_requests(&state.db).await?,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1966,6 +1858,12 @@ async fn list_review_reminders(
 #[derive(Debug, Serialize)]
 struct RechnungsausgangItem {
     id: Uuid,
+    /// Invoice source: `"umzug"` (core inquiry invoice) or `"lagerung"` (storage).
+    /// Distinguishes which table the payment-method editor writes to.
+    kind: &'static str,
+    /// Parent inquiry — `None` for `"lagerung"`, which hangs off a storage contract.
+    /// The register's review prompt needs it to address the review request.
+    inquiry_id: Option<Uuid>,
     invoice_number: String,
     customer_name: Option<String>,
     scheduled_date: Option<NaiveDate>,
@@ -1991,7 +1889,7 @@ async fn rechnungsausgangsbuch(
 ) -> Result<Json<Vec<RechnungsausgangItem>>, ApiError> {
     let rows = invoice_repo::list_for_rechnungsausgangsbuch(&state.db).await?;
 
-    let items: Vec<RechnungsausgangItem> = rows
+    let mut items: Vec<RechnungsausgangItem> = rows
         .into_iter()
         .map(|r| {
             let netto_cents = r.offer_netto_cents;
@@ -2008,6 +1906,8 @@ async fn rechnungsausgangsbuch(
 
             RechnungsausgangItem {
                 id: r.id,
+                kind: "umzug",
+                inquiry_id: Some(r.inquiry_id),
                 invoice_number: r.invoice_number,
                 customer_name: r.customer_name,
                 scheduled_date: r.scheduled_date,
@@ -2024,6 +1924,35 @@ async fn rechnungsausgangsbuch(
             }
         })
         .collect();
+
+    // Storage invoices share the invoice-number sequence and belong in the same
+    // legal register. Merge them in and re-sort so the ledger stays sequential.
+    let storage_rows = storage_repo::list_for_register(&state.db).await?;
+    for r in storage_rows {
+        let netto = r.netto_cents;
+        let brutto = (netto as f64 * 1.19).round() as i64;
+        let paid = r.status == "paid";
+        items.push(RechnungsausgangItem {
+            id: r.id,
+            kind: "lagerung",
+            inquiry_id: None,
+            invoice_number: r.invoice_number,
+            customer_name: r.customer_name,
+            scheduled_date: NaiveDate::from_ymd_opt(r.period_year, r.period_month as u32, 1),
+            netto_cents: Some(netto),
+            mwst_cents: Some(brutto - netto),
+            brutto_cents: Some(brutto),
+            sent_at: r.sent_at,
+            created_at: r.created_at,
+            due_date: r.sent_at.map(|s| (s + chrono::Duration::days(7)).date_naive()),
+            paid_at: r.paid_at,
+            offene_zahlungen_cents: if paid { Some(0) } else { Some(brutto) },
+            payment_method: r.payment_method,
+            notes: None,
+        });
+    }
+
+    items.sort_by_key(|it| it.sent_at.unwrap_or(it.created_at));
 
     Ok(Json(items))
 }
@@ -2045,8 +1974,55 @@ async fn update_payment_method(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin(&claims)?;
     let payment_method = body.payment_method.as_deref().filter(|s| !s.trim().is_empty());
-    invoice_repo::update_payment_method(&state.db, id, payment_method).await?;
+    // The id may belong to either the core invoices table or a storage invoice
+    // (both appear in the register). Try storage first; fall back to invoices.
+    let storage_hit = storage_repo::set_invoice_payment_method(&state.db, id, payment_method).await?;
+    if storage_hit == 0 {
+        invoice_repo::update_payment_method(&state.db, id, payment_method).await?;
+    }
     Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+#[derive(Debug, Deserialize)]
+struct MarkPaidRequest {
+    /// Payment date. Defaults to today — Alex usually books the payment the day he
+    /// sees it, but a bank statement can be a few days old.
+    paid_on: Option<NaiveDate>,
+}
+
+/// `POST /api/v1/admin/rechnungsausgangsbuch/{id}/paid` — Mark a register row paid.
+///
+/// **Caller**: Admin Rechnungsausgangsbuch — the "Bezahlt" button on an open row.
+/// **Why**: Payment could previously only be booked from the dashboard's dunning
+/// card, which only lists invoices that are already *overdue*. An invoice paid on
+/// time had no way to be marked paid at all.
+///
+/// Accepts an id from either register table. For a core invoice this also closes any
+/// open dunning step and settles the inquiry once its last invoice is paid.
+///
+/// # Returns
+/// `200 OK` with the [`PaidOutcome`](billing_reminder_service::PaidOutcome) — notably
+/// `review_prompt`, which tells the page whether to open the Bewertungsanfrage dialog.
+async fn mark_register_invoice_paid(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<TokenClaims>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<MarkPaidRequest>,
+) -> Result<Json<billing_reminder_service::PaidOutcome>, ApiError> {
+    require_admin(&claims)?;
+
+    // A date-only input becomes noon UTC rather than midnight: the register renders
+    // paid_at in Europe/Berlin, and midnight UTC would display as the previous day.
+    let paid_at = match body.paid_on {
+        Some(d) => d
+            .and_hms_opt(12, 0, 0)
+            .map(|dt| DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc))
+            .ok_or_else(|| ApiError::BadRequest("Ungültiges Zahlungsdatum".into()))?,
+        None => Utc::now(),
+    };
+
+    let outcome = billing_reminder_service::mark_invoice_paid(&state.db, id, paid_at).await?;
+    Ok(Json(outcome))
 }
 
 // ── Flash contacts (admin) ─────────────────────────────────────────────────
@@ -2259,6 +2235,182 @@ mod tests {
             issued_invoice_numbers,
             vec![target_invoice],
             "Rechnungsnummer must match the value set via the settings endpoint"
+        );
+    }
+
+    /// POST /rechnungsausgangsbuch/{id}/paid on the last open invoice of a job must
+    /// do all four things at once, or the register and the assistant drift apart:
+    /// stamp paid_at, close the dunning step, settle the inquiry, and ask for a review.
+    ///
+    /// The dunning step is the one that bites: leave it `pending` and Josie's nag
+    /// keeps firing daily on an invoice that is already paid.
+    #[tokio::test]
+    async fn marking_register_invoice_paid_closes_dunning_and_prompts_review() {
+        use crate::test_helpers::{
+            generate_test_jwt, insert_test_customer, insert_test_quote_with_status, test_app_state,
+        };
+        use axum::body::Body;
+        use hyper::Request;
+        use tower::ServiceExt;
+
+        let state = test_app_state().await;
+        let pool = state.db.clone();
+        let token = generate_test_jwt();
+
+        let customer_id = insert_test_customer(&pool).await;
+        let inquiry_id = insert_test_quote_with_status(&pool, "invoiced").await;
+        sqlx::query("UPDATE inquiries SET customer_id = $1 WHERE id = $2")
+            .bind(customer_id)
+            .bind(inquiry_id)
+            .execute(&pool)
+            .await
+            .expect("link customer");
+
+        // A sent invoice with an overdue dunning step — exactly what the dashboard
+        // card and Josie's nag both key off.
+        let invoice_id = uuid::Uuid::now_v7();
+        let invoice_number = format!("TEST-{}", uuid::Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO invoices (id, inquiry_id, invoice_number, invoice_type, status, sent_at)
+             VALUES ($1, $2, $3, 'full', 'sent', NOW())",
+        )
+        .bind(invoice_id)
+        .bind(inquiry_id)
+        .bind(&invoice_number)
+        .execute(&pool)
+        .await
+        .expect("insert invoice");
+
+        sqlx::query(
+            "INSERT INTO invoice_reminders (invoice_id, level, status, remind_after)
+             VALUES ($1, 1, 'pending', CURRENT_DATE - 3)",
+        )
+        .bind(invoice_id)
+        .execute(&pool)
+        .await
+        .expect("insert dunning step");
+
+        let app = crate::create_router(state);
+        let resp = app
+            .oneshot(
+                Request::post(format!("/api/v1/admin/rechnungsausgangsbuch/{invoice_id}/paid"))
+                    .header("Authorization", format!("Bearer {token}"))
+                    .header("Content-Type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "marking paid must succeed");
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(body["kind"], "umzug");
+        assert_eq!(body["inquiry_settled"], true, "last open invoice settles the job");
+        assert_eq!(
+            body["review_prompt"], true,
+            "a settled job with no review decision yet must prompt for one"
+        );
+
+        let (status, paid_at): (String, Option<chrono::DateTime<Utc>>) =
+            sqlx::query_as("SELECT status, paid_at FROM invoices WHERE id = $1")
+                .bind(invoice_id)
+                .fetch_one(&pool)
+                .await
+                .expect("reload invoice");
+        assert_eq!(status, "paid");
+        assert!(paid_at.is_some(), "paid_at must be stamped, not just the status");
+
+        let (dunning_status,): (String,) =
+            sqlx::query_as("SELECT status FROM invoice_reminders WHERE invoice_id = $1")
+                .bind(invoice_id)
+                .fetch_one(&pool)
+                .await
+                .expect("reload dunning step");
+        assert_eq!(
+            dunning_status, "closed",
+            "a paid invoice must not keep a pending dunning step — Josie would nag forever"
+        );
+
+        let (inquiry_status,): (String,) =
+            sqlx::query_as("SELECT status FROM inquiries WHERE id = $1")
+                .bind(inquiry_id)
+                .fetch_one(&pool)
+                .await
+                .expect("reload inquiry");
+        assert_eq!(inquiry_status, "paid");
+    }
+
+    /// Once the review question has been answered — here: deferred — paying another
+    /// invoice on the same job must not re-open the dialog.
+    #[tokio::test]
+    async fn marking_paid_does_not_reprompt_an_answered_review() {
+        use crate::repositories::review_repo;
+        use crate::test_helpers::{
+            generate_test_jwt, insert_test_customer, insert_test_quote_with_status, test_app_state,
+        };
+        use axum::body::Body;
+        use hyper::Request;
+        use tower::ServiceExt;
+
+        let state = test_app_state().await;
+        let pool = state.db.clone();
+        let token = generate_test_jwt();
+
+        let customer_id = insert_test_customer(&pool).await;
+        let inquiry_id = insert_test_quote_with_status(&pool, "invoiced").await;
+        sqlx::query("UPDATE inquiries SET customer_id = $1 WHERE id = $2")
+            .bind(customer_id)
+            .bind(inquiry_id)
+            .execute(&pool)
+            .await
+            .expect("link customer");
+
+        let invoice_id = uuid::Uuid::now_v7();
+        let invoice_number = format!("TEST-{}", uuid::Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO invoices (id, inquiry_id, invoice_number, invoice_type, status, sent_at)
+             VALUES ($1, $2, $3, 'full', 'sent', NOW())",
+        )
+        .bind(invoice_id)
+        .bind(inquiry_id)
+        .bind(&invoice_number)
+        .execute(&pool)
+        .await
+        .expect("insert invoice");
+
+        // Alex already said "später" on this job.
+        review_repo::upsert(
+            &pool,
+            inquiry_id,
+            "pending",
+            Some(Utc::now().date_naive() + chrono::Days::new(3)),
+            None,
+        )
+        .await
+        .expect("defer review request");
+
+        let app = crate::create_router(state);
+        let resp = app
+            .oneshot(
+                Request::post(format!("/api/v1/admin/rechnungsausgangsbuch/{invoice_id}/paid"))
+                    .header("Authorization", format!("Bearer {token}"))
+                    .header("Content-Type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(body["inquiry_settled"], true);
+        assert_eq!(
+            body["review_prompt"], false,
+            "the review question was already answered — don't ask again"
         );
     }
 }

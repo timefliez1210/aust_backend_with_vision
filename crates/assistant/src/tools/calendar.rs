@@ -17,7 +17,7 @@ pub struct GetCalendar;
 impl Tool for GetCalendar {
     fn name(&self) -> &'static str { "get_calendar" }
     fn description(&self) -> &'static str {
-        "Gibt Kalendereinträge für einen Datumsbereich zurück (Umzugstermine, Mitarbeiteraufgaben, interne Ereignisse). Jeder Eintrag hat ein Feld 'kind': \"termin\" = Kalendereintrag (ID ist calendar_item), \"auftrag\" = Umzug aus einer Anfrage (ID ist inquiry_id). Danach richtet sich, welches Schreib-Tool zu verwenden ist."
+        "Gibt Kalendereinträge für einen Datumsbereich zurück (Umzugstermine, Besichtigungen, Mitarbeiteraufgaben, interne Ereignisse). Jeder Eintrag hat ein Feld 'kind': \"termin\" = freier Kalendereintrag (ID ist calendar_item), \"auftrag\" = Umzug aus einer Anfrage (ID ist inquiry_id), \"besichtigung\" = Zusatztermin an einer Anfrage (ID ist appointment_id, 'inquiry_id' nennt die Anfrage). Danach richtet sich, welches Schreib-Tool zu verwenden ist."
     }
     fn params_schema(&self) -> Value {
         json!({
@@ -152,7 +152,7 @@ pub struct CreateCalendarItem;
 impl Tool for CreateCalendarItem {
     fn name(&self) -> &'static str { "create_calendar_item" }
     fn description(&self) -> &'static str {
-        "Erstellt einen Kalendereintrag (z.B. Urlaub, Krankheit, Blocker, Besichtigung). Uhrzeiten als \"HH:MM\". Nur für Inhaber."
+        "Erstellt einen FREIEN Kalendereintrag ohne Bezug zu einer Anfrage (z.B. Urlaub, Krankheit, Blocker, Werkstatt, TÜV). Uhrzeiten als \"HH:MM\". Nur für Inhaber. NICHT für Besichtigungen oder sonstige Termine zu einer Anfrage/einem Kunden verwenden — dafür ausschließlich create_inquiry_appointment. Ein bereits per create_inquiry_appointment angelegter Termin steht schon im Kalender (get_calendar, kind=\"besichtigung\"); lege ihn NIEMALS zusätzlich hier an, das erzeugt einen Doppeleintrag."
     }
     fn params_schema(&self) -> Value {
         json!({

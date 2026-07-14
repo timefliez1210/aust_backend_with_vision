@@ -13,6 +13,7 @@ use aust_core::models::{CustomerSnapshot, InquiryListItem, InquiryResponse, Inqu
 use aust_core::services::{
     AddressPatch, AddressService, AvailableSlot, CalendarItem, CalendarItemPatch, CalendarService,
     ComputedLineItem, CrewMember, CustomerPatch, CustomerService, DailyMetrics, DistanceResult,
+    DueDunning, DueReviewRequest,
     EmailDetail, EmailService, EmailSummary, EmployeePatch, EmployeeRecord, EmployeeSchedulePatch,
     EmployeeService, EmployeeWorkloadEntry, EstimationService, EstimationSummary, FeedbackRecord,
     InquiryService, InvoiceDetail, InvoiceReminder, InvoiceService, InvoiceSummary, MetricsService,
@@ -282,6 +283,7 @@ impl CalendarService for MockCalendarService {
             end_time: None,
             location: None,
             kind: "termin".to_string(),
+            inquiry_id: None,
         }])
     }
 
@@ -314,6 +316,7 @@ impl CalendarService for MockCalendarService {
             end_time,
             location: location.map(str::to_string),
             kind: "termin".to_string(),
+            inquiry_id: None,
         })
     }
 
@@ -332,6 +335,7 @@ impl CalendarService for MockCalendarService {
             end_time: None,
             location: None,
             kind: "termin".to_string(),
+            inquiry_id: None,
         })
     }
 
@@ -358,6 +362,7 @@ impl CalendarService for MockCalendarService {
             end_time,
             location: None,
             kind: "termin".to_string(),
+            inquiry_id: None,
         })
     }
 
@@ -377,6 +382,7 @@ impl CalendarService for MockCalendarService {
             end_time: None,
             location: None,
             kind: "termin".to_string(),
+            inquiry_id: None,
         })
     }
 
@@ -674,6 +680,29 @@ impl InvoiceService for MockInvoiceService {
     ) -> Result<Uuid, ServiceError> {
         Ok(Uuid::new_v4())
     }
+
+    async fn list_due_dunning(&self) -> Result<Vec<DueDunning>, ServiceError> {
+        Ok(vec![DueDunning {
+            reminder_id: Uuid::new_v4(),
+            invoice_id: Uuid::new_v4(),
+            inquiry_id: Uuid::new_v4(),
+            invoice_number: "2026-0042".to_string(),
+            level: 2,
+            level_label: "1. Mahnung".to_string(),
+            remind_after: Utc::now().date_naive() - chrono::Duration::days(4),
+            days_overdue: 4,
+            customer_name: Some("Frau Schilling".to_string()),
+            customer_email: Some("schilling@example.de".to_string()),
+        }])
+    }
+
+    async fn send_dunning(&self, _reminder_id: Uuid) -> Result<(i32, String), ServiceError> {
+        Ok((2, "1. Mahnung".to_string()))
+    }
+
+    async fn mark_paid(&self, _invoice_id: Uuid) -> Result<(), ServiceError> {
+        Ok(())
+    }
 }
 
 // ── Employee mock ─────────────────────────────────────────────────────────────
@@ -877,6 +906,29 @@ impl ReviewService for MockReviewService {
         _notes: Option<&str>,
     ) -> Result<(), ServiceError> {
         Ok(())
+    }
+
+    async fn list_due_review_requests(&self) -> Result<Vec<DueReviewRequest>, ServiceError> {
+        Ok(vec![DueReviewRequest {
+            inquiry_id: Uuid::new_v4(),
+            remind_after: Utc::now().date_naive() - chrono::Duration::days(1),
+            days_overdue: 1,
+            customer_name: Some("Frau Schilling".to_string()),
+            customer_email: Some("schilling@example.de".to_string()),
+        }])
+    }
+
+    async fn decide_review_request(
+        &self,
+        _inquiry_id: Uuid,
+        action: &str,
+        _remind_after_days: Option<u32>,
+    ) -> Result<String, ServiceError> {
+        Ok(match action {
+            "later" => "pending".to_string(),
+            "skip" => "skipped".to_string(),
+            _ => "sent".to_string(),
+        })
     }
 }
 

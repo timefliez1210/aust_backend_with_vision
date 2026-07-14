@@ -41,6 +41,7 @@ pub(crate) struct InvoiceRow {
 #[derive(Debug, FromRow)]
 pub(crate) struct RechnungsausgangRow {
     pub id: Uuid,
+    pub inquiry_id: Uuid,
     pub invoice_number: String,
     pub sent_at: Option<DateTime<Utc>>,
     pub paid_at: Option<DateTime<Utc>>,
@@ -376,6 +377,28 @@ pub(crate) async fn mark_paid(
     Ok(())
 }
 
+/// The inquiry and customer behind an invoice.
+///
+/// **Caller**: `services::billing_reminders::mark_invoice_paid`
+/// **Why**: The register's "Bezahlt" button only knows the invoice id, but the
+/// review request hangs off the inquiry and the toast needs the customer's name.
+/// Returns `None` when `inv_id` is not a core invoice (e.g. it's a storage one).
+pub(crate) async fn fetch_inquiry_and_customer(
+    pool: &PgPool,
+    inv_id: Uuid,
+) -> Result<Option<(Uuid, Option<String>)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT inv.inquiry_id, c.name AS customer_name
+         FROM invoices inv
+         JOIN inquiries i ON i.id = inv.inquiry_id
+         LEFT JOIN customers c ON c.id = i.customer_id
+         WHERE inv.id = $1",
+    )
+    .bind(inv_id)
+    .fetch_optional(pool)
+    .await
+}
+
 /// Count unpaid invoices for an inquiry.
 ///
 /// **Caller**: `invoices::update_invoice`
@@ -661,6 +684,7 @@ pub(crate) async fn list_for_rechnungsausgangsbuch(
     sqlx::query_as(
         "SELECT
             inv.id,
+            inv.inquiry_id,
             inv.invoice_number,
             inv.sent_at,
             inv.paid_at,

@@ -10,6 +10,24 @@ pub(crate) fn map_sqlx(e: sqlx::Error) -> aust_core::services::ServiceError {
     aust_core::services::ServiceError::Db(anyhow::Error::new(e))
 }
 
+/// Map an `ApiError` into a `ServiceError`, for impls that delegate to a shared
+/// `services::*` function rather than talking to sqlx directly.
+///
+/// Anything the caller could have avoided (bad input, missing row, wrong state)
+/// becomes `Validation`, which the assistant surfaces to Alex as a plain sentence
+/// instead of a system error. Everything else is a genuine fault.
+pub(crate) fn map_api(e: crate::ApiError) -> aust_core::services::ServiceError {
+    use aust_core::services::ServiceError;
+    use crate::ApiError;
+    match e {
+        ApiError::NotFound(m)
+        | ApiError::BadRequest(m)
+        | ApiError::Conflict(m)
+        | ApiError::Validation(m) => ServiceError::Validation(m),
+        other => ServiceError::Db(anyhow::Error::new(other)),
+    }
+}
+
 pub mod address_service_impl;
 pub mod calendar_service_impl;
 pub mod customer_service_impl;
@@ -57,12 +75,12 @@ pub fn build_service_bundle(
         calendar: Arc::new(CalendarServiceImpl::new(pool.clone())),
         customers: Arc::new(CustomerServiceImpl::new(pool.clone())),
         emails: Arc::new(EmailServiceImpl::new(pool.clone(), config.clone())),
-        invoices: Arc::new(InvoiceServiceImpl::new(pool.clone(), storage.clone())),
+        invoices: Arc::new(InvoiceServiceImpl::new(pool.clone(), storage.clone(), config.clone())),
         employees: Arc::new(EmployeeServiceImpl::new(pool.clone())),
         estimations: Arc::new(EstimationServiceImpl::new(pool.clone())),
         addresses: Arc::new(AddressServiceImpl::new(pool.clone())),
-        settings: Arc::new(SettingsServiceImpl::new(pool.clone(), config)),
-        reviews: Arc::new(ReviewServiceImpl::new(pool.clone())),
+        settings: Arc::new(SettingsServiceImpl::new(pool.clone(), config.clone())),
+        reviews: Arc::new(ReviewServiceImpl::new(pool.clone(), config)),
         metrics: Arc::new(MetricsServiceImpl::new(pool.clone())),
         todos: Arc::new(TodoServiceImpl::new(pool.clone())),
         reminders: Arc::new(ReminderServiceImpl::new(pool)),

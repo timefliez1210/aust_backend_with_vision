@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 
 use crate::error::Result;
 use crate::roles::Role;
-use super::{parse_str, parse_uuid, Safety, Tool, ToolCtx};
+use super::{parse_str, parse_uuid, pending_confirmation, Safety, Tool, ToolCtx};
 
 // ── ListReviews ───────────────────────────────────────────────────────────────
 
@@ -108,6 +108,100 @@ impl Tool for CreateFeedback {
                 "priority": priority,
                 "title": title
             })),
+            Err(aust_core::services::ServiceError::Validation(msg)) => {
+                Ok(json!({ "ok": false, "message": msg }))
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+// ── ListDueReviewRequests ─────────────────────────────────────────────────────
+
+pub struct ListDueReviewRequests;
+
+#[async_trait]
+impl Tool for ListDueReviewRequests {
+    fn name(&self) -> &'static str { "list_due_review_requests" }
+    fn description(&self) -> &'static str {
+        "Listet die fälligen Bewertungsanfragen: abgeschlossene Umzüge, bei denen Alex die \
+         Google-Rezension auf 'später' gelegt hat und das Datum jetzt erreicht ist. Nutze das für \
+         'Welche Bewertungen stehen an?' oder 'Sollen wir noch jemanden um eine Rezension bitten?'. \
+         Zum Senden: send_review_request mit der inquiry_id."
+    }
+    fn params_schema(&self) -> Value {
+        json!({ "type": "object", "properties": {} })
+    }
+    fn safety(&self) -> Safety { Safety::Read }
+    fn min_role(&self) -> Role { Role::Operator }
+
+    async fn execute(&self, ctx: &ToolCtx, _args: &Value) -> Result<Value> {
+        let items = ctx.services.reviews.list_due_review_requests().await?;
+        let count = items.len();
+        Ok(json!({ "review_requests": items, "count": count }))
+    }
+}
+
+// ── SendReviewRequest (Confirm) ───────────────────────────────────────────────
+
+pub struct SendReviewRequest;
+
+#[async_trait]
+impl Tool for SendReviewRequest {
+    fn name(&self) -> &'static str { "send_review_request" }
+    fn description(&self) -> &'static str {
+        "Entscheidet über die Google-Bewertungsanfrage zu einer Anfrage. action='now' sendet die \
+         Bewertungs-E-Mail sofort an den Kunden; action='later' verschiebt die Erinnerung um \
+         remind_after_days Tage (Standard 3); action='skip' fragt bei diesem Auftrag nie wieder. \
+         Erfordert Bestätigung, weil bei 'now' eine E-Mail an den Kunden rausgeht."
+    }
+    fn params_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "inquiry_id":        { "type": "string", "format": "uuid" },
+                "action":            { "type": "string", "enum": ["now", "later", "skip"] },
+                "remind_after_days": {
+                    "type": "integer", "minimum": 1, "maximum": 90,
+                    "description": "Nur bei action='later'. Standard 3."
+                }
+            },
+            "required": ["inquiry_id", "action"]
+        })
+    }
+    fn safety(&self) -> Safety { Safety::Confirm }
+    fn min_role(&self) -> Role { Role::Owner }
+
+    fn summarize(&self, args: &Value) -> String {
+        let id = args["inquiry_id"].as_str().unwrap_or("?");
+        match args["action"].as_str().unwrap_or("now") {
+            "later" => {
+                let days = args["remind_after_days"].as_i64().unwrap_or(3);
+                format!("Bewertungsanfrage für Anfrage {id} um {days} Tage verschieben?")
+            }
+            "skip" => format!("Bewertungsanfrage für Anfrage {id} überspringen?"),
+            _ => format!("Bewertungs-E-Mail (Google-Rezension) für Anfrage {id} jetzt senden?"),
+        }
+    }
+
+    async fn execute(&self, ctx: &ToolCtx, args: &Value) -> Result<Value> {
+        let inquiry_id = parse_uuid(args, "inquiry_id", self.name())?;
+        let action = parse_str(args, "action", self.name())?;
+        let days = args["remind_after_days"].as_u64().map(|d| d as u32);
+
+        // 'later' and 'skip' touch nobody outside the company; only an actual send
+        // needs Alex to sign off.
+        if action == "now" && !ctx.confirmed {
+            return Ok(pending_confirmation(self.name(), args, self.summarize(args)));
+        }
+
+        match ctx
+            .services
+            .reviews
+            .decide_review_request(inquiry_id, action, days)
+            .await
+        {
+            Ok(status) => Ok(json!({ "ok": true, "status": status })),
             Err(aust_core::services::ServiceError::Validation(msg)) => {
                 Ok(json!({ "ok": false, "message": msg }))
             }
@@ -237,6 +331,59 @@ mod tests {
             .unwrap();
         assert_eq!(r["ok"], json!(true));
         assert_eq!(r["report_type"], json!("bug"));
+    }
+
+    #[tokio::test]
+    async fn list_due_review_requests_ok() {
+        let services = testing::mock_bundle(uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let r = ListDueReviewRequests.execute(&ctx(services), &json!({})).await.unwrap();
+        assert_eq!(r["count"], json!(1));
+        assert_eq!(r["review_requests"][0]["customer_name"], json!("Frau Schilling"));
+    }
+
+    /// Sending a review mail reaches the customer, so it must not fire before Alex
+    /// has confirmed — the unconfirmed call returns a confirmation request instead.
+    #[tokio::test]
+    async fn send_review_request_now_requires_confirmation() {
+        let services = testing::mock_bundle(uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let r = SendReviewRequest
+            .execute(
+                &ctx(services),
+                &json!({ "inquiry_id": uuid::Uuid::new_v4(), "action": "now" }),
+            )
+            .await
+            .unwrap();
+        assert_ne!(r["ok"], json!(true), "must not send before confirmation");
+        assert!(
+            r.to_string().contains("send_review_request"),
+            "expected a pending-confirmation payload, got {r}"
+        );
+    }
+
+    /// Deferring or skipping touches nobody outside the company, so it goes through
+    /// without a confirmation round-trip.
+    #[tokio::test]
+    async fn send_review_request_later_and_skip_need_no_confirmation() {
+        let services = testing::mock_bundle(uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let later = SendReviewRequest
+            .execute(
+                &ctx(services),
+                &json!({ "inquiry_id": uuid::Uuid::new_v4(), "action": "later", "remind_after_days": 5 }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(later["ok"], json!(true));
+        assert_eq!(later["status"], json!("pending"));
+
+        let services = testing::mock_bundle(uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let skip = SendReviewRequest
+            .execute(
+                &ctx(services),
+                &json!({ "inquiry_id": uuid::Uuid::new_v4(), "action": "skip" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(skip["status"], json!("skipped"));
     }
 
     #[tokio::test]

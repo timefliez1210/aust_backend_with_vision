@@ -17,6 +17,7 @@ pub mod inquiry_appointments;
 pub mod invoices;
 pub mod offers;
 pub(crate) mod shared;
+pub mod storage;
 pub mod submissions;
 pub mod vehicles;
 

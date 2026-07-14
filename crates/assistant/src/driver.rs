@@ -144,6 +144,13 @@ pub async fn process_turn(
     // still zero, it fabricated the action without calling any tool — the failure
     // mode behind the "Erinnerung gesetzt, aber nichts passiert" incident.
     let mut tools_acted_this_turn = 0usize;
+    // Names of the tools that actually *succeeded* this turn. The count above only
+    // catches a turn where nothing ran at all; it misses the turn that runs some
+    // tools and then claims a *different* write on top (the Besichtigung incident:
+    // create_customer + create_inquiry ran, and the reply announced an appointment
+    // that no tool ever created). `unbacked_claim` checks the claim against this set.
+    let mut tools_ran_this_turn: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     if !ctx_text.is_empty() {
         messages.push(aust_llm_providers::LlmMessage::user(format!(
             "[Gesprächsverlauf]\n{ctx_text}"
@@ -193,7 +200,12 @@ pub async fn process_turn(
                 // actually performed it. This catches fabrications that cite no UUID
                 // and so slip past the ID-based grounding check above.
                 let phantom_write = tools_acted_this_turn == 0 && claims_completed_write(&text);
-                if !ungrounded.is_empty() || phantom_write {
+                // Unbacked-claim guard: the reply announces a completed write to some
+                // entity (a Termin, an Angebot, a Rechnung …) but no tool that touches
+                // that entity ran this turn — even though *other* tools did, which is
+                // what lets it slip past the phantom-write gate above.
+                let unbacked = unbacked_claim(&text, &tools_ran_this_turn);
+                if !ungrounded.is_empty() || phantom_write || unbacked.is_some() {
                     if grounding_corrections < MAX_GROUNDING_CORRECTIONS {
                         grounding_corrections += 1;
                         let correction = if !ungrounded.is_empty() {
@@ -210,7 +222,7 @@ pub async fn process_turn(
                                  hast — ganz ohne erfundene ID.",
                                 ungrounded.join(", ")
                             )
-                        } else {
+                        } else if phantom_write {
                             warn!("Reply claims a completed write but no tool ran — forcing honesty correction");
                             "[Grounding-Stopp] Deine Antwort behauptet eine erledigte Aktion (z. B. eine \
                              gesetzte Erinnerung, eine gespeicherte Änderung oder eine gesendete E-Mail), \
@@ -219,6 +231,17 @@ pub async fn process_turn(
                              Rufe JETZT das passende Tool auf (z. B. set_reminder) und warte auf das echte \
                              Ergebnis, oder sag ehrlich, dass du es noch nicht getan hast."
                                 .to_string()
+                        } else {
+                            let subject = unbacked.unwrap_or("diese Aktion");
+                            warn!(subject, "Reply claims a write no tool in this turn backs — forcing honesty correction");
+                            format!(
+                                "[Grounding-Stopp] Deine Antwort meldet '{subject}' als erledigt. In diesem Zug \
+                                 wurde aber KEIN Tool ausgeführt, das '{subject}' anlegt, ändert oder auch nur \
+                                 liest. Andere Tools aufzurufen genügt nicht — eine Anfrage anzulegen legt z. B. \
+                                 KEINEN Termin an. Du hast '{subject}' nicht gespeichert. Rufe JETZT das passende \
+                                 Tool auf (z. B. create_inquiry_appointment für eine Besichtigung) und warte auf \
+                                 das echte Ergebnis, oder sag ehrlich, dass du es noch nicht getan hast."
+                            )
                         };
                         messages.push(aust_llm_providers::LlmMessage::assistant(text.clone()));
                         messages.push(aust_llm_providers::LlmMessage::user(correction));
@@ -228,6 +251,7 @@ pub async fn process_turn(
                     warn!(
                         ?ungrounded,
                         phantom_write,
+                        unbacked,
                         "Reply still claims an unbacked action after correction — replacing with honest fallback"
                     );
                     reply = "Ich habe diese Aktion nicht nachweislich ausgeführt und kann sie \
@@ -365,8 +389,10 @@ pub async fn process_turn(
                             .await
                             .unwrap_or_else(|e| warn!("Audit write failed: {e}"));
 
-                            // Every ID returned by a real tool call is now citable.
+                            // Every ID returned by a real tool call is now citable,
+                            // and the tool itself now backs claims about its entity.
                             grounded_ids.extend(extract_uuid_shapes(&result.to_string()));
+                            tools_ran_this_turn.insert(call.name.clone());
 
                             // Feed the tool result back into the conversation.
                             messages.push(aust_llm_providers::LlmMessage::user(format!(
@@ -573,6 +599,156 @@ pub(crate) fn claims_completed_write(text: &str) -> bool {
     CLAIMS.iter().any(|c| t.contains(c))
 }
 
+/// Verbs asserting a side-effect has already happened.
+const DONE_VERBS: [&str; 19] = [
+    "angelegt",
+    "eingetragen",
+    "erstellt",
+    "gesetzt",
+    "gebucht",
+    "eingeplant",
+    "hinterlegt",
+    "gespeichert",
+    "aktualisiert",
+    "geändert",
+    "korrigiert",
+    "storniert",
+    "abgesagt",
+    "verschoben",
+    "versendet",
+    "gesendet",
+    "verschickt",
+    "gelöscht",
+    "zugewiesen",
+];
+
+/// A class of entity the assistant can claim to have written, and the tools whose
+/// execution makes a claim about it credible.
+struct ClaimClass {
+    /// Nouns naming the entity.
+    subjects: &'static [&'static str],
+    /// Tools that write *or* read this entity. Writing proves the claim; reading is
+    /// allowed too, because a reply may legitimately restate an entity a read tool
+    /// just surfaced ("der Termin ist für den 16.07. eingetragen"). If neither ran,
+    /// nothing in this turn could have told the model the entity exists.
+    backing: &'static [&'static str],
+}
+
+/// Entity classes, checked in order. Deliberately coarse: this is a tripwire for
+/// confident fabrication, not a proof system. A class that omits a legitimate
+/// backing tool costs a wasted correction round-trip; a class that omits a *subject*
+/// silently lets that fabrication through, so subjects err on the inclusive side.
+const CLAIM_CLASSES: [ClaimClass; 6] = [
+    // Termine — the Besichtigung incident (2026-07-13): Josie announced an
+    // appointment for Frau Schilling after only create_customer + create_inquiry.
+    ClaimClass {
+        subjects: &["termin", "besichtigung", "kalender", "umzugstag"],
+        backing: &[
+            "create_inquiry_appointment",
+            "create_calendar_item",
+            "update_calendar_item",
+            "delete_calendar_item",
+            "schedule_inquiry",
+            "reassign_termin",
+            "cancel_termin",
+            "get_calendar",
+            "find_available_slots",
+            "get_inquiry",
+            "get_employee_assignments",
+        ],
+    },
+    ClaimClass {
+        subjects: &["erinnerung"],
+        backing: &["set_reminder", "cancel_reminder", "list_reminders"],
+    },
+    ClaimClass {
+        subjects: &["angebot"],
+        backing: &[
+            "recompute_offer",
+            "apply_nl_override",
+            "override_estimation",
+            "send_offer_to_customer",
+            "cancel_offer",
+            "mark_offer_accepted",
+            "mark_offer_rejected",
+            "get_offer_history",
+            "get_inquiry",
+        ],
+    },
+    ClaimClass {
+        subjects: &["rechnung"],
+        backing: &[
+            "create_invoice",
+            "send_invoice",
+            "update_invoice_status",
+            "void_invoice",
+            "record_payment",
+            "send_payment_reminder",
+            "get_invoice",
+            "list_invoices",
+            "list_invoice_reminders",
+        ],
+    },
+    ClaimClass {
+        subjects: &["e-mail", "email", "mail"],
+        backing: &[
+            "send_email",
+            "draft_reply",
+            "mark_email_handled",
+            "categorize_email",
+            "request_info_from_customer",
+            "get_email",
+            "list_inbox",
+            "list_thread",
+        ],
+    },
+    ClaimClass {
+        subjects: &["crew", "mitarbeiter", "helfer"],
+        backing: &[
+            "set_inquiry_crew",
+            "assign_employee",
+            "set_employee_schedule",
+            "set_employee_active",
+            "update_employee",
+            "get_assigned_crew",
+            "get_employee",
+            "get_employee_workload",
+            "get_employee_assignments",
+            "list_employees",
+        ],
+    },
+];
+
+/// Does the reply announce a completed write to an entity that no tool in this turn
+/// touched? Returns the offending subject noun.
+///
+/// Complements the zero-tool phantom-write gate: this one fires on the turn that
+/// *did* run tools, just not one that could substantiate what it claims. Subject and
+/// verb must land in the same sentence, so a completed write in one sentence cannot
+/// launder an unrelated noun in the next ("Anfrage angelegt. Für den Termin fehlt
+/// noch ein Datum." must not trip the Termin class).
+pub(crate) fn unbacked_claim(
+    text: &str,
+    ran: &std::collections::HashSet<String>,
+) -> Option<&'static str> {
+    let lower = text.to_lowercase();
+    for sentence in lower.split(['.', '!', '?', '\n', ';']) {
+        if !DONE_VERBS.iter().any(|v| sentence.contains(v)) {
+            continue;
+        }
+        for class in &CLAIM_CLASSES {
+            let Some(subject) = class.subjects.iter().find(|s| sentence.contains(**s)) else {
+                continue;
+            };
+            if class.backing.iter().any(|b| ran.contains(*b)) {
+                continue;
+            }
+            return Some(subject);
+        }
+    }
+    None
+}
+
 /// Extract all UUID-shaped tokens (8-4-4-4-12 alphanumeric groups) from text,
 /// lowercased. Deliberately matches *alphanumeric* groups, not strict hex, so it
 /// also catches malformed fabrications like `b8c5d9f3-2e4a-5f6g-0b9c-3d4e5f6g7a8c`
@@ -729,6 +905,55 @@ mod tests {
         let args = json!({ "inquiry_id": id });
         let new_scopes = extract_scopes_from_args(&args, &existing, 10);
         assert!(new_scopes.is_empty(), "duplicate scope must not be added");
+    }
+
+    fn ran(tools: &[&str]) -> std::collections::HashSet<String> {
+        tools.iter().map(|t| (*t).to_string()).collect()
+    }
+
+    /// The 2026-07-13 Besichtigung incident, replayed: Josie ran create_customer and
+    /// create_inquiry, then announced an appointment no tool had created. Two writes
+    /// had run, so the zero-tool phantom-write gate stayed silent.
+    #[test]
+    fn unbacked_claim_catches_fabricated_besichtigung() {
+        let reply = "Besichtigungstermin für Frau Schilling angelegt.\n\n\
+                     **Termin:** Do 16.07.2026, 14:00–15:00 Uhr";
+        let tools = ran(&["search_customers", "create_customer", "create_inquiry"]);
+        assert!(!claims_completed_write(reply), "no first-person phrase to catch");
+        assert_eq!(unbacked_claim(reply, &tools), Some("termin"));
+    }
+
+    /// The same claim is fine once the appointment tool actually ran.
+    #[test]
+    fn unbacked_claim_accepts_backed_besichtigung() {
+        let reply = "Besichtigungstermin für Frau Schilling angelegt.";
+        let tools = ran(&["create_inquiry", "create_inquiry_appointment"]);
+        assert_eq!(unbacked_claim(reply, &tools), None);
+    }
+
+    /// A read tool backs a restatement of an existing Termin — get_calendar surfaced
+    /// it, so reporting it is grounded, not a fabricated write.
+    #[test]
+    fn unbacked_claim_allows_read_backed_restatement() {
+        let reply = "Der Umzug Meier ist für den 16.07. eingetragen.";
+        assert_eq!(unbacked_claim(reply, &ran(&["get_calendar"])), None);
+    }
+
+    /// Subject and verb must share a sentence: a real write must not launder an
+    /// unrelated noun in the following sentence.
+    #[test]
+    fn unbacked_claim_requires_subject_and_verb_in_one_sentence() {
+        let reply = "Anfrage angelegt. Für den Termin brauche ich noch ein Datum.";
+        let tools = ran(&["create_inquiry"]);
+        assert_eq!(unbacked_claim(reply, &tools), None);
+    }
+
+    /// A fabricated reminder is caught even though an unrelated tool ran.
+    #[test]
+    fn unbacked_claim_catches_fabricated_reminder() {
+        let reply = "Erinnerung für heute 14:00 Uhr gesetzt.";
+        assert_eq!(unbacked_claim(reply, &ran(&["get_calendar"])), Some("erinnerung"));
+        assert_eq!(unbacked_claim(reply, &ran(&["set_reminder"])), None);
     }
 
     /// Grounding: a real UUID in backticks is extracted (lowercased).

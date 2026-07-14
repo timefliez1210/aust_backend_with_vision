@@ -108,6 +108,37 @@ pub async fn run_offer_event_handler(
                     handle_offer_denial(&state, &client, bot_token, chat_id, offer_id).await;
                 }
             }
+            ApprovalDecision::StorageApprove(id_str) => {
+                if let Ok(invoice_id) = Uuid::parse_str(&id_str) {
+                    match crate::services::storage_billing_service::approve_and_send(
+                        &state.db,
+                        state.storage.as_ref(),
+                        &state.config,
+                        invoice_id,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            send_telegram_message(&client, bot_token, chat_id, "✅ Lagerungsrechnung wurde per E-Mail versendet.").await;
+                        }
+                        Err(e) => {
+                            send_telegram_message(&client, bot_token, chat_id, &format!("⚠️ Versand fehlgeschlagen: {e}")).await;
+                        }
+                    }
+                }
+            }
+            ApprovalDecision::StorageReject(id_str) => {
+                if let Ok(invoice_id) = Uuid::parse_str(&id_str) {
+                    match crate::services::storage_billing_service::reject(&state.db, invoice_id).await {
+                        Ok(()) => {
+                            send_telegram_message(&client, bot_token, chat_id, "❌ Lagerungsrechnung abgelehnt.").await;
+                        }
+                        Err(e) => {
+                            send_telegram_message(&client, bot_token, chat_id, &format!("⚠️ {e}")).await;
+                        }
+                    }
+                }
+            }
             ApprovalDecision::InquiryComplete(inquiry) => {
                 handle_complete_inquiry(&state, &client, bot_token, chat_id, *inquiry).await;
             }

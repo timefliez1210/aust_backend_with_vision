@@ -6,20 +6,29 @@ use sqlx::PgPool;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use aust_core::services::{InvoiceDetail, InvoiceReminder, InvoiceService, InvoiceSummary, ServiceError};
+use aust_core::services::{
+    DueDunning, InvoiceDetail, InvoiceReminder, InvoiceService, InvoiceSummary, ServiceError,
+};
 use aust_storage::StorageProvider;
 
 use crate::repositories::invoice_repo;
+use crate::services::billing_reminder_service;
 use aust_offer_generator::{convert_xlsx_to_pdf, generate_invoice_xlsx, InvoiceType, InvoiceLineItem};
 
 pub struct InvoiceServiceImpl {
     pool: PgPool,
     storage: Arc<dyn StorageProvider>,
+    /// Needed to send dunning mail — the assistant can escalate a Mahnung itself.
+    config: Arc<aust_core::Config>,
 }
 
 impl InvoiceServiceImpl {
-    pub fn new(pool: PgPool, storage: Arc<dyn StorageProvider>) -> Self {
-        Self { pool, storage }
+    pub fn new(
+        pool: PgPool,
+        storage: Arc<dyn StorageProvider>,
+        config: Arc<aust_core::Config>,
+    ) -> Self {
+        Self { pool, storage, config }
     }
 }
 
@@ -279,6 +288,14 @@ impl InvoiceService for InvoiceServiceImpl {
         id: Uuid,
         status: &str,
     ) -> Result<InvoiceDetail, ServiceError> {
+        // "paid" is not just a status write: it has to stamp paid_at, close the
+        // dunning step, and settle the inquiry. Route it through the shared path so
+        // the assistant can't leave an invoice that reads paid but still nags.
+        if status == "paid" {
+            self.mark_paid(id).await?;
+            return self.get(id).await;
+        }
+
         sqlx::query("UPDATE invoices SET status = $1 WHERE id = $2")
             .bind(status)
             .bind(id)
@@ -286,6 +303,42 @@ impl InvoiceService for InvoiceServiceImpl {
             .await
             .map_err(super::map_sqlx)?;
         self.get(id).await
+    }
+
+    async fn list_due_dunning(&self) -> Result<Vec<DueDunning>, ServiceError> {
+        let rows = billing_reminder_service::list_due_invoice_reminders(&self.pool)
+            .await
+            .map_err(super::map_api)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| DueDunning {
+                reminder_id: r.id,
+                invoice_id: r.invoice_id,
+                inquiry_id: r.inquiry_id,
+                invoice_number: r.invoice_number,
+                level: r.level,
+                level_label: r.level_label.to_string(),
+                remind_after: r.remind_after,
+                days_overdue: r.days_overdue,
+                customer_name: r.customer_name,
+                customer_email: r.customer_email,
+            })
+            .collect())
+    }
+
+    async fn send_dunning(&self, reminder_id: Uuid) -> Result<(i32, String), ServiceError> {
+        let (level, label) =
+            billing_reminder_service::send_dunning(&self.pool, &self.config.email, reminder_id)
+                .await
+                .map_err(super::map_api)?;
+        Ok((level, label.to_string()))
+    }
+
+    async fn mark_paid(&self, invoice_id: Uuid) -> Result<(), ServiceError> {
+        billing_reminder_service::mark_invoice_paid(&self.pool, invoice_id, Utc::now())
+            .await
+            .map_err(super::map_api)?;
+        Ok(())
     }
 
     async fn record_payment(

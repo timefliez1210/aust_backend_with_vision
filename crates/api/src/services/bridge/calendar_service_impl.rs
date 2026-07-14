@@ -10,7 +10,7 @@ use aust_core::services::{
     EmployeeSchedulePatch, EmployeeWorkloadEntry, ServiceError,
 };
 
-use crate::repositories::calendar_item_repo;
+use crate::repositories::{calendar_item_repo, inquiry_appointment_repo};
 
 /// Row shape for a single `calendar_items` read with time + location columns.
 type TerminRow = (
@@ -130,6 +130,7 @@ impl CalendarService for CalendarServiceImpl {
                         end_time,
                         location,
                         kind: "termin".to_string(),
+                        inquiry_id: None,
                     }
                 },
             )
@@ -146,10 +147,42 @@ impl CalendarService for CalendarServiceImpl {
                     end_time,
                     location,
                     kind: "auftrag".to_string(),
+                    inquiry_id: None,
                 }
             },
         ));
-        items.sort_by(|a, b| a.scheduled_date.cmp(&b.scheduled_date));
+
+        // Light appointments (Besichtigung etc.) hanging off an inquiry. The admin
+        // UI renders these (routes::calendar), so leaving them out here made the
+        // assistant blind to Besichtigungen it had just created — which drove it to
+        // create a duplicate standalone calendar_item on top.
+        let appt_rows = inquiry_appointment_repo::fetch_for_schedule_range(&self.pool, from, to)
+            .await
+            .map_err(super::map_sqlx)?;
+        items.extend(appt_rows.into_iter().map(|r| {
+            let title = match r.customer_name.as_deref() {
+                Some(name) => format!("{} — {name}", r.kind),
+                None => r.kind.clone(),
+            };
+            CalendarItem {
+                id: r.id,
+                title,
+                category: r.kind,
+                scheduled_date: Some(r.scheduled_date),
+                end_date: None,
+                start_time: r.start_time,
+                end_time: r.end_time,
+                location: r.location,
+                kind: "besichtigung".to_string(),
+                inquiry_id: Some(r.inquiry_id),
+            }
+        }));
+
+        items.sort_by(|a, b| {
+            a.scheduled_date
+                .cmp(&b.scheduled_date)
+                .then(a.start_time.cmp(&b.start_time))
+        });
         Ok(items)
     }
 
@@ -234,6 +267,7 @@ impl CalendarService for CalendarServiceImpl {
             end_time,
             location: location.map(str::to_string),
             kind: "termin".to_string(),
+            inquiry_id: None,
         })
     }
 
@@ -293,6 +327,7 @@ impl CalendarService for CalendarServiceImpl {
             end_time,
             location,
             kind: "termin".to_string(),
+            inquiry_id: None,
         })
     }
 
@@ -398,6 +433,7 @@ impl CalendarService for CalendarServiceImpl {
             end_time,
             location: None,
             kind: "termin".to_string(),
+            inquiry_id: None,
         })
     }
 
@@ -495,6 +531,7 @@ impl CalendarService for CalendarServiceImpl {
             end_time,
             location,
             kind: "termin".to_string(),
+            inquiry_id: None,
         })
     }
 
@@ -844,5 +881,123 @@ impl CalendarService for CalendarServiceImpl {
         }
 
         self.get_assigned_crew(parent_id).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn try_pool() -> Option<PgPool> {
+        let url = std::env::var("DATABASE_URL").ok()?;
+        sqlx::PgPool::connect(&url).await.ok()
+    }
+
+    /// Regression (2026-07-13): a Besichtigung created via create_inquiry_appointment
+    /// was invisible to the assistant's get_calendar, because get_range only read
+    /// calendar_items and inquiries. Josie saw an empty day, concluded the write had
+    /// failed, and created a duplicate standalone calendar_item on top.
+    #[tokio::test]
+    async fn get_range_includes_inquiry_appointments() {
+        let Some(pool) = try_pool().await else { return };
+
+        let customer_id = Uuid::now_v7();
+        sqlx::query("INSERT INTO customers (id, name, email) VALUES ($1, $2, $3)")
+            .bind(customer_id)
+            .bind("Schilling")
+            .bind(format!("{customer_id}@test.de"))
+            .execute(&pool)
+            .await
+            .expect("insert customer");
+
+        let inquiry_id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO inquiries (id, customer_id, status, source) VALUES ($1, $2, 'pending', 'test')",
+        )
+        .bind(inquiry_id)
+        .bind(customer_id)
+        .execute(&pool)
+        .await
+        .expect("insert inquiry");
+
+        let day = NaiveDate::from_ymd_opt(2031, 7, 16).expect("valid date");
+        let appt_id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO inquiry_appointments
+                (id, inquiry_id, kind, scheduled_date, start_time, end_time, location, status)
+             VALUES ($1, $2, 'besichtigung', $3, '14:00', '15:00', 'An der Renne 71', 'scheduled')",
+        )
+        .bind(appt_id)
+        .bind(inquiry_id)
+        .bind(day)
+        .execute(&pool)
+        .await
+        .expect("insert appointment");
+
+        let svc = CalendarServiceImpl::new(pool.clone());
+        let items = svc.get_range(day, day).await.expect("get_range");
+
+        let appt = items
+            .iter()
+            .find(|i| i.id == appt_id)
+            .expect("Besichtigung must appear in the assistant's calendar");
+        assert_eq!(appt.kind, "besichtigung");
+        assert_eq!(appt.inquiry_id, Some(inquiry_id), "links back to its inquiry");
+        assert_eq!(appt.start_time, NaiveTime::from_hms_opt(14, 0, 0));
+        assert!(appt.title.contains("Schilling"), "title carries the customer");
+
+        sqlx::query("DELETE FROM inquiry_appointments WHERE id = $1").bind(appt_id).execute(&pool).await.ok();
+        sqlx::query("DELETE FROM inquiries WHERE id = $1").bind(inquiry_id).execute(&pool).await.ok();
+        sqlx::query("DELETE FROM customers WHERE id = $1").bind(customer_id).execute(&pool).await.ok();
+    }
+
+    /// A cancelled appointment must not show up on the calendar.
+    #[tokio::test]
+    async fn get_range_excludes_cancelled_appointments() {
+        let Some(pool) = try_pool().await else { return };
+
+        let customer_id = Uuid::now_v7();
+        sqlx::query("INSERT INTO customers (id, name, email) VALUES ($1, $2, $3)")
+            .bind(customer_id)
+            .bind("Abgesagt")
+            .bind(format!("{customer_id}@test.de"))
+            .execute(&pool)
+            .await
+            .expect("insert customer");
+
+        let inquiry_id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO inquiries (id, customer_id, status, source) VALUES ($1, $2, 'pending', 'test')",
+        )
+        .bind(inquiry_id)
+        .bind(customer_id)
+        .execute(&pool)
+        .await
+        .expect("insert inquiry");
+
+        let day = NaiveDate::from_ymd_opt(2031, 7, 17).expect("valid date");
+        let appt_id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO inquiry_appointments
+                (id, inquiry_id, kind, scheduled_date, status)
+             VALUES ($1, $2, 'besichtigung', $3, 'cancelled')",
+        )
+        .bind(appt_id)
+        .bind(inquiry_id)
+        .bind(day)
+        .execute(&pool)
+        .await
+        .expect("insert appointment");
+
+        let svc = CalendarServiceImpl::new(pool.clone());
+        let items = svc.get_range(day, day).await.expect("get_range");
+        assert!(
+            !items.iter().any(|i| i.id == appt_id),
+            "cancelled Besichtigung must not appear"
+        );
+
+        sqlx::query("DELETE FROM inquiry_appointments WHERE id = $1").bind(appt_id).execute(&pool).await.ok();
+        sqlx::query("DELETE FROM inquiries WHERE id = $1").bind(inquiry_id).execute(&pool).await.ok();
+        sqlx::query("DELETE FROM customers WHERE id = $1").bind(customer_id).execute(&pool).await.ok();
     }
 }

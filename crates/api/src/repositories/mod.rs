@@ -22,6 +22,7 @@ pub(crate) mod invoice_repo;
 pub(crate) mod offer_repo;
 pub(crate) mod review_repo;
 pub(crate) mod settings_repo;
+pub(crate) mod storage_repo;
 pub(crate) mod invoice_reminder_repo;
 pub(crate) mod vehicle_repo;
 

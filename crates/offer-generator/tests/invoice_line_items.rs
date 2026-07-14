@@ -156,6 +156,36 @@ fn test_manual_hours_line_item_renders_quantity_and_unit_price() {
 }
 
 #[test]
+fn test_storage_invoice_renders_month_label_and_netto() {
+    // A monthly storage ("Lagerung") invoice is a single netto line item:
+    // "Lagerung <Monat> <Jahr>" with the rented m² as the remark. Netto 100,00 €
+    // (brutto 119,00) — the template re-adds 19% MwSt.
+    let items = vec![InvoiceLineItem {
+        pos: 1,
+        description: "Lagerung Juli 2026".into(),
+        quantity: 1.0,
+        unit_price: 100.0,
+        remark: Some("12,5 m² Lagerfläche".into()),
+    }];
+    let data = make_invoice_data(items, InvoiceType::Full);
+    let bytes = generate_invoice_xlsx(&data).expect("XLSX generation should succeed");
+
+    let reader = std::io::Cursor::new(bytes);
+    let mut archive = zip::ZipArchive::new(reader).expect("Should be valid ZIP");
+    // Text may be inline or in sharedStrings depending on the template — scan both.
+    let mut all_xml = String::new();
+    for i in 0..archive.len() {
+        let mut f = archive.by_index(i).unwrap();
+        if f.name().ends_with(".xml") {
+            all_xml.push_str(&std::io::read_to_string(&mut f).unwrap_or_default());
+        }
+    }
+    assert!(all_xml.contains("Lagerung Juli 2026"), "month label should render");
+    assert!(all_xml.contains("12,5 m² Lagerfläche"), "m² remark should render");
+    assert!(all_xml.contains(">100<"), "netto unit price should render in Einzelpreis");
+}
+
+#[test]
 fn test_partial_first_invoice_single_line_item() {
     let items = vec![InvoiceLineItem {
         pos: 1,
