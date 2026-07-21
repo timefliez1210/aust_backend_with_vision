@@ -17,6 +17,8 @@ pub enum EstimationMethod {
     DepthSensor,
     /// AR phone scan pipeline (per-item structured 3D reconstruction).
     Ar,
+    /// AR phone scan with volume computed on-device (LiDAR depth + OBB in the app).
+    ArDevice,
     /// 3D video reconstruction pipeline (MASt3R + SAM 2 temporal tracking).
     Video,
     /// Volume entered manually by an admin without any automated pipeline.
@@ -31,6 +33,7 @@ impl EstimationMethod {
             Self::Inventory => "inventory",
             Self::DepthSensor => "depth_sensor",
             Self::Ar => "ar",
+            Self::ArDevice => "ar_device",
             Self::Video => "video",
             Self::Manual => "manual",
         }
@@ -59,6 +62,7 @@ impl std::str::FromStr for EstimationMethod {
             "inventory" => Ok(Self::Inventory),
             "depth_sensor" => Ok(Self::DepthSensor),
             "ar" => Ok(Self::Ar),
+            "ar_device" => Ok(Self::ArDevice),
             "video" => Ok(Self::Video),
             "manual" => Ok(Self::Manual),
             other => Err(format!("unknown EstimationMethod: {other}")),
@@ -237,6 +241,7 @@ mod tests {
         assert_eq!(EstimationMethod::Inventory.as_str(), "inventory");
         assert_eq!(EstimationMethod::DepthSensor.as_str(), "depth_sensor");
         assert_eq!(EstimationMethod::Ar.as_str(), "ar");
+        assert_eq!(EstimationMethod::ArDevice.as_str(), "ar_device");
         assert_eq!(EstimationMethod::Video.as_str(), "video");
         assert_eq!(EstimationMethod::Manual.as_str(), "manual");
     }
@@ -248,6 +253,7 @@ mod tests {
             ("inventory", EstimationMethod::Inventory),
             ("depth_sensor", EstimationMethod::DepthSensor),
             ("ar", EstimationMethod::Ar),
+            ("ar_device", EstimationMethod::ArDevice),
             ("video", EstimationMethod::Video),
             ("manual", EstimationMethod::Manual),
         ] {

@@ -17,7 +17,7 @@ use uuid::Uuid;
 use crate::repositories::{address_repo, customer_repo, estimation_repo, inquiry_repo};
 use crate::services::offer_pipeline::try_auto_generate_offer;
 use crate::{services, ApiError, AppState};
-use aust_core::models::{EstimationMethod, Services};
+use aust_core::models::{DetectedItem, EstimationMethod, ItemDimensions, Services};
 use aust_storage::StorageProvider;
 
 // ---------------------------------------------------------------------------
@@ -426,14 +426,17 @@ async fn handle_ar_submission(
     ))
 }
 
-/// Background task for AR submissions: distance calc → semaphore → Modal AR pipeline
-/// → store estimation → update inquiry → offer generation.
+/// Background task for AR submissions: distance calc → estimation → offer generation.
 ///
 /// **Caller**: `handle_ar_submission` via `tokio::spawn`
-/// **Why**: Same async submit/poll pattern as `process_submission_background` and
-///          `process_video_background`. Images are sent as raw bytes to Modal (already
-///          uploaded to S3 for admin UI — Modal receives bytes directly to avoid
-///          needing S3 credentials in the no-GPU `serve()` container).
+/// **Why**: Estimation backend is chosen in priority order:
+///          1. **On-device volumes** — LiDAR iPhones compute per-item volumes in the
+///             app (depth back-projection + OBB). If every manifest item carries a
+///             plausible `device_volume_m3`, no server-side vision runs at all
+///             (method `ar_device`).
+///          2. **VLM** (`vision_service.backend = "vlm"`) — one representative frame
+///             per item through the catalogue-grounded Ollama vision model (method `ar`).
+///          3. **Modal** — legacy Python GPU pipeline via async submit + poll.
 ///
 /// # Errors
 /// Returns `Err(String)` on any fatal failure; caller marks the estimation 'failed'.
@@ -477,54 +480,6 @@ async fn process_ar_submission_background(
         }
     }
 
-    // 2. Acquire vision semaphore
-    let _permit = state
-        .vision_semaphore
-        .acquire()
-        .await
-        .map_err(|e| format!("Vision semaphore closed: {e}"))?;
-    tracing::info!(estimation_id = %estimation_id, "AR vision semaphore acquired, submitting to Modal");
-
-    // 3. Submit to Modal AR endpoint and poll for result
-    let client = state
-        .vision_service
-        .as_ref()
-        .ok_or("Vision service not configured")?;
-
-    let poll_interval =
-        std::time::Duration::from_secs(state.config.vision_service.poll_interval_secs);
-    let max_polls = state.config.vision_service.max_polls;
-    let max_retries = state.config.vision_service.max_retries;
-
-    let response = client
-        .estimate_ar_async(
-            &estimation_id.to_string(),
-            &images,
-            &item_manifest,
-            intrinsics.as_deref(),
-            poses.as_deref(),
-            poll_interval,
-            max_polls,
-            max_retries,
-        )
-        .await
-        .map_err(|e| {
-            tracing::error!(
-                inquiry_id = %inquiry_id,
-                estimation_id = %estimation_id,
-                "AR estimation failed after all retries — manual intervention required: {e}"
-            );
-            format!("AR estimation failed: {e}")
-        })?;
-
-    tracing::info!(
-        estimation_id = %estimation_id,
-        volume = response.total_volume_m3,
-        items = response.detected_items.len(),
-        "AR estimation succeeded"
-    );
-
-    // 4. Persist estimation result
     let source_data = serde_json::json!({
         "source": "mobile_app_ar",
         "s3_rgb_keys": &s3_rgb_keys,
@@ -532,39 +487,237 @@ async fn process_ar_submission_background(
         "item_manifest": &item_manifest_json,
         "has_depth": !s3_depth_keys.is_empty(),
     });
-    let result_data = serde_json::to_value(&response.detected_items)
-        .map_err(|e| format!("Failed to serialize AR items: {e}"))?;
 
+    // 2. On-device volumes (LiDAR): if every manifest item carries a plausible
+    //    device-computed volume, trust it and skip server-side vision entirely.
+    let (method, total_volume, confidence, result_data) = if let Some((items, total, conf)) =
+        device_volume_items(&item_manifest_json)
+    {
+        tracing::info!(
+            estimation_id = %estimation_id,
+            volume = total,
+            items = items.len(),
+            "AR estimation from on-device LiDAR volumes"
+        );
+        let result_data = serde_json::to_value(&items)
+            .map_err(|e| format!("Failed to serialize device items: {e}"))?;
+        (EstimationMethod::ArDevice, total, conf, result_data)
+    } else {
+        // Server-side estimation — single-flight like the photo/video paths.
+        let _permit = state
+            .vision_semaphore
+            .acquire()
+            .await
+            .map_err(|e| format!("Vision semaphore closed: {e}"))?;
+
+        if state.config.vision_service.backend == "vlm" {
+            // 3a. VLM: one representative frame per item, catalogue-grounded.
+            let frames = select_representative_frames(&images, &item_manifest_json);
+            tracing::info!(
+                estimation_id = %estimation_id,
+                n_frames = frames.len(),
+                "AR estimation via VLM backend"
+            );
+            let (total, conf, result) = services::vision::try_vlm_photos(&state, &frames)
+                .await
+                .map_err(|e| {
+                    tracing::error!(
+                        inquiry_id = %inquiry_id,
+                        estimation_id = %estimation_id,
+                        "AR VLM estimation failed — manual intervention required: {e}"
+                    );
+                    format!("AR VLM estimation failed: {e}")
+                })?;
+            (
+                EstimationMethod::Ar,
+                total,
+                conf,
+                result.unwrap_or(serde_json::Value::Null),
+            )
+        } else {
+            // 3b. Modal: legacy Python GPU pipeline (submit + poll).
+            tracing::info!(estimation_id = %estimation_id, "AR vision semaphore acquired, submitting to Modal");
+            let client = state
+                .vision_service
+                .as_ref()
+                .ok_or("Vision service not configured")?;
+
+            let poll_interval =
+                std::time::Duration::from_secs(state.config.vision_service.poll_interval_secs);
+            let max_polls = state.config.vision_service.max_polls;
+            let max_retries = state.config.vision_service.max_retries;
+
+            let response = client
+                .estimate_ar_async(
+                    &estimation_id.to_string(),
+                    &images,
+                    &item_manifest,
+                    intrinsics.as_deref(),
+                    poses.as_deref(),
+                    poll_interval,
+                    max_polls,
+                    max_retries,
+                )
+                .await
+                .map_err(|e| {
+                    tracing::error!(
+                        inquiry_id = %inquiry_id,
+                        estimation_id = %estimation_id,
+                        "AR estimation failed after all retries — manual intervention required: {e}"
+                    );
+                    format!("AR estimation failed: {e}")
+                })?;
+            let result_data = serde_json::to_value(&response.detected_items)
+                .map_err(|e| format!("Failed to serialize AR items: {e}"))?;
+            (
+                EstimationMethod::Ar,
+                response.total_volume_m3,
+                response.confidence_score,
+                result_data,
+            )
+        }
+    };
+
+    tracing::info!(
+        estimation_id = %estimation_id,
+        volume = total_volume,
+        method = method.as_str(),
+        "AR estimation succeeded"
+    );
+
+    // 4. Persist estimation result
     let now = chrono::Utc::now();
     estimation_repo::upsert(
         &state.db,
         estimation_id,
         inquiry_id,
-        EstimationMethod::Ar.as_str(),
+        method.as_str(),
         &source_data,
         Some(&result_data),
-        response.total_volume_m3,
-        response.confidence_score,
+        total_volume,
+        confidence,
         now,
     )
     .await
     .map_err(|e| format!("Failed to store AR estimation: {e}"))?;
 
     // 5. Update inquiry volume and advance status
-    inquiry_repo::update_volume_and_status(
-        &state.db,
-        inquiry_id,
-        response.total_volume_m3,
-        "estimated",
-        now,
-    )
-    .await
-    .map_err(|e| format!("Failed to update AR inquiry: {e}"))?;
+    inquiry_repo::update_volume_and_status(&state.db, inquiry_id, total_volume, "estimated", now)
+        .await
+        .map_err(|e| format!("Failed to update AR inquiry: {e}"))?;
 
     // 6. Auto-generate offer (XLSX → PDF → Telegram)
     try_auto_generate_offer(Arc::clone(&state), inquiry_id).await;
 
     Ok(())
+}
+
+/// Per-item volume bounds for on-device estimates. Anything outside means the
+/// device measurement is untrustworthy and the whole submission falls back to
+/// server-side estimation (no partial mixing of device + server volumes).
+const DEVICE_VOLUME_MIN_M3: f64 = 0.005;
+const DEVICE_VOLUME_MAX_M3: f64 = 12.0;
+
+/// Build `DetectedItem`s from an AR item manifest whose entries carry
+/// app-computed volumes (`device_volume_m3`, optional `dims_m: [l, w, h]`,
+/// optional `device_confidence`).
+///
+/// **Caller**: `process_ar_submission_background`
+/// **Why**: LiDAR iPhones measure item volumes on-device; when every item has a
+///          plausible measurement the server pipeline is skipped entirely.
+///
+/// Returns `None` unless the manifest is a non-empty array and *every* entry has
+/// a finite volume within `[DEVICE_VOLUME_MIN_M3, DEVICE_VOLUME_MAX_M3]`.
+fn device_volume_items(manifest: &serde_json::Value) -> Option<(Vec<DetectedItem>, f64, f64)> {
+    let entries = manifest.as_array().filter(|a| !a.is_empty())?;
+
+    let mut items = Vec::with_capacity(entries.len());
+    let mut confidence_sum = 0.0;
+    for entry in entries {
+        let label = entry.get("label")?.as_str()?.trim();
+        if label.is_empty() {
+            return None;
+        }
+        let volume = entry.get("device_volume_m3")?.as_f64()?;
+        if !volume.is_finite() || !(DEVICE_VOLUME_MIN_M3..=DEVICE_VOLUME_MAX_M3).contains(&volume) {
+            return None;
+        }
+        let dimensions = entry
+            .get("dims_m")
+            .and_then(|d| d.as_array())
+            .filter(|d| d.len() == 3)
+            .and_then(|d| {
+                let l = d[0].as_f64()?;
+                let w = d[1].as_f64()?;
+                let h = d[2].as_f64()?;
+                Some(ItemDimensions {
+                    length_m: l,
+                    width_m: w,
+                    height_m: h,
+                })
+            });
+        let confidence = entry
+            .get("device_confidence")
+            .and_then(|c| c.as_f64())
+            .filter(|c| c.is_finite() && (0.0..=1.0).contains(c))
+            .unwrap_or(0.85);
+        confidence_sum += confidence;
+
+        items.push(DetectedItem {
+            name: label.to_string(),
+            volume_m3: volume,
+            confidence,
+            dimensions,
+            category: None,
+            german_name: Some(label.to_string()),
+            re_value: None,
+            volume_source: Some("device_obb".to_string()),
+            bbox: None,
+            bbox_image_index: None,
+            crop_s3_key: None,
+            seen_in_images: None,
+        });
+    }
+
+    let total: f64 = items.iter().map(|i| i.volume_m3).sum();
+    let confidence = confidence_sum / items.len() as f64;
+    Some((items, total, confidence))
+}
+
+/// Pick one representative RGB frame per manifest item (the middle frame of each
+/// item's arc sweep) for VLM estimation. Falls back to all frames (capped) when
+/// the manifest frame counts don't line up with the flat image list.
+///
+/// **Caller**: `process_ar_submission_background` (VLM backend)
+/// **Why**: The VLM prompt dedupes across photos, but 4–8 near-identical frames
+///          per item just burn tokens; the middle frame is the most head-on view.
+fn select_representative_frames(
+    images: &[(Vec<u8>, String)],
+    manifest: &serde_json::Value,
+) -> Vec<(Vec<u8>, String)> {
+    const MAX_FALLBACK_FRAMES: usize = 24;
+
+    if let Some(entries) = manifest.as_array().filter(|a| !a.is_empty()) {
+        let counts: Vec<usize> = entries
+            .iter()
+            .map(|e| {
+                e.get("frame_count")
+                    .and_then(|c| c.as_u64())
+                    .unwrap_or(0) as usize
+            })
+            .collect();
+        if counts.iter().all(|&c| c > 0) && counts.iter().sum::<usize>() == images.len() {
+            let mut frames = Vec::with_capacity(counts.len());
+            let mut offset = 0;
+            for count in counts {
+                frames.push(images[offset + count / 2].clone());
+                offset += count;
+            }
+            return frames;
+        }
+    }
+
+    images.iter().take(MAX_FALLBACK_FRAMES).cloned().collect()
 }
 
 /// `POST /api/v1/submit/video` — Public video inquiry (Source E).
@@ -2407,5 +2560,81 @@ mod tests {
         assert_eq!(form.stop_floor, Some("2".to_string()));
         assert_eq!(form.stop_elevator, Some(true));
         assert_eq!(form.stop_parking_ban, Some(false));
+    }
+
+    // --- device_volume_items ---
+
+    #[test]
+    fn device_volumes_all_present_returns_items_and_total() {
+        let manifest = serde_json::json!([
+            {"label": "Sofa", "frame_count": 5, "device_volume_m3": 1.8, "dims_m": [2.1, 0.9, 0.95], "device_confidence": 0.9},
+            {"label": "Schrank", "frame_count": 4, "device_volume_m3": 2.4},
+        ]);
+        let (items, total, confidence) = device_volume_items(&manifest).unwrap();
+        assert_eq!(items.len(), 2);
+        assert!((total - 4.2).abs() < 1e-9);
+        assert!((confidence - 0.875).abs() < 1e-9);
+        assert_eq!(items[0].name, "Sofa");
+        assert_eq!(items[0].volume_source.as_deref(), Some("device_obb"));
+        let dims = items[0].dimensions.as_ref().unwrap();
+        assert!((dims.length_m - 2.1).abs() < 1e-9);
+        assert!(items[1].dimensions.is_none());
+    }
+
+    #[test]
+    fn device_volumes_missing_on_one_item_returns_none() {
+        let manifest = serde_json::json!([
+            {"label": "Sofa", "frame_count": 5, "device_volume_m3": 1.8},
+            {"label": "Schrank", "frame_count": 4},
+        ]);
+        assert!(device_volume_items(&manifest).is_none());
+    }
+
+    #[test]
+    fn device_volumes_out_of_range_returns_none() {
+        for bad in [0.0, -1.0, 55.0, f64::NAN, f64::INFINITY] {
+            let manifest = serde_json::json!([
+                {"label": "Sofa", "device_volume_m3": bad},
+            ]);
+            assert!(
+                device_volume_items(&manifest).is_none(),
+                "volume {bad} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn device_volumes_empty_or_nonarray_returns_none() {
+        assert!(device_volume_items(&serde_json::json!([])).is_none());
+        assert!(device_volume_items(&serde_json::json!({})).is_none());
+        assert!(device_volume_items(&serde_json::Value::Null).is_none());
+    }
+
+    // --- select_representative_frames ---
+
+    fn dummy_frames(n: usize) -> Vec<(Vec<u8>, String)> {
+        (0..n).map(|i| (vec![i as u8], "image/jpeg".to_string())).collect()
+    }
+
+    #[test]
+    fn representative_frames_picks_middle_of_each_item() {
+        let images = dummy_frames(9);
+        let manifest = serde_json::json!([
+            {"label": "Sofa", "frame_count": 5},
+            {"label": "Regal", "frame_count": 4},
+        ]);
+        let frames = select_representative_frames(&images, &manifest);
+        // Item 1: frames 0-4 → middle = index 2. Item 2: frames 5-8 → 5 + 4/2 = 7.
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].0, vec![2u8]);
+        assert_eq!(frames[1].0, vec![7u8]);
+    }
+
+    #[test]
+    fn representative_frames_falls_back_on_count_mismatch() {
+        let images = dummy_frames(6);
+        let manifest = serde_json::json!([{"label": "Sofa", "frame_count": 99}]);
+        let frames = select_representative_frames(&images, &manifest);
+        assert_eq!(frames.len(), 6);
     }
 }
