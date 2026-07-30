@@ -140,7 +140,11 @@ impl InquiryService for MockInquiryService {
             assignee_id,
             assignee_name: None,
             location: None,
+            description: None,
+            address: None,
             notes: notes.map(str::to_string),
+            employee_notes: None,
+            employees: Vec::new(),
             status: "scheduled".to_string(),
             created_at: Utc::now(),
         })

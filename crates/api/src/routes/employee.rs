@@ -43,6 +43,8 @@ pub fn protected_router() -> Router<Arc<AppState>> {
         .route("/jobs/{id}/clock", axum::routing::patch(patch_employee_clock))
         .route("/items/{id}", get(get_item_detail))
         .route("/items/{id}/clock", axum::routing::patch(patch_item_clock))
+        .route("/appointments/{id}", get(get_appointment_detail))
+        .route("/appointments/{id}/clock", axum::routing::patch(patch_appointment_clock))
         .route("/hours", get(get_hours))
 }
 
@@ -243,10 +245,12 @@ struct DateQuery {
 
 #[derive(Debug, Serialize)]
 struct ScheduleJob {
-    /// `"job"` for moving inquiries, `"item"` for internal calendar items.
+    /// `"job"` for moving inquiries, `"item"` for internal calendar items,
+    /// `"appointment"` for paid Zusatztermine (linked to an inquiry).
     entry_type: String,
     inquiry_id: Option<Uuid>,
     calendar_item_id: Option<Uuid>,
+    appointment_id: Option<Uuid>,
     title: Option<String>,
     location: Option<String>,
     category: Option<String>,
@@ -306,6 +310,7 @@ async fn get_schedule(
                 entry_type: "job".into(),
                 inquiry_id: Some(r.inquiry_id),
                 calendar_item_id: None,
+                appointment_id: None,
                 title: None,
                 location: None,
                 category: None,
@@ -347,6 +352,7 @@ async fn get_schedule(
             entry_type: "item".to_string(),
             inquiry_id: None,
             calendar_item_id: Some(r.calendar_item_id),
+            appointment_id: None,
             title: Some(r.title),
             location: r.location,
             category: Some(r.category),
@@ -360,6 +366,51 @@ async fn get_schedule(
             destination_postal_code: None,
             estimated_volume_m3: None,
             customer_name: None,
+            customer_phone: None,
+            actual_hours: r.actual_hours,
+            colleague_names: colleagues,
+            employee_notes: r.employee_notes,
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Fetch appointment (paid Zusatztermin) assignments
+    // -----------------------------------------------------------------------
+
+    let appt_rows =
+        employee_repo::fetch_schedule_appointments(&state.db, claims.employee_id, from_date, to_date)
+            .await?;
+
+    let appt_ids: Vec<Uuid> = appt_rows.iter().map(|r| r.appointment_id).collect();
+    let appt_colleague_map =
+        employee_repo::fetch_appointment_colleague_names(&state.db, &appt_ids, claims.employee_id)
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    for r in appt_rows {
+        let colleagues = appt_colleague_map
+            .get(&r.appointment_id)
+            .cloned()
+            .unwrap_or_default();
+        entries.push(ScheduleJob {
+            entry_type: "appointment".to_string(),
+            // Linked inquiry so the entry stays connected to its move.
+            inquiry_id: Some(r.inquiry_id),
+            calendar_item_id: None,
+            appointment_id: Some(r.appointment_id),
+            title: Some(r.kind),
+            location: r.location,
+            category: None,
+            job_date: r.scheduled_date,
+            status: r.status,
+            origin_street: None,
+            origin_city: None,
+            origin_postal_code: None,
+            destination_street: None,
+            destination_city: None,
+            destination_postal_code: None,
+            estimated_volume_m3: None,
+            customer_name: r.customer_name,
             customer_phone: None,
             actual_hours: r.actual_hours,
             colleague_names: colleagues,
@@ -791,6 +842,167 @@ async fn patch_item_clock(
 }
 
 // ---------------------------------------------------------------------------
+// Protected: Appointment (paid Zusatztermin) detail
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+struct AppointmentDetail {
+    appointment_id: Uuid,
+    /// The move this extra-service entry is linked to.
+    inquiry_id: Uuid,
+    job_date: Option<NaiveDate>,
+    status: String,
+    /// Free-text kind (e.g. "halteverbot"), shown as the title.
+    kind: String,
+    start_time: Option<NaiveTime>,
+    end_time: Option<NaiveTime>,
+    description: Option<String>,
+    // Own address (structured if present, else free-text location).
+    location: Option<String>,
+    address_street: Option<String>,
+    address_house_number: Option<String>,
+    address_city: Option<String>,
+    address_postal_code: Option<String>,
+    address_floor: Option<String>,
+    address_elevator: Option<bool>,
+    // Linked customer contact
+    customer_name: Option<String>,
+    customer_phone: Option<String>,
+    // Per-assignment note + admin note for all crew
+    notes: Option<String>,
+    employee_notes: Option<String>,
+    // Worker self-reported times (editable via PATCH /appointments/{id}/clock)
+    employee_clock_in: Option<DateTime<Utc>>,
+    employee_clock_out: Option<DateTime<Utc>>,
+    employee_break_minutes: Option<i32>,
+    employee_actual_hours: Option<f64>,
+    colleague_names: Vec<String>,
+}
+
+/// `GET /employee/appointments/{id}` — full detail for one assigned Zusatztermin.
+///
+/// **Caller**: Worker portal appointment detail page.
+/// **Why**: Paid extra-service entries (Halteverbotszone etc.) must be openable
+///          in the worker portal like jobs and Termine. Verifies the requesting
+///          employee is actually assigned.
+async fn get_appointment_detail(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<EmployeeClaims>,
+    Path(appointment_id): Path<Uuid>,
+) -> Result<Json<AppointmentDetail>, ApiError> {
+    let assign =
+        employee_repo::fetch_appointment_assignment(&state.db, appointment_id, claims.employee_id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound("Termin nicht gefunden oder keine Berechtigung".into()))?;
+
+    let row = employee_repo::fetch_appointment_detail(&state.db, appointment_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Termin nicht gefunden".into()))?;
+
+    let employee_actual_hours = match (assign.employee_clock_in, assign.employee_clock_out) {
+        (Some(ci), Some(co)) => {
+            let break_secs = assign.employee_break_minutes.unwrap_or(0).max(0) as i64 * 60;
+            let secs = (co - ci).num_seconds() - break_secs;
+            if secs > 0 {
+                Some(secs as f64 / 3600.0)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+
+    let colleague_map = employee_repo::fetch_appointment_colleague_names(
+        &state.db,
+        &[appointment_id],
+        claims.employee_id,
+    )
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let colleague_names = colleague_map.get(&appointment_id).cloned().unwrap_or_default();
+
+    Ok(Json(AppointmentDetail {
+        appointment_id,
+        inquiry_id: row.inquiry_id,
+        job_date: assign.scheduled_date.or(row.scheduled_date),
+        status: row.status,
+        kind: row.kind,
+        start_time: row.start_time,
+        end_time: row.end_time,
+        description: row.description,
+        location: row.location,
+        address_street: row.address_street,
+        address_house_number: row.address_house_number,
+        address_city: row.address_city,
+        address_postal_code: row.address_postal_code,
+        address_floor: row.address_floor,
+        address_elevator: row.address_elevator,
+        customer_name: row.customer_name,
+        customer_phone: row.customer_phone,
+        notes: assign.notes,
+        employee_notes: row.employee_notes,
+        employee_clock_in: assign.employee_clock_in,
+        employee_clock_out: assign.employee_clock_out,
+        employee_break_minutes: assign.employee_break_minutes,
+        employee_actual_hours,
+        colleague_names,
+    }))
+}
+
+/// `PATCH /employee/appointments/{id}/clock` — worker submits their own clock-in/out.
+///
+/// **Caller**: Worker portal appointment detail page (post-work time logging).
+/// **Why**: Mirrors the job/Termin clock endpoints so movers log actual times on
+///          paid Zusatztermine too; these feed the monthly hours summary.
+async fn patch_appointment_clock(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<EmployeeClaims>,
+    Path(appointment_id): Path<Uuid>,
+    Json(body): Json<ClockBody>,
+) -> Result<StatusCode, ApiError> {
+    // The appointment's own date anchors lenient bare-time input.
+    let job_date = employee_repo::fetch_appointment_detail(&state.db, appointment_id)
+        .await?
+        .and_then(|r| r.scheduled_date)
+        .unwrap_or_else(|| Utc::now().date_naive());
+
+    let clock_in = parse_clock_time(body.employee_clock_in, job_date)?;
+    let clock_out = parse_clock_time(body.employee_clock_out, job_date)?;
+    let break_minutes = body.employee_break_minutes.map(|m| m.max(0));
+
+    let rows_affected = employee_repo::update_appointment_clock_times(
+        &state.db,
+        appointment_id,
+        claims.employee_id,
+        clock_in,
+        clock_out,
+        break_minutes,
+    )
+    .await?;
+
+    if rows_affected == 0 {
+        return Err(ApiError::NotFound(
+            "Termin nicht gefunden oder keine Berechtigung".into(),
+        ));
+    }
+
+    // A complete log (start + end) notifies the office via Telegram.
+    if let (Some(ci), Some(co)) = (clock_in, clock_out) {
+        let ctx = employee_repo::fetch_appointment_log_notify_ctx(
+            &state.db,
+            claims.employee_id,
+            appointment_id,
+        )
+        .await
+        .ok()
+        .flatten();
+        notify_hours_logged(&state, ctx, false, ci, co, break_minutes).await;
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
 // Protected: Hours
 // ---------------------------------------------------------------------------
 
@@ -805,10 +1017,12 @@ struct HoursSummary {
 
 #[derive(Debug, Serialize)]
 struct HoursEntry {
-    /// `"job"` for moving inquiries, `"item"` for internal calendar items.
+    /// `"job"` for moving inquiries, `"item"` for internal calendar items,
+    /// `"appointment"` for paid Zusatztermine.
     entry_type: String,
     inquiry_id: Option<Uuid>,
     calendar_item_id: Option<Uuid>,
+    appointment_id: Option<Uuid>,
     title: Option<String>,
     location: Option<String>,
     job_date: Option<NaiveDate>,
@@ -855,6 +1069,7 @@ async fn get_hours(
                 entry_type: r.entry_type,
                 inquiry_id: r.inquiry_id,
                 calendar_item_id: r.calendar_item_id,
+                appointment_id: r.appointment_id,
                 title: r.title,
                 location: r.location,
                 job_date: r.job_date,

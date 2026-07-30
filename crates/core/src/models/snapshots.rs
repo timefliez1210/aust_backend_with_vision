@@ -108,15 +108,28 @@ pub struct AppointmentSnapshot {
     pub start_time: Option<NaiveTime>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub end_time: Option<NaiveTime>,
-    /// Optional single assignee (the person doing the visit).
+    /// Optional single assignee (the person doing the visit). Kept for lightweight
+    /// Besichtigungen; paid work uses the `employees` crew list below instead.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assignee_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assignee_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<String>,
+    /// Long free-text description of the work to be done.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Structured own-address for the entry (falls back to `location`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<AddressSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
+    /// Admin note shown to every assigned crew member.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub employee_notes: Option<String>,
+    /// Crew assigned to this entry with per-employee hours (empty for Besichtigungen).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub employees: Vec<EmployeeAssignmentSnapshot>,
     /// `scheduled` | `done` | `cancelled`.
     pub status: String,
     pub created_at: DateTime<Utc>,

@@ -299,12 +299,82 @@ pub(crate) async fn fetch_schedule_items(
     .await
 }
 
+/// Row for an appointment (paid Zusatztermin) assignment in the worker schedule.
+#[derive(FromRow)]
+pub(crate) struct ScheduleAppointmentJobRow {
+    pub appointment_id: Uuid,
+    pub inquiry_id: Uuid,
+    /// Free-text kind (e.g. "halteverbot"), used as the entry title.
+    pub kind: String,
+    pub scheduled_date: Option<NaiveDate>,
+    pub status: String,
+    /// Display location: structured address if present, else free-text.
+    pub location: Option<String>,
+    pub customer_name: Option<String>,
+    pub actual_hours: Option<f64>,
+    pub employee_notes: Option<String>,
+}
+
+/// Fetch appointment (paid Zusatztermin) assignments for an employee in a date range.
+///
+/// **Caller**: `employee::get_schedule`
+/// **Why**: Surfaces paid extra-service entries (Halteverbotszone etc.) in the
+/// worker schedule, mirroring [`fetch_schedule_items`].
+pub(crate) async fn fetch_schedule_appointments(
+    pool: &PgPool,
+    employee_id: Uuid,
+    from_date: NaiveDate,
+    to_date: NaiveDate,
+) -> Result<Vec<ScheduleAppointmentJobRow>, sqlx::Error> {
+    sqlx::query_as(
+        r#"
+        SELECT
+            iae.appointment_id,
+            a.inquiry_id,
+            a.kind,
+            a.scheduled_date,
+            a.status,
+            COALESCE(
+                NULLIF(TRIM(CONCAT_WS(', ',
+                    NULLIF(TRIM(CONCAT_WS(' ', ad.street, ad.house_number)), ''),
+                    NULLIF(TRIM(CONCAT_WS(' ', ad.postal_code, ad.city)), ''))), ''),
+                a.location
+            ) AS location,
+            COALESCE(c.first_name || ' ' || c.last_name, c.name) AS customer_name,
+            COALESCE(iae.actual_hours::float8,
+                 CASE WHEN iae.clock_out IS NOT NULL AND iae.clock_in IS NOT NULL
+                      THEN (EXTRACT(EPOCH FROM (iae.clock_out - iae.clock_in)) / 3600.0
+                            - COALESCE(iae.break_minutes, 0) / 60.0)::float8
+                      ELSE NULL END) AS actual_hours,
+            a.employee_notes
+        FROM inquiry_appointment_employees iae
+        JOIN inquiry_appointments a ON a.id = iae.appointment_id
+        JOIN inquiries  i ON i.id = a.inquiry_id
+        JOIN customers  c ON c.id = i.customer_id
+        LEFT JOIN addresses ad ON ad.id = a.address_id
+        WHERE iae.employee_id = $1
+          AND a.scheduled_date BETWEEN $2 AND $3
+          AND a.status <> 'cancelled'
+          -- Drop fully-logged entries from the worker's tab (see fetch_schedule_jobs).
+          AND (iae.employee_clock_in IS NULL OR iae.employee_clock_out IS NULL)
+        ORDER BY a.scheduled_date ASC
+        "#,
+    )
+    .bind(employee_id)
+    .bind(from_date)
+    .bind(to_date)
+    .fetch_all(pool)
+    .await
+}
+
 /// A past assignment for which the employee still owes their hours.
 #[derive(FromRow, serde::Serialize)]
 pub(crate) struct PendingHoursRow {
     pub entry_type: String,
     pub inquiry_id: Option<Uuid>,
     pub calendar_item_id: Option<Uuid>,
+    /// Set for `entry_type = 'appointment'` (paid Zusatztermine).
+    pub appointment_id: Option<Uuid>,
     pub job_date: NaiveDate,
     /// Calendar item title (Termine only).
     pub title: Option<String>,
@@ -337,6 +407,7 @@ pub(crate) async fn fetch_pending_hours(
             'job'              AS entry_type,
             ie.inquiry_id      AS inquiry_id,
             NULL::uuid         AS calendar_item_id,
+            NULL::uuid         AS appointment_id,
             ie.job_date        AS job_date,
             NULL::text         AS title,
             COALESCE(c.first_name || ' ' || c.last_name, c.name) AS customer_name,
@@ -361,6 +432,7 @@ pub(crate) async fn fetch_pending_hours(
             'item'                 AS entry_type,
             NULL::uuid             AS inquiry_id,
             cie.calendar_item_id   AS calendar_item_id,
+            NULL::uuid             AS appointment_id,
             cie.job_date           AS job_date,
             ci.title               AS title,
             NULL::text             AS customer_name,
@@ -375,6 +447,28 @@ pub(crate) async fn fetch_pending_hours(
           AND cie.job_date >= $3
           AND (cie.employee_clock_in IS NULL OR cie.employee_clock_out IS NULL)
           AND ci.status NOT IN ('cancelled')
+
+        UNION ALL
+
+        SELECT
+            'appointment'          AS entry_type,
+            a.inquiry_id           AS inquiry_id,
+            NULL::uuid             AS calendar_item_id,
+            a.id                   AS appointment_id,
+            a.scheduled_date       AS job_date,
+            a.kind                 AS title,
+            NULL::text             AS customer_name,
+            NULL::text             AS origin_city,
+            NULL::text             AS destination_city,
+            a.location             AS location,
+            a.start_time           AS start_time
+        FROM inquiry_appointment_employees iae
+        JOIN inquiry_appointments a ON a.id = iae.appointment_id
+        WHERE iae.employee_id = $1
+          AND a.scheduled_date < $2
+          AND a.scheduled_date >= $3
+          AND (iae.employee_clock_in IS NULL OR iae.employee_clock_out IS NULL)
+          AND a.status <> 'cancelled'
 
         ORDER BY job_date ASC
         "#,
@@ -521,6 +615,50 @@ pub(crate) async fn fetch_item_colleague_names(
     let mut map = std::collections::HashMap::new();
     for r in rows {
         map.entry(r.calendar_item_id)
+            .or_insert_with(Vec::new)
+            .push(format!("{} {}", r.first_name, r.last_name));
+    }
+    Ok(map)
+}
+
+/// Fetch colleague names for appointments (paid Zusatztermine).
+///
+/// **Caller**: `employee::get_schedule`, `employee::get_appointment_detail`
+/// **Why**: Shows the rest of the crew on the same extra-service entry.
+pub(crate) async fn fetch_appointment_colleague_names(
+    pool: &PgPool,
+    appointment_ids: &[Uuid],
+    exclude_employee_id: Uuid,
+) -> Result<std::collections::HashMap<Uuid, Vec<String>>, sqlx::Error> {
+    if appointment_ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    #[derive(FromRow)]
+    struct ColleagueRow {
+        appointment_id: Uuid,
+        first_name: String,
+        last_name: String,
+    }
+
+    let rows: Vec<ColleagueRow> = sqlx::query_as(
+        r#"
+        SELECT iae.appointment_id, e.first_name, e.last_name
+        FROM inquiry_appointment_employees iae
+        JOIN employees e ON iae.employee_id = e.id
+        WHERE iae.appointment_id = ANY($1) AND iae.employee_id != $2
+        GROUP BY iae.appointment_id, e.first_name, e.last_name
+        ORDER BY e.last_name, e.first_name
+        "#,
+    )
+    .bind(appointment_ids)
+    .bind(exclude_employee_id)
+    .fetch_all(pool)
+    .await?;
+
+    let mut map = std::collections::HashMap::new();
+    for r in rows {
+        map.entry(r.appointment_id)
             .or_insert_with(Vec::new)
             .push(format!("{} {}", r.first_name, r.last_name));
     }
@@ -802,6 +940,163 @@ pub(crate) async fn update_item_clock_times(
     Ok(result.rows_affected())
 }
 
+// ---------------------------------------------------------------------------
+// Appointment (paid Zusatztermin) detail — worker portal
+// ---------------------------------------------------------------------------
+
+/// Assignment row for an appointment, mirroring [`ItemAssignmentRow`].
+#[derive(FromRow)]
+pub(crate) struct AppointmentAssignmentRow {
+    pub scheduled_date: Option<NaiveDate>,
+    pub notes: Option<String>,
+    pub employee_clock_in: Option<DateTime<Utc>>,
+    pub employee_clock_out: Option<DateTime<Utc>>,
+    pub employee_break_minutes: Option<i32>,
+}
+
+/// Verify an appointment assignment and return the assignment fields.
+///
+/// **Caller**: `employee::get_appointment_detail`
+/// **Why**: An appointment is exactly one day → one row per (appointment,
+/// employee), so no date scoping is needed (unlike [`fetch_item_assignment`]).
+pub(crate) async fn fetch_appointment_assignment(
+    pool: &PgPool,
+    appointment_id: Uuid,
+    employee_id: Uuid,
+) -> Result<Option<AppointmentAssignmentRow>, sqlx::Error> {
+    sqlx::query_as(
+        r#"
+        SELECT a.scheduled_date,
+               iae.notes,
+               iae.employee_clock_in,
+               iae.employee_clock_out,
+               iae.employee_break_minutes
+        FROM inquiry_appointment_employees iae
+        JOIN inquiry_appointments a ON a.id = iae.appointment_id
+        WHERE iae.appointment_id = $1 AND iae.employee_id = $2
+        "#,
+    )
+    .bind(appointment_id)
+    .bind(employee_id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Appointment detail row for the worker portal (no financial data).
+#[derive(FromRow)]
+pub(crate) struct AppointmentDetailRow {
+    pub scheduled_date: Option<NaiveDate>,
+    pub status: String,
+    pub kind: String,
+    pub start_time: Option<NaiveTime>,
+    pub end_time: Option<NaiveTime>,
+    pub description: Option<String>,
+    pub location: Option<String>,
+    pub employee_notes: Option<String>,
+    // Structured own-address (if set)
+    pub address_street: Option<String>,
+    pub address_house_number: Option<String>,
+    pub address_city: Option<String>,
+    pub address_postal_code: Option<String>,
+    pub address_floor: Option<String>,
+    pub address_elevator: Option<bool>,
+    // Linked inquiry's customer contact
+    pub customer_name: Option<String>,
+    pub customer_phone: Option<String>,
+    pub inquiry_id: Uuid,
+}
+
+/// Fetch an appointment's logistics detail for the worker portal.
+///
+/// **Caller**: `employee::get_appointment_detail`
+pub(crate) async fn fetch_appointment_detail(
+    pool: &PgPool,
+    appointment_id: Uuid,
+) -> Result<Option<AppointmentDetailRow>, sqlx::Error> {
+    sqlx::query_as(
+        r#"
+        SELECT a.scheduled_date,
+               a.status,
+               a.kind,
+               a.start_time,
+               a.end_time,
+               a.description,
+               a.location,
+               a.employee_notes,
+               ad.street       AS address_street,
+               ad.house_number AS address_house_number,
+               ad.city         AS address_city,
+               ad.postal_code  AS address_postal_code,
+               ad.floor        AS address_floor,
+               ad.elevator     AS address_elevator,
+               COALESCE(c.first_name || ' ' || c.last_name, c.name) AS customer_name,
+               c.phone AS customer_phone,
+               a.inquiry_id
+        FROM inquiry_appointments a
+        JOIN inquiries i ON i.id = a.inquiry_id
+        JOIN customers c ON c.id = i.customer_id
+        LEFT JOIN addresses ad ON ad.id = a.address_id
+        WHERE a.id = $1
+        "#,
+    )
+    .bind(appointment_id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Update employee self-reported clock times on an appointment assignment.
+///
+/// **Caller**: `employee::patch_appointment_clock`
+/// **Why**: Mirrors [`update_item_clock_times`]; a single row per (appointment,
+/// employee), so no per-day scoping.
+pub(crate) async fn update_appointment_clock_times(
+    pool: &PgPool,
+    appointment_id: Uuid,
+    employee_id: Uuid,
+    clock_in: Option<DateTime<Utc>>,
+    clock_out: Option<DateTime<Utc>>,
+    break_minutes: Option<i32>,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        r#"
+        UPDATE inquiry_appointment_employees
+        SET employee_clock_in      = $1,
+            employee_clock_out     = $2,
+            employee_break_minutes = $3
+        WHERE appointment_id = $4 AND employee_id = $5
+        "#,
+    )
+    .bind(clock_in)
+    .bind(clock_out)
+    .bind(break_minutes)
+    .bind(appointment_id)
+    .bind(employee_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Fetch the employee name + appointment label for the log notification.
+pub(crate) async fn fetch_appointment_log_notify_ctx(
+    pool: &PgPool,
+    employee_id: Uuid,
+    appointment_id: Uuid,
+) -> Result<Option<HoursLogNotifyCtx>, sqlx::Error> {
+    sqlx::query_as(
+        r#"
+        SELECT e.first_name,
+               e.last_name,
+               (SELECT a.kind FROM inquiry_appointments a WHERE a.id = $2) AS job_label
+        FROM employees e
+        WHERE e.id = $1
+        "#,
+    )
+    .bind(employee_id)
+    .bind(appointment_id)
+    .fetch_optional(pool)
+    .await
+}
+
 /// Fetch employee monthly hours target.
 ///
 /// **Caller**: `employee::get_hours`
@@ -825,6 +1120,8 @@ pub(crate) struct HoursRow {
     pub entry_type: String,
     pub inquiry_id: Option<Uuid>,
     pub calendar_item_id: Option<Uuid>,
+    /// Set for `entry_type = 'appointment'`.
+    pub appointment_id: Option<Uuid>,
     pub title: Option<String>,
     pub location: Option<String>,
     pub job_date: Option<NaiveDate>,
@@ -850,6 +1147,7 @@ pub(crate) async fn fetch_hours_entries(
             'job'                                AS entry_type,
             ie.inquiry_id                        AS inquiry_id,
             NULL::uuid                           AS calendar_item_id,
+            NULL::uuid                           AS appointment_id,
             NULL::text                           AS title,
             NULL::text                           AS location,
             ie.job_date                          AS job_date,
@@ -875,6 +1173,7 @@ pub(crate) async fn fetch_hours_entries(
             'item'                     AS entry_type,
             NULL::uuid                 AS inquiry_id,
             cie.calendar_item_id       AS calendar_item_id,
+            NULL::uuid                 AS appointment_id,
             ci.title                   AS title,
             ci.location                AS location,
             cie.job_date               AS job_date,
@@ -891,6 +1190,30 @@ pub(crate) async fn fetch_hours_entries(
         WHERE cie.employee_id = $1
           AND cie.job_date BETWEEN $2 AND $3
           AND ci.status NOT IN ('cancelled')
+
+        UNION ALL
+
+        SELECT
+            'appointment'              AS entry_type,
+            a.inquiry_id               AS inquiry_id,
+            NULL::uuid                 AS calendar_item_id,
+            a.id                       AS appointment_id,
+            a.kind                     AS title,
+            a.location                 AS location,
+            a.scheduled_date           AS job_date,
+            NULL::text                 AS origin_city,
+            NULL::text                 AS destination_city,
+            COALESCE(iae.actual_hours::float8,
+                 CASE WHEN iae.clock_out IS NOT NULL AND iae.clock_in IS NOT NULL
+                      THEN (EXTRACT(EPOCH FROM (iae.clock_out - iae.clock_in)) / 3600.0
+                            - COALESCE(iae.break_minutes, 0) / 60.0)::float8
+                      ELSE NULL END)   AS actual_hours,
+            a.status                   AS status
+        FROM inquiry_appointment_employees iae
+        JOIN inquiry_appointments a ON a.id = iae.appointment_id
+        WHERE iae.employee_id = $1
+          AND a.scheduled_date BETWEEN $2 AND $3
+          AND a.status <> 'cancelled'
 
         ORDER BY job_date ASC
         "#,
@@ -1044,6 +1367,17 @@ pub(crate) async fn fetch_month_hours(
             WHERE cie.employee_id = $1
               AND cie.job_date BETWEEN $2 AND $3
               AND ci.status NOT IN ('cancelled')
+            UNION ALL
+            SELECT COALESCE(iae.actual_hours::float8,
+                        CASE WHEN iae.clock_out IS NOT NULL AND iae.clock_in IS NOT NULL
+                             THEN (EXTRACT(EPOCH FROM (iae.clock_out - iae.clock_in)) / 3600.0
+                                   - COALESCE(iae.break_minutes, 0) / 60.0)::float8
+                             ELSE NULL END) AS actual_hours
+            FROM inquiry_appointment_employees iae
+            JOIN inquiry_appointments a ON a.id = iae.appointment_id
+            WHERE iae.employee_id = $1
+              AND a.scheduled_date BETWEEN $2 AND $3
+              AND a.status <> 'cancelled'
         ) combined
         "#,
     )
@@ -1371,6 +1705,83 @@ pub(crate) async fn fetch_admin_calendar_item_hours(
           AND cie.job_date BETWEEN $2 AND $3
           AND ci.status NOT IN ('cancelled')
         ORDER BY cie.job_date
+        "#,
+    )
+    .bind(employee_id)
+    .bind(from_date)
+    .bind(to_date)
+    .fetch_all(pool)
+    .await
+}
+
+/// Admin appointment (paid Zusatztermin) hours row.
+#[derive(Debug, FromRow)]
+pub(crate) struct AdminAppointmentHoursRow {
+    pub appointment_id: Uuid,
+    pub inquiry_id: Uuid,
+    pub kind: String,
+    pub customer_name: Option<String>,
+    pub location: Option<String>,
+    pub scheduled_date: Option<NaiveDate>,
+    pub start_time: Option<NaiveTime>,
+    pub end_time: Option<NaiveTime>,
+    pub clock_in: Option<NaiveTime>,
+    pub clock_out: Option<NaiveTime>,
+    pub break_minutes: i32,
+    pub actual_hours: Option<f64>,
+    pub employee_clock_in: Option<chrono::DateTime<chrono::Utc>>,
+    pub employee_clock_out: Option<chrono::DateTime<chrono::Utc>>,
+    pub employee_break_minutes: Option<i32>,
+    pub status: String,
+}
+
+/// Fetch appointment (paid Zusatztermin) hours entries for the admin hours summary.
+///
+/// **Caller**: `admin::employee_hours_summary`
+/// **Why**: Includes paid extra-service work (Halteverbotszone etc.) in the
+/// per-employee monthly hours breakdown, mirroring [`fetch_admin_calendar_item_hours`].
+pub(crate) async fn fetch_admin_appointment_hours(
+    pool: &PgPool,
+    employee_id: Uuid,
+    from_date: NaiveDate,
+    to_date: NaiveDate,
+) -> Result<Vec<AdminAppointmentHoursRow>, sqlx::Error> {
+    sqlx::query_as(
+        r#"
+        SELECT iae.appointment_id,
+               a.inquiry_id,
+               a.kind,
+               COALESCE(c.first_name || ' ' || c.last_name, c.name) AS customer_name,
+               COALESCE(
+                   NULLIF(TRIM(CONCAT_WS(', ',
+                       NULLIF(TRIM(CONCAT_WS(' ', ad.street, ad.house_number)), ''),
+                       NULLIF(TRIM(CONCAT_WS(' ', ad.postal_code, ad.city)), ''))), ''),
+                   a.location
+               ) AS location,
+               a.scheduled_date,
+               iae.start_time,
+               iae.end_time,
+               iae.clock_in,
+               iae.clock_out,
+               COALESCE(iae.break_minutes, 0) AS break_minutes,
+               COALESCE(iae.actual_hours::float8,
+                    CASE WHEN iae.clock_out IS NOT NULL AND iae.clock_in IS NOT NULL
+                         THEN (EXTRACT(EPOCH FROM (iae.clock_out - iae.clock_in)) / 3600.0
+                               - COALESCE(iae.break_minutes, 0) / 60.0)::float8
+                         ELSE NULL END) AS actual_hours,
+               iae.employee_clock_in,
+               iae.employee_clock_out,
+               iae.employee_break_minutes,
+               a.status
+        FROM inquiry_appointment_employees iae
+        JOIN inquiry_appointments a ON a.id = iae.appointment_id
+        JOIN inquiries  i ON i.id = a.inquiry_id
+        JOIN customers  c ON c.id = i.customer_id
+        LEFT JOIN addresses ad ON ad.id = a.address_id
+        WHERE iae.employee_id = $1
+          AND a.scheduled_date BETWEEN $2 AND $3
+          AND a.status <> 'cancelled'
+        ORDER BY a.scheduled_date
         "#,
     )
     .bind(employee_id)

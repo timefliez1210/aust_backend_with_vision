@@ -101,6 +101,10 @@ struct ScheduleAppointment {
     notes: Option<String>,
     status: String,
     scheduled_date: NaiveDate,
+    /// Assigned crew (paid Zusatztermine); comma-separated names + count.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    crew_names: Option<String>,
+    crew_count: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -370,6 +374,8 @@ async fn get_schedule(
             notes: r.notes,
             status: r.status,
             scheduled_date: r.scheduled_date,
+            crew_names: r.crew_names,
+            crew_count: r.crew_count,
         });
     }
 

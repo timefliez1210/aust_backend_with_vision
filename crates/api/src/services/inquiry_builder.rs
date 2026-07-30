@@ -269,10 +269,13 @@ pub async fn build_inquiry_response(
         })
         .collect();
 
-    // 6b. Fetch linked appointments (Besichtigung etc.) on their own dates.
+    // 6b. Fetch linked appointments (Besichtigung, paid Zusatztermine) on their
+    // own dates, each with its crew + own address.
     let appointment_rows = inquiry_appointment_repo::list_for_inquiry(pool, inquiry_id).await?;
-    let appointments: Vec<AppointmentSnapshot> =
-        appointment_rows.into_iter().map(appointment_snapshot).collect();
+    let mut appointments: Vec<AppointmentSnapshot> = Vec::with_capacity(appointment_rows.len());
+    for a in appointment_rows {
+        appointments.push(appointment_snapshot_full(pool, a).await?);
+    }
 
     let end_date = row.end_date;
     let is_multi_day = end_date.is_some_and(|ed| row.scheduled_date.is_some_and(|sd| ed > sd));
@@ -433,13 +436,55 @@ fn parse_quantity_prefix(name: &str, total_volume_m3: f64) -> (String, i64, f64)
     (name.to_string(), 1, total_volume_m3)
 }
 
-/// Map an appointment repo row to its API snapshot.
+/// Map an appointment repo row to its API snapshot, loading its crew and
+/// structured address.
 ///
 /// **Caller**: `build_inquiry_response`, `routes::inquiry_appointments`.
-pub fn appointment_snapshot(
+/// **Why**: appointments are now full work entries — the snapshot embeds the
+/// assigned crew (with per-employee hours) and the entry's own address.
+pub async fn appointment_snapshot_full(
+    pool: &PgPool,
     a: inquiry_appointment_repo::AppointmentRow,
-) -> AppointmentSnapshot {
-    AppointmentSnapshot {
+) -> Result<AppointmentSnapshot, ApiError> {
+    let crew_rows = inquiry_appointment_repo::fetch_appointment_employees(pool, a.id).await?;
+    let employees = crew_rows
+        .into_iter()
+        .map(|r| {
+            // Worker self-reported hours, derived from their clock times minus break.
+            let employee_actual_hours = match (r.employee_clock_in, r.employee_clock_out) {
+                (Some(ci), Some(co)) => {
+                    let secs = (co - ci).num_seconds();
+                    if secs > 0 { Some(secs as f64 / 3600.0) } else { None }
+                }
+                _ => None,
+            };
+            EmployeeAssignmentSnapshot {
+                employee_id: r.employee_id,
+                first_name: r.first_name,
+                last_name: r.last_name,
+                clock_in: r.clock_in,
+                clock_out: r.clock_out,
+                start_time: r.start_time,
+                end_time: r.end_time,
+                break_minutes: r.break_minutes,
+                actual_hours: r.actual_hours,
+                employee_clock_in: r.employee_clock_in,
+                employee_clock_out: r.employee_clock_out,
+                employee_actual_hours,
+                notes: r.notes,
+                job_date: Some(a.scheduled_date),
+                transport_mode: r.transport_mode,
+                travel_costs_cents: r.travel_costs_cents,
+                accommodation_cents: r.accommodation_cents,
+                misc_costs_cents: r.misc_costs_cents,
+                meal_deduction: r.meal_deduction,
+            }
+        })
+        .collect();
+
+    let address = fetch_address(pool, a.address_id).await?;
+
+    Ok(AppointmentSnapshot {
         id: a.id,
         kind: a.kind,
         scheduled_date: a.scheduled_date,
@@ -448,10 +493,14 @@ pub fn appointment_snapshot(
         assignee_id: a.assignee_id,
         assignee_name: a.assignee_name,
         location: a.location,
+        description: a.description,
+        address,
         notes: a.notes,
+        employee_notes: a.employee_notes,
+        employees,
         status: a.status,
         created_at: a.created_at,
-    }
+    })
 }
 
 /// Fetch an address row and convert to snapshot, if the ID is present.

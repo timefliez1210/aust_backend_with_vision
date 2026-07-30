@@ -653,6 +653,9 @@ async fn employee_hours_summary(
     // Also fetch calendar item assignments for this employee in the same month.
     let item_rows = employee_repo::fetch_admin_calendar_item_hours(&state.db, id, from_date, to_date).await?;
 
+    // And paid Zusatztermin (appointment) assignments.
+    let appt_rows = employee_repo::fetch_admin_appointment_hours(&state.db, id, from_date, to_date).await?;
+
     // Payroll override layer: deactivations + paid-time adjustments per day.
     let adjustments = employee_repo::fetch_hours_adjustments(&state.db, id, from_date, to_date).await?;
     let adj_map = build_adjustment_map(&adjustments);
@@ -737,8 +740,43 @@ async fn employee_hours_summary(
         })
         .collect();
 
+    // Paid Zusatztermine (Halteverbotszone etc.). No payroll-override layer yet
+    // (adj = None → paid = worked); deactivation/paid-time edits are a follow-up.
+    let appointments: Vec<serde_json::Value> = appt_rows
+        .into_iter()
+        .map(|r| {
+            let worked = r.actual_hours;
+            let paid = worked;
+            worked_sum += worked.unwrap_or(0.0);
+            paid_sum += paid.unwrap_or(0.0);
+            if r.clock_in.is_none() || r.clock_out.is_none() {
+                all_days_confirmed = false;
+            }
+            serde_json::json!({
+                "appointment_id": r.appointment_id,
+                "inquiry_id": r.inquiry_id,
+                "kind": r.kind,
+                "customer_name": r.customer_name,
+                "location": r.location,
+                "scheduled_date": r.scheduled_date,
+                "start_time": r.start_time,
+                "end_time": r.end_time,
+                "clock_in": r.clock_in,
+                "clock_out": r.clock_out,
+                "break_minutes": r.break_minutes,
+                "actual_hours": r.actual_hours,
+                "worked_hours": worked,
+                "paid_hours": paid,
+                "employee_clock_in": r.employee_clock_in,
+                "employee_clock_out": r.employee_clock_out,
+                "employee_break_minutes": r.employee_break_minutes,
+                "status": r.status,
+            })
+        })
+        .collect();
+
     // No days at all ⇒ nothing to confirm ⇒ edit mode stays disabled.
-    if assignments.is_empty() && calendar_items.is_empty() {
+    if assignments.is_empty() && calendar_items.is_empty() && appointments.is_empty() {
         all_days_confirmed = false;
     }
 
@@ -753,9 +791,10 @@ async fn employee_hours_summary(
         "paid_total": paid_sum,
         "hour_account": worked_sum - paid_sum,
         "all_days_confirmed": all_days_confirmed,
-        "assignment_count": assignments.len() + calendar_items.len(),
+        "assignment_count": assignments.len() + calendar_items.len() + appointments.len(),
         "assignments": assignments,
         "calendar_items": calendar_items,
+        "appointments": appointments,
     })))
 }
 
@@ -923,6 +962,7 @@ async fn employee_hours_export(
     // Load assignments for the month
     let inq_rows = employee_repo::fetch_admin_hours(&state.db, id, from_date, to_date).await?;
     let item_rows = employee_repo::fetch_admin_calendar_item_hours(&state.db, id, from_date, to_date).await?;
+    let appt_rows = employee_repo::fetch_admin_appointment_hours(&state.db, id, from_date, to_date).await?;
 
     // Payroll override layer: deactivations + paid-time adjustments per day.
     let adjustments = employee_repo::fetch_hours_adjustments(&state.db, id, from_date, to_date).await?;
@@ -950,6 +990,17 @@ async fn employee_hours_export(
             }
             let (clock_in, clock_out, actual_hours) = paid_export_fields(r.clock_in, r.clock_out, r.actual_hours, adj.copied());
             entries.push(TimesheetEntry { date, clock_in, clock_out, actual_hours });
+        }
+    }
+    // Paid Zusatztermine — no payroll-override layer yet, so export recorded times.
+    for r in &appt_rows {
+        if let Some(date) = r.scheduled_date {
+            entries.push(TimesheetEntry {
+                date,
+                clock_in: r.clock_in,
+                clock_out: r.clock_out,
+                actual_hours: r.actual_hours,
+            });
         }
     }
 

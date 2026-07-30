@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use crate::repositories::{inquiry_appointment_repo as appt_repo, inquiry_repo};
 use crate::repositories::inquiry_appointment_repo::AppointmentInput;
-use crate::services::inquiry_builder::appointment_snapshot;
+use crate::services::inquiry_builder::appointment_snapshot_full;
 use crate::{ApiError, AppState};
 use aust_core::models::AppointmentSnapshot;
 
@@ -35,6 +35,14 @@ pub fn router() -> Router<Arc<AppState>> {
             "/{id}/appointments/{appt_id}",
             patch(update_appointment).delete(delete_appointment),
         )
+        .route(
+            "/{id}/appointments/{appt_id}/employees",
+            get(list_crew).post(assign_crew).put(replace_crew),
+        )
+        .route(
+            "/{id}/appointments/{appt_id}/employees/{emp_id}",
+            patch(update_crew).delete(remove_crew),
+        )
 }
 
 /// `GET /api/v1/inquiries/{id}/appointments` — list an inquiry's appointments.
@@ -43,7 +51,11 @@ async fn list_appointments(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<AppointmentSnapshot>>, ApiError> {
     let rows = appt_repo::list_for_inquiry(&state.db, id).await?;
-    Ok(Json(rows.into_iter().map(appointment_snapshot).collect()))
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        out.push(appointment_snapshot_full(&state.db, row).await?);
+    }
+    Ok(Json(out))
 }
 
 #[derive(Debug, Deserialize)]
@@ -54,7 +66,10 @@ struct CreateAppointmentRequest {
     end_time: Option<NaiveTime>,
     assignee_id: Option<Uuid>,
     location: Option<String>,
+    description: Option<String>,
+    address_id: Option<Uuid>,
     notes: Option<String>,
+    employee_notes: Option<String>,
     status: Option<String>,
 }
 
@@ -79,7 +94,10 @@ async fn create_appointment(
         end_time: Some(body.end_time),
         assignee_id: Some(body.assignee_id),
         location: Some(body.location.as_deref()),
+        description: Some(body.description.as_deref()),
+        address_id: Some(body.address_id),
         notes: Some(body.notes.as_deref()),
+        employee_notes: Some(body.employee_notes.as_deref()),
         status: body.status.as_deref(),
     };
     let new_id = appt_repo::create(&state.db, id, &input).await?;
@@ -87,7 +105,7 @@ async fn create_appointment(
     let row = appt_repo::fetch_one(&state.db, id, new_id)
         .await?
         .ok_or_else(|| ApiError::Internal("Termin nach dem Anlegen nicht gefunden.".into()))?;
-    Ok((StatusCode::CREATED, Json(appointment_snapshot(row))))
+    Ok((StatusCode::CREATED, Json(appointment_snapshot_full(&state.db, row).await?)))
 }
 
 /// `PATCH /api/v1/inquiries/{id}/appointments/{appt_id}` — partial update.
@@ -113,7 +131,10 @@ async fn update_appointment(
     let end_time = opt_time_field(&body, "end_time")?;
     let assignee_id = opt_uuid_field(&body, "assignee_id")?;
     let location = opt_str_field(&body, "location");
+    let description = opt_str_field(&body, "description");
+    let address_id = opt_uuid_field(&body, "address_id")?;
     let notes = opt_str_field(&body, "notes");
+    let employee_notes = opt_str_field(&body, "employee_notes");
 
     if let Some(Some(assignee)) = assignee_id {
         validate_assignee(&state, Some(assignee)).await?;
@@ -126,7 +147,10 @@ async fn update_appointment(
         end_time,
         assignee_id,
         location: location.as_ref().map(|o| o.as_deref()),
+        description: description.as_ref().map(|o| o.as_deref()),
+        address_id,
         notes: notes.as_ref().map(|o| o.as_deref()),
+        employee_notes: employee_notes.as_ref().map(|o| o.as_deref()),
         status: status.as_deref(),
     };
     let affected = appt_repo::update(&state.db, id, appt_id, &input).await?;
@@ -137,7 +161,7 @@ async fn update_appointment(
     let row = appt_repo::fetch_one(&state.db, id, appt_id)
         .await?
         .ok_or_else(|| ApiError::NotFound("Termin nicht gefunden.".into()))?;
-    Ok(Json(appointment_snapshot(row)))
+    Ok(Json(appointment_snapshot_full(&state.db, row).await?))
 }
 
 /// `DELETE /api/v1/inquiries/{id}/appointments/{appt_id}` — remove an appointment.
@@ -150,6 +174,181 @@ async fn delete_appointment(
         return Err(ApiError::NotFound("Termin nicht gefunden.".into()));
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ── Crew (paid Zusatztermine) ────────────────────────────────────────────────
+
+/// Load the full appointment snapshot scoped to its inquiry (404 if missing).
+async fn load_appointment(
+    state: &AppState,
+    inquiry_id: Uuid,
+    appt_id: Uuid,
+) -> Result<AppointmentSnapshot, ApiError> {
+    let row = appt_repo::fetch_one(&state.db, inquiry_id, appt_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Termin nicht gefunden.".into()))?;
+    appointment_snapshot_full(&state.db, row).await
+}
+
+#[derive(Debug, Deserialize)]
+struct AssignCrewBody {
+    employee_id: Uuid,
+}
+
+/// `GET /{id}/appointments/{appt_id}/employees` — the appointment's crew.
+async fn list_crew(
+    State(state): State<Arc<AppState>>,
+    Path((id, appt_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<Vec<aust_core::models::EmployeeAssignmentSnapshot>>, ApiError> {
+    let appt = load_appointment(&state, id, appt_id).await?;
+    Ok(Json(appt.employees))
+}
+
+/// `POST /{id}/appointments/{appt_id}/employees` — assign an employee to the entry.
+async fn assign_crew(
+    State(state): State<Arc<AppState>>,
+    Path((id, appt_id)): Path<(Uuid, Uuid)>,
+    Json(body): Json<AssignCrewBody>,
+) -> Result<(StatusCode, Json<AppointmentSnapshot>), ApiError> {
+    // Scope the appointment to its inquiry, then validate the employee.
+    if appt_repo::fetch_one(&state.db, id, appt_id).await?.is_none() {
+        return Err(ApiError::NotFound("Termin nicht gefunden.".into()));
+    }
+    if inquiry_repo::check_employee_active(&state.db, body.employee_id).await?.is_none() {
+        return Err(ApiError::NotFound("Mitarbeiter nicht gefunden.".into()));
+    }
+    appt_repo::insert_appointment_employee(&state.db, appt_id, body.employee_id).await?;
+    Ok((StatusCode::CREATED, Json(load_appointment(&state, id, appt_id).await?)))
+}
+
+/// Body for updating hours/notes/expenses on a crew assignment.
+/// Time fields use the lenient parser (accepts "7:30", "07:30", "7.30").
+#[derive(Debug, Deserialize)]
+struct UpdateCrewBody {
+    #[serde(default, deserialize_with = "aust_core::models::deserialize_lenient_time")]
+    clock_in: Option<NaiveTime>,
+    #[serde(default, deserialize_with = "aust_core::models::deserialize_lenient_time")]
+    clock_out: Option<NaiveTime>,
+    #[serde(default, deserialize_with = "aust_core::models::deserialize_lenient_time")]
+    start_time: Option<NaiveTime>,
+    #[serde(default, deserialize_with = "aust_core::models::deserialize_lenient_time")]
+    end_time: Option<NaiveTime>,
+    break_minutes: Option<i32>,
+    actual_hours: Option<f64>,
+    notes: Option<String>,
+    transport_mode: Option<String>,
+    travel_costs_cents: Option<i64>,
+    accommodation_cents: Option<i64>,
+    misc_costs_cents: Option<i64>,
+    meal_deduction: Option<String>,
+}
+
+/// `PATCH /{id}/appointments/{appt_id}/employees/{emp_id}` — update a crew assignment.
+async fn update_crew(
+    State(state): State<Arc<AppState>>,
+    Path((id, appt_id, emp_id)): Path<(Uuid, Uuid, Uuid)>,
+    Json(body): Json<UpdateCrewBody>,
+) -> Result<Json<AppointmentSnapshot>, ApiError> {
+    if appt_repo::fetch_one(&state.db, id, appt_id).await?.is_none() {
+        return Err(ApiError::NotFound("Termin nicht gefunden.".into()));
+    }
+    let rows = appt_repo::update_appointment_employee(
+        &state.db,
+        appt_id,
+        emp_id,
+        body.clock_in,
+        body.clock_out,
+        body.start_time,
+        body.end_time,
+        body.break_minutes,
+        body.actual_hours,
+        body.notes.as_deref(),
+        body.transport_mode.as_deref(),
+        body.travel_costs_cents,
+        body.accommodation_cents,
+        body.misc_costs_cents,
+        body.meal_deduction.as_deref(),
+    )
+    .await?;
+    if rows == 0 {
+        return Err(ApiError::NotFound(
+            "Mitarbeiter ist nicht zugewiesen — bitte erst zuweisen, dann Zeiten eintragen.".into(),
+        ));
+    }
+    Ok(Json(load_appointment(&state, id, appt_id).await?))
+}
+
+/// `DELETE /{id}/appointments/{appt_id}/employees/{emp_id}` — unassign an employee.
+async fn remove_crew(
+    State(state): State<Arc<AppState>>,
+    Path((id, appt_id, emp_id)): Path<(Uuid, Uuid, Uuid)>,
+) -> Result<StatusCode, ApiError> {
+    if appt_repo::fetch_one(&state.db, id, appt_id).await?.is_none() {
+        return Err(ApiError::NotFound("Termin nicht gefunden.".into()));
+    }
+    let rows = appt_repo::delete_appointment_employee(&state.db, appt_id, emp_id).await?;
+    if rows == 0 {
+        return Err(ApiError::NotFound("Zuweisung nicht gefunden.".into()));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// One crew row for the full-replace (`PUT`) body.
+#[derive(Debug, Deserialize)]
+struct BulkCrewBody {
+    employee_id: Uuid,
+    notes: Option<String>,
+    #[serde(default, deserialize_with = "aust_core::models::deserialize_lenient_time")]
+    start_time: Option<NaiveTime>,
+    #[serde(default, deserialize_with = "aust_core::models::deserialize_lenient_time")]
+    end_time: Option<NaiveTime>,
+    #[serde(default, deserialize_with = "aust_core::models::deserialize_lenient_time")]
+    clock_in: Option<NaiveTime>,
+    #[serde(default, deserialize_with = "aust_core::models::deserialize_lenient_time")]
+    clock_out: Option<NaiveTime>,
+    break_minutes: Option<i32>,
+    actual_hours: Option<f64>,
+    transport_mode: Option<String>,
+    travel_costs_cents: Option<i64>,
+    accommodation_cents: Option<i64>,
+    misc_costs_cents: Option<i64>,
+    meal_deduction: Option<String>,
+}
+
+/// `PUT /{id}/appointments/{appt_id}/employees` — full-replace the crew.
+async fn replace_crew(
+    State(state): State<Arc<AppState>>,
+    Path((id, appt_id)): Path<(Uuid, Uuid)>,
+    Json(body): Json<Vec<BulkCrewBody>>,
+) -> Result<Json<AppointmentSnapshot>, ApiError> {
+    if appt_repo::fetch_one(&state.db, id, appt_id).await?.is_none() {
+        return Err(ApiError::NotFound("Termin nicht gefunden.".into()));
+    }
+    for b in &body {
+        if inquiry_repo::check_employee_active(&state.db, b.employee_id).await?.is_none() {
+            return Err(ApiError::NotFound("Mitarbeiter nicht gefunden.".into()));
+        }
+    }
+    let inputs: Vec<appt_repo::AppointmentEmployeeInput> = body
+        .into_iter()
+        .map(|b| appt_repo::AppointmentEmployeeInput {
+            employee_id: b.employee_id,
+            notes: b.notes,
+            start_time: b.start_time,
+            end_time: b.end_time,
+            clock_in: b.clock_in,
+            clock_out: b.clock_out,
+            break_minutes: b.break_minutes.unwrap_or(0),
+            actual_hours: b.actual_hours,
+            transport_mode: b.transport_mode,
+            travel_costs_cents: b.travel_costs_cents,
+            accommodation_cents: b.accommodation_cents,
+            misc_costs_cents: b.misc_costs_cents,
+            meal_deduction: b.meal_deduction,
+        })
+        .collect();
+    appt_repo::put_appointment_employees(&state.db, appt_id, &inputs).await?;
+    Ok(Json(load_appointment(&state, id, appt_id).await?))
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────

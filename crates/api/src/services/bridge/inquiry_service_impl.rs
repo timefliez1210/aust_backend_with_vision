@@ -359,6 +359,8 @@ impl InquiryService for InquiryServiceImpl {
             .ok_or_else(|| {
                 ServiceError::Db(anyhow::anyhow!("Termin nach dem Anlegen nicht gefunden"))
             })?;
-        Ok(inquiry_builder::appointment_snapshot(row))
+        inquiry_builder::appointment_snapshot_full(&self.pool, row)
+            .await
+            .map_err(|e| ServiceError::Db(anyhow::anyhow!(e.to_string())))
     }
 }
