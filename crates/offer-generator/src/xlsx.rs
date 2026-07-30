@@ -364,6 +364,24 @@ fn address_block_lines(street: &str, city: &str, floor: &str, col_width: f64) ->
         .max(1)
 }
 
+/// Excel column-width units of the line-item "Bemerkung" column (C), used to
+/// estimate when a long remark wraps to further lines. Matches the template's
+/// `<col min="3" max="3" width="27.72">`.
+const REMARK_WIDTH_C: f64 = 27.72;
+
+/// Estimate how many rendered lines a remark needs in column C, honouring
+/// explicit newlines the same way `address_block_lines` honours separate
+/// fields. Always at least 1.
+fn remark_lines(remark: &str) -> u32 {
+    let cpl = REMARK_WIDTH_C.max(1.0);
+    remark
+        .trim()
+        .lines()
+        .map(|s| ((s.chars().count() as f64 / cpl).ceil() as u32).max(1))
+        .sum::<u32>()
+        .max(1)
+}
+
 /// `(cell_ref, value)` pairs, rows to hide, rows to un-hide, row heights to set.
 type CellModResult = (Vec<(String, CellValue)>, Vec<u32>, Vec<u32>, Vec<(u32, f64)>);
 
@@ -500,6 +518,11 @@ fn build_cell_modifications(data: &OfferData) -> CellModResult {
     // Style pairs indexed by [color]: 0 = white (fill 4), 1 = blue (fill 3)
     const STYLES_AB: [&str; 2] = ["58", "53"]; // columns A, B
     const STYLES_C: [&str; 2] = ["59", "54"];  // column C
+    // Same fill/border as STYLES_C but with wrapText + top alignment (added to
+    // styles.xml alongside style 44's address-wrap approach); used only when
+    // the remark needs more than one line, so untouched short remarks keep
+    // their original vertical-centered look.
+    const STYLES_C_WRAP: [&str; 2] = ["88", "89"];
     const STYLES_DE: [&str; 2] = ["60", "55"]; // columns D, E
     const STYLES_F: [&str; 2] = ["61", "56"];          // column F (€)
     const STYLES_F_LABOR: [&str; 2] = ["86", "85"];   // column F labor (€/Stunde)
@@ -546,12 +569,19 @@ fn build_cell_modifications(data: &OfferData) -> CellModResult {
             format!("B{row}"),
             CellValue::StyledText(String::new(), STYLES_AB[color]),
         ));
-        // Column C: Bemerkung (remark)
+        // Column C: Bemerkung (remark) — long remarks wrap instead of clipping,
+        // mirroring the A26/F26 address block: switch to the wrap-enabled style
+        // and grow the row to fit, only when the remark actually needs it.
         let remark = item.remark.as_deref().unwrap_or("");
+        let lines = remark_lines(remark);
+        let c_style = if lines > 1 { STYLES_C_WRAP[color] } else { STYLES_C[color] };
         mods.push((
             format!("C{row}"),
-            CellValue::StyledText(remark.to_string(), STYLES_C[color]),
+            CellValue::StyledText(remark.to_string(), c_style),
         ));
+        if lines > 1 {
+            row_heights.push((row, lines as f64 * ADDR_LINE_HEIGHT));
+        }
         // Clear column D (mostly empty, but some rows have preset text)
         mods.push((
             format!("D{row}"),
@@ -1934,6 +1964,63 @@ mod tests {
         assert!(
             f31_region.contains("<v>100</v>"),
             "F31 should contain unit_price 100, got: {f31_region}"
+        );
+    }
+
+    #[test]
+    fn short_remark_keeps_non_wrap_style_and_default_row_height() {
+        let mut data = minimal_offer_data();
+        data.line_items = vec![OfferLineItem {
+            description: "Umzugsmaterial".to_string(),
+            quantity: 4.0,
+            unit_price: 30.0,
+            is_labor: false,
+            flat_total: None,
+            remark: Some("Kartons".to_string()),
+        }];
+        let bytes = generate_offer_xlsx(&data).expect("generate should succeed");
+        let xml = read_xlsx_sheet1(&bytes);
+        let c31_pos = xml.find(r#"r="C31""#).unwrap();
+        let c31_region = &xml[c31_pos..c31_pos + 200.min(xml.len() - c31_pos)];
+        assert!(
+            c31_region.contains(r#"s="54""#),
+            "short remark should keep the original non-wrap style, got: {c31_region}"
+        );
+        let row31 = &xml[xml.find(r#"<row r="31""#).unwrap()..];
+        let row31_tag = &row31[..row31.find('>').unwrap()];
+        assert!(
+            !row31_tag.contains("customHeight=\"true\""),
+            "row 31 should keep its default height for a short remark, got: {row31_tag}"
+        );
+    }
+
+    #[test]
+    fn long_remark_wraps_and_grows_row_height() {
+        let mut data = minimal_offer_data();
+        data.line_items = vec![OfferLineItem {
+            description: "Umzugsmaterial".to_string(),
+            quantity: 4.0,
+            unit_price: 30.0,
+            is_labor: false,
+            flat_total: None,
+            remark: Some(
+                "Stretchfolie, Decken, Gurte, Klebeband, Luftpolsterfolie, Packpapier, Umzugskartons"
+                    .to_string(),
+            ),
+        }];
+        let bytes = generate_offer_xlsx(&data).expect("generate should succeed");
+        let xml = read_xlsx_sheet1(&bytes);
+        let c31_pos = xml.find(r#"r="C31""#).unwrap();
+        let c31_region = &xml[c31_pos..c31_pos + 300.min(xml.len() - c31_pos)];
+        assert!(
+            c31_region.contains(r#"s="89""#),
+            "long remark should switch to the wrap-enabled blue style, got: {c31_region}"
+        );
+        let row31 = &xml[xml.find(r#"<row r="31""#).unwrap()..];
+        let row31_tag = &row31[..row31.find('>').unwrap()];
+        assert!(
+            row31_tag.contains("customHeight=\"true\""),
+            "row 31 should get an explicit height for a wrapped remark, got: {row31_tag}"
         );
     }
 
