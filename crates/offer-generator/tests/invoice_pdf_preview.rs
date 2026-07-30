@@ -208,6 +208,51 @@ async fn preview_4_partial_final_restbetrag() {
 }
 
 #[tokio::test]
+async fn preview_6_stache_gutschrift_kaputt_tv() {
+    // Invoice 2026-0059 — separate Gutschrift invoice for a broken TV.
+    // Single negative line: -650,00 € brutto → netto = -650/1.19 = -546.22 €
+    let items = vec![InvoiceLineItem {
+        pos: 1,
+        description: "Gutschrift Kaputt TV".into(),
+        quantity: 1.0,
+        unit_price: -546.22, // netto; brutto = -650,00 €
+        remark: None,
+    }];
+
+    let data = InvoiceData {
+        invoice_number: "2026-0059".into(),
+        invoice_type: InvoiceType::Full,
+        invoice_date: NaiveDate::from_ymd_opt(2026, 6, 30).unwrap(),
+        service_date: Some(NaiveDate::from_ymd_opt(2026, 4, 7).unwrap()),
+        customer_name: "Stache".into(),
+        customer_email: Some("katharina.mozart.kw@gmail.com".into()),
+        company_name: None,
+        attention_line: None,
+        billing_street: "Geschwister-Scholl-Straße 5".into(),
+        billing_city: "31139 Hildesheim".into(),
+        service_street: String::new(),
+        service_city: String::new(),
+        offer_number: "2026-0219".into(),
+        salutation: "Sehr geehrte Damen und Herren,".into(),
+        line_items: items,
+        #[allow(deprecated)]
+        base_netto_cents: 0,
+        #[allow(deprecated)]
+        extra_services: vec![],
+        #[allow(deprecated)]
+        origin_street: String::new(),
+        #[allow(deprecated)]
+        origin_city: String::new(),
+    };
+
+    let xlsx = generate_invoice_xlsx(&data).expect("XLSX generation failed");
+    std::fs::write("/tmp/rechnung_stache_gutschrift.xlsx", &xlsx).unwrap();
+    let _pdf = xlsx_to_pdf(&xlsx, "/tmp/rechnung_stache_gutschrift.pdf").await;
+    println!("✓ Gutschrift Kaputt TV → /tmp/rechnung_stache_gutschrift.pdf");
+    println!("  Netto: -546.22 €, MwSt: -103.78 €, Brutto: -650.00 €");
+}
+
+#[tokio::test]
 async fn preview_5_business_customer_invoice() {
     // Business customer with company name + attention line
     let items = vec![

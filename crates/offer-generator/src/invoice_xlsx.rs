@@ -258,6 +258,13 @@ pub fn generate_invoice_xlsx(data: &InvoiceData) -> Result<Vec<u8>, OfferError> 
         .map_err(|e| OfferError::Template(format!("drawing1.xml not valid UTF-8: {e}")))?;
     let modified_drawing = strip_rechnung_drawing(&drawing_str);
 
+    // Read styles.xml and fix accounting number format so negative totals
+    // render the minus sign next to the number (not at the cell's left edge).
+    let styles_xml = read_zip_entry(&mut template_zip, "xl/styles.xml")?;
+    let styles_str = String::from_utf8(styles_xml)
+        .map_err(|e| OfferError::Template(format!("styles.xml not valid UTF-8: {e}")))?;
+    let modified_styles = fix_accounting_number_format(&styles_str);
+
     // Reassemble ZIP
     assemble_invoice_xlsx(
         &mut template_zip,
@@ -265,6 +272,7 @@ pub fn generate_invoice_xlsx(data: &InvoiceData) -> Result<Vec<u8>, OfferError> 
         &modified_workbook,
         &modified_sheet1_rels,
         &modified_drawing,
+        &modified_styles,
     )
 }
 
@@ -563,6 +571,35 @@ fn strip_rechnung_drawing(xml: &str) -> String {
     xml.to_string()
 }
 
+/// Replace the accounting number format (numFmtId 166) with a simple currency
+/// format so that negative values render the minus sign directly before the
+/// number (e.g. `-546.22 €`) instead of at the cell's left edge (`_-*` format).
+///
+/// The template's format 166 is:
+///   `_-* #,##0.00\ [$€-407]_-;\-* #,##0.00\ [$€-407]_-;_-* "-"??\ [$€-407]_-;_-@_-`
+///
+/// We replace it with:
+///   `#,##0.00\ "€";-#,##0.00\ "€"`
+///
+/// which matches the line-item format (167) but adds an explicit negative section.
+fn fix_accounting_number_format(xml: &str) -> String {
+    // The accounting format used in the template for totals (E51, E52, E54).
+    const ACCOUNTING_FMT: &str =
+        r#"_-* #,##0.00\ [$€-407]_-;\-* #,##0.00\ [$€-407]_-;_-* &quot;-&quot;??\ [$€-407]_-;_-@_-"#;
+    // Simple format: minus directly before the number.
+    const SIMPLE_FMT: &str = r#"#,##0.00\ &quot;€&quot;;-#,##0.00\ &quot;€&quot;"#;
+
+    if xml.contains(ACCOUNTING_FMT) {
+        xml.replace(ACCOUNTING_FMT, SIMPLE_FMT)
+    } else {
+        // Fallback: try without XML-escaped quotes (in case the template uses raw quotes)
+        const ACCOUNTING_RAW: &str =
+            r#"_-* #,##0.00\ [$€-407]_-;\-* #,##0.00\ [$€-407]_-;_-* "-"??\ [$€-407]_-;_-@_-"#;
+        const SIMPLE_RAW: &str = r#"#,##0.00\ "€";-#,##0.00\ "€""#;
+        xml.replace(ACCOUNTING_RAW, SIMPLE_RAW)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ZIP assembly
 // ---------------------------------------------------------------------------
@@ -577,6 +614,7 @@ fn assemble_invoice_xlsx(
     modified_workbook: &str,
     modified_sheet1_rels: &str,
     modified_drawing: &str,
+    modified_styles: &str,
 ) -> Result<Vec<u8>, OfferError> {
     let buf: Vec<u8> = Vec::new();
     let cursor = Cursor::new(buf);
@@ -589,6 +627,7 @@ fn assemble_invoice_xlsx(
         ("xl/workbook.xml", modified_workbook),
         ("xl/worksheets/_rels/sheet1.xml.rels", modified_sheet1_rels),
         ("xl/drawings/drawing1.xml", modified_drawing),
+        ("xl/styles.xml", modified_styles),
     ];
     copy_zip_entries(template_zip, &mut writer, options, &replacements, |_| false)?;
 
