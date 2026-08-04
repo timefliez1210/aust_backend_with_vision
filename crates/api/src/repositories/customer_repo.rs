@@ -42,7 +42,16 @@ impl CustomerRow {
         {
             return "Sehr geehrte Damen und Herren,".to_string();
         }
-        match (self.salutation.as_deref(), self.last_name.as_deref()) {
+        // An explicit salutation always wins over the name heuristic; customers
+        // created via the admin dashboard have `salutation` + `name` but no
+        // structured `last_name`, so recover the family name from `name`.
+        let family = self.last_name.clone().or_else(|| {
+            self.name
+                .as_deref()
+                .and_then(aust_core::models::family_name_from_full_name)
+        });
+
+        match (self.salutation.as_deref(), family.as_deref()) {
             (Some("Herr"), Some(ln)) => format!("Sehr geehrter Herr {ln},"),
             (Some("Frau"), Some(ln)) => format!("Sehr geehrte Frau {ln},"),
             (Some("D"), Some(ln)) => format!("Sehr geehrte Person {ln},"),
@@ -283,4 +292,52 @@ pub(crate) async fn create_recipient(
     .await
     .map(|(id,): (Uuid,)| id)
     .map_err(|e| ApiError::Internal(format!("Empfaenger konnte nicht erstellt werden: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(salutation: Option<&str>, last_name: Option<&str>, name: Option<&str>) -> CustomerRow {
+        CustomerRow {
+            id: Uuid::now_v7(),
+            email: None,
+            name: name.map(str::to_string),
+            salutation: salutation.map(str::to_string),
+            first_name: None,
+            last_name: last_name.map(str::to_string),
+            phone: None,
+            customer_type: Some("private".to_string()),
+            company_name: None,
+            billing_address_id: None,
+        }
+    }
+
+    /// Regression: inquiry 019fb30a-e012-7e51-aee3-e0496d82eac7 — "Frau" + full
+    /// name, no structured last name. The first-name heuristic used to win and
+    /// produced "Sehr geehrter Herr Pithan,".
+    #[test]
+    fn stored_salutation_beats_first_name_heuristic() {
+        let r = row(Some("Frau"), None, Some("Lilian Pithan"));
+        assert_eq!(r.formal_greeting(), "Sehr geehrte Frau Pithan,");
+        assert_eq!(r.address_salutation(), "Frau");
+    }
+
+    #[test]
+    fn structured_last_name_still_wins() {
+        let r = row(Some("Herr"), Some("Müller"), Some("Thomas Müller"));
+        assert_eq!(r.formal_greeting(), "Sehr geehrter Herr Müller,");
+    }
+
+    #[test]
+    fn salutation_prefix_in_name_is_not_used_as_family_name() {
+        let r = row(Some("Frau"), None, Some("Frau Schmidt"));
+        assert_eq!(r.formal_greeting(), "Sehr geehrte Frau Schmidt,");
+    }
+
+    #[test]
+    fn no_salutation_falls_back_to_heuristic() {
+        let r = row(None, None, Some("Thomas Müller"));
+        assert_eq!(r.formal_greeting(), "Sehr geehrter Herr Müller,");
+    }
 }

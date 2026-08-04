@@ -87,6 +87,32 @@ pub fn detect_salutation_from_name(name: &str) -> (String, String) {
     }
 }
 
+/// Recover the family name from a legacy full-name string.
+///
+/// **Caller**: `resolve_greeting` — only when the structured `last_name` column is
+/// empty but an explicit `salutation` is stored.
+/// **Why**: Customers created through the admin dashboard get `salutation` + `name`
+/// but no `first_name`/`last_name`. Without this the greeting fell through to the
+/// female-first-name heuristic, which addressed "Frau Lilian Pithan" as
+/// "Sehr geehrter Herr Pithan,".
+///
+/// # Parameters
+/// - `name` — raw full-name string, possibly with a "Herr "/"Frau " prefix
+///
+/// # Returns
+/// The last whitespace-separated word, or `None` when the string is blank.
+pub fn family_name_from_full_name(name: &str) -> Option<String> {
+    let trimmed = name.trim();
+    let without_prefix = trimmed
+        .strip_prefix("Frau ")
+        .or_else(|| trimmed.strip_prefix("Herr "))
+        .unwrap_or(trimmed);
+    without_prefix
+        .split_whitespace()
+        .last()
+        .map(str::to_string)
+}
+
 /// Build the formal greeting line from structured customer fields.
 ///
 /// **Caller**: `Customer::formal_greeting`, `CustomerRow::formal_greeting` in
@@ -97,7 +123,7 @@ pub fn detect_salutation_from_name(name: &str) -> (String, String) {
 ///
 /// Priority:
 /// 1. Explicit `salutation` + `last_name` → deterministic template
-/// 2. `salutation` only (no last name) → generic fallback
+/// 2. Explicit `salutation` + family name recovered from `name` → same template
 /// 3. `name` string present → `detect_salutation_from_name` heuristic
 /// 4. No usable data → `"Sehr geehrte Damen und Herren,"`
 ///
@@ -116,7 +142,13 @@ pub fn resolve_greeting(
     last_name: Option<&str>,
     name: Option<&str>,
 ) -> String {
-    match (salutation, last_name) {
+    // An explicit salutation always wins over the name heuristic; when the
+    // structured last name is missing, recover it from the full-name string.
+    let family = last_name
+        .map(str::to_string)
+        .or_else(|| name.and_then(|n| family_name_from_full_name(n)));
+
+    match (salutation, family.as_deref()) {
         (Some("Herr"), Some(ln)) => format!("Sehr geehrter Herr {ln},"),
         (Some("Frau"), Some(ln)) => format!("Sehr geehrte Frau {ln},"),
         (Some("D"),    Some(ln)) => format!("Sehr geehrte Person {ln},"),
