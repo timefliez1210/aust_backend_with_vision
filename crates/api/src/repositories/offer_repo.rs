@@ -374,7 +374,8 @@ pub(crate) async fn fetch_inquiry_for_offer(
         r#"
         SELECT id, customer_id, origin_address_id, destination_address_id, stop_address_id,
                status, estimated_volume_m3, distance_km, scheduled_date, notes, services,
-               source, custom_fields, offer_sent_at, accepted_at, created_at, updated_at
+               source, custom_fields, offer_sent_at, accepted_at, created_at, updated_at,
+               billing_address_id AS inquiry_billing_address_id
         FROM inquiries WHERE id = $1
         "#,
     )
@@ -570,6 +571,51 @@ mod kva_buch_tests {
         let statuses: Vec<&str> = rows.iter().map(|r| r.status.as_str()).collect();
         assert!(statuses.contains(&"rejected"), "{statuses:?}");
         assert!(statuses.contains(&"expired"), "{statuses:?}");
+    }
+
+    /// Regression guard for the Kostenvoranschlag letterhead: this query used to omit
+    /// `billing_address_id`, and because `InquiryRow` marked the field `#[sqlx(default)]`
+    /// the omission silently produced `None`. Every KVA therefore ignored the
+    /// Rechnungsadresse and addressed the customer at the Beladestelle instead — and
+    /// regenerating the offer could not fix it, because the value never reached the
+    /// builder. Live example: offer 2026-0267 (erfi Ernst Fischer GmbH) went to
+    /// "Bundesallee 100, Braunschweig" instead of "Alte Poststr. 8, Freudenstadt".
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn offer_query_carries_the_inquiry_billing_address(pool: PgPool) {
+        let customer_id = test_helpers::insert_test_customer(&pool).await;
+        let origin = test_helpers::insert_test_address(
+            &pool, "Bundesallee 100", "Braunschweig", "38116", None, None,
+        )
+        .await;
+        let dest = test_helpers::insert_test_address(
+            &pool, "Zielstr. 5", "Hannover", "30159", None, None,
+        )
+        .await;
+        let billing = test_helpers::insert_test_address(
+            &pool, "Alte Poststr. 8", "Freudenstadt", "72250", None, None,
+        )
+        .await;
+        let inquiry_id = test_helpers::insert_test_inquiry_full(
+            &pool, customer_id, origin, dest, "offer_ready", "termin", None,
+        )
+        .await;
+        sqlx::query("UPDATE inquiries SET billing_address_id = $1 WHERE id = $2")
+            .bind(billing)
+            .bind(inquiry_id)
+            .execute(&pool)
+            .await
+            .expect("set billing address");
+
+        let row = fetch_inquiry_for_offer(&pool, inquiry_id)
+            .await
+            .unwrap()
+            .expect("inquiry missing");
+
+        assert_eq!(
+            row.inquiry_billing_address_id,
+            Some(billing),
+            "the KVA builder must see the Rechnungsadresse, not fall back to origin"
+        );
     }
 
     /// The register links each row to its own document, including non-active offers.

@@ -37,7 +37,10 @@ pub(crate) struct InquiryRow {
     pub submission_mode: Option<String>,
     #[sqlx(default)]
     pub recipient_id: Option<Uuid>,
-    #[sqlx(default)]
+    /// Deliberately NOT `#[sqlx(default)]`: `fetch_inquiry_for_offer` once omitted this
+    /// column, and the default silently made it `None`, so every Kostenvoranschlag fell
+    /// back to the origin address instead of the Rechnungsadresse. Without the attribute
+    /// a query that forgets the column fails loudly instead.
     pub inquiry_billing_address_id: Option<Uuid>,
     #[sqlx(default)]
     pub custom_fields: serde_json::Value,
