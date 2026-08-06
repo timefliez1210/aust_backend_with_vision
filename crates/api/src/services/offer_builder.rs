@@ -1341,6 +1341,78 @@ fn detected_item_to_row(item: DetectedItem) -> DetectedItemRow {
 mod tests {
     use super::*;
 
+    /// The Kostenvoranschlag letterhead must carry the Rechnungsadresse.
+    ///
+    /// Reproduces the shape of live inquiry 019fcc9c-… (erfi Ernst Fischer GmbH+Co. KG):
+    /// a business customer whose move starts at Bundesallee 100 in Braunschweig but who
+    /// is billed at Alte Poststr. 8 in Freudenstadt. The rendered KVA addressed the
+    /// customer at the Beladestelle, and regenerating it did not help, because
+    /// `fetch_inquiry_for_offer` never selected `billing_address_id` and `InquiryRow`
+    /// marked the field `#[sqlx(default)]` — so the column silently arrived as `None`
+    /// and the resolver fell through to the origin address.
+    ///
+    /// This walks the exact chain `build_offer_with_overrides` uses to fill
+    /// `OfferData::customer_street` / `customer_city` (the A10/A11 address window).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn kva_letterhead_uses_the_billing_address_not_the_origin(pool: sqlx::PgPool) {
+        use crate::repositories::{address_repo, offer_repo};
+        use crate::test_helpers;
+        use crate::types::resolve_billing_address_id;
+
+        let customer_id = test_helpers::insert_test_customer(&pool).await;
+        let origin = test_helpers::insert_test_address(
+            &pool, "Bundesallee 100", "Braunschweig", "38116", None, None,
+        )
+        .await;
+        let dest = test_helpers::insert_test_address(
+            &pool, "Zielstr. 5", "Hannover", "30159", None, None,
+        )
+        .await;
+        let billing = test_helpers::insert_test_address(
+            &pool, "Alte Poststr. 8", "Freudenstadt", "72250", None, None,
+        )
+        .await;
+        let inquiry_id = test_helpers::insert_test_inquiry_full(
+            &pool, customer_id, origin, dest, "offer_ready", "termin", None,
+        )
+        .await;
+        sqlx::query("UPDATE inquiries SET billing_address_id = $1 WHERE id = $2")
+            .bind(billing)
+            .bind(inquiry_id)
+            .execute(&pool)
+            .await
+            .expect("set Rechnungsadresse");
+
+        // --- the chain from build_offer_with_overrides ---
+        let inquiry_row = offer_repo::fetch_inquiry_for_offer(&pool, inquiry_id)
+            .await
+            .expect("query")
+            .expect("inquiry exists");
+        let inquiry = Inquiry::from(inquiry_row);
+        let customer = customer_repo::fetch_by_id(&pool, inquiry.customer_id)
+            .await
+            .expect("customer");
+
+        let billing_addr_id = resolve_billing_address_id(
+            inquiry.billing_address_id,
+            customer.billing_address_id,
+            inquiry.origin_address_id,
+            inquiry.destination_address_id,
+            inquiry.status.as_str(),
+        );
+        assert_eq!(billing_addr_id, Some(billing), "resolver ignored the Rechnungsadresse");
+
+        let billing_addr = address_repo::fetch_optional(&pool, billing_addr_id)
+            .await
+            .expect("fetch billing address");
+        let street = billing_addr.as_ref().map(format_street).unwrap_or_default();
+        let city = billing_addr.as_ref().map(format_city).unwrap_or_default();
+
+        assert_eq!(street, "Alte Poststr. 8", "A10 must hold the billing street");
+        assert_eq!(city, "72250 Freudenstadt", "A11 must hold the billing city");
+        assert_ne!(street, "Bundesallee 100", "letterhead fell back to the Beladestelle");
+    }
+
     fn make_vol_est(result_data: serde_json::Value) -> VolumeEstimationRow {
         VolumeEstimationRow {
             result_data: Some(result_data),
