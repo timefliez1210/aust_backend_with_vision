@@ -424,6 +424,77 @@ pub(crate) async fn fetch_active_for_builder(
     .await
 }
 
+/// Fetch one specific offer's PDF storage key.
+///
+/// **Caller**: `admin::kva_buch_pdf`
+/// **Why**: The KVA-Buch lists every offer including rejected and expired ones, so it
+/// cannot go through `fetch_active_pdf_key`, which only resolves the active offer.
+/// Outer `None` = no such offer; inner `None` = offer exists but has no rendered file.
+pub(crate) async fn fetch_pdf_key_by_id(
+    pool: &PgPool,
+    offer_id: Uuid,
+) -> Result<Option<Option<String>>, sqlx::Error> {
+    sqlx::query_scalar("SELECT pdf_storage_key FROM offers WHERE id = $1")
+        .bind(offer_id)
+        .fetch_optional(pool)
+        .await
+}
+
+/// Flat projection for the KVA-Buch — one row per Kostenvoranschlag.
+#[derive(Debug, FromRow)]
+pub(crate) struct KvaBuchRow {
+    pub id: Uuid,
+    pub inquiry_id: Uuid,
+    pub offer_number: Option<String>,
+    pub price_cents: i64,
+    pub status: String,
+    pub pdf_storage_key: Option<String>,
+    pub valid_until: Option<NaiveDate>,
+    pub sent_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub customer_name: Option<String>,
+    pub scheduled_date: Option<NaiveDate>,
+    /// Set once the inquiry has an invoice — the KVA became a real job.
+    pub invoice_number: Option<String>,
+}
+
+/// List every Kostenvoranschlag for the KVA-Buch.
+///
+/// **Caller**: `admin::kva_buch`
+/// **Why**: Alex wants the same yearly register he has for invoices, but for KVAs
+/// (feedback report fa436f07). Deliberately mirrors
+/// `invoice_repo::list_for_rechnungsausgangsbuch`: inquiry and customer are LEFT
+/// joins so a KVA never drops out of the register, and `superseded` drafts are
+/// excluded because a replaced draft was never a document Alex handed out.
+pub(crate) async fn list_for_kva_buch(pool: &PgPool) -> Result<Vec<KvaBuchRow>, sqlx::Error> {
+    sqlx::query_as(
+        r#"
+        SELECT
+            o.id,
+            o.inquiry_id,
+            o.offer_number,
+            o.price_cents,
+            o.status,
+            o.pdf_storage_key,
+            o.valid_until,
+            o.sent_at,
+            o.created_at,
+            c.name AS customer_name,
+            i.scheduled_date,
+            (SELECT inv.invoice_number FROM invoices inv
+              WHERE inv.inquiry_id = o.inquiry_id
+              ORDER BY inv.created_at ASC LIMIT 1) AS invoice_number
+        FROM offers o
+        LEFT JOIN inquiries i ON i.id = o.inquiry_id
+        LEFT JOIN customers c ON c.id = i.customer_id
+        WHERE o.status <> 'superseded'
+        ORDER BY COALESCE(o.sent_at, o.created_at) ASC
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+}
+
 /// Fetch all PDF storage keys for an inquiry's offers.
 /// Used for S3 cleanup when deleting an inquiry.
 pub(crate) async fn fetch_all_pdf_keys(
@@ -437,4 +508,81 @@ pub(crate) async fn fetch_all_pdf_keys(
     .fetch_all(pool)
     .await?;
     Ok(rows.into_iter().map(|(k,)| k).collect())
+}
+
+#[cfg(test)]
+mod kva_buch_tests {
+    use super::*;
+    use crate::test_helpers;
+
+    async fn seed_inquiry(pool: &PgPool, status: &str) -> Uuid {
+        let customer_id = test_helpers::insert_test_customer(pool).await;
+        let origin = test_helpers::insert_test_address(
+            pool, "Musterstr. 1", "Hildesheim", "31134", None, None,
+        )
+        .await;
+        let dest = test_helpers::insert_test_address(
+            pool, "Zielstr. 5", "Hannover", "30159", None, None,
+        )
+        .await;
+        test_helpers::insert_test_inquiry_full(
+            pool, customer_id, origin, dest, status, "termin", None,
+        )
+        .await
+    }
+
+    /// Pins the KVA-Buch projection (a runtime-typed `query_as`) and the one row class
+    /// it deliberately hides: `superseded` drafts were replaced before anyone saw them.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn lists_offers_and_hides_superseded_drafts(pool: PgPool) {
+        let kept = seed_inquiry(&pool, "offer_sent").await;
+        let replaced = seed_inquiry(&pool, "estimated").await;
+
+        let kept_offer = test_helpers::insert_test_offer(&pool, kept, "sent").await;
+        test_helpers::insert_test_offer(&pool, replaced, "superseded").await;
+
+        let rows = list_for_kva_buch(&pool).await.unwrap();
+        let ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
+
+        assert!(ids.contains(&kept_offer), "sent KVA missing from the register");
+        assert_eq!(rows.len(), 1, "superseded draft must not appear: {rows:?}");
+
+        let row = &rows[0];
+        assert_eq!(row.inquiry_id, kept);
+        assert_eq!(row.status, "sent");
+        assert_eq!(row.price_cents, 50_000);
+        assert!(row.customer_name.is_some());
+        assert_eq!(row.pdf_storage_key.as_deref(), Some("test.pdf"));
+        // No invoice exists yet — the KVA has not become a job.
+        assert_eq!(row.invoice_number, None);
+    }
+
+    /// A rejected or expired KVA still belongs in the register — only `superseded`
+    /// is filtered, and `offers.status` is NOT NULL so nothing drops silently.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn keeps_rejected_and_expired_offers(pool: PgPool) {
+        let a = seed_inquiry(&pool, "rejected").await;
+        let b = seed_inquiry(&pool, "expired").await;
+        test_helpers::insert_test_offer(&pool, a, "rejected").await;
+        test_helpers::insert_test_offer(&pool, b, "expired").await;
+
+        let rows = list_for_kva_buch(&pool).await.unwrap();
+        let statuses: Vec<&str> = rows.iter().map(|r| r.status.as_str()).collect();
+        assert!(statuses.contains(&"rejected"), "{statuses:?}");
+        assert!(statuses.contains(&"expired"), "{statuses:?}");
+    }
+
+    /// The register links each row to its own document, including non-active offers.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn fetches_a_specific_offers_pdf_key(pool: PgPool) {
+        let inquiry_id = seed_inquiry(&pool, "rejected").await;
+        let offer_id = test_helpers::insert_test_offer(&pool, inquiry_id, "rejected").await;
+
+        assert_eq!(
+            fetch_pdf_key_by_id(&pool, offer_id).await.unwrap(),
+            Some(Some("test.pdf".to_string()))
+        );
+        // Outer None distinguishes "no such offer" from "offer without a file".
+        assert_eq!(fetch_pdf_key_by_id(&pool, Uuid::now_v7()).await.unwrap(), None);
+    }
 }

@@ -1247,6 +1247,53 @@ pub(crate) async fn fetch_estimation_result_data(
     Ok(row.map(|(d,)| d))
 }
 
+/// Fetch the customer photo and video S3 keys attached to a job.
+///
+/// **Caller**: `employee::get_job_detail`
+/// **Why**: Crews arrived at jobs without ever seeing what they were moving
+/// (feedback report 2424940e). The media already exist on the inquiry's volume
+/// estimation; only the worker portal never surfaced them. Every estimation for the
+/// inquiry is scanned, not just the newest, because a re-run can produce a fresh
+/// estimation whose `source_data` no longer lists the original upload.
+///
+/// Returns `(photo_keys, video_keys)` — both are always scoped to this `inquiry_id`.
+pub(crate) async fn fetch_job_media_keys(
+    pool: &PgPool,
+    inquiry_id: Uuid,
+) -> Result<(Vec<String>, Vec<String>), sqlx::Error> {
+    let rows: Vec<(Option<serde_json::Value>,)> = sqlx::query_as(
+        r#"
+        SELECT source_data FROM volume_estimations
+        WHERE inquiry_id = $1
+        ORDER BY created_at ASC
+        "#,
+    )
+    .bind(inquiry_id)
+    .fetch_all(pool)
+    .await?;
+
+    let mut photos: Vec<String> = Vec::new();
+    let mut videos: Vec<String> = Vec::new();
+    for (source_data,) in rows {
+        let Some(sd) = source_data else { continue };
+        if let Some(arr) = sd.get("s3_keys").and_then(|v| v.as_array()) {
+            for k in arr.iter().filter_map(|v| v.as_str()) {
+                if !photos.iter().any(|existing| existing == k) {
+                    photos.push(k.to_string());
+                }
+            }
+        }
+        // A video submission stores `video_s3_key` instead of `s3_keys`; without this
+        // a video-estimated job would show no media at all.
+        if let Some(k) = sd.get("video_s3_key").and_then(|v| v.as_str()) {
+            if !videos.iter().any(|existing| existing == k) {
+                videos.push(k.to_string());
+            }
+        }
+    }
+    Ok((photos, videos))
+}
+
 // ---------------------------------------------------------------------------
 // Admin employee management queries
 // ---------------------------------------------------------------------------

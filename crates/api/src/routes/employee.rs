@@ -473,6 +473,13 @@ struct JobDetail {
     // Volume
     estimated_volume_m3: Option<f64>,
     items: Vec<ItemInfo>,
+    /// Customer photos of the Umzugsgut, as ready-to-use image URLs
+    /// (`/api/v1/estimates/images/{key}`). That route is public, so the worker
+    /// app can render them straight in an `<img src>` without an auth header.
+    photo_urls: Vec<String>,
+    /// Customer walkthrough videos, same route and same reasoning. Separate from
+    /// `photo_urls` because the client needs a `<video>` element, not an `<img>`.
+    video_urls: Vec<String>,
     // Customer contact — phone only, no financial data
     customer_name: Option<String>,
     customer_phone: Option<String>,
@@ -538,6 +545,13 @@ async fn get_job_detail(
     // Fetch items from latest volume estimation
     let items = fetch_estimation_items(&state.db, inquiry_id).await?;
 
+    // Customer photos and videos of the Umzugsgut (feedback report 2424940e).
+    let (photo_keys, video_keys) =
+        employee_repo::fetch_job_media_keys(&state.db, inquiry_id).await?;
+    let to_url = |k: String| format!("/api/v1/estimates/images/{k}");
+    let photo_urls: Vec<String> = photo_keys.into_iter().map(to_url).collect();
+    let video_urls: Vec<String> = video_keys.into_iter().map(to_url).collect();
+
     // Fetch colleagues
     let colleague_map =
         fetch_colleague_names(&state.db, &[inquiry_id], claims.employee_id).await?;
@@ -563,6 +577,8 @@ async fn get_job_detail(
         destination_elevator: row.destination_elevator,
         estimated_volume_m3: row.estimated_volume_m3,
         items,
+        photo_urls,
+        video_urls,
         customer_name: row.customer_name,
         customer_phone: row.customer_phone,
         notes: assign.notes,

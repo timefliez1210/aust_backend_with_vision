@@ -1520,12 +1520,46 @@ async fn upload_invoice_pdf(
 // Response builder
 // ---------------------------------------------------------------------------
 
-/// Build an `InvoiceResponse` from a DB row plus the offer netto for amount calculation.
-fn build_invoice_response(row: InvoiceRow, offer_netto_cents: i64) -> InvoiceResponse {
+/// The amount-bearing fields of an invoice, independent of which query loaded it.
+///
+/// **Caller**: `build_invoice_response` and `admin::rechnungsausgangsbuch`.
+/// **Why**: The Rechnungsausgangsbuch used to derive its amounts straight from the
+/// offer price, so an Anzahlung/Schlussrechnung pair showed the full sum twice and a
+/// Gutschrift showed up positive (feedback reports afebffcb / 6d73ec72). Both call
+/// sites now go through the same arithmetic.
+pub(crate) struct InvoiceAmountInput<'a> {
+    pub invoice_type: &'a str,
+    pub partial_percent: Option<i32>,
+    pub is_manual: bool,
+    /// Raw `invoices.extra_services` JSONB.
+    pub extra_services: &'a serde_json::Value,
+    /// Raw `invoices.line_items_json` JSONB — only read for manual invoices.
+    pub line_items_json: Option<&'a serde_json::Value>,
+    /// `invoices.base_netto_cents`, or `None` on pre-migration rows.
+    pub base_netto_cents: Option<i64>,
+    /// Fallback netto used when `base_netto_cents` is NULL — the active offer price.
+    pub offer_netto_cents: i64,
+}
+
+/// Parsed amount-bearing parts of an invoice: its totals plus the line items the
+/// response needs to echo back.
+pub(crate) struct InvoiceAmounts {
+    pub total_netto_cents: i64,
+    pub total_brutto_cents: i64,
+    pub extra_services: Vec<ExtraServiceRequest>,
+    pub manual_items: Vec<ManualLineItem>,
+}
+
+/// Compute an invoice's netto/brutto totals from its own stored fields.
+///
+/// Honours the three shapes an invoice can take: manual (Σ line items), the
+/// Anzahlung/Schlussrechnung split, and the plain full invoice with extras
+/// (which may be negative — a Gutschrift).
+pub(crate) fn compute_invoice_amounts(input: InvoiceAmountInput<'_>) -> InvoiceAmounts {
     // The base captured at creation wins — for manual-price invoices the
     // active-offer fallback is 0 and would zero out every total.
-    let offer_netto_cents = row.base_netto_cents.unwrap_or(offer_netto_cents);
-    let extra_services: Vec<ExtraServiceRequest> = row
+    let offer_netto_cents = input.base_netto_cents.unwrap_or(input.offer_netto_cents);
+    let extra_services: Vec<ExtraServiceRequest> = input
         .extra_services
         .as_array()
         .map(|arr| {
@@ -1537,9 +1571,9 @@ fn build_invoice_response(row: InvoiceRow, offer_netto_cents: i64) -> InvoiceRes
 
     // Manual invoices carry their own line items and totals — independent of the
     // offer/extras model used by offer-derived invoices.
-    let manual_items: Vec<ManualLineItem> = if row.is_manual {
-        row.line_items_json
-            .as_ref()
+    let manual_items: Vec<ManualLineItem> = if input.is_manual {
+        input
+            .line_items_json
             .and_then(|j| serde_json::from_value(j.clone()).ok())
             .unwrap_or_default()
     } else {
@@ -1554,7 +1588,7 @@ fn build_invoice_response(row: InvoiceRow, offer_netto_cents: i64) -> InvoiceRes
     // round(offer_brutto * pct), final = the remainder. This guarantees first_brutto +
     // final_brutto == offer_brutto to the cent. Independently rounding total_netto * 1.19
     // (the previous approach) could drift ±1ct away from the generated PDF total.
-    let (total_netto, total_brutto) = if row.is_manual {
+    let (total_netto, total_brutto) = if input.is_manual {
         // Sum the exact line products, then round once — mirrors the template's
         // Nettosumme = SUM(Menge × Einzelpreis) → ×1.19 for brutto.
         let netto: f64 = manual_items
@@ -1564,26 +1598,52 @@ fn build_invoice_response(row: InvoiceRow, offer_netto_cents: i64) -> InvoiceRes
         let netto = netto.round() as i64;
         (netto, (netto as f64 * 1.19).round() as i64)
     } else {
-        match row.invoice_type.as_str() {
-        "partial_first" => {
-            let pct = row.partial_percent.unwrap_or(0) as f64;
-            let first_brutto = (offer_brutto as f64 * pct / 100.0).round() as i64;
-            let first_netto = (first_brutto as f64 / 1.19).round() as i64;
-            (first_netto, first_brutto) // no extras on partial_first
-        }
-        "partial_final" => {
-            let pct = row.partial_percent.unwrap_or(0) as f64;
-            let first_brutto = (offer_brutto as f64 * pct / 100.0).round() as i64;
-            let first_netto = (first_brutto as f64 / 1.19).round() as i64;
-            let final_netto = offer_netto_cents - first_netto;
-            (final_netto + extra_netto, (offer_brutto - first_brutto) + extra_brutto)
-        }
-        _ => {
-            // full
-            (offer_netto_cents + extra_netto, offer_brutto + extra_brutto)
-        }
+        match input.invoice_type {
+            "partial_first" => {
+                let pct = input.partial_percent.unwrap_or(0) as f64;
+                let first_brutto = (offer_brutto as f64 * pct / 100.0).round() as i64;
+                let first_netto = (first_brutto as f64 / 1.19).round() as i64;
+                (first_netto, first_brutto) // no extras on partial_first
+            }
+            "partial_final" => {
+                let pct = input.partial_percent.unwrap_or(0) as f64;
+                let first_brutto = (offer_brutto as f64 * pct / 100.0).round() as i64;
+                let first_netto = (first_brutto as f64 / 1.19).round() as i64;
+                let final_netto = offer_netto_cents - first_netto;
+                (final_netto + extra_netto, (offer_brutto - first_brutto) + extra_brutto)
+            }
+            _ => {
+                // full
+                (offer_netto_cents + extra_netto, offer_brutto + extra_brutto)
+            }
         }
     };
+
+    InvoiceAmounts {
+        total_netto_cents: total_netto,
+        total_brutto_cents: total_brutto,
+        extra_services,
+        manual_items,
+    }
+}
+
+/// Build an `InvoiceResponse` from a DB row plus the offer netto for amount calculation.
+fn build_invoice_response(row: InvoiceRow, offer_netto_cents: i64) -> InvoiceResponse {
+    let amounts = compute_invoice_amounts(InvoiceAmountInput {
+        invoice_type: &row.invoice_type,
+        partial_percent: row.partial_percent,
+        is_manual: row.is_manual,
+        extra_services: &row.extra_services,
+        line_items_json: row.line_items_json.as_ref(),
+        base_netto_cents: row.base_netto_cents,
+        offer_netto_cents,
+    });
+    let InvoiceAmounts {
+        total_netto_cents: total_netto,
+        total_brutto_cents: total_brutto,
+        extra_services,
+        manual_items,
+    } = amounts;
 
     InvoiceResponse {
         id: row.id,
@@ -1633,6 +1693,103 @@ mod tests {
             is_manual: true,
             line_items_json: Some(line_items_json),
         }
+    }
+
+    /// Amount input for an offer-derived invoice, as the Rechnungsausgangsbuch
+    /// query loads it.
+    fn register_input<'a>(
+        invoice_type: &'a str,
+        partial_percent: Option<i32>,
+        extra_services: &'a serde_json::Value,
+        base_netto_cents: i64,
+    ) -> InvoiceAmountInput<'a> {
+        InvoiceAmountInput {
+            invoice_type,
+            partial_percent,
+            is_manual: false,
+            extra_services,
+            line_items_json: None,
+            base_netto_cents: Some(base_netto_cents),
+            offer_netto_cents: 0,
+        }
+    }
+
+    /// Report afebffcb: the register showed the FULL offer amount on both halves of
+    /// a 30/70 pair (Nicole Wolf 2026-0050 / 2026-0051 both at 3.697,00 € netto).
+    /// The two halves must instead add up to the offer total, to the cent.
+    #[test]
+    fn register_amounts_split_an_anzahlung_pair_instead_of_doubling_it() {
+        let none = serde_json::json!([]);
+        let offer_netto = 369_700; // 3.697,00 €
+
+        let first = compute_invoice_amounts(register_input(
+            "partial_first",
+            Some(30),
+            &none,
+            offer_netto,
+        ));
+        let final_ = compute_invoice_amounts(register_input(
+            "partial_final",
+            Some(30),
+            &none,
+            offer_netto,
+        ));
+
+        // Neither half carries the full amount any more.
+        assert_ne!(first.total_netto_cents, offer_netto);
+        assert_ne!(final_.total_netto_cents, offer_netto);
+
+        // 3.697,00 € netto → 4.399,43 € brutto; 30 % = 1.319,83 €.
+        assert_eq!(first.total_brutto_cents, 131_983);
+        // The two halves reconstitute the offer brutto exactly.
+        assert_eq!(first.total_brutto_cents + final_.total_brutto_cents, 439_943);
+        assert_eq!(first.total_netto_cents + final_.total_netto_cents, offer_netto);
+    }
+
+    /// Report 6d73ec72: a Gutschrift (negative extra service) appeared in the
+    /// register with the positive offer price, because the register read
+    /// `offers.price_cents` and never looked at the invoice's own positions.
+    #[test]
+    fn register_amounts_honour_negative_extras_for_a_gutschrift() {
+        // A pure credit note: no base amount, one negative position (broken TV, −50 €).
+        let extras = serde_json::json!([
+            { "description": "Gutschrift Kaputt TV", "price_cents": -5_000 }
+        ]);
+        let amounts = compute_invoice_amounts(register_input("full", None, &extras, 0));
+
+        assert_eq!(amounts.total_netto_cents, -5_000);
+        assert_eq!(amounts.total_brutto_cents, -5_950); // −50,00 × 1,19
+        assert!(amounts.total_brutto_cents < 0, "Gutschrift must stay negative");
+    }
+
+    /// A normal full invoice keeps base + extras, so the register still agrees with
+    /// the invoice view for the ordinary case.
+    #[test]
+    fn register_amounts_add_extras_to_a_full_invoice() {
+        let extras = serde_json::json!([
+            { "description": "Umzugshelfer", "price_cents": 10_000 }
+        ]);
+        let amounts = compute_invoice_amounts(register_input("full", None, &extras, 100_000));
+        assert_eq!(amounts.total_netto_cents, 110_000);
+        assert_eq!(amounts.total_brutto_cents, 130_900);
+    }
+
+    /// Pre-migration rows have no `base_netto_cents`; the active offer price is the
+    /// documented fallback and must still produce a total.
+    #[test]
+    fn register_amounts_fall_back_to_the_offer_when_no_base_is_stored() {
+        let none = serde_json::json!([]);
+        let amounts = compute_invoice_amounts(InvoiceAmountInput {
+            invoice_type: "full",
+            partial_percent: None,
+            is_manual: false,
+            extra_services: &none,
+            line_items_json: None,
+            base_netto_cents: None,
+            offer_netto_cents: 221_800,
+        });
+        assert_eq!(amounts.total_netto_cents, 221_800);
+        assert_eq!(amounts.total_brutto_cents, 263_942);
     }
 
     #[test]

@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use aust_core::models::TokenClaims;
 use aust_offer_generator::{convert_xlsx_to_pdf, generate_timesheet_xlsx, TimesheetData, TimesheetEntry};
-use crate::repositories::{admin_repo, employee_repo, feedback_repo, review_repo, invoice_reminder_repo, invoice_repo, settings_repo, storage_repo};
+use crate::repositories::{admin_repo, employee_repo, feedback_repo, review_repo, invoice_reminder_repo, invoice_repo, offer_repo, settings_repo, storage_repo};
 use crate::repositories::settings_repo::PricingSettings;
 use crate::services::billing_reminder_service;
 use aust_flash_contact;
@@ -22,6 +22,7 @@ use crate::{ApiError, AppState};
 
 use super::admin_customers;
 use super::admin_emails;
+use super::invoices::{compute_invoice_amounts, InvoiceAmountInput};
 
 /// Register all admin-panel routes (protected under JWT middleware).
 ///
@@ -50,6 +51,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/emails/messages/{id}/send", post(admin_emails::send_draft_email))
         .route("/emails/messages/{id}/discard", post(admin_emails::discard_draft_email))
         .route("/emails/{id}/reply", post(admin_emails::reply_to_thread))
+        .route("/emails/{id}/inquiry", patch(admin_emails::link_thread_to_inquiry))
         .route("/emails/compose", post(admin_emails::compose_email))
         .route(
             "/emails/messages/{id}/attachments/{idx}",
@@ -84,6 +86,8 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/rechnungsausgangsbuch", get(rechnungsausgangsbuch))
         .route("/rechnungsausgangsbuch/{id}/payment-method", patch(update_payment_method))
         .route("/rechnungsausgangsbuch/{id}/paid", post(mark_register_invoice_paid))
+        .route("/kva-buch", get(kva_buch))
+        .route("/kva-buch/{id}/pdf", get(kva_buch_pdf))
         .route("/flash-contacts", get(list_flash_contacts))
         .route("/flash-contacts/{id}/handle", post(handle_flash_contact))
         .route("/settings", get(get_settings))
@@ -1928,6 +1932,19 @@ struct RechnungsausgangItem {
     offene_zahlungen_cents: Option<i64>,
     payment_method: Option<String>,
     notes: Option<String>,
+    /// `full` | `partial_first` | `partial_final` for Umzug rows, `lagerung` for
+    /// storage. Lets the register label an Anzahlung as such instead of showing
+    /// two rows that look like duplicates.
+    invoice_type: String,
+    /// Anzahlung percentage on a partial pair; `None` otherwise.
+    partial_percent: Option<i32>,
+    /// `draft` | `ready` | `sent` | `paid` — a row without `sent_at` is not yet a
+    /// legally issued invoice and is marked as such in the UI.
+    status: String,
+    /// TRUE when the invoice total is negative overall — a Gutschrift.
+    is_gutschrift: bool,
+    /// Present when a PDF has been rendered; the register links to it.
+    pdf_s3_key: Option<String>,
 }
 
 /// `GET /api/v1/admin/rechnungsausgangsbuch` — Flat list of all invoices with computed amounts.
@@ -1943,16 +1960,39 @@ async fn rechnungsausgangsbuch(
     let mut items: Vec<RechnungsausgangItem> = rows
         .into_iter()
         .map(|r| {
-            let netto_cents = r.offer_netto_cents;
-            let brutto_cents = r.offer_brutto_cents;
-            let mwst_cents = brutto_cents
-                .zip(netto_cents)
-                .map(|(b, n)| b - n);
+            // Derive the amounts from the invoice's OWN fields, not from the offer
+            // price: an Anzahlung/Schlussrechnung pair otherwise showed the full sum
+            // twice, and a Gutschrift showed up positive (reports afebffcb / 6d73ec72).
+            let amounts = compute_invoice_amounts(InvoiceAmountInput {
+                invoice_type: &r.invoice_type,
+                partial_percent: r.partial_percent,
+                is_manual: r.is_manual,
+                extra_services: &r.extra_services,
+                line_items_json: r.line_items_json.as_ref(),
+                base_netto_cents: r.base_netto_cents,
+                offer_netto_cents: r.offer_netto_cents.unwrap_or(0),
+            });
 
-            let offen = if r.paid_at.is_some() {
-                Some(0i64)
+            // Distinguish "the amount is zero" from "we have no amount". Rows predating
+            // `base_netto_cents` (added 2026-06-13) whose inquiry also lost its offer
+            // have neither; reporting those as a confident 0,00 € in a legal register —
+            // and silently summing them as zero — is worse than showing a dash.
+            let has_amount = r.base_netto_cents.is_some()
+                || r.offer_netto_cents.is_some()
+                || r.is_manual
+                || !amounts.extra_services.is_empty();
+
+            let (netto_cents, mwst_cents, brutto_cents) = if has_amount {
+                let netto = amounts.total_netto_cents;
+                let brutto = amounts.total_brutto_cents;
+                (Some(netto), Some(brutto - netto), Some(brutto))
             } else {
-                brutto_cents
+                (None, None, None)
+            };
+
+            let offen = match (r.paid_at, brutto_cents) {
+                (Some(_), _) => Some(0i64),
+                (None, b) => b,
             };
 
             RechnungsausgangItem {
@@ -1972,6 +2012,11 @@ async fn rechnungsausgangsbuch(
                 offene_zahlungen_cents: offen,
                 payment_method: r.payment_method,
                 notes: r.notes,
+                invoice_type: r.invoice_type,
+                partial_percent: r.partial_percent,
+                status: r.status,
+                is_gutschrift: brutto_cents.is_some_and(|b| b < 0),
+                pdf_s3_key: r.pdf_s3_key,
             }
         })
         .collect();
@@ -2000,12 +2045,134 @@ async fn rechnungsausgangsbuch(
             offene_zahlungen_cents: if paid { Some(0) } else { Some(brutto) },
             payment_method: r.payment_method,
             notes: None,
+            invoice_type: "lagerung".to_string(),
+            partial_percent: None,
+            status: r.status.clone(),
+            is_gutschrift: brutto < 0,
+            pdf_s3_key: r.pdf_s3_key,
         });
     }
 
     items.sort_by_key(|it| it.sent_at.unwrap_or(it.created_at));
 
     Ok(Json(items))
+}
+
+// ---------------------------------------------------------------------------
+// --- KVA-Buch ---
+// ---------------------------------------------------------------------------
+
+/// One Kostenvoranschlag row in the KVA-Buch.
+#[derive(Debug, Serialize)]
+struct KvaBuchItem {
+    id: Uuid,
+    inquiry_id: Uuid,
+    /// `None` only for pre-numbering offers; the UI falls back to "—".
+    offer_number: Option<String>,
+    customer_name: Option<String>,
+    /// Move date on the linked inquiry, if it has been scheduled.
+    scheduled_date: Option<NaiveDate>,
+    netto_cents: i64,
+    mwst_cents: i64,
+    brutto_cents: i64,
+    /// Raw `offers.status` — `draft` | `sent` | `viewed` | `accepted` | `rejected` | `expired`.
+    status: String,
+    valid_until: Option<NaiveDate>,
+    sent_at: Option<DateTime<Utc>>,
+    created_at: DateTime<Utc>,
+    /// Invoice number once the KVA turned into a job — the register's counterpart.
+    invoice_number: Option<String>,
+    /// Present when a KVA PDF has been rendered.
+    pdf_s3_key: Option<String>,
+}
+
+/// `GET /api/v1/admin/kva-buch` — Register of all Kostenvoranschläge.
+///
+/// **Caller**: Admin KVA-Buch page.
+/// **Why**: Counterpart to the Rechnungsausgangsbuch, requested in feedback report
+/// fa436f07 ("same as the Rechnungsausgangsbuch, just for KVAs"). Grouping by year
+/// and month happens in the frontend, exactly as it does for invoices.
+async fn kva_buch(
+    State(state): State<Arc<AppState>>,
+    Extension(_claims): Extension<TokenClaims>,
+) -> Result<Json<Vec<KvaBuchItem>>, ApiError> {
+    let rows = offer_repo::list_for_kva_buch(&state.db).await?;
+
+    let items: Vec<KvaBuchItem> = rows
+        .into_iter()
+        .map(|r| {
+            // `offers.price_cents` is the netto KVA total; MWSt is derived the same
+            // way the KVA PDF derives it, so the register agrees with the document.
+            let netto = r.price_cents;
+            let brutto = (netto as f64 * 1.19).round() as i64;
+            KvaBuchItem {
+                id: r.id,
+                inquiry_id: r.inquiry_id,
+                offer_number: r.offer_number,
+                customer_name: r.customer_name,
+                scheduled_date: r.scheduled_date,
+                netto_cents: netto,
+                mwst_cents: brutto - netto,
+                brutto_cents: brutto,
+                status: r.status,
+                valid_until: r.valid_until,
+                sent_at: r.sent_at,
+                created_at: r.created_at,
+                invoice_number: r.invoice_number,
+                pdf_s3_key: r.pdf_storage_key,
+            }
+        })
+        .collect();
+
+    Ok(Json(items))
+}
+
+/// `GET /api/v1/admin/kva-buch/{offer_id}/pdf` — Download one specific KVA document.
+///
+/// **Caller**: Admin KVA-Buch page — the PDF button on a row.
+/// **Why**: `/api/v1/inquiries/{id}/pdf` only ever serves the *active* offer, but the
+/// register lists rejected and expired KVAs too and each row must open its own document.
+async fn kva_buch_pdf(
+    State(state): State<Arc<AppState>>,
+    Extension(_claims): Extension<TokenClaims>,
+    Path(offer_id): Path<Uuid>,
+) -> Result<Response, ApiError> {
+    let storage_key = offer_repo::fetch_pdf_key_by_id(&state.db, offer_id)
+        .await?
+        .flatten()
+        .ok_or_else(|| ApiError::NotFound("KVA hat keine generierte Datei".into()))?;
+
+    let file_bytes = state.storage.download(&storage_key).await.map_err(|e| match e {
+        aust_storage::StorageError::NotFound(_) => {
+            ApiError::NotFound("KVA-PDF nicht gefunden.".into())
+        }
+        _ => ApiError::Internal(format!("Download fehlgeschlagen: {e}")),
+    })?;
+
+    let (content_type, ext) = if storage_key.ends_with(".pdf") {
+        ("application/pdf", "pdf")
+    } else {
+        (
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "xlsx",
+        )
+    };
+    let filename = if let Ok(Some((offer_num, last_name))) =
+        offer_repo::fetch_offer_filename_parts(&state.db, offer_id).await
+    {
+        offer_repo::build_offer_filename(&offer_num, &last_name, ext)
+    } else {
+        format!("Angebot-{offer_id}.{ext}")
+    };
+
+    Response::builder()
+        .header(header::CONTENT_TYPE, content_type)
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{filename}\""),
+        )
+        .body(axum::body::Body::from(file_bytes))
+        .map_err(|e| ApiError::Internal(format!("Antwort konnte nicht gebaut werden: {e}")))
 }
 
 #[derive(Debug, Deserialize)]

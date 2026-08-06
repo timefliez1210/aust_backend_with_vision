@@ -342,6 +342,8 @@ pub(crate) struct StorageRegisterRow {
     pub customer_name: Option<String>,
     pub period_year: i32,
     pub period_month: i32,
+    /// Rendered storage invoice, if one exists — the register links to it.
+    pub pdf_s3_key: Option<String>,
 }
 
 /// All non-cancelled storage invoices for the Rechnungsausgangsbuch.
@@ -349,7 +351,7 @@ pub(crate) async fn list_for_register(pool: &PgPool) -> Result<Vec<StorageRegist
     sqlx::query_as(
         "SELECT si.id, si.invoice_number, si.netto_cents, si.status, si.payment_method,
                 si.sent_at, si.paid_at, si.created_at, c.name AS customer_name,
-                si.period_year, si.period_month
+                si.period_year, si.period_month, si.pdf_s3_key
          FROM storage_invoices si
          JOIN storage_contracts sc ON sc.id = si.contract_id
          JOIN customers c ON c.id = sc.customer_id

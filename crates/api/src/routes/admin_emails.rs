@@ -11,7 +11,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use aust_core::models::TokenClaims;
-use crate::repositories::{admin_repo, offer_repo};
+use crate::repositories::{admin_repo, email_repo, offer_repo};
 use crate::routes::admin::mime_from_ext;
 use crate::{ApiError, AppState};
 
@@ -121,6 +121,34 @@ pub(super) struct EmailMessageItem {
     status: String,
     attachment_keys: Vec<String>,
     created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct LinkThreadInquiryRequest {
+    inquiry_id: Uuid,
+}
+
+/// `PATCH /api/v1/admin/emails/{id}/inquiry` — Attach an email thread to an inquiry.
+///
+/// **Caller**: Admin email thread page, after creating an inquiry straight from a
+/// customer mail.
+/// **Why**: Alex could not turn an incoming mail into an Anfrage without leaving the
+/// mailbox, copying the address by hand and losing the conversation link (feedback
+/// report 71e097f6). The thread carries the customer; only the inquiry link was
+/// missing, and it already exists as a column on `email_threads`.
+pub(super) async fn link_thread_to_inquiry(
+    State(state): State<Arc<AppState>>,
+    Extension(_claims): Extension<TokenClaims>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<LinkThreadInquiryRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    admin_repo::fetch_email_thread(&state.db, id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("E-Mail-Thread {id} nicht gefunden")))?;
+
+    email_repo::link_thread_to_inquiry(&state.db, id, req.inquiry_id).await?;
+
+    Ok(Json(serde_json::json!({ "inquiry_id": req.inquiry_id })))
 }
 
 /// `GET /api/v1/admin/emails/{id}` — Return an email thread with all its messages.

@@ -37,22 +37,30 @@ pub(crate) struct InvoiceRow {
 }
 
 /// Flat projection for Rechnungsausgangsbuch — one row per invoice with
-/// customer name, service date, and offer amounts.
+/// customer name, service date, and everything needed to compute the invoice's
+/// own amounts.
 #[derive(Debug, FromRow)]
 pub(crate) struct RechnungsausgangRow {
     pub id: Uuid,
     pub inquiry_id: Uuid,
     pub invoice_number: String,
+    pub invoice_type: String,
+    pub partial_percent: Option<i32>,
+    pub status: String,
+    pub is_manual: bool,
+    pub extra_services: serde_json::Value,
+    pub line_items_json: Option<serde_json::Value>,
+    pub base_netto_cents: Option<i64>,
+    pub pdf_s3_key: Option<String>,
     pub sent_at: Option<DateTime<Utc>>,
     pub paid_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub payment_method: Option<String>,
     pub notes: Option<String>,
     pub due_date: Option<chrono::NaiveDate>,
-    /// Netto amount from the active offer in cents.
+    /// Netto amount from the active offer in cents — fallback for pre-migration
+    /// rows whose `base_netto_cents` is NULL.
     pub offer_netto_cents: Option<i64>,
-    /// Brutto = netto * 1.19
-    pub offer_brutto_cents: Option<i64>,
     pub customer_name: Option<String>,
     pub scheduled_date: Option<chrono::NaiveDate>,
 }
@@ -674,10 +682,18 @@ pub(crate) async fn fetch_offer_netto(
     Ok(row.map(|(c,)| c).unwrap_or(0))
 }
 
-/// List all invoices with customer name and offer amounts for Rechnungsausgangsbuch.
+/// List every invoice ever issued, with customer name and the fields needed to
+/// compute its own amounts, for the Rechnungsausgangsbuch.
 ///
-/// **Caller**: `admin`
-/// **Why**: Flat list of all invoices regardless of inquiry, with computed amounts.
+/// **Caller**: `admin::rechnungsausgangsbuch`
+/// **Why**: A Rechnungsausgangsbuch is a legal register — once a number has been
+/// issued the row must appear, whatever happened to the surrounding inquiry.
+/// This query used to INNER JOIN `inquiries` filtered to
+/// `status IN ('completed','invoiced','paid')` and INNER JOIN `customers`, so an
+/// invoice whose inquiry sat in any other status (or whose customer row was gone)
+/// silently vanished from the register — 43 of 80 issued numbers were missing in
+/// production (feedback report a61982f1). Both joins are now LEFT joins and the
+/// status filter is gone: `invoices` alone decides which rows exist.
 pub(crate) async fn list_for_rechnungsausgangsbuch(
     pool: &PgPool,
 ) -> Result<Vec<RechnungsausgangRow>, sqlx::Error> {
@@ -686,6 +702,14 @@ pub(crate) async fn list_for_rechnungsausgangsbuch(
             inv.id,
             inv.inquiry_id,
             inv.invoice_number,
+            inv.invoice_type,
+            inv.partial_percent,
+            inv.status,
+            inv.is_manual,
+            inv.extra_services,
+            inv.line_items_json,
+            inv.base_netto_cents,
+            inv.pdf_s3_key,
             inv.sent_at,
             inv.paid_at,
             inv.created_at,
@@ -693,12 +717,11 @@ pub(crate) async fn list_for_rechnungsausgangsbuch(
             inv.notes,
             inv.due_date,
             off.price_cents AS offer_netto_cents,
-            (off.price_cents * 119 / 100) AS offer_brutto_cents,
             c.name AS customer_name,
             i.scheduled_date
          FROM invoices inv
-         JOIN inquiries i ON i.id = inv.inquiry_id AND i.status IN ('completed', 'invoiced', 'paid')
-         JOIN customers c ON c.id = i.customer_id
+         LEFT JOIN inquiries i ON i.id = inv.inquiry_id
+         LEFT JOIN customers c ON c.id = i.customer_id
          LEFT JOIN offers off ON off.inquiry_id = inv.inquiry_id
              AND off.id = (SELECT o2.id FROM offers o2
                            WHERE o2.inquiry_id = inv.inquiry_id
@@ -707,4 +730,102 @@ pub(crate) async fn list_for_rechnungsausgangsbuch(
     )
     .fetch_all(pool)
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_helpers;
+
+    /// Insert a bare invoice row directly — the register must not care how it got there.
+    async fn insert_invoice(
+        pool: &PgPool,
+        inquiry_id: Uuid,
+        number: &str,
+        invoice_type: &str,
+        status: &str,
+        sent: bool,
+    ) -> Uuid {
+        let id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO invoices (id, inquiry_id, invoice_number, invoice_type, status,
+                extra_services, base_netto_cents, created_at, sent_at)
+             VALUES ($1,$2,$3,$4,$5,'[]',100000, NOW(), CASE WHEN $6 THEN NOW() ELSE NULL END)",
+        )
+        .bind(id)
+        .bind(inquiry_id)
+        .bind(number)
+        .bind(invoice_type)
+        .bind(status)
+        .bind(sent)
+        .execute(pool)
+        .await
+        .expect("insert test invoice");
+        id
+    }
+
+    async fn seed_inquiry(pool: &PgPool, status: &str) -> Uuid {
+        let customer_id = test_helpers::insert_test_customer(pool).await;
+        let origin = test_helpers::insert_test_address(
+            pool, "Musterstr. 1", "Hildesheim", "31134", None, None,
+        )
+        .await;
+        let dest = test_helpers::insert_test_address(
+            pool, "Zielstr. 5", "Hannover", "30159", None, None,
+        )
+        .await;
+        test_helpers::insert_test_inquiry_full(
+            pool, customer_id, origin, dest, status, "termin", None,
+        )
+        .await
+    }
+
+    /// The register is a legal ledger: an issued number must appear regardless of what
+    /// the surrounding inquiry is doing. The old query INNER JOINed `inquiries` filtered
+    /// to `completed|invoiced|paid`, which hid 43 of 80 issued numbers in production
+    /// (feedback report a61982f1).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn lists_invoices_whatever_the_inquiry_status_is(pool: PgPool) {
+        // Two of these statuses were excluded by the old query.
+        let scheduled = seed_inquiry(&pool, "scheduled").await;
+        let cancelled = seed_inquiry(&pool, "cancelled").await;
+        let invoiced = seed_inquiry(&pool, "invoiced").await;
+
+        insert_invoice(&pool, scheduled, "2026-9001", "full", "sent", true).await;
+        insert_invoice(&pool, cancelled, "2026-9002", "full", "sent", true).await;
+        insert_invoice(&pool, invoiced, "2026-9003", "full", "sent", true).await;
+
+        let rows = list_for_rechnungsausgangsbuch(&pool).await.unwrap();
+        let numbers: Vec<&str> = rows.iter().map(|r| r.invoice_number.as_str()).collect();
+
+        assert!(numbers.contains(&"2026-9001"), "scheduled inquiry dropped: {numbers:?}");
+        assert!(numbers.contains(&"2026-9002"), "cancelled inquiry dropped: {numbers:?}");
+        assert!(numbers.contains(&"2026-9003"), "invoiced inquiry dropped: {numbers:?}");
+    }
+
+    /// Guards the projection itself: the query is a runtime-typed `query_as`, so a
+    /// renamed or retyped column only fails at request time. This pins every field the
+    /// register handler reads.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn projects_every_column_the_register_renders(pool: PgPool) {
+        let inquiry_id = seed_inquiry(&pool, "invoiced").await;
+        test_helpers::insert_test_offer(&pool, inquiry_id, "accepted").await;
+        insert_invoice(&pool, inquiry_id, "2026-9010", "partial_first", "sent", true).await;
+
+        let rows = list_for_rechnungsausgangsbuch(&pool).await.unwrap();
+        let row = rows
+            .iter()
+            .find(|r| r.invoice_number == "2026-9010")
+            .expect("invoice missing from register");
+
+        assert_eq!(row.inquiry_id, inquiry_id);
+        assert_eq!(row.invoice_type, "partial_first");
+        assert_eq!(row.status, "sent");
+        assert!(!row.is_manual);
+        assert_eq!(row.base_netto_cents, Some(100_000));
+        assert_eq!(row.offer_netto_cents, Some(50_000)); // from the helper's offer
+        assert!(row.customer_name.is_some());
+        assert!(row.sent_at.is_some());
+        assert!(row.extra_services.is_array());
+    }
 }
