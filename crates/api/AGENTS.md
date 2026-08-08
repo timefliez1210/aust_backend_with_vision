@@ -99,6 +99,8 @@ All pricing constants are in `CompanyConfig`:
 ### Submission Handlers
 5 handlers in `submissions.rs`: photo, mobile (via `handle_submission`), AR, video, manual. All create billing addresses from parsed fields via `merge_address_parts()`. Manual mode has volume fast-path (skip vision pipeline).
 
+**AR submissions are volume-first.** The mobile app's capture screen makes the item name optional, so `item_manifest` entries may carry an empty (or missing) `label`. `device_volume_items()` keeps those items — only an implausible `device_volume_m3` (outside 0.005–12 m³) drops the whole submission back to server-side vision. Unnamed items are then named by `fill_missing_labels()` via `VlmEstimator::label_objects` (one representative frame per item, batches of 8), falling back to `aust_volume_estimator::FALLBACK_LABEL` when the VLM backend is unconfigured or unreachable. A missing name must never cost a measured volume.
+
 ## Test Infrastructure
 
 - `src/test_helpers.rs` — DB pool factory, JWT generator, insert factories (customer, address, inquiry, employee, estimation)

@@ -490,7 +490,7 @@ async fn process_ar_submission_background(
 
     // 2. On-device volumes (LiDAR): if every manifest item carries a plausible
     //    device-computed volume, trust it and skip server-side vision entirely.
-    let (method, total_volume, confidence, result_data) = if let Some((items, total, conf)) =
+    let (method, total_volume, confidence, result_data) = if let Some((mut items, total, conf)) =
         device_volume_items(&item_manifest_json)
     {
         tracing::info!(
@@ -499,6 +499,8 @@ async fn process_ar_submission_background(
             items = items.len(),
             "AR estimation from on-device LiDAR volumes"
         );
+        // Volumes are measured; anything the customer left unnamed gets a name here.
+        fill_missing_labels(&state, &mut items, &images, &item_manifest_json).await;
         let result_data = serde_json::to_value(&items)
             .map_err(|e| format!("Failed to serialize device items: {e}"))?;
         (EstimationMethod::ArDevice, total, conf, result_data)
@@ -634,10 +636,14 @@ fn device_volume_items(manifest: &serde_json::Value) -> Option<(Vec<DetectedItem
     let mut items = Vec::with_capacity(entries.len());
     let mut confidence_sum = 0.0;
     for entry in entries {
-        let label = entry.get("label")?.as_str()?.trim();
-        if label.is_empty() {
-            return None;
-        }
+        // The label is optional by design: the device measured the volume, and
+        // an unnamed item is named server-side (see `fill_missing_labels`).
+        // Refusing it here would throw away a good measurement over a blank.
+        let label = entry
+            .get("label")
+            .and_then(|l| l.as_str())
+            .unwrap_or("")
+            .trim();
         let volume = entry.get("device_volume_m3")?.as_f64()?;
         if !volume.is_finite() || !(DEVICE_VOLUME_MIN_M3..=DEVICE_VOLUME_MAX_M3).contains(&volume) {
             return None;
@@ -669,7 +675,7 @@ fn device_volume_items(manifest: &serde_json::Value) -> Option<(Vec<DetectedItem
             confidence,
             dimensions,
             category: None,
-            german_name: Some(label.to_string()),
+            german_name: (!label.is_empty()).then(|| label.to_string()),
             re_value: None,
             volume_source: Some("device_obb".to_string()),
             bbox: None,
@@ -682,6 +688,69 @@ fn device_volume_items(manifest: &serde_json::Value) -> Option<(Vec<DetectedItem
     let total: f64 = items.iter().map(|i| i.volume_m3).sum();
     let confidence = confidence_sum / items.len() as f64;
     Some((items, total, confidence))
+}
+
+/// Name the items the customer left unnamed, from their representative photo.
+///
+/// **Caller**: `process_ar_submission_background`, after `device_volume_items`.
+/// **Why**: The app's capture screen is volume-first — customers measure an
+///          object and may skip the label entirely. The measurement is what
+///          prices the move, so naming happens here, not on the phone.
+///
+/// Uses the VLM naming-only pass (one photo per unnamed item). Falls back to
+/// [`aust_volume_estimator::FALLBACK_LABEL`] when the VLM backend is not
+/// configured or the model is unreachable — an unnamed item is never dropped.
+async fn fill_missing_labels(
+    state: &AppState,
+    items: &mut [DetectedItem],
+    images: &[(Vec<u8>, String)],
+    manifest: &serde_json::Value,
+) {
+    let missing: Vec<usize> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, i)| i.name.trim().is_empty())
+        .map(|(idx, _)| idx)
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+
+    // One representative frame per manifest item, in item order — index i of
+    // `frames` belongs to `items[i]`. Without that alignment we cannot tell
+    // which photo shows which unnamed item, so only the fallback is safe.
+    let aligned = representative_frame_per_item(images, manifest)
+        .filter(|frames| frames.len() == items.len());
+    let named: Vec<String> = if let Some(frames) = aligned {
+        let to_label: Vec<(Vec<u8>, String)> =
+            missing.iter().map(|&idx| frames[idx].clone()).collect();
+        match services::vision::build_vlm_estimator(state) {
+            Ok(estimator) => {
+                tracing::info!(
+                    n_items = to_label.len(),
+                    "Naming unlabelled AR items via VLM"
+                );
+                estimator.label_objects(&to_label).await
+            }
+            Err(e) => {
+                tracing::warn!("VLM naming unavailable, using fallback names: {e}");
+                vec![aust_volume_estimator::FALLBACK_LABEL.to_string(); to_label.len()]
+            }
+        }
+    } else {
+        tracing::warn!(
+            n_images = images.len(),
+            n_items = items.len(),
+            "AR manifest frame counts don't line up with the images — cannot map \
+             photos to unnamed items, using fallback names"
+        );
+        vec![aust_volume_estimator::FALLBACK_LABEL.to_string(); missing.len()]
+    };
+
+    for (&idx, name) in missing.iter().zip(named) {
+        items[idx].german_name = Some(name.clone());
+        items[idx].name = name;
+    }
 }
 
 /// Pick one representative RGB frame per manifest item (the middle frame of each
@@ -697,27 +766,38 @@ fn select_representative_frames(
 ) -> Vec<(Vec<u8>, String)> {
     const MAX_FALLBACK_FRAMES: usize = 24;
 
-    if let Some(entries) = manifest.as_array().filter(|a| !a.is_empty()) {
-        let counts: Vec<usize> = entries
-            .iter()
-            .map(|e| {
-                e.get("frame_count")
-                    .and_then(|c| c.as_u64())
-                    .unwrap_or(0) as usize
-            })
-            .collect();
-        if counts.iter().all(|&c| c > 0) && counts.iter().sum::<usize>() == images.len() {
-            let mut frames = Vec::with_capacity(counts.len());
-            let mut offset = 0;
-            for count in counts {
-                frames.push(images[offset + count / 2].clone());
-                offset += count;
-            }
-            return frames;
-        }
+    representative_frame_per_item(images, manifest)
+        .unwrap_or_else(|| images.iter().take(MAX_FALLBACK_FRAMES).cloned().collect())
+}
+
+/// The middle frame of each manifest item's sweep, index-aligned with the
+/// manifest — or `None` when the declared frame counts don't add up to the
+/// images actually uploaded.
+///
+/// **Caller**: `select_representative_frames` and `fill_missing_labels`.
+/// **Why**: Naming needs to know *which* photo shows which item; a length match
+///          alone doesn't prove that (three items and three loose photos would
+///          line up by accident and mislabel every one of them).
+fn representative_frame_per_item(
+    images: &[(Vec<u8>, String)],
+    manifest: &serde_json::Value,
+) -> Option<Vec<(Vec<u8>, String)>> {
+    let entries = manifest.as_array().filter(|a| !a.is_empty())?;
+    let counts: Vec<usize> = entries
+        .iter()
+        .map(|e| e.get("frame_count").and_then(|c| c.as_u64()).unwrap_or(0) as usize)
+        .collect();
+    if !counts.iter().all(|&c| c > 0) || counts.iter().sum::<usize>() != images.len() {
+        return None;
     }
 
-    images.iter().take(MAX_FALLBACK_FRAMES).cloned().collect()
+    let mut frames = Vec::with_capacity(counts.len());
+    let mut offset = 0;
+    for count in counts {
+        frames.push(images[offset + count / 2].clone());
+        offset += count;
+    }
+    Some(frames)
 }
 
 /// `POST /api/v1/submit/video` — Public video inquiry (Source E).
@@ -2604,6 +2684,25 @@ mod tests {
     }
 
     #[test]
+    fn device_volumes_keep_unlabelled_items() {
+        // Volume-first capture: the label is optional and filled in server-side,
+        // so a blank or absent one must not sink a measured item.
+        let manifest = serde_json::json!([
+            {"label": "Sofa", "frame_count": 5, "device_volume_m3": 1.8},
+            {"label": "   ", "frame_count": 4, "device_volume_m3": 2.4},
+            {"frame_count": 3, "device_volume_m3": 0.6},
+        ]);
+        let (items, total, _) = device_volume_items(&manifest).unwrap();
+        assert_eq!(items.len(), 3);
+        assert!((total - 4.8).abs() < 1e-9);
+        assert_eq!(items[0].name, "Sofa");
+        assert_eq!(items[1].name, "");
+        assert_eq!(items[2].name, "");
+        // Unnamed items carry no german_name either — `fill_missing_labels` sets both.
+        assert!(items[1].german_name.is_none());
+    }
+
+    #[test]
     fn device_volumes_empty_or_nonarray_returns_none() {
         assert!(device_volume_items(&serde_json::json!([])).is_none());
         assert!(device_volume_items(&serde_json::json!({})).is_none());
@@ -2628,6 +2727,17 @@ mod tests {
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0].0, vec![2u8]);
         assert_eq!(frames[1].0, vec![7u8]);
+    }
+
+    #[test]
+    fn per_item_frames_refuse_to_guess_on_count_mismatch() {
+        // Three items, three loose photos: the lengths match by accident but the
+        // declared counts don't, so naming must not map photo i to item i.
+        let images = dummy_frames(3);
+        let manifest = serde_json::json!([
+            {"frame_count": 4}, {"frame_count": 4}, {"frame_count": 4},
+        ]);
+        assert!(representative_frame_per_item(&images, &manifest).is_none());
     }
 
     #[test]

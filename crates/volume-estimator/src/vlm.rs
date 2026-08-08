@@ -66,6 +66,35 @@ Respond ONLY with a single JSON object, no markdown, no explanation:
     )
 }
 
+/// Prompt for the naming-only pass: the device already measured the volume,
+/// the model only has to say *what* the centered object is.
+fn build_label_prompt(n: usize) -> String {
+    format!(
+        r#"You are naming furniture for a German moving company's inventory list.
+
+You are given {n} photos. Each photo shows ONE piece of furniture or one household object that the customer measured with their phone — it is the object in the CENTER of the frame. Ignore everything in the background.
+
+For each photo, in order, name that centered object with the German name from the catalogue below that fits best. Each catalogue line is `english_key | German name | volume | flags`; use the German name column verbatim when it matches. If nothing in the catalogue fits, use a short plain German noun (e.g. "Stehlampe"). Never leave a name empty — if the photo is unusable, answer "Möbelstück".
+
+CATALOGUE:
+{RE_CATALOGUE}
+
+Respond ONLY with a single JSON object, no markdown, no explanation, with exactly {n} entries in photo order:
+{{"labels": ["<German name photo 1>", "<German name photo 2>", ...]}}"#
+    )
+}
+
+/// Fallback name for an unlabelled item when the model is unavailable or
+/// returns nothing usable. Deliberately generic: the volume is already
+/// measured, so the name only has to read sensibly on the offer.
+pub const FALLBACK_LABEL: &str = "Möbelstück";
+
+#[derive(Debug, Deserialize)]
+struct VlmLabelResponse {
+    #[serde(default)]
+    labels: Vec<String>,
+}
+
 /// Raw JSON shape returned by the model.
 #[derive(Debug, Deserialize)]
 struct VlmResponse {
@@ -198,6 +227,95 @@ impl VlmEstimator {
             .collect();
         self.estimate_photos(&images).await
     }
+
+    /// Name one object per photo — no volume, no deduplication.
+    ///
+    /// **Caller**: the AR submission path, for items whose volume the device
+    /// measured with LiDAR but which the customer left unnamed. Volume is the
+    /// number that drives pricing; the label only has to read sensibly on the
+    /// offer, so a naming-only pass is enough and much cheaper than a full
+    /// estimation run.
+    ///
+    /// Returns exactly `images.len()` names, in the same order. Photos the
+    /// model skips (or a failing batch) come back as [`FALLBACK_LABEL`] rather
+    /// than an error — a missing name must never cost a measured volume.
+    pub async fn label_objects(&self, images: &[(Vec<u8>, String)]) -> Vec<String> {
+        let mut labels = Vec::with_capacity(images.len());
+        for chunk in images.chunks(LABEL_BATCH_SIZE) {
+            labels.extend(self.label_batch(chunk).await);
+        }
+        labels
+    }
+
+    /// One naming call over at most [`LABEL_BATCH_SIZE`] photos. Always yields
+    /// `chunk.len()` names.
+    async fn label_batch(&self, chunk: &[(Vec<u8>, String)]) -> Vec<String> {
+        let fallback = || vec![FALLBACK_LABEL.to_string(); chunk.len()];
+
+        let mut images_b64 = Vec::with_capacity(chunk.len());
+        for (data, mime) in chunk {
+            match decode_and_downscale(data).await {
+                Ok(jpeg) => images_b64
+                    .push(base64::engine::general_purpose::STANDARD.encode(jpeg)),
+                Err(e) => {
+                    // Position matters — the model answers per photo index, so a
+                    // dropped photo would shift every following name.
+                    tracing::warn!("Undecodable image in labelling batch ({mime}): {e}");
+                    return fallback();
+                }
+            }
+        }
+
+        let messages = vec![LlmMessage::user_with_images(
+            build_label_prompt(chunk.len()),
+            images_b64,
+        )];
+        let response = match self
+            .provider
+            .complete_streaming(&messages, self.timeout)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("VLM labelling failed, using fallback names: {e}");
+                return fallback();
+            }
+        };
+
+        parse_label_response(&response, chunk.len())
+    }
+}
+
+/// Photos per naming call. Small batches keep the photo↔name ordering reliable;
+/// the model has to hold only a handful of positions at once.
+const LABEL_BATCH_SIZE: usize = 8;
+
+/// Parse `{"labels": [...]}` into exactly `expected` names, padding short
+/// answers and dropping extras.
+fn parse_label_response(response: &str, expected: usize) -> Vec<String> {
+    let json_str = extract_json(response).unwrap_or(response);
+    let parsed: VlmLabelResponse = match serde_json::from_str(json_str) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                "Failed to parse VLM labelling response: {e}\nResponse: {:.1000}",
+                response
+            );
+            return vec![FALLBACK_LABEL.to_string(); expected];
+        }
+    };
+
+    (0..expected)
+        .map(|i| {
+            parsed
+                .labels
+                .get(i)
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty())
+                .unwrap_or(FALLBACK_LABEL)
+                .to_string()
+        })
+        .collect()
 }
 
 /// Decode an image to a ≤512px JPEG, falling back to `heif-convert` for
@@ -527,6 +645,51 @@ mod tests {
     fn parse_rejects_empty_inventory() {
         let response = r#"{"movable_items":[],"boxes_estimate":0,"not_moved":[]}"#;
         assert!(parse_vlm_response(response).is_err());
+    }
+
+    // --- naming-only pass ---
+
+    #[test]
+    fn parse_labels_in_order() {
+        let response = r#"{"labels": ["Sofa", "Kleiderschrank", "Waschmaschine"]}"#;
+        assert_eq!(
+            parse_label_response(response, 3),
+            vec!["Sofa", "Kleiderschrank", "Waschmaschine"]
+        );
+    }
+
+    #[test]
+    fn parse_labels_wrapped_in_markdown() {
+        let response = "```json\n{\"labels\":[\"Bett\"]}\n```";
+        assert_eq!(parse_label_response(response, 1), vec!["Bett"]);
+    }
+
+    #[test]
+    fn parse_labels_pads_short_answers() {
+        // Model named only the first of three photos — the rest must still get
+        // a usable name so their measured volumes survive.
+        let response = r#"{"labels": ["Sofa"]}"#;
+        assert_eq!(
+            parse_label_response(response, 3),
+            vec!["Sofa", FALLBACK_LABEL, FALLBACK_LABEL]
+        );
+    }
+
+    #[test]
+    fn parse_labels_drops_extras_and_blanks() {
+        let response = r#"{"labels": ["Sofa", "  ", "Tisch", "Regal"]}"#;
+        assert_eq!(
+            parse_label_response(response, 3),
+            vec!["Sofa", FALLBACK_LABEL, "Tisch"]
+        );
+    }
+
+    #[test]
+    fn parse_labels_falls_back_on_garbage() {
+        assert_eq!(
+            parse_label_response("I cannot see the images.", 2),
+            vec![FALLBACK_LABEL, FALLBACK_LABEL]
+        );
     }
 
     /// Live keyframe extraction against a synthetic ffmpeg-generated clip.

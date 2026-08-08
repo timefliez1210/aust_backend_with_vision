@@ -32,6 +32,11 @@ Not a DB enum — parsed from string. `as_str()` returns lowercase snake_case. `
 - Catalogue prompt embedded from `src/re_catalogue.txt`; regenerate via
   `services/vision/vlm_cloud_eval.py::build_catalogue()` when `RE_CATALOG` changes
 - Totals recomputed server-side from line volumes; the model's own total is ignored
+- `label_objects()` is a second, naming-only mode: one German name per photo, no
+  volume, no dedup. Used for AR items the customer measured on-device but left
+  unnamed (the app's capture screen makes naming optional). Batches of 8 photos
+  keep photo↔name ordering reliable; every failure path returns `FALLBACK_LABEL`
+  ("Möbelstück") rather than an error, so a missing name can't cost a measurement
 
 ### 2. ML Vision Service (`VisionServiceClient`)
 - HTTP client for `services/vision/` (`vision_service.backend = "modal"`)

@@ -9,4 +9,4 @@ pub use error::VolumeError;
 pub use inventory::InventoryProcessor;
 pub use vision::VisionAnalyzer;
 pub use vision_service::VisionServiceClient;
-pub use vlm::VlmEstimator;
+pub use vlm::{VlmEstimator, FALLBACK_LABEL};
