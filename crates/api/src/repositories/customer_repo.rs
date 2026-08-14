@@ -125,6 +125,31 @@ pub(crate) async fn fetch_by_id(pool: &PgPool, customer_id: Uuid) -> Result<Cust
     .await?
     .ok_or_else(|| ApiError::NotFound("Customer not found".into()))
 }
+/// Overwrite the customer's `billing_address_id` from an inquiry/offer.
+///
+/// **Caller**: `create_inquiry`, `update_inquiry`, submission handlers —
+/// whenever a Rechnungsadresse is set on an inquiry, it must also land on the
+/// customer record so the kundenakte stays in sync (feedback c7a8081e).
+///
+/// Overwrite semantics: the inquiry's billing address always wins, even if the
+/// customer already has one. A `None` billing_address_id is a no-op (nothing
+/// to sync).
+pub(crate) async fn sync_billing_address(
+    executor: impl sqlx::Executor<'_, Database = sqlx::Postgres>,
+    customer_id: Uuid,
+    billing_address_id: Option<Uuid>,
+) -> Result<(), sqlx::Error> {
+    if let Some(addr_id) = billing_address_id {
+        sqlx::query(
+            "UPDATE customers SET billing_address_id = $2, updated_at = NOW() WHERE id = $1",
+        )
+        .bind(customer_id)
+        .bind(addr_id)
+        .execute(executor)
+        .await?;
+    }
+    Ok(())
+}
 
 /// Fetch a customer by email address.
 ///
@@ -339,5 +364,65 @@ mod tests {
     fn no_salutation_falls_back_to_heuristic() {
         let r = row(None, None, Some("Thomas Müller"));
         assert_eq!(r.formal_greeting(), "Sehr geehrter Herr Müller,");
+    }
+
+    /// Feedback c7a8081e: when a Rechnungsadresse is set on an inquiry, it must
+    /// also overwrite the customer's `billing_address_id`. This test proves the
+    /// repo function does exactly that — including overwriting a pre-existing value.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn sync_billing_address_overwrites_customer(pool: sqlx::PgPool) {
+        use crate::test_helpers;
+
+        let customer_id = test_helpers::insert_test_customer(&pool).await;
+        let addr1 = test_helpers::insert_test_address(
+            &pool, "Alte Poststr. 8", "Freudenstadt", "72250", None, None,
+        )
+        .await;
+        let addr2 = test_helpers::insert_test_address(
+            &pool, "Bundesallee 100", "Braunschweig", "38116", None, None,
+        )
+        .await;
+
+        // Sync first address — customer goes from None → addr1.
+        sync_billing_address(&pool, customer_id, Some(addr1))
+            .await
+            .expect("first sync");
+        let billing1: Option<Uuid> = sqlx::query_scalar(
+            "SELECT billing_address_id FROM customers WHERE id = $1",
+        )
+        .bind(customer_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(billing1, Some(addr1), "first sync must set the billing address");
+
+        // Sync second address — customer goes from addr1 → addr2 (overwrite).
+        sync_billing_address(&pool, customer_id, Some(addr2))
+            .await
+            .expect("overwrite sync");
+        let billing2: Option<Uuid> = sqlx::query_scalar(
+            "SELECT billing_address_id FROM customers WHERE id = $1",
+        )
+        .bind(customer_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            billing2, Some(addr2),
+            "second sync must overwrite, not skip, the existing billing address"
+        );
+
+        // None is a no-op — must not clear the existing value.
+        sync_billing_address(&pool, customer_id, None)
+            .await
+            .expect("noop sync");
+        let billing3: Option<Uuid> = sqlx::query_scalar(
+            "SELECT billing_address_id FROM customers WHERE id = $1",
+        )
+        .bind(customer_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(billing3, Some(addr2), "None sync must be a no-op");
     }
 }

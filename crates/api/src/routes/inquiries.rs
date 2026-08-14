@@ -371,6 +371,8 @@ async fn create_inquiry(
         now,
     )
     .await?;
+    // Overwrite the customer's billing address from the inquiry (feedback c7a8081e).
+    let _ = customer_repo::sync_billing_address(&state.db, request.customer_id, billing_address_id).await;
 
     // Store manual volume estimation if provided
     if let Some(volume) = request.estimated_volume_m3 {
@@ -566,10 +568,40 @@ async fn update_inquiry(
         now,
     )
     .await?;
+    // Overwrite the customer's billing address from the inquiry (feedback c7a8081e).
+    // Only sync when a billing address was explicitly provided in this request.
+    if billing_address_id.is_some() {
+        let _ = customer_repo::sync_billing_address(&state.db, current_inquiry.customer_id, billing_address_id).await;
+    }
 
-    // Auto-update billing address from origin → destination on completion
+    // Auto-update billing address from origin → destination on completion, and
+    // mirror the new address onto the customer: post-move it is the current one
+    // (feedback c7a8081e). Best-effort — a failed sync must not fail the update.
     if request.status.as_deref() == Some("completed") {
-        let _ = inquiry_repo::auto_update_billing_on_completed(&state.db, id).await;
+        match inquiry_repo::auto_update_billing_on_completed(&state.db, id).await {
+            Ok(Some(new_billing_id)) => {
+                if let Err(e) = customer_repo::sync_billing_address(
+                    &state.db,
+                    current_inquiry.customer_id,
+                    Some(new_billing_id),
+                )
+                .await
+                {
+                    tracing::warn!(
+                        customer_id = %current_inquiry.customer_id,
+                        inquiry_id = %id,
+                        error = %e,
+                        "Post-completion billing address sync to customer failed"
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!(
+                inquiry_id = %id,
+                error = %e,
+                "Auto-update of billing address on completion failed"
+            ),
+        }
     }
 
     // Emit status.changed domain event when a status transition was requested (non-fatal).

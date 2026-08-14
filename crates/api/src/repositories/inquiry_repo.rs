@@ -46,6 +46,8 @@ pub(crate) struct InquiryDbRow {
     pub updated_at: DateTime<Utc>,
     #[sqlx(default)]
     pub has_pauschale: bool,
+    #[sqlx(default)]
+    pub custom_fields: serde_json::Value,
 }
 
 /// Readiness check projection for auto-offer generation.
@@ -84,7 +86,7 @@ pub(crate) async fn fetch_by_id(
                end_date, start_time, end_time, service_type, submission_mode, recipient_id,
                billing_address_id AS inquiry_billing_address_id, notes,
                services, source, offer_sent_at, accepted_at, created_at, updated_at,
-               has_pauschale
+               has_pauschale, custom_fields
         FROM inquiries WHERE id = $1
         "#,
     )
@@ -505,11 +507,16 @@ pub(crate) async fn update_fields(
 ///
 /// **Caller**: `update_inquiry` handler, after status change to "completed".
 /// **Why**: Once the customer has moved, invoices should go to the new address.
+///
+/// Returns the new `billing_address_id` when the update actually fired, `None`
+/// when the guard conditions excluded this inquiry. The caller uses that to
+/// mirror the new address onto the customer record (feedback c7a8081e) — the
+/// post-move address is the most recent one, so the Kundenakte must follow it.
 pub(crate) async fn auto_update_billing_on_completed(
     pool: &PgPool,
     inquiry_id: Uuid,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
+) -> Result<Option<Uuid>, sqlx::Error> {
+    sqlx::query_scalar(
         r#"
         UPDATE inquiries SET
             billing_address_id = destination_address_id,
@@ -517,12 +524,12 @@ pub(crate) async fn auto_update_billing_on_completed(
         WHERE id = $1
           AND (billing_address_id IS NULL OR billing_address_id = origin_address_id)
           AND destination_address_id IS NOT NULL
+        RETURNING billing_address_id
         "#,
     )
     .bind(inquiry_id)
-    .execute(pool)
-    .await?;
-    Ok(())
+    .fetch_optional(pool)
+    .await
 }
 
 /// Fetch customer name, email, and origin/destination cities for LLM email draft generation.
@@ -1063,6 +1070,45 @@ pub(crate) async fn count_active_days_and_employees(
 
 #[cfg(test)]
 mod tests {
+    /// `auto_update_billing_on_completed` must report whether it actually fired,
+    /// because `update_inquiry` mirrors the returned address onto the customer
+    /// record (feedback c7a8081e). A wrong `None` would silently leave the
+    /// Kundenakte on the pre-move address.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn auto_update_billing_reports_new_address(pool: sqlx::PgPool) {
+        use crate::test_helpers;
+
+        let customer_id = test_helpers::insert_test_customer(&pool).await;
+        let origin = test_helpers::insert_test_address(
+            &pool, "Alte Poststr. 8", "Freudenstadt", "72250", None, None,
+        )
+        .await;
+        let dest = test_helpers::insert_test_address(
+            &pool, "Bundesallee 100", "Braunschweig", "38116", None, None,
+        )
+        .await;
+
+        // billing_address_id is NULL → the update fires and returns the destination.
+        let inquiry_id = test_helpers::insert_test_inquiry_full(
+            &pool, customer_id, origin, dest, "pending", "manuell", None,
+        )
+        .await;
+        let fired = super::auto_update_billing_on_completed(&pool, inquiry_id)
+            .await
+            .expect("query ok");
+        assert_eq!(
+            fired,
+            Some(dest),
+            "must return the new billing address when the update fires"
+        );
+
+        // Already pointing at the destination → guard excludes it, nothing returned.
+        let again = super::auto_update_billing_on_completed(&pool, inquiry_id)
+            .await
+            .expect("query ok");
+        assert_eq!(again, None, "must return None when the guard excludes the row");
+    }
+
     /// Verify that the submission_mode CHECK constraint values are recognized.
     /// The migration adding 'ar' and 'mobile' was required because the AR
     /// endpoint created inquiries with submission_mode = 'ar' which violated

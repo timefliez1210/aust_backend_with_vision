@@ -68,6 +68,7 @@ impl InquiryService for MockInquiryService {
             end_date: None,
             is_multi_day: false,
             has_pauschale: false,
+            custom_fields: serde_json::json!({}),
             appointments: vec![],
         })
     }

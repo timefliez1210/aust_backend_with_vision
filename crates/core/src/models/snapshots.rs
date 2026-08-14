@@ -95,6 +95,17 @@ pub struct InquiryResponse {
     /// from the move's contiguous day range and from crew/hours tracking.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub appointments: Vec<AppointmentSnapshot>,
+    /// Arbitrary key-value store for admin-only overrides (offer_headline_override,
+    /// cached pricing inputs, etc.). Returned to the frontend so it can restore
+    /// form state after a reload (feedback a10329a2, 10d9cc36).
+    #[serde(default, skip_serializing_if = "is_null_or_empty_object")]
+    pub custom_fields: serde_json::Value,
+}
+
+/// `true` when the JSON value is `null` or an empty object `{}` — used to suppress
+/// `custom_fields` from the API response when it carries no meaningful data.
+fn is_null_or_empty_object(v: &serde_json::Value) -> bool {
+    v.is_null() || v.as_object().is_some_and(|m| m.is_empty())
 }
 
 /// A single lightweight appointment attached to an inquiry (Besichtigung, etc.).

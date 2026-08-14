@@ -332,6 +332,7 @@ pub async fn build_inquiry_response(
         end_date,
         is_multi_day,
         has_pauschale: row.has_pauschale,
+        custom_fields: row.custom_fields,
         appointments,
     })
 }

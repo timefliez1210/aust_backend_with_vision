@@ -318,9 +318,24 @@ async fn handle_ar_submission(
         )
         .await
         .map_err(|e| ApiError::Internal(format!("Anfrage konnte nicht erstellt werden: {e}")))?;
-
         tx.commit().await
             .map_err(|e| ApiError::Internal(format!("Transaktion konnte nicht abgeschlossen werden: {e}")))?;
+
+        // Overwrite the customer's billing address from the inquiry (feedback c7a8081e).
+        // Deliberately AFTER the commit and best-effort: this is a denormalized
+        // convenience copy, so a failed sync must leave the submission standing.
+        // Inside the tx a failure would abort it, and the COMMIT would then silently
+        // roll back the whole submission while still returning 200.
+        if let Err(e) =
+            customer_repo::sync_billing_address(&state.db, customer_id, billing_address_id).await
+        {
+            tracing::warn!(
+                customer_id = %customer_id,
+                inquiry_id = %inquiry_id,
+                error = %e,
+                "Billing address sync to customer failed"
+            );
+        }
 
         (customer_id, inquiry_id)
     };
@@ -1126,9 +1141,24 @@ async fn video_inquiry(
         )
         .await
         .map_err(|e| ApiError::Internal(format!("Anfrage konnte nicht erstellt werden: {e}")))?;
-
         tx.commit().await
             .map_err(|e| ApiError::Internal(format!("Transaktion konnte nicht abgeschlossen werden: {e}")))?;
+
+        // Overwrite the customer's billing address from the inquiry (feedback c7a8081e).
+        // Deliberately AFTER the commit and best-effort: this is a denormalized
+        // convenience copy, so a failed sync must leave the submission standing.
+        // Inside the tx a failure would abort it, and the COMMIT would then silently
+        // roll back the whole submission while still returning 200.
+        if let Err(e) =
+            customer_repo::sync_billing_address(&state.db, customer_id, billing_address_id).await
+        {
+            tracing::warn!(
+                customer_id = %customer_id,
+                inquiry_id = %inquiry_id,
+                error = %e,
+                "Billing address sync to customer failed"
+            );
+        }
 
         (customer_id, inquiry_id)
     };
@@ -1363,9 +1393,24 @@ async fn manual_inquiry(
         )
         .await
         .map_err(|e| ApiError::Internal(format!("Anfrage konnte nicht erstellt werden: {e}")))?;
-
         tx.commit().await
             .map_err(|e| ApiError::Internal(format!("Transaktion konnte nicht abgeschlossen werden: {e}")))?;
+
+        // Overwrite the customer's billing address from the inquiry (feedback c7a8081e).
+        // Deliberately AFTER the commit and best-effort: this is a denormalized
+        // convenience copy, so a failed sync must leave the submission standing.
+        // Inside the tx a failure would abort it, and the COMMIT would then silently
+        // roll back the whole submission while still returning 200.
+        if let Err(e) =
+            customer_repo::sync_billing_address(&state.db, customer_id, billing_address_id).await
+        {
+            tracing::warn!(
+                customer_id = %customer_id,
+                inquiry_id = %inquiry_id,
+                error = %e,
+                "Billing address sync to customer failed"
+            );
+        }
 
         (customer_id, inquiry_id)
     };
@@ -1858,9 +1903,24 @@ pub(crate) async fn handle_submission(
         )
         .await
         .map_err(|e| ApiError::Internal(format!("Anfrage konnte nicht erstellt werden: {e}")))?;
-
         tx.commit().await
             .map_err(|e| ApiError::Internal(format!("Transaktion konnte nicht abgeschlossen werden: {e}")))?;
+
+        // Overwrite the customer's billing address from the inquiry (feedback c7a8081e).
+        // Deliberately AFTER the commit and best-effort: this is a denormalized
+        // convenience copy, so a failed sync must leave the submission standing.
+        // Inside the tx a failure would abort it, and the COMMIT would then silently
+        // roll back the whole submission while still returning 200.
+        if let Err(e) =
+            customer_repo::sync_billing_address(&state.db, customer_id, billing_address_id).await
+        {
+            tracing::warn!(
+                customer_id = %customer_id,
+                inquiry_id = %inquiry_id,
+                error = %e,
+                "Billing address sync to customer failed"
+            );
+        }
 
         (customer_id, inquiry_id)
     };
