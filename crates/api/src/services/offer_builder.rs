@@ -14,7 +14,8 @@ use aust_core::models::{
 };
 use aust_distance_calculator::{RouteCalculator, RouteRequest};
 use aust_offer_generator::{
-    convert_xlsx_to_pdf, generate_offer_xlsx, parse_floor, DetectedItemRow, OfferData,
+    convert_xlsx_to_pdf, generate_offer_xlsx, parse_floor, substitute_entruempelung_page_2,
+    DetectedItemRow, OfferData,
     OfferLineItem, PricingEngine,
 };
 use aust_storage::StorageProvider;
@@ -124,7 +125,7 @@ pub(crate) struct OfferComputationContext {
 ///
 /// # Errors
 /// - 404 if inquiry or customer not found
-/// - 400 if inquiry has no volume estimate
+/// - Volume defaults to 0.0 when inquiry has no estimate (pure-labor jobs: Umzugshelfer, Lagerung)
 /// - 500 on pricing/DB errors
 pub(crate) async fn run_offer_computation(
     db: &PgPool,
@@ -140,13 +141,15 @@ pub(crate) async fn run_offer_computation(
 
     let inquiry = Inquiry::from(inquiry_row);
 
-    // Use the override volume if provided; otherwise require the inquiry's stored estimate.
+    // Use the override volume if provided; otherwise fall back to the inquiry's
+    // stored estimate. Volume may be None for pure-labor jobs (Umzugshelfer,
+    // Lagerung) — pricing heuristics are overridden by the admin's persons/hours
+    // inputs, and the XLSX headline falls back to the override or a generic label
+    // (feedback 10d9cc36: "KVAs one volumen sollten erstellbar sein").
     let volume = if let Some(v) = overrides.volume_m3 {
         v
     } else {
-        inquiry
-            .estimated_volume_m3
-            .ok_or_else(|| ApiError::BadRequest("Inquiry has no volume estimate".into()))?
+        inquiry.estimated_volume_m3.unwrap_or(0.0)
     };
 
     let distance = inquiry.distance_km.unwrap_or(0.0);
@@ -517,6 +520,27 @@ pub(crate) async fn build_offer_with_overrides(
     let (s3_key, pdf_bytes) =
         match convert_xlsx_to_pdf(&xlsx_bytes).await {
             Ok(pdf_bytes) => {
+                // Entrümpelung gets its own terms page — the template's page 2 lists
+                // Umzug-specific conditions that don't apply to a clearing job.
+                // Umzüge and all other service types keep the template page.
+                let pdf_bytes = if inquiry.service_type.as_deref() == Some("entruempelung") {
+                    match substitute_entruempelung_page_2(&pdf_bytes).await {
+                        Ok(swapped) => swapped,
+                        Err(e) => {
+                            tracing::error!(
+                                inquiry_id = %inquiry.id,
+                                offer_id = %offer_id,
+                                error = %e,
+                                "Entrümpelung terms page substitution failed — \
+                                 offer keeps the Umzug terms page"
+                            );
+                            pdf_bytes
+                        }
+                    }
+                } else {
+                    pdf_bytes
+                };
+
                 let key = format!("offers/{offer_id}/angebot.pdf");
                 storage
                     .upload(&key, bytes::Bytes::from(pdf_bytes.clone()), "application/pdf")

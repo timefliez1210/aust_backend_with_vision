@@ -502,7 +502,13 @@ fn build_cell_modifications(data: &OfferData) -> CellModResult {
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .map(String::from)
-        .unwrap_or_else(|| format!("Umzugspauschale {:.1} m³", data.volume_m3));
+        .unwrap_or_else(|| {
+            if data.volume_m3 > 0.0 {
+                format!("Umzugspauschale {:.1} m³", data.volume_m3)
+            } else {
+                "Umzugshilfe".to_string()
+            }
+        });
     mods.push(("A29".into(), CellValue::Text(headline)));
 
     // --- Line items: dynamic row assignment with alternating styles ---
