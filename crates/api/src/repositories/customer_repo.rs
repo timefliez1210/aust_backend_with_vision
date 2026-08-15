@@ -84,21 +84,55 @@ impl CustomerRow {
 
     /// Attention line for XLSX cell A9 — "z.Hd. Herrn Müller" for business
     /// customers with a known Ansprechpartner. Empty string for private.
+    ///
+    /// The Ansprechpartner may be stored structured (`first_name`/`last_name`)
+    /// or, for customers created before those columns existed and for those
+    /// entered through the admin dashboard, only in the legacy `name` string —
+    /// so fall back to it the way `formal_greeting` does (feedback adf774fe).
     pub fn attention_line(&self) -> String {
         if self.customer_type.as_deref() != Some("business") {
             return String::new();
         }
-        // Business with known Ansprechpartner
-        
-        match (self.salutation.as_deref(), self.first_name.as_deref(), self.last_name.as_deref()) {
-            (Some("Herr"), Some(f), Some(l)) => format!("z.Hd. Herrn {f} {l}"),
-            (Some("Frau"), Some(f), Some(l)) => format!("z.Hd. Frau {f} {l}"),
-            (Some("D"), Some(f), Some(l)) => format!("z.Hd. {f} {l}"),
-            (Some("Herr"), None, Some(l)) => format!("z.Hd. Herrn {l}"),
-            (Some("Frau"), None, Some(l)) => format!("z.Hd. Frau {l}"),
-            (_, Some(f), Some(l)) => format!("z.Hd. {f} {l}"),
-            _ => String::new(),
+        let Some(person) = self.contact_person() else {
+            return String::new();
+        };
+        match self.salutation.as_deref() {
+            Some("Herr") => format!("z.Hd. Herrn {person}"),
+            Some("Frau") => format!("z.Hd. Frau {person}"),
+            _ => format!("z.Hd. {person}"),
         }
+    }
+
+    /// The Ansprechpartner's name, however it happens to be stored.
+    ///
+    /// Returns `None` when no personal name is known. A legacy `name` that just
+    /// repeats the company is not a contact person — emitting it would print
+    /// the company name twice, once at A8 and again as "z.Hd. …" at A9.
+    fn contact_person(&self) -> Option<String> {
+        let structured = match (self.first_name.as_deref(), self.last_name.as_deref()) {
+            (Some(f), Some(l)) => Some(format!("{} {}", f.trim(), l.trim())),
+            (Some(n), None) | (None, Some(n)) => Some(n.trim().to_string()),
+            (None, None) => None,
+        };
+        if let Some(s) = structured.filter(|s| !s.is_empty()) {
+            return Some(s);
+        }
+
+        let legacy = self.name.as_deref()?.trim();
+        let legacy = legacy
+            .strip_prefix("Herrn ")
+            .or_else(|| legacy.strip_prefix("Herr "))
+            .or_else(|| legacy.strip_prefix("Frau "))
+            .unwrap_or(legacy)
+            .trim();
+        if legacy.is_empty() {
+            return None;
+        }
+        let company = self.company_name.as_deref().unwrap_or("").trim();
+        if !company.is_empty() && legacy.eq_ignore_ascii_case(company) {
+            return None;
+        }
+        Some(legacy.to_string())
     }
 
     /// Full display name: first + last, or the legacy `name` field, or email.
@@ -364,6 +398,70 @@ mod tests {
     fn no_salutation_falls_back_to_heuristic() {
         let r = row(None, None, Some("Thomas Müller"));
         assert_eq!(r.formal_greeting(), "Sehr geehrter Herr Müller,");
+    }
+
+    /// Business customer, contact person however it happens to be stored.
+    fn business_row(
+        salutation: Option<&str>,
+        first_name: Option<&str>,
+        last_name: Option<&str>,
+        name: Option<&str>,
+        company_name: Option<&str>,
+    ) -> CustomerRow {
+        CustomerRow {
+            customer_type: Some("business".to_string()),
+            first_name: first_name.map(str::to_string),
+            company_name: company_name.map(str::to_string),
+            ..row(salutation, last_name, name)
+        }
+    }
+
+    #[test]
+    fn attention_line_uses_structured_names() {
+        let r = business_row(
+            Some("Herr"), Some("Thomas"), Some("Müller"), None, Some("Müller GmbH"),
+        );
+        assert_eq!(r.attention_line(), "z.Hd. Herrn Thomas Müller");
+    }
+
+    /// Feedback adf774fe: a business customer whose Ansprechpartner lives only in
+    /// the legacy `name` column used to fall through to an empty string, so the
+    /// "z.Hd." line silently vanished from the KVA.
+    #[test]
+    fn attention_line_falls_back_to_legacy_name() {
+        let r = business_row(Some("Frau"), None, None, Some("Sabine Karge"), Some("Karge AG"));
+        assert_eq!(r.attention_line(), "z.Hd. Frau Sabine Karge");
+    }
+
+    #[test]
+    fn attention_line_without_salutation_omits_the_gendered_word() {
+        let r = business_row(None, None, None, Some("Kim Bauer"), Some("Bauer & Co."));
+        assert_eq!(r.attention_line(), "z.Hd. Kim Bauer");
+    }
+
+    #[test]
+    fn attention_line_strips_a_salutation_prefix_from_the_legacy_name() {
+        let r = business_row(Some("Herr"), None, None, Some("Herr Schmidt"), None);
+        assert_eq!(r.attention_line(), "z.Hd. Herrn Schmidt");
+    }
+
+    /// The company name at A8 must not be repeated as an Ansprechpartner at A9.
+    #[test]
+    fn attention_line_ignores_a_name_that_just_repeats_the_company() {
+        let r = business_row(None, None, None, Some("Musterfirma GmbH"), Some("musterfirma gmbh"));
+        assert_eq!(r.attention_line(), "");
+    }
+
+    #[test]
+    fn attention_line_is_empty_without_any_contact_name() {
+        let r = business_row(Some("Herr"), None, None, None, Some("Musterfirma GmbH"));
+        assert_eq!(r.attention_line(), "");
+    }
+
+    #[test]
+    fn attention_line_is_empty_for_private_customers() {
+        let r = row(Some("Herr"), Some("Müller"), Some("Thomas Müller"));
+        assert_eq!(r.attention_line(), "");
     }
 
     /// Feedback c7a8081e: when a Rechnungsadresse is set on an inquiry, it must
