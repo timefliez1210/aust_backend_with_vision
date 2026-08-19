@@ -244,7 +244,7 @@ pub(crate) async fn fetch_appointment_employees(
 }
 
 /// Assign an employee to an appointment, seeding planned start/end from the
-/// appointment's own times (falling back to 08:00–17:00). No-op if already assigned.
+/// appointment's own times (falling back to 08:00–16:30). No-op if already assigned.
 pub(crate) async fn insert_appointment_employee(
     pool: &PgPool,
     appointment_id: Uuid,
@@ -256,7 +256,7 @@ pub(crate) async fn insert_appointment_employee(
             (appointment_id, employee_id, start_time, end_time)
         SELECT $1, $2,
                COALESCE(a.start_time, '08:00'::time),
-               COALESCE(a.end_time,   '17:00'::time)
+               COALESCE(a.end_time,   '16:30'::time)
         FROM inquiry_appointments a
         WHERE a.id = $1
         ON CONFLICT (appointment_id, employee_id) DO NOTHING

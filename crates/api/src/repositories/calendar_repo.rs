@@ -173,7 +173,7 @@ pub(crate) async fn fetch_schedule_inquiries(
             i.notes,
             i.employee_notes,
             COALESCE(i.start_time, '08:00'::time)                    AS start_time,
-            COALESCE(i.end_time,   '17:00'::time)                    AS end_time,
+            COALESCE(i.end_time,   '16:30'::time)                    AS end_time,
             COUNT(ie.employee_id)                                     AS employees_assigned,
             NULLIF(STRING_AGG(
                 DISTINCT e.first_name || ' ' || LEFT(e.last_name, 1) || '.',

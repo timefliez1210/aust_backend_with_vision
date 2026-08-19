@@ -624,7 +624,7 @@ pub(crate) async fn insert_employee_assignment(
                d::date,
                $3,
                COALESCE(start_time, '08:00'::time),
-               COALESCE(end_time,   '17:00'::time)
+               COALESCE(end_time,   '16:30'::time)
         FROM inquiries,
              generate_series(
                  COALESCE(scheduled_date, created_at::date),
@@ -1070,6 +1070,65 @@ pub(crate) async fn count_active_days_and_employees(
 
 #[cfg(test)]
 mod tests {
+    /// The standard Auftragszeit is 08:00–16:30, and it is the *column DEFAULT*
+    /// that decides it — `start_time`/`end_time` are NOT NULL, so an INSERT that
+    /// omits them writes the default and the `COALESCE(..., '08:00')` fallbacks
+    /// in the read queries can never fire. An earlier fix changed only those
+    /// fallbacks and therefore did nothing (feedback be449a19). This test asserts
+    /// what the database actually stores.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn new_inquiry_defaults_to_the_standard_workday(pool: sqlx::PgPool) {
+        use crate::test_helpers;
+
+        let customer_id = test_helpers::insert_test_customer(&pool).await;
+        let inquiry_id = uuid::Uuid::now_v7();
+        // Deliberately omit start_time/end_time — this is the path every caller
+        // that does not set times explicitly takes.
+        sqlx::query(
+            "INSERT INTO inquiries (id, customer_id, service_type, status, created_at, updated_at)
+             VALUES ($1, $2, 'privatumzug', 'pending', NOW(), NOW())",
+        )
+        .bind(inquiry_id)
+        .bind(customer_id)
+        .execute(&pool)
+        .await
+        .expect("insert inquiry");
+
+        let (start, end): (chrono::NaiveTime, chrono::NaiveTime) =
+            sqlx::query_as("SELECT start_time, end_time FROM inquiries WHERE id = $1")
+                .bind(inquiry_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read times");
+
+        assert_eq!(start, chrono::NaiveTime::from_hms_opt(8, 0, 0).unwrap());
+        assert_eq!(end, chrono::NaiveTime::from_hms_opt(16, 30, 0).unwrap());
+    }
+
+    /// Same guarantee for Termine (`calendar_items`), whose `start_time` is also
+    /// NOT NULL DEFAULT. `end_time` is nullable there and stays unset.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn new_calendar_item_defaults_to_the_standard_start(pool: sqlx::PgPool) {
+        let item_id = uuid::Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO calendar_items (id, title, category, scheduled_date, created_at, updated_at)
+             VALUES ($1, 'Test-Termin', 'intern', CURRENT_DATE, NOW(), NOW())",
+        )
+        .bind(item_id)
+        .execute(&pool)
+        .await
+        .expect("insert calendar item");
+
+        let start: chrono::NaiveTime =
+            sqlx::query_scalar("SELECT start_time FROM calendar_items WHERE id = $1")
+                .bind(item_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read start time");
+
+        assert_eq!(start, chrono::NaiveTime::from_hms_opt(8, 0, 0).unwrap());
+    }
+
     /// `auto_update_billing_on_completed` must report whether it actually fired,
     /// because `update_inquiry` mirrors the returned address onto the customer
     /// record (feedback c7a8081e). A wrong `None` would silently leave the

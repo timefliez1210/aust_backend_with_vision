@@ -232,7 +232,7 @@ pub(crate) async fn insert_item_employee(
         SELECT gen_random_uuid(), $1, $2,
                d::date,
                COALESCE(start_time, '08:00'::time),
-               COALESCE(end_time,   '17:00'::time)
+               COALESCE(end_time,   '16:30'::time)
         FROM calendar_items,
              generate_series(
                  COALESCE(scheduled_date, created_at::date),
