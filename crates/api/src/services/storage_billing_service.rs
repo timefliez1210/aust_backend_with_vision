@@ -105,8 +105,8 @@ async fn generate_invoice(
         return Ok(None);
     }
 
-    let seq = invoice_repo::next_invoice_numbers(db, 1).await?;
-    let invoice_number = format!("{year}-{:04}", seq[0]);
+    let seq = invoice_repo::next_invoice_numbers(db, 1, year).await?;
+    let invoice_number = crate::services::invoice_number::format(year, seq[0]);
 
     // The UNIQUE constraint is still the source of truth: it closes the race between
     // the hourly tick and a manual "jetzt erzeugen". Losing that race burns a single
@@ -475,14 +475,14 @@ mod tests {
         let (year, month) = (today.year(), today.month());
 
         // Pretend this month was already billed.
-        let seq = invoice_repo::next_invoice_numbers(&pool, 1).await.expect("seq");
+        let seq = invoice_repo::next_invoice_numbers(&pool, 1, year).await.expect("seq");
         sqlx::query(
             "INSERT INTO storage_invoices
                 (contract_id, invoice_number, period_year, period_month, netto_cents)
              VALUES ($1, $2, $3, $4, 10000)",
         )
         .bind(contract_id)
-        .bind(format!("{year}-{:04}", seq[0]))
+        .bind(crate::services::invoice_number::format(year, seq[0]))
         .bind(year)
         .bind(month as i32)
         .execute(&pool)
@@ -490,7 +490,7 @@ mod tests {
         .expect("seed existing invoice");
 
         // Where the shared sequence stands now.
-        let before = invoice_repo::next_invoice_numbers(&pool, 1).await.expect("seq before");
+        let before = invoice_repo::next_invoice_numbers(&pool, 1, year).await.expect("seq before");
 
         // Re-entering for the same period must be a no-op — no number drawn.
         assert!(
@@ -500,7 +500,7 @@ mod tests {
             "the period we just seeded must read as billed"
         );
 
-        let after = invoice_repo::next_invoice_numbers(&pool, 1).await.expect("seq after");
+        let after = invoice_repo::next_invoice_numbers(&pool, 1, year).await.expect("seq after");
         assert_eq!(
             after[0] - before[0],
             1,

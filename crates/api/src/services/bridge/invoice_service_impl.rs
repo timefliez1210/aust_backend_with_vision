@@ -1,7 +1,7 @@
 //! Bridge impl for `InvoiceService`.
 
 use async_trait::async_trait;
-use chrono::{NaiveDate, Utc};
+use chrono::{Datelike, NaiveDate, Utc};
 use sqlx::PgPool;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -85,10 +85,11 @@ impl InvoiceService for InvoiceServiceImpl {
         // Generate invoice number.
         let now = Utc::now();
         let today = now.date_naive();
-        let seqs = invoice_repo::next_invoice_numbers(&self.pool, 1)
+        let year = today.year();
+        let seqs = invoice_repo::next_invoice_numbers(&self.pool, 1, year)
             .await
             .map_err(super::map_sqlx)?;
-        let invoice_num = format!("{}-{:04}", today.format("%Y"), seqs[0]);
+        let invoice_num = crate::services::invoice_number::format(year, seqs[0]);
         let inv_id = Uuid::now_v7();
 
         // Build a minimal line item from the offer.

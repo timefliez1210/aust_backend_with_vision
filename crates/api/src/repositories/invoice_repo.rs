@@ -63,6 +63,14 @@ pub(crate) struct RechnungsausgangRow {
     pub offer_netto_cents: Option<i64>,
     pub customer_name: Option<String>,
     pub scheduled_date: Option<chrono::NaiveDate>,
+    /// Last day of the job. A multi-day move is one Leistungszeitraum in the
+    /// register ("12.-13.01.2026"), not a single date — 26 of Alex's 86 rows for
+    /// 2026 are spans he had to type as free text because the app had no end.
+    pub end_date: Option<chrono::NaiveDate>,
+    /// Amount received so far, in cents. NULL means no partial payment was
+    /// recorded: the invoice is settled iff `paid_at` is set. See migration
+    /// 20260821100000.
+    pub paid_amount_cents: Option<i64>,
 }
 
 /// Minimal offer projection for invoice amount calculation.
@@ -132,42 +140,46 @@ pub(crate) async fn fetch_inquiry_status(
     Ok(row.map(|(s,)| s))
 }
 
-/// Allocate N sequential invoice numbers in a single round-trip.
+/// Allocate `count` consecutive invoice numbers for `year`, in one round-trip.
 ///
-/// **Caller**: `invoices::create_invoice`
-/// **Why**: Avoids sequence gaps on partial failures by fetching all needed numbers at once.
+/// **Caller**: `invoices::create_invoice`, `storage_billing_service`, the assistant bridge
+/// **Why**: Invoice numbers restart at 1 each January — Alex's Rechnungsausgangsbuch is
+/// one book per calendar year and its numbers run `2026-01 … 2026-86`, `2027-01`. The
+/// old allocator was a single global sequence (`invoice_number_seq`) that never reset, so
+/// the first invoice of 2027 would have been `2027-0087`.
+///
+/// Returns the sequence numbers themselves; render them with
+/// [`invoice_number::format`](crate::services::invoice_number::format).
+///
+/// # Concurrency
+/// The `INSERT … ON CONFLICT DO UPDATE … RETURNING` is a single statement, so the
+/// counter row is locked for its duration and two concurrent allocations can never
+/// receive the same number. Reserving all `count` numbers at once (rather than looping)
+/// also keeps a partial failure from leaving a gap mid-pair.
 pub(crate) async fn next_invoice_numbers(
     pool: &PgPool,
     count: usize,
+    year: i32,
 ) -> Result<Vec<i64>, sqlx::Error> {
-    match count {
-        1 => {
-            let (v,): (i64,) =
-                sqlx::query_as("SELECT nextval('invoice_number_seq')")
-                    .fetch_one(pool)
-                    .await?;
-            Ok(vec![v])
-        }
-        2 => {
-            let (v1, v2): (i64, i64) =
-                sqlx::query_as("SELECT nextval('invoice_number_seq'), nextval('invoice_number_seq')")
-                    .fetch_one(pool)
-                    .await?;
-            Ok(vec![v1, v2])
-        }
-        _ => {
-            // Fallback for arbitrary counts
-            let mut vals = Vec::with_capacity(count);
-            for _ in 0..count {
-                let (v,): (i64,) =
-                    sqlx::query_as("SELECT nextval('invoice_number_seq')")
-                        .fetch_one(pool)
-                        .await?;
-                vals.push(v);
-            }
-            Ok(vals)
-        }
+    if count == 0 {
+        return Ok(Vec::new());
     }
+    let count = count as i64;
+    let (last,): (i64,) = sqlx::query_as(
+        "INSERT INTO invoice_number_counters (year, last_value)
+         VALUES ($1, $2)
+         ON CONFLICT (year) DO UPDATE
+             SET last_value = invoice_number_counters.last_value + $2
+         RETURNING last_value",
+    )
+    .bind(year)
+    .bind(count)
+    .fetch_one(pool)
+    .await?;
+
+    // `last` is the highest number just reserved; the block is the `count` numbers
+    // ending there.
+    Ok(((last - count + 1)..=last).collect())
 }
 
 /// Insert a partial_first invoice row.
@@ -460,21 +472,63 @@ pub(crate) async fn update_payment_method(
     Ok(())
 }
 
-/// Move `invoice_number_seq` forward so the next generated number is `> seq`.
+/// Raise `year`'s counter so the next generated number is `> seq`.
 ///
 /// **Caller**: `invoices::update_invoice_number`
-/// **Why**: After an overwrite to a higher number, the auto-counter must catch up so
-/// the next generated invoice doesn't collide. `GREATEST` guarantees the sequence
-/// only ever advances — never rewinds (which would risk reusing a number).
+/// **Why**: After Alex overwrites an invoice number by hand, the auto-counter must catch
+/// up or the next generated invoice collides with the number he just set. `GREATEST`
+/// guarantees the counter only ever advances — never rewinds, which would risk handing
+/// out a number that is already on a customer's invoice.
 pub(crate) async fn advance_invoice_sequence(
     pool: &PgPool,
+    year: i32,
     seq: i64,
 ) -> Result<(), sqlx::Error> {
-    // setval(..., is_called = true) ⇒ next nextval() returns the set value + 1.
     sqlx::query(
-        "SELECT setval('invoice_number_seq', GREATEST((SELECT last_value FROM invoice_number_seq), $1), true)",
+        "INSERT INTO invoice_number_counters (year, last_value)
+         VALUES ($1, $2)
+         ON CONFLICT (year) DO UPDATE
+             SET last_value = GREATEST(invoice_number_counters.last_value, EXCLUDED.last_value)",
     )
+    .bind(year)
     .bind(seq)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The next number `year` will hand out, without consuming it.
+///
+/// **Caller**: `settings_repo::get_next_numbers` (Einstellungen → Nummernkreise)
+pub(crate) async fn peek_next_invoice_number(
+    pool: &PgPool,
+    year: i32,
+) -> Result<i64, sqlx::Error> {
+    let last: Option<(i64,)> =
+        sqlx::query_as("SELECT last_value FROM invoice_number_counters WHERE year = $1")
+            .bind(year)
+            .fetch_optional(pool)
+            .await?;
+    Ok(last.map_or(1, |(v,)| v + 1))
+}
+
+/// Force `year`'s counter so the next number handed out is exactly `n`.
+///
+/// **Caller**: `settings_repo::set_next_invoice` (Einstellungen → Nummernkreise)
+/// **Why**: Unlike [`advance_invoice_sequence`] this may also move the counter *down* —
+/// it is the manual override for the case where the counter itself is wrong.
+pub(crate) async fn set_next_invoice_number(
+    pool: &PgPool,
+    year: i32,
+    n: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO invoice_number_counters (year, last_value)
+         VALUES ($1, $2)
+         ON CONFLICT (year) DO UPDATE SET last_value = EXCLUDED.last_value",
+    )
+    .bind(year)
+    .bind(n - 1)
     .execute(pool)
     .await?;
     Ok(())
@@ -716,9 +770,11 @@ pub(crate) async fn list_for_rechnungsausgangsbuch(
             inv.payment_method,
             inv.notes,
             inv.due_date,
+            inv.paid_amount_cents,
             off.price_cents AS offer_netto_cents,
             c.name AS customer_name,
-            i.scheduled_date
+            i.scheduled_date,
+            i.end_date
          FROM invoices inv
          LEFT JOIN inquiries i ON i.id = inv.inquiry_id
          LEFT JOIN customers c ON c.id = i.customer_id
@@ -726,10 +782,79 @@ pub(crate) async fn list_for_rechnungsausgangsbuch(
              AND off.id = (SELECT o2.id FROM offers o2
                            WHERE o2.inquiry_id = inv.inquiry_id
                            ORDER BY o2.created_at DESC LIMIT 1)
-         ORDER BY COALESCE(inv.sent_at, inv.created_at) ASC",
+         ORDER BY inv.invoice_number ASC",
     )
     .fetch_all(pool)
     .await
+}
+
+/// Set (or clear) an invoice's Bemerkung.
+///
+/// **Caller**: `admin::update_register_notes` (Rechnungsausgangsbuch editor)
+/// **Why**: `notes` was rendered read-only in the register although it is the column
+/// Alex actually works in — "19.08.26 erinnert per mail", "verrechnung mit RG 12",
+/// "1300 Teilzahlung". Without a write path the page was a report, not a ledger.
+///
+/// Returns rows affected: 0 means `inv_id` is not a core invoice, which is how the
+/// shared register endpoint decides to fall through to `storage_invoices`.
+pub(crate) async fn update_notes(
+    pool: &PgPool,
+    inv_id: Uuid,
+    notes: Option<&str>,
+) -> Result<u64, sqlx::Error> {
+    let res = sqlx::query("UPDATE invoices SET notes = $1 WHERE id = $2")
+        .bind(notes)
+        .bind(inv_id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
+/// Stamp `payment_method = 'EC'` on an invoice that has none, at the moment it is booked paid.
+///
+/// **Caller**: `billing_reminder_service::mark_invoice_paid`
+/// **Why**: In Alex's book every row carries a Zahlungsart, and 83 of 86 for 2026 are
+/// "EC" — it is his default, and a row without one reads as unfinished. Filling it in
+/// when the payment is *booked* (rather than defaulting the column at invoice creation)
+/// keeps the register honest: an unpaid invoice never claims a payment method it does
+/// not have, and Alex can still switch the cell to BAR afterwards.
+pub(crate) async fn default_payment_method_to_ec(
+    pool: &PgPool,
+    inv_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE invoices SET payment_method = 'EC'
+         WHERE id = $1 AND (payment_method IS NULL OR btrim(payment_method) = '')",
+    )
+    .bind(inv_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Record a partial payment (Teilzahlung) against an invoice.
+///
+/// **Caller**: `admin::update_register_payment` (Rechnungsausgangsbuch "Offen" cell)
+/// **Why**: A customer paying 1.300 € of a 1.372,49 € invoice used to be untrackable —
+/// the register could only say paid or open, so Alex wrote the remainder into the
+/// Bemerkung by hand.
+///
+/// `paid_at` is set only once the invoice is *fully* settled; a partial payment leaves
+/// it NULL so the row stays open in the register and in the dunning list. Passing
+/// `None` for `paid_amount_cents` clears the partial payment entirely.
+///
+/// Returns rows affected — 0 means `inv_id` is not a core invoice.
+pub(crate) async fn update_paid_amount(
+    pool: &PgPool,
+    inv_id: Uuid,
+    paid_amount_cents: Option<i64>,
+) -> Result<u64, sqlx::Error> {
+    let res = sqlx::query("UPDATE invoices SET paid_amount_cents = $1 WHERE id = $2")
+        .bind(paid_amount_cents)
+        .bind(inv_id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
 }
 
 #[cfg(test)]
@@ -827,5 +952,185 @@ mod tests {
         assert!(row.customer_name.is_some());
         assert!(row.sent_at.is_some());
         assert!(row.extra_services.is_array());
+    }
+
+    /// The register renders a Leistungszeitraum, so the projection must carry both ends
+    /// of a multi-day job — 26 of Alex's 86 rows for 2026 are spans he had to type as
+    /// free text because the app only ever had a single date.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn projects_both_ends_of_a_multi_day_job(pool: PgPool) {
+        let inquiry_id = seed_inquiry(&pool, "invoiced").await;
+        sqlx::query("UPDATE inquiries SET scheduled_date = $2, end_date = $3 WHERE id = $1")
+            .bind(inquiry_id)
+            .bind(chrono::NaiveDate::from_ymd_opt(2026, 1, 12).unwrap())
+            .bind(chrono::NaiveDate::from_ymd_opt(2026, 1, 13).unwrap())
+            .execute(&pool)
+            .await
+            .expect("set job dates");
+        insert_invoice(&pool, inquiry_id, "2026-9020", "full", "sent", true).await;
+
+        let rows = list_for_rechnungsausgangsbuch(&pool).await.unwrap();
+        let row = rows.iter().find(|r| r.invoice_number == "2026-9020").expect("invoice");
+
+        assert_eq!(row.scheduled_date, chrono::NaiveDate::from_ymd_opt(2026, 1, 12));
+        assert_eq!(row.end_date, chrono::NaiveDate::from_ymd_opt(2026, 1, 13));
+    }
+
+    // ── Bemerkungen ─────────────────────────────────────────────────────────
+
+    /// Bemerkungen is the column Alex actually works in ("19.08.26 erinnert per mail")
+    /// and it had no write path at all — the register rendered it read-only.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn notes_round_trip_through_the_register(pool: PgPool) {
+        let inquiry_id = seed_inquiry(&pool, "invoiced").await;
+        let inv = insert_invoice(&pool, inquiry_id, "2026-9030", "full", "sent", true).await;
+
+        assert_eq!(update_notes(&pool, inv, Some("19.08.26 erinnert per mail")).await.unwrap(), 1);
+        let rows = list_for_rechnungsausgangsbuch(&pool).await.unwrap();
+        let row = rows.iter().find(|r| r.invoice_number == "2026-9030").expect("invoice");
+        assert_eq!(row.notes.as_deref(), Some("19.08.26 erinnert per mail"));
+
+        // Clearing the cell must clear the column, not store an empty string.
+        assert_eq!(update_notes(&pool, inv, None).await.unwrap(), 1);
+        let rows = list_for_rechnungsausgangsbuch(&pool).await.unwrap();
+        let row = rows.iter().find(|r| r.invoice_number == "2026-9030").expect("invoice");
+        assert_eq!(row.notes, None);
+    }
+
+    /// The register endpoint tries storage first and falls through to invoices; that
+    /// only works if a miss reports zero rows rather than succeeding silently.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn notes_report_a_miss_so_the_endpoint_can_fall_through(pool: PgPool) {
+        assert_eq!(update_notes(&pool, Uuid::now_v7(), Some("x")).await.unwrap(), 0);
+    }
+
+    // ── Teilzahlung ─────────────────────────────────────────────────────────
+
+    /// Alex's 2026-23: 1.372,49 € invoiced, 1.300,00 € received. A part payment must be
+    /// storable *without* settling the invoice — it is still an open receivable and has
+    /// to stay in the Offen column and in the dunning list.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_teilzahlung_is_recorded_without_settling_the_invoice(pool: PgPool) {
+        let inquiry_id = seed_inquiry(&pool, "invoiced").await;
+        let inv = insert_invoice(&pool, inquiry_id, "2026-9040", "full", "sent", true).await;
+
+        assert_eq!(update_paid_amount(&pool, inv, Some(130_000)).await.unwrap(), 1);
+
+        let rows = list_for_rechnungsausgangsbuch(&pool).await.unwrap();
+        let row = rows.iter().find(|r| r.invoice_number == "2026-9040").expect("invoice");
+        assert_eq!(row.paid_amount_cents, Some(130_000));
+        assert_eq!(row.paid_at, None, "a part payment must not book the invoice as paid");
+
+        // Clearing it removes the Teilzahlung rather than storing a zero, which would
+        // read as "nothing received yet, and we know it".
+        assert_eq!(update_paid_amount(&pool, inv, None).await.unwrap(), 1);
+        let rows = list_for_rechnungsausgangsbuch(&pool).await.unwrap();
+        let row = rows.iter().find(|r| r.invoice_number == "2026-9040").expect("invoice");
+        assert_eq!(row.paid_amount_cents, None);
+    }
+
+    /// Every row in Alex's book carries a Zahlungsart and 83 of 86 are EC, so booking a
+    /// payment fills it in — but only when he has not chosen one himself.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn booking_a_payment_defaults_the_zahlungsart_to_ec_without_overwriting(pool: PgPool) {
+        let inquiry_id = seed_inquiry(&pool, "invoiced").await;
+        let blank = insert_invoice(&pool, inquiry_id, "2026-9050", "full", "sent", true).await;
+        let chosen = insert_invoice(&pool, inquiry_id, "2026-9051", "full", "sent", true).await;
+        update_payment_method(&pool, chosen, Some("BAR")).await.unwrap();
+
+        default_payment_method_to_ec(&pool, blank).await.unwrap();
+        default_payment_method_to_ec(&pool, chosen).await.unwrap();
+
+        let rows = list_for_rechnungsausgangsbuch(&pool).await.unwrap();
+        let method = |n: &str| {
+            rows.iter()
+                .find(|r| r.invoice_number == n)
+                .expect("invoice")
+                .payment_method
+                .clone()
+        };
+        assert_eq!(method("2026-9050").as_deref(), Some("EC"));
+        assert_eq!(method("2026-9051").as_deref(), Some("BAR"), "a chosen method must survive");
+    }
+
+    // ── Per-year numbering ──────────────────────────────────────────────────
+
+    /// The whole point of the counter table: numbers restart at 1 each January. The old
+    /// global sequence would have issued "2027-0087" as the first invoice of 2027.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn numbering_restarts_at_one_each_year(pool: PgPool) {
+        // A year with no history starts at 1 — these years hold no seeded rows.
+        let first_2031 = next_invoice_numbers(&pool, 1, 2031).await.unwrap();
+        assert_eq!(first_2031, vec![1]);
+
+        let next_2031 = next_invoice_numbers(&pool, 1, 2031).await.unwrap();
+        assert_eq!(next_2031, vec![2]);
+
+        // The new year is independent of how far the old one ran.
+        let first_2032 = next_invoice_numbers(&pool, 1, 2032).await.unwrap();
+        assert_eq!(first_2032, vec![1], "a new year must not continue the previous count");
+    }
+
+    /// An Anzahlung/Schlussrechnung pair draws two numbers at once; they must be
+    /// consecutive, or the pair straddles an unrelated invoice in the register.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_pair_draws_consecutive_numbers(pool: PgPool) {
+        let pair = next_invoice_numbers(&pool, 2, 2033).await.unwrap();
+        assert_eq!(pair, vec![1, 2]);
+
+        let after = next_invoice_numbers(&pool, 1, 2033).await.unwrap();
+        assert_eq!(after, vec![3], "the block must consume both numbers, not one");
+    }
+
+    /// Numbers must never be reused: after Alex overwrites an invoice number by hand the
+    /// counter has to catch up, and it must never rewind past numbers already issued.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_counter_advances_but_never_rewinds(pool: PgPool) {
+        advance_invoice_sequence(&pool, 2034, 50).await.unwrap();
+        assert_eq!(next_invoice_numbers(&pool, 1, 2034).await.unwrap(), vec![51]);
+
+        // A lower correction must not hand number 52 back out a second time.
+        advance_invoice_sequence(&pool, 2034, 10).await.unwrap();
+        assert_eq!(next_invoice_numbers(&pool, 1, 2034).await.unwrap(), vec![52]);
+    }
+
+    /// The settings page reads and writes the counter; peek must not consume a number.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn peeking_and_setting_the_next_number(pool: PgPool) {
+        assert_eq!(peek_next_invoice_number(&pool, 2035).await.unwrap(), 1);
+        assert_eq!(peek_next_invoice_number(&pool, 2035).await.unwrap(), 1, "peek must not consume");
+
+        set_next_invoice_number(&pool, 2035, 87).await.unwrap();
+        assert_eq!(peek_next_invoice_number(&pool, 2035).await.unwrap(), 87);
+        assert_eq!(next_invoice_numbers(&pool, 1, 2035).await.unwrap(), vec![87]);
+        assert_eq!(peek_next_invoice_number(&pool, 2035).await.unwrap(), 88);
+    }
+
+    /// The migration seeds the counter from the numbers already issued, so the first
+    /// allocation after deployment continues the register instead of colliding with it.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn seeded_years_continue_where_the_register_left_off(pool: PgPool) {
+        let inquiry_id = seed_inquiry(&pool, "invoiced").await;
+        insert_invoice(&pool, inquiry_id, "2036-40", "full", "sent", true).await;
+
+        // Re-running the migration's seed statement is what a deploy does.
+        sqlx::query(
+            "INSERT INTO invoice_number_counters (year, last_value)
+             SELECT split_part(invoice_number, '-', 1)::INT,
+                    MAX(split_part(invoice_number, '-', 2)::BIGINT)
+             FROM invoices
+             WHERE invoice_number ~ '^[0-9]{4}-[0-9]+$'
+             GROUP BY 1
+             ON CONFLICT (year) DO NOTHING",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed counters");
+
+        assert_eq!(
+            next_invoice_numbers(&pool, 1, 2036).await.unwrap(),
+            vec![41],
+            "the next number must follow the highest already issued, not restart at 1"
+        );
     }
 }

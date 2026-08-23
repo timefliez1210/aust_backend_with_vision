@@ -344,6 +344,10 @@ pub(crate) struct StorageRegisterRow {
     pub period_month: i32,
     /// Rendered storage invoice, if one exists — the register links to it.
     pub pdf_s3_key: Option<String>,
+    /// Alex's Bemerkung for this row (migration 20260821100000).
+    pub notes: Option<String>,
+    /// Amount received so far, in cents; NULL = no partial payment recorded.
+    pub paid_amount_cents: Option<i64>,
 }
 
 /// All non-cancelled storage invoices for the Rechnungsausgangsbuch.
@@ -351,7 +355,8 @@ pub(crate) async fn list_for_register(pool: &PgPool) -> Result<Vec<StorageRegist
     sqlx::query_as(
         "SELECT si.id, si.invoice_number, si.netto_cents, si.status, si.payment_method,
                 si.sent_at, si.paid_at, si.created_at, c.name AS customer_name,
-                si.period_year, si.period_month, si.pdf_s3_key
+                si.period_year, si.period_month, si.pdf_s3_key, si.notes,
+                si.paid_amount_cents
          FROM storage_invoices si
          JOIN storage_contracts sc ON sc.id = si.contract_id
          JOIN customers c ON c.id = sc.customer_id
@@ -377,6 +382,52 @@ pub(crate) async fn mark_invoice_paid(
     .bind(paid_at)
     .execute(pool)
     .await?;
+    Ok(res.rows_affected())
+}
+
+/// Set (or clear) a storage invoice's Bemerkung. Mirror of `invoice_repo::update_notes`;
+/// returns rows affected so the shared register endpoint can try one table then the other.
+pub(crate) async fn set_invoice_notes(
+    pool: &PgPool,
+    id: Uuid,
+    notes: Option<&str>,
+) -> Result<u64, sqlx::Error> {
+    let res = sqlx::query("UPDATE storage_invoices SET notes = $2 WHERE id = $1")
+        .bind(id)
+        .bind(notes)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
+/// Mirror of `invoice_repo::default_payment_method_to_ec` for storage invoices.
+pub(crate) async fn default_payment_method_to_ec(
+    pool: &PgPool,
+    id: Uuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE storage_invoices SET payment_method = 'EC'
+         WHERE id = $1 AND (payment_method IS NULL OR btrim(payment_method) = '')",
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Record a partial payment against a storage invoice. Mirror of
+/// `invoice_repo::update_paid_amount`; `status`/`paid_at` are left alone, so the row
+/// stays open until it is settled in full.
+pub(crate) async fn set_invoice_paid_amount(
+    pool: &PgPool,
+    id: Uuid,
+    paid_amount_cents: Option<i64>,
+) -> Result<u64, sqlx::Error> {
+    let res = sqlx::query("UPDATE storage_invoices SET paid_amount_cents = $2 WHERE id = $1")
+        .bind(id)
+        .bind(paid_amount_cents)
+        .execute(pool)
+        .await?;
     Ok(res.rows_affected())
 }
 

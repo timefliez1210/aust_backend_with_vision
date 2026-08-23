@@ -189,6 +189,7 @@ pub(crate) async fn mark_invoice_paid(
 ) -> Result<PaidOutcome, ApiError> {
     // Storage invoice?
     if storage_repo::mark_invoice_paid(db, id, paid_at).await? > 0 {
+        storage_repo::default_payment_method_to_ec(db, id).await?;
         return Ok(PaidOutcome {
             kind: "lagerung",
             paid_at,
@@ -205,6 +206,7 @@ pub(crate) async fn mark_invoice_paid(
         .ok_or_else(|| ApiError::NotFound("Rechnung nicht gefunden".into()))?;
 
     invoice_repo::mark_paid(db, id, paid_at).await?;
+    invoice_repo::default_payment_method_to_ec(db, id).await?;
     invoice_reminder_repo::close_for_invoice(db, id).await?;
 
     // A partial invoice pair only settles the inquiry once both halves are in.

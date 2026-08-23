@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 
+use chrono::Datelike;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
@@ -142,7 +143,7 @@ pub(crate) async fn upsert_pricing(
 /// accept them as bind parameters), so we gate it on an explicit allowlist
 /// rather than trusting callers. Mirrors the `resolve_doc_column` pattern in
 /// `employee_repo.rs`.
-const ALLOWED_SEQUENCES: &[&str] = &["invoice_number_seq", "offer_number_seq"];
+const ALLOWED_SEQUENCES: &[&str] = &["offer_number_seq"];
 
 fn resolve_seq(seq: &str) -> Result<&'static str, ApiError> {
     ALLOWED_SEQUENCES
@@ -165,9 +166,24 @@ async fn next_for_seq(db: &PgPool, seq: &str) -> Result<i64, ApiError> {
     Ok(if is_called { last_value + 1 } else { last_value })
 }
 
+/// The current calendar year — the book invoice numbers are drawn from right now.
+///
+/// Invoice numbers are per-year (see `invoice_number_counters`), so "the next invoice
+/// number" is only meaningful for a given year, and the settings page always means the
+/// one Alex is invoicing in today.
+fn current_year() -> i32 {
+    chrono::Utc::now().date_naive().year()
+}
+
 pub(crate) async fn get_next_numbers(db: &PgPool) -> Result<NextNumbers, ApiError> {
     Ok(NextNumbers {
-        next_invoice_number: next_for_seq(db, "invoice_number_seq").await?,
+        // Invoice numbers no longer come from a sequence: they restart at 1 each
+        // January, so the counter is a per-year table rather than `invoice_number_seq`.
+        next_invoice_number: crate::repositories::invoice_repo::peek_next_invoice_number(
+            db,
+            current_year(),
+        )
+        .await?,
         next_offer_number: next_for_seq(db, "offer_number_seq").await?,
     })
 }
@@ -185,7 +201,8 @@ async fn set_next_for_seq(db: &PgPool, seq: &str, n: i64) -> Result<(), ApiError
 }
 
 pub(crate) async fn set_next_invoice(db: &PgPool, n: i64) -> Result<(), ApiError> {
-    set_next_for_seq(db, "invoice_number_seq", n).await
+    crate::repositories::invoice_repo::set_next_invoice_number(db, current_year(), n).await?;
+    Ok(())
 }
 
 pub(crate) async fn set_next_offer(db: &PgPool, n: i64) -> Result<(), ApiError> {

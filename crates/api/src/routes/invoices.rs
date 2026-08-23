@@ -14,12 +14,13 @@ use axum::{
     routing::{get, patch, post},
     Json, Router,
 };
-use chrono::Utc;
+use chrono::{Datelike, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::repositories::{address_repo, invoice_repo, CustomerRow};
+use crate::services::invoice_number;
 use crate::ApiError;
 use crate::AppState;
 use aust_offer_generator::{
@@ -289,10 +290,11 @@ async fn create_invoice(
 
         // Generate invoice numbers — single round-trip to avoid sequence gaps on failure
         let (first_num, final_num) = {
-            let seqs = invoice_repo::next_invoice_numbers(&state.db, 2).await?;
+            let year = today.year();
+            let seqs = invoice_repo::next_invoice_numbers(&state.db, 2, year).await?;
             (
-                format!("{}-{:04}", today.format("%Y"), seqs[0]),
-                format!("{}-{:04}", today.format("%Y"), seqs[1]),
+                invoice_number::format(year, seqs[0]),
+                invoice_number::format(year, seqs[1]),
             )
         };
 
@@ -419,8 +421,9 @@ async fn create_invoice(
         ]))
     } else {
         // Single full invoice
-        let seqs = invoice_repo::next_invoice_numbers(&state.db, 1).await?;
-        let invoice_num = format!("{}-{:04}", today.format("%Y"), seqs[0]);
+        let year = today.year();
+        let seqs = invoice_repo::next_invoice_numbers(&state.db, 1, year).await?;
+        let invoice_num = invoice_number::format(year, seqs[0]);
         let inv_id = Uuid::now_v7();
 
         // Full invoice: KVA line items, falling back to a lump-sum if none stored
@@ -479,7 +482,7 @@ async fn create_invoice(
 /// Request body for `PATCH /inquiries/{id}/invoices/{inv_id}/number`.
 #[derive(Debug, Deserialize)]
 pub struct UpdateInvoiceNumberRequest {
-    /// The corrected invoice number, e.g. `"2026-0053"`.
+    /// The corrected invoice number, e.g. `"2026-53"`.
     pub invoice_number: String,
 }
 
@@ -536,10 +539,10 @@ async fn update_invoice_number(
             ApiError::Database(e)
         })?;
 
-    // Nudge the sequence forward so the next auto-generated number won't collide.
-    // Only when the number is in the standard `YYYY-NNNN` shape we can parse.
-    if let Some(seq) = parse_invoice_sequence(&new_number) {
-        invoice_repo::advance_invoice_sequence(&state.db, seq).await?;
+    // Nudge that year's counter forward so the next auto-generated number won't
+    // collide. Only when the number is in the standard `YYYY-N` shape we can parse.
+    if let Some((year, seq)) = invoice_number::parse(&new_number) {
+        invoice_repo::advance_invoice_sequence(&state.db, year, seq).await?;
     }
 
     // Regenerate the PDF so it shows the corrected number, then return fresh state.
@@ -551,13 +554,6 @@ async fn update_invoice_number(
     let final_row = fetch_invoice_row(&state.db, inv_id).await?;
     let offer_netto = get_offer_netto(&state.db, inquiry_id).await?;
     Ok(Json(build_invoice_response(final_row, offer_netto)))
-}
-
-/// Extract the trailing sequence integer from a `YYYY-NNNN` invoice number.
-/// Returns `None` for free-form numbers we can't map onto `invoice_number_seq`.
-fn parse_invoice_sequence(invoice_number: &str) -> Option<i64> {
-    let (_, seq) = invoice_number.split_once('-')?;
-    seq.parse::<i64>().ok()
 }
 
 /// `GET /api/v1/inquiries/{id}/invoices/{inv_id}` — Get a single invoice.

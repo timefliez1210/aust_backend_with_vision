@@ -6,7 +6,7 @@ use axum::{
     Extension, Json, Router,
 };
 use bytes::Bytes;
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 use std::sync::Arc;
@@ -16,7 +16,7 @@ use aust_core::models::TokenClaims;
 use aust_offer_generator::{convert_xlsx_to_pdf, generate_timesheet_xlsx, TimesheetData, TimesheetEntry};
 use crate::repositories::{admin_repo, employee_repo, feedback_repo, review_repo, invoice_reminder_repo, invoice_repo, offer_repo, settings_repo, storage_repo};
 use crate::repositories::settings_repo::PricingSettings;
-use crate::services::billing_reminder_service;
+use crate::services::{billing_reminder_service, invoice_number, register_export};
 use aust_flash_contact;
 use crate::{ApiError, AppState};
 
@@ -85,7 +85,10 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/invoice-reminders/{id}/action", post(invoice_reminder_action))
         .route("/rechnungsausgangsbuch", get(rechnungsausgangsbuch))
         .route("/rechnungsausgangsbuch/{id}/payment-method", patch(update_payment_method))
+        .route("/rechnungsausgangsbuch/{id}/notes", patch(update_register_notes))
+        .route("/rechnungsausgangsbuch/{id}/paid-amount", patch(update_register_paid_amount))
         .route("/rechnungsausgangsbuch/{id}/paid", post(mark_register_invoice_paid))
+        .route("/rechnungsausgangsbuch/export", get(export_rechnungsausgangsbuch))
         .route("/kva-buch", get(kva_buch))
         .route("/kva-buch/{id}/pdf", get(kva_buch_pdf))
         .route("/flash-contacts", get(list_flash_contacts))
@@ -1921,7 +1924,12 @@ struct RechnungsausgangItem {
     inquiry_id: Option<Uuid>,
     invoice_number: String,
     customer_name: Option<String>,
+    /// First day of the job — the start of the Leistungszeitraum.
     scheduled_date: Option<NaiveDate>,
+    /// Last day of the job. Equal to `scheduled_date` for a single-day move; the
+    /// register renders the pair as a span ("12.-13.01.2026") when they differ,
+    /// which is how Alex writes multi-day moves and storage periods in his book.
+    end_date: Option<NaiveDate>,
     netto_cents: Option<i64>,
     mwst_cents: Option<i64>,
     brutto_cents: Option<i64>,
@@ -1930,6 +1938,16 @@ struct RechnungsausgangItem {
     due_date: Option<NaiveDate>,
     paid_at: Option<DateTime<Utc>>,
     offene_zahlungen_cents: Option<i64>,
+    /// TRUE once the invoice is fully settled.
+    ///
+    /// Not the same as `paid_at.is_some()`: a storage invoice can carry
+    /// `status = 'paid'` with no `paid_at` (rows predating that column), and the
+    /// register must show those as settled rather than offering to book them again.
+    /// Deriving it here keeps the page from having to guess.
+    is_settled: bool,
+    /// Amount received so far. `None` when no partial payment was recorded — the row
+    /// is then simply paid (`paid_at` set) or fully open.
+    paid_amount_cents: Option<i64>,
     payment_method: Option<String>,
     notes: Option<String>,
     /// `full` | `partial_first` | `partial_final` for Umzug rows, `lagerung` for
@@ -1990,10 +2008,8 @@ async fn rechnungsausgangsbuch(
                 (None, None, None)
             };
 
-            let offen = match (r.paid_at, brutto_cents) {
-                (Some(_), _) => Some(0i64),
-                (None, b) => b,
-            };
+            let settled = r.paid_at.is_some();
+            let offen = open_amount_cents(settled, brutto_cents, r.paid_amount_cents);
 
             RechnungsausgangItem {
                 id: r.id,
@@ -2002,6 +2018,7 @@ async fn rechnungsausgangsbuch(
                 invoice_number: r.invoice_number,
                 customer_name: r.customer_name,
                 scheduled_date: r.scheduled_date,
+                end_date: r.end_date,
                 netto_cents,
                 mwst_cents,
                 brutto_cents,
@@ -2010,6 +2027,8 @@ async fn rechnungsausgangsbuch(
                 due_date: r.due_date,
                 paid_at: r.paid_at,
                 offene_zahlungen_cents: offen,
+                is_settled: settled,
+                paid_amount_cents: r.paid_amount_cents,
                 payment_method: r.payment_method,
                 notes: r.notes,
                 invoice_type: r.invoice_type,
@@ -2035,6 +2054,9 @@ async fn rechnungsausgangsbuch(
             invoice_number: r.invoice_number,
             customer_name: r.customer_name,
             scheduled_date: NaiveDate::from_ymd_opt(r.period_year, r.period_month as u32, 1),
+            // A storage invoice bills a whole month, so its Leistungszeitraum is the
+            // first to the last day of that month rather than a single date.
+            end_date: last_day_of_month(r.period_year, r.period_month as u32),
             netto_cents: Some(netto),
             mwst_cents: Some(brutto - netto),
             brutto_cents: Some(brutto),
@@ -2042,9 +2064,11 @@ async fn rechnungsausgangsbuch(
             created_at: r.created_at,
             due_date: r.sent_at.map(|s| (s + chrono::Duration::days(7)).date_naive()),
             paid_at: r.paid_at,
-            offene_zahlungen_cents: if paid { Some(0) } else { Some(brutto) },
+            offene_zahlungen_cents: open_amount_cents(paid, Some(brutto), r.paid_amount_cents),
+            is_settled: paid,
+            paid_amount_cents: r.paid_amount_cents,
             payment_method: r.payment_method,
-            notes: None,
+            notes: r.notes,
             invoice_type: "lagerung".to_string(),
             partial_percent: None,
             status: r.status.clone(),
@@ -2053,9 +2077,46 @@ async fn rechnungsausgangsbuch(
         });
     }
 
-    items.sort_by_key(|it| it.sent_at.unwrap_or(it.created_at));
+    // Number order, not date order. The register is a running ledger read as a number
+    // sequence; invoice dates are not monotonic (2026-25 is dated 29.05., 2026-26
+    // 13.03.), so sorting by date scrambles the very sequence the book exists to show.
+    items.sort_by(|a, b| {
+        invoice_number::sort_key(&a.invoice_number).cmp(&invoice_number::sort_key(&b.invoice_number))
+    });
 
     Ok(Json(items))
+}
+
+/// How much of an invoice is still outstanding, in cents.
+///
+/// Three states, in order of authority:
+/// - settled → nothing open, whatever else the row says.
+/// - a recorded Teilzahlung → the remainder (never negative: an overpayment shows as 0,
+///   and Alex settles it with a Gutschrift row, which is how 2026-12 was handled).
+/// - otherwise → the full Brutto.
+///
+/// `None` in, `None` out: a row whose Brutto we cannot compute must not claim 0,00 € open.
+fn open_amount_cents(
+    settled: bool,
+    brutto_cents: Option<i64>,
+    paid_amount_cents: Option<i64>,
+) -> Option<i64> {
+    if settled {
+        return Some(0);
+    }
+    let brutto = brutto_cents?;
+    match paid_amount_cents {
+        Some(paid) => Some((brutto - paid).max(0)),
+        None => Some(brutto),
+    }
+}
+
+/// Last calendar day of `(year, month)` — the end of a storage invoice's billed period.
+///
+/// Computed as "first of the next month, minus one day" so it needs no leap-year table.
+fn last_day_of_month(year: i32, month: u32) -> Option<NaiveDate> {
+    let (next_year, next_month) = if month == 12 { (year + 1, 1) } else { (year, month + 1) };
+    NaiveDate::from_ymd_opt(next_year, next_month, 1).map(|d| d.pred_opt().unwrap_or(d))
 }
 
 // ---------------------------------------------------------------------------
@@ -2199,6 +2260,144 @@ async fn update_payment_method(
         invoice_repo::update_payment_method(&state.db, id, payment_method).await?;
     }
     Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateNotesRequest {
+    /// The Bemerkung. Empty/whitespace clears it.
+    notes: Option<String>,
+}
+
+/// `PATCH /api/v1/admin/rechnungsausgangsbuch/{id}/notes` — Set a row's Bemerkung.
+///
+/// **Caller**: Admin Rechnungsausgangsbuch — the Bemerkungen cell.
+/// **Why**: Bemerkungen is the column Alex actually works in — "19.08.26 erinnert per
+/// mail", "verrechnung mit RG 12 … 1432,-", "doppelt überwiesen verrechnet". The
+/// register rendered it read-only, so the page was a report rather than a ledger.
+///
+/// Accepts an id from either register table (core invoice or storage invoice).
+async fn update_register_notes(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<TokenClaims>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<UpdateNotesRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&claims)?;
+    let notes = body.notes.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    // Storage first, then core invoices — the two tables share one id space in the
+    // register and only one of them can match.
+    if storage_repo::set_invoice_notes(&state.db, id, notes).await? == 0
+        && invoice_repo::update_notes(&state.db, id, notes).await? == 0
+    {
+        return Err(ApiError::NotFound(format!("Rechnung {id} nicht gefunden")));
+    }
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdatePaidAmountRequest {
+    /// Amount received so far, in cents. `null` clears the Teilzahlung.
+    paid_amount_cents: Option<i64>,
+}
+
+/// `PATCH /api/v1/admin/rechnungsausgangsbuch/{id}/paid-amount` — Record a Teilzahlung.
+///
+/// **Caller**: Admin Rechnungsausgangsbuch — the Offen cell.
+/// **Why**: A customer paying 1.300 € of a 1.372,49 € invoice (Alex's row 2026-23) was
+/// untrackable: the register knew only paid or open, so the remainder lived in the
+/// Bemerkung as free text and never reached the totals.
+///
+/// Deliberately does **not** stamp `paid_at`: a part-paid invoice is still an open
+/// receivable and must stay in the register's Offen column and in the dunning list.
+/// Booking it as settled is [`mark_register_invoice_paid`]'s job.
+///
+/// # Errors
+/// - 400 if the amount is negative
+/// - 404 if the id is in neither register table
+async fn update_register_paid_amount(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<TokenClaims>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<UpdatePaidAmountRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&claims)?;
+    if body.paid_amount_cents.is_some_and(|c| c < 0) {
+        return Err(ApiError::BadRequest(
+            "Teilzahlung darf nicht negativ sein".into(),
+        ));
+    }
+    let amount = body.paid_amount_cents;
+    if storage_repo::set_invoice_paid_amount(&state.db, id, amount).await? == 0
+        && invoice_repo::update_paid_amount(&state.db, id, amount).await? == 0
+    {
+        return Err(ApiError::NotFound(format!("Rechnung {id} nicht gefunden")));
+    }
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+#[derive(Debug, Deserialize)]
+struct RegisterExportQuery {
+    /// Calendar year to export. Defaults to the current one.
+    year: Option<i32>,
+}
+
+/// `GET /api/v1/admin/rechnungsausgangsbuch/export?year=2026` — Download one year as XLSX.
+///
+/// **Caller**: Admin Rechnungsausgangsbuch — the "Als Excel exportieren" button.
+/// **Why**: The register is what Alex hands to the Steuerberater, who has always
+/// received an .xlsx. Without an export the app could not replace the spreadsheet.
+///
+/// The sheet mirrors his own column order exactly, so the file he sends on looks like
+/// the file he used to send.
+async fn export_rechnungsausgangsbuch(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<TokenClaims>,
+    Query(q): Query<RegisterExportQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    use axum::http::header;
+    require_admin(&claims)?;
+
+    let year = q.year.unwrap_or_else(|| Utc::now().date_naive().year());
+    let Json(items) = rechnungsausgangsbuch(State(state), Extension(claims)).await?;
+
+    let rows: Vec<register_export::ExportRow> = items
+        .iter()
+        .filter(|it| {
+            invoice_number::register_year(
+                &it.invoice_number,
+                it.sent_at.unwrap_or(it.created_at).date_naive().year(),
+            ) == year
+        })
+        .map(|it| register_export::ExportRow {
+            invoice_number: it.invoice_number.clone(),
+            service_period: register_export::format_service_period(it.scheduled_date, it.end_date),
+            customer: it.customer_name.clone().unwrap_or_default(),
+            netto_cents: it.netto_cents,
+            mwst_cents: it.mwst_cents,
+            brutto_cents: it.brutto_cents,
+            sent_at: it.sent_at.map(register_export::berlin_date),
+            due_date: it.due_date,
+            paid_at: it.paid_at.map(register_export::berlin_date),
+            offen_cents: it.offene_zahlungen_cents,
+            payment_method: it.payment_method.clone().unwrap_or_default(),
+            notes: it.notes.clone().unwrap_or_default(),
+        })
+        .collect();
+
+    let bytes = register_export::build_xlsx(year, &rows)?;
+    let filename = format!("Rechnungsausgangsbuch_{year}.xlsx");
+
+    Response::builder()
+        .header(
+            header::CONTENT_TYPE,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{filename}\""),
+        )
+        .body(axum::body::Body::from(bytes))
+        .map_err(|e| ApiError::Internal(format!("Antwort konnte nicht gebaut werden: {e}")))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2440,7 +2639,7 @@ mod tests {
         let issued_offer_number = offer_repo::next_offer_number(&pool, today)
             .await
             .expect("issue offer number");
-        let issued_invoice_numbers = invoice_repo::next_invoice_numbers(&pool, 1)
+        let issued_invoice_numbers = invoice_repo::next_invoice_numbers(&pool, 1, today.year())
             .await
             .expect("issue invoice number");
 
@@ -2629,6 +2828,367 @@ mod tests {
         assert_eq!(
             body["review_prompt"], false,
             "the review question was already answered — don't ask again"
+        );
+    }
+
+    // ── Register parity with Alex's Excel book ──────────────────────────────
+
+    /// Seeds a sent invoice on its own inquiry and returns its id.
+    #[cfg(test)]
+    async fn seed_register_invoice(pool: &sqlx::PgPool, number: &str) -> uuid::Uuid {
+        use crate::test_helpers::{insert_test_customer, insert_test_quote_with_status};
+
+        let customer_id = insert_test_customer(pool).await;
+        let inquiry_id = insert_test_quote_with_status(pool, "invoiced").await;
+        sqlx::query("UPDATE inquiries SET customer_id = $1 WHERE id = $2")
+            .bind(customer_id)
+            .bind(inquiry_id)
+            .execute(pool)
+            .await
+            .expect("link customer");
+
+        let invoice_id = uuid::Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO invoices (id, inquiry_id, invoice_number, invoice_type, status,
+                extra_services, base_netto_cents, sent_at)
+             VALUES ($1, $2, $3, 'full', 'sent', '[]', 100000, NOW())",
+        )
+        .bind(invoice_id)
+        .bind(inquiry_id)
+        .bind(number)
+        .execute(pool)
+        .await
+        .expect("insert invoice");
+        invoice_id
+    }
+
+    /// Fetches the register and returns the row for one invoice number.
+    #[cfg(test)]
+    async fn register_row(
+        state: std::sync::Arc<AppState>,
+        token: &str,
+        number: &str,
+    ) -> serde_json::Value {
+        use axum::body::Body;
+        use hyper::Request;
+        use tower::ServiceExt;
+
+        let resp = crate::create_router((*state).clone())
+            .oneshot(
+                Request::get("/api/v1/admin/rechnungsausgangsbuch")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "register must load");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let items: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        items
+            .into_iter()
+            .find(|it| it["invoice_number"] == number)
+            .unwrap_or_else(|| panic!("invoice {number} missing from the register"))
+    }
+
+    /// Bemerkungen is the column Alex works in; it was rendered read-only, which made
+    /// the page a report rather than a ledger. The endpoint must reach a core invoice
+    /// even though it tries the storage table first.
+    #[tokio::test]
+    async fn register_notes_can_be_written_and_cleared() {
+        use crate::test_helpers::{generate_test_jwt, test_app_state};
+        use axum::body::Body;
+        use hyper::Request;
+        use tower::ServiceExt;
+
+        let state = std::sync::Arc::new(test_app_state().await);
+        let token = generate_test_jwt();
+        let number = format!("2026-{}", uuid::Uuid::new_v4().simple());
+        let invoice_id = seed_register_invoice(&state.db, &number).await;
+
+        let patch = |body: serde_json::Value| {
+            let state = state.clone();
+            let token = token.clone();
+            async move {
+                crate::create_router((*state).clone())
+                    .oneshot(
+                        Request::builder()
+                            .method("PATCH")
+                            .uri(format!("/api/v1/admin/rechnungsausgangsbuch/{invoice_id}/notes"))
+                            .header("Authorization", format!("Bearer {token}"))
+                            .header("Content-Type", "application/json")
+                            .body(Body::from(serde_json::to_string(&body).unwrap()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let resp = patch(serde_json::json!({ "notes": "19.08.26 erinnert per mail" })).await;
+        assert_eq!(resp.status(), 200);
+        let row = register_row(state.clone(), &token, &number).await;
+        assert_eq!(row["notes"], "19.08.26 erinnert per mail");
+
+        // Whitespace-only clears the cell rather than storing a blank string.
+        let resp = patch(serde_json::json!({ "notes": "   " })).await;
+        assert_eq!(resp.status(), 200);
+        let row = register_row(state.clone(), &token, &number).await;
+        assert!(row["notes"].is_null(), "blank input must clear the Bemerkung");
+    }
+
+    /// An id in neither register table must 404 rather than silently succeeding — the
+    /// endpoint tries two tables and a miss on both is a real error.
+    #[tokio::test]
+    async fn register_notes_on_an_unknown_id_is_not_found() {
+        use crate::test_helpers::{generate_test_jwt, test_app_state};
+        use axum::body::Body;
+        use hyper::Request;
+        use tower::ServiceExt;
+
+        let state = test_app_state().await;
+        let token = generate_test_jwt();
+        let unknown = uuid::Uuid::now_v7();
+
+        let resp = crate::create_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/v1/admin/rechnungsausgangsbuch/{unknown}/notes"))
+                    .header("Authorization", format!("Bearer {token}"))
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"notes":"x"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+    }
+
+    /// Alex's 2026-23: 1.372,49 € invoiced, 1.300,00 € received. Recording the part
+    /// payment must leave only the remainder open and must NOT settle the invoice —
+    /// it is still a receivable and belongs in the dunning list.
+    #[tokio::test]
+    async fn a_teilzahlung_leaves_only_the_remainder_open() {
+        use crate::test_helpers::{generate_test_jwt, test_app_state};
+        use axum::body::Body;
+        use hyper::Request;
+        use tower::ServiceExt;
+
+        let state = std::sync::Arc::new(test_app_state().await);
+        let token = generate_test_jwt();
+        let number = format!("2026-{}", uuid::Uuid::new_v4().simple());
+        let invoice_id = seed_register_invoice(&state.db, &number).await;
+
+        // Netto 1000,00 € ⇒ Brutto 1190,00 €. Alex receives 1000,00 €.
+        let before = register_row(state.clone(), &token, &number).await;
+        assert_eq!(before["brutto_cents"], 119_000);
+        assert_eq!(before["offene_zahlungen_cents"], 119_000);
+
+        let resp = crate::create_router((*state).clone())
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!(
+                        "/api/v1/admin/rechnungsausgangsbuch/{invoice_id}/paid-amount"
+                    ))
+                    .header("Authorization", format!("Bearer {token}"))
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"paid_amount_cents":100000}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let row = register_row(state.clone(), &token, &number).await;
+        assert_eq!(row["paid_amount_cents"], 100_000);
+        assert_eq!(row["offene_zahlungen_cents"], 19_000, "only the remainder stays open");
+        assert!(row["paid_at"].is_null(), "a part payment must not settle the invoice");
+    }
+
+    /// An overpayment reads as nothing outstanding, never as a negative amount — Alex
+    /// settles those with a Gutschrift row (his 2026-12, "doppelt überwiesen verrechnet").
+    #[tokio::test]
+    async fn an_overpayment_reads_as_zero_open_not_negative() {
+        use crate::test_helpers::{generate_test_jwt, test_app_state};
+        use axum::body::Body;
+        use hyper::Request;
+        use tower::ServiceExt;
+
+        let state = std::sync::Arc::new(test_app_state().await);
+        let token = generate_test_jwt();
+        let number = format!("2026-{}", uuid::Uuid::new_v4().simple());
+        let invoice_id = seed_register_invoice(&state.db, &number).await;
+
+        let resp = crate::create_router((*state).clone())
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!(
+                        "/api/v1/admin/rechnungsausgangsbuch/{invoice_id}/paid-amount"
+                    ))
+                    .header("Authorization", format!("Bearer {token}"))
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"paid_amount_cents":200000}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let row = register_row(state.clone(), &token, &number).await;
+        assert_eq!(row["offene_zahlungen_cents"], 0);
+    }
+
+    /// A negative Teilzahlung is a typo, not a Gutschrift — reject it rather than
+    /// inflating the year's open total.
+    #[tokio::test]
+    async fn a_negative_teilzahlung_is_rejected() {
+        use crate::test_helpers::{generate_test_jwt, test_app_state};
+        use axum::body::Body;
+        use hyper::Request;
+        use tower::ServiceExt;
+
+        let state = test_app_state().await;
+        let number = format!("2026-{}", uuid::Uuid::new_v4().simple());
+        let invoice_id = seed_register_invoice(&state.db, &number).await;
+        let token = generate_test_jwt();
+
+        let resp = crate::create_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!(
+                        "/api/v1/admin/rechnungsausgangsbuch/{invoice_id}/paid-amount"
+                    ))
+                    .header("Authorization", format!("Bearer {token}"))
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"paid_amount_cents":-100}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+    }
+
+    /// The register must come back in invoice-number order. Sorting by date scrambles
+    /// the sequence, because Alex's dates are not monotonic — his 2026-25 is dated
+    /// 29.05. and his 2026-26 13.03.
+    #[tokio::test]
+    async fn the_register_is_ordered_by_invoice_number_not_by_date() {
+        use crate::test_helpers::{generate_test_jwt, test_app_state};
+        use axum::body::Body;
+        use hyper::Request;
+        use tower::ServiceExt;
+
+        let state = test_app_state().await;
+        let pool = state.db.clone();
+        let token = generate_test_jwt();
+
+        // A year of its own, so parallel test data can't interleave into it.
+        let year = 2040 + (chrono::Utc::now().timestamp() % 50) as i32;
+        let later_number = format!("{year}-26");
+        let earlier_number = format!("{year}-25");
+
+        // The higher number is issued EARLIER in the calendar — the exact shape that
+        // used to reverse these two rows.
+        let later = seed_register_invoice(&pool, &later_number).await;
+        let earlier = seed_register_invoice(&pool, &earlier_number).await;
+        sqlx::query("UPDATE invoices SET sent_at = $2 WHERE id = $1")
+            .bind(later)
+            .bind(Utc::now() - chrono::Duration::days(60))
+            .execute(&pool)
+            .await
+            .expect("backdate 26");
+        sqlx::query("UPDATE invoices SET sent_at = $2 WHERE id = $1")
+            .bind(earlier)
+            .bind(Utc::now())
+            .execute(&pool)
+            .await
+            .expect("date 25");
+
+        let resp = crate::create_router(state)
+            .oneshot(
+                Request::get("/api/v1/admin/rechnungsausgangsbuch")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let items: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        let numbers: Vec<&str> = items
+            .iter()
+            .filter_map(|it| it["invoice_number"].as_str())
+            .filter(|n| n.starts_with(&format!("{year}-")))
+            .collect();
+
+        assert_eq!(
+            numbers,
+            vec![earlier_number.as_str(), later_number.as_str()],
+            "the register must read as a number sequence, not a date sequence"
+        );
+    }
+
+    /// The export is what Alex hands to the Steuerberater; it must be a real, openable
+    /// workbook scoped to one year, not the whole register.
+    #[tokio::test]
+    async fn exporting_a_year_produces_an_xlsx_with_only_that_year() {
+        use crate::test_helpers::{generate_test_jwt, test_app_state};
+        use axum::body::Body;
+        use hyper::Request;
+        use std::io::Read;
+        use tower::ServiceExt;
+
+        let state = test_app_state().await;
+        let pool = state.db.clone();
+        let token = generate_test_jwt();
+
+        let year = 2050 + (chrono::Utc::now().timestamp() % 40) as i32;
+        let in_year = format!("{year}-07");
+        let other_year = format!("{}-07", year + 1);
+        seed_register_invoice(&pool, &in_year).await;
+        seed_register_invoice(&pool, &other_year).await;
+
+        let resp = crate::create_router(state)
+            .oneshot(
+                Request::get(format!(
+                    "/api/v1/admin/rechnungsausgangsbuch/export?year={year}"
+                ))
+                .header("Authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers()[axum::http::header::CONTENT_TYPE],
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        );
+        assert!(
+            resp.headers()[axum::http::header::CONTENT_DISPOSITION]
+                .to_str()
+                .unwrap()
+                .contains(&format!("Rechnungsausgangsbuch_{year}.xlsx")),
+            "the download must be named after the year"
+        );
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes.to_vec()))
+            .expect("the export must be a readable workbook");
+        let mut sheet = String::new();
+        zip.by_name("xl/worksheets/sheet1.xml")
+            .expect("sheet part")
+            .read_to_string(&mut sheet)
+            .expect("read sheet");
+
+        assert!(sheet.contains(&in_year), "the year's own invoice must be in the sheet");
+        assert!(
+            !sheet.contains(&other_year),
+            "the export must be scoped to one year — the next year's invoice leaked in"
         );
     }
 }
