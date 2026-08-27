@@ -224,7 +224,7 @@ impl OfferService for OfferServiceImpl {
         sqlx::query(
             r#"
             UPDATE offers SET status = 'accepted', updated_at = NOW()
-            WHERE inquiry_id = $1 AND status NOT IN ('rejected', 'cancelled')
+            WHERE inquiry_id = $1 AND status NOT IN ('rejected', 'cancelled', 'superseded')
             "#,
         )
         .bind(inquiry_id)
@@ -276,7 +276,7 @@ impl OfferService for OfferServiceImpl {
         sqlx::query(
             r#"
             UPDATE offers SET status = 'rejected', updated_at = NOW()
-            WHERE inquiry_id = $1 AND status NOT IN ('rejected', 'cancelled')
+            WHERE inquiry_id = $1 AND status NOT IN ('rejected', 'cancelled', 'superseded')
             "#,
         )
         .bind(inquiry_id)

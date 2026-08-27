@@ -1,7 +1,7 @@
 //! Offer repository — centralised queries for the `offers` table.
 
 use chrono::{DateTime, NaiveDate, Utc};
-use sqlx::{FromRow, PgPool};
+use sqlx::{FromRow, PgExecutor, PgPool};
 use uuid::Uuid;
 
 use crate::ApiError;
@@ -31,7 +31,7 @@ pub(crate) async fn fetch_active_id_for_inquiry(
     inquiry_id: Uuid,
 ) -> Result<Option<Uuid>, sqlx::Error> {
     let row: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT id FROM offers WHERE inquiry_id = $1 AND status NOT IN ('rejected', 'cancelled') ORDER BY created_at DESC LIMIT 1",
+        "SELECT id FROM offers WHERE inquiry_id = $1 AND status NOT IN ('rejected', 'cancelled', 'superseded') ORDER BY created_at DESC LIMIT 1",
     )
     .bind(inquiry_id)
     .fetch_optional(pool)
@@ -273,9 +273,14 @@ pub(crate) struct OfferFullRow {
 ///
 /// **Caller**: `offers::build_offer_with_overrides` (regenerate path)
 /// **Why**: Regenerating an offer updates the price, PDF key, and pricing parameters.
+///
+/// `offer_number` is normally `None` — the KVA keeps the number it was issued under.
+/// It is only `Some` when the regenerate path adopts an offer row that appeared while
+/// this request was rendering its PDF: that PDF already carries the new number, so the
+/// row has to follow it or the document and the KVA-Buch would disagree.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn update_returning(
-    pool: &PgPool,
+    executor: impl PgExecutor<'_>,
     offer_id: Uuid,
     price_cents: i64,
     pdf_storage_key: Option<&str>,
@@ -285,6 +290,7 @@ pub(crate) async fn update_returning(
     rate_per_hour_cents: i64,
     line_items_json: &Option<serde_json::Value>,
     fahrt_override_cents: Option<i32>,
+    offer_number: Option<&str>,
 ) -> Result<OfferFullRow, sqlx::Error> {
     sqlx::query_as(
         r#"
@@ -292,8 +298,9 @@ pub(crate) async fn update_returning(
         SET price_cents = $1, pdf_storage_key = $2, status = $3,
             persons = $4, hours_estimated = $5, rate_per_hour_cents = $6,
             line_items_json = $7,
-            fahrt_override_cents = $8
-        WHERE id = $9
+            fahrt_override_cents = $8,
+            offer_number = COALESCE($9, offer_number)
+        WHERE id = $10
         RETURNING id, inquiry_id, price_cents, currency, valid_until, pdf_storage_key, status,
                   created_at, sent_at, offer_number, persons, hours_estimated,
                   rate_per_hour_cents, line_items_json
@@ -307,8 +314,9 @@ pub(crate) async fn update_returning(
     .bind(rate_per_hour_cents)
     .bind(line_items_json)
     .bind(fahrt_override_cents)
+    .bind(offer_number)
     .bind(offer_id)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
 }
 
@@ -318,7 +326,7 @@ pub(crate) async fn update_returning(
 /// **Why**: Creates the offer record with pricing, PDF key, and all line item data.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn insert_returning(
-    pool: &PgPool,
+    executor: impl PgExecutor<'_>,
     id: Uuid,
     inquiry_id: Uuid,
     price_cents: i64,
@@ -358,7 +366,7 @@ pub(crate) async fn insert_returning(
     .bind(rate_per_hour_cents)
     .bind(line_items_json)
     .bind(fahrt_override_cents)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
 }
 
@@ -416,7 +424,7 @@ pub(crate) async fn fetch_active_for_builder(
                rate_per_hour_cents, line_items_json, pdf_storage_key, valid_until,
                created_at
         FROM offers
-        WHERE inquiry_id = $1 AND status NOT IN ('rejected', 'cancelled')
+        WHERE inquiry_id = $1 AND status NOT IN ('rejected', 'cancelled', 'superseded')
         ORDER BY created_at DESC LIMIT 1
         "#,
     )
@@ -730,6 +738,52 @@ mod kva_buch_tests {
             Some(billing),
             "the KVA builder must see the Rechnungsadresse, not fall back to origin"
         );
+    }
+
+    /// Regenerating a KVA reuses the *active* offer. A `superseded` row is newer than the
+    /// draft that replaced it in `created_at` terms whenever the draft was updated in place,
+    /// so picking it would UPDATE it back to `draft` and collide with the live draft on
+    /// `offers_inquiry_active_unique` (prod 500 on 2026-08-27).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn active_offer_lookup_skips_superseded_rows(pool: PgPool) {
+        let inquiry_id = seed_inquiry(&pool, "offer_ready").await;
+        let active = test_helpers::insert_test_offer(&pool, inquiry_id, "draft").await;
+        let superseded = test_helpers::insert_test_offer(&pool, inquiry_id, "superseded").await;
+        assert!(superseded > active, "the superseded row must be the newer one");
+
+        assert_eq!(
+            fetch_active_id_for_inquiry(&pool, inquiry_id).await.unwrap(),
+            Some(active)
+        );
+    }
+
+    /// A regeneration keeps the KVA number it was issued under; only the concurrent-write
+    /// takeover in `build_offer_with_overrides` passes a number, because its PDF already
+    /// carries a different one.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn update_keeps_the_offer_number_unless_one_is_passed(pool: PgPool) {
+        let inquiry_id = seed_inquiry(&pool, "offer_ready").await;
+        let offer_id = test_helpers::insert_test_offer(&pool, inquiry_id, "draft").await;
+        sqlx::query("UPDATE offers SET offer_number = '2026-9001' WHERE id = $1")
+            .bind(offer_id)
+            .execute(&pool)
+            .await
+            .expect("set offer number");
+
+        let kept = update_returning(
+            &pool, offer_id, 60000, Some("neu.pdf"), "draft", 3, 5.0, 3500, &None, None, None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(kept.offer_number.as_deref(), Some("2026-9001"));
+
+        let adopted = update_returning(
+            &pool, offer_id, 60000, Some("neu.pdf"), "draft", 3, 5.0, 3500, &None, None,
+            Some("2026-9002"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(adopted.offer_number.as_deref(), Some("2026-9002"));
     }
 
     /// The register links each row to its own document, including non-active offers.

@@ -583,45 +583,69 @@ pub(crate) async fn build_offer_with_overrides(
         offer_repo::update_returning(
             db, offer_id, actual_netto_cents, Some(&s3_key), OfferStatus::Draft.as_str(),
             pricing_result.estimated_helpers as i32, pricing_result.estimated_hours,
-            rate_cents, &line_items_json, fahrt_override_cents,
+            rate_cents, &line_items_json, fahrt_override_cents, None,
         )
         .await
         .map_err(ApiError::Database)?
     } else {
-        // B7: Before inserting a new offer, supersede any existing active offer for this
-        // inquiry. This prevents `offers_inquiry_active_unique` constraint violations when
-        // `commit_offer_draft` is called multiple times (e.g. from the RecomputeOffer tool).
-        // The 'superseded' status is excluded from the unique partial index (migration
-        // 20260609000026), so the subsequent INSERT will succeed cleanly.
-        let supersede_result = sqlx::query(
+        // A KVA is replaced in place, so there is exactly one active offer row per inquiry
+        // (enforced by `offers_inquiry_active_unique`). Reaching this branch means no active
+        // offer existed when the request started — but rendering the PDF above takes seconds,
+        // and a second "Angebot erstellen" click in that window would insert its own row and
+        // leave the inquiry with two KVAs (prod, 2026-08-27). Serialise the persist step per
+        // inquiry and re-check under the lock so the later request updates the row the earlier
+        // one created instead of adding a second one.
+        let mut tx = db.begin().await.map_err(ApiError::Database)?;
+
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))")
+            .bind(inquiry_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(ApiError::Database)?;
+
+        let concurrent_active: Option<(Uuid,)> = sqlx::query_as(
             r#"
-            UPDATE offers
-               SET status = 'superseded', updated_at = NOW()
+            SELECT id FROM offers
              WHERE inquiry_id = $1
                AND status NOT IN ('rejected', 'cancelled', 'superseded')
+             ORDER BY created_at DESC
+             LIMIT 1
             "#,
         )
         .bind(inquiry_id)
-        .execute(db)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(ApiError::Database)?;
 
-        if supersede_result.rows_affected() > 0 {
-            tracing::info!(
+        let row = if let Some((concurrent_id,)) = concurrent_active {
+            // Only a row created during this very request can show up here, so it is an
+            // unsent draft — adopt it, carrying over the number this PDF was rendered with.
+            tracing::warn!(
                 inquiry_id = %inquiry_id,
-                "Superseded {} existing active offer(s) before inserting new draft",
-                supersede_result.rows_affected()
+                offer_id = %concurrent_id,
+                "Concurrent offer generation detected; updating the existing draft in place"
             );
-        }
+            offer_repo::update_returning(
+                &mut *tx, concurrent_id, actual_netto_cents, Some(&s3_key),
+                OfferStatus::Draft.as_str(), pricing_result.estimated_helpers as i32,
+                pricing_result.estimated_hours, rate_cents, &line_items_json,
+                fahrt_override_cents, Some(&offer_number),
+            )
+            .await
+            .map_err(ApiError::Database)?
+        } else {
+            offer_repo::insert_returning(
+                &mut *tx, offer_id, inquiry_id, actual_netto_cents, "EUR", valid_until_date,
+                Some(&s3_key), OfferStatus::Draft.as_str(), now, &offer_number,
+                pricing_result.estimated_helpers as i32, pricing_result.estimated_hours,
+                rate_cents, &line_items_json, fahrt_override_cents,
+            )
+            .await
+            .map_err(ApiError::Database)?
+        };
 
-        offer_repo::insert_returning(
-            db, offer_id, inquiry_id, actual_netto_cents, "EUR", valid_until_date,
-            Some(&s3_key), OfferStatus::Draft.as_str(), now, &offer_number,
-            pricing_result.estimated_helpers as i32, pricing_result.estimated_hours,
-            rate_cents, &line_items_json, fahrt_override_cents,
-        )
-        .await
-        .map_err(ApiError::Database)?
+        tx.commit().await.map_err(ApiError::Database)?;
+        row
     };
 
     // Map repo row to Offer domain model

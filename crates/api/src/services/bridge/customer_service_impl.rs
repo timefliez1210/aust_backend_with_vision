@@ -234,11 +234,11 @@ impl CustomerService for CustomerServiceImpl {
                 i.status,
                 EXISTS (
                     SELECT 1 FROM offers
-                    WHERE inquiry_id = i.id AND status NOT IN ('rejected', 'cancelled')
+                    WHERE inquiry_id = i.id AND status NOT IN ('rejected', 'cancelled', 'superseded')
                 ) AS has_offer,
                 (
                     SELECT o2.status FROM offers o2
-                    WHERE o2.inquiry_id = i.id AND o2.status NOT IN ('rejected', 'cancelled')
+                    WHERE o2.inquiry_id = i.id AND o2.status NOT IN ('rejected', 'cancelled', 'superseded')
                     ORDER BY o2.created_at DESC LIMIT 1
                 ) AS offer_status,
                 i.created_at

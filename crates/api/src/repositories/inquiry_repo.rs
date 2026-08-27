@@ -928,11 +928,11 @@ pub(crate) async fn list_items(
             i.status,
             EXISTS (
                 SELECT 1 FROM offers
-                WHERE inquiry_id = i.id AND status NOT IN ('rejected', 'cancelled')
+                WHERE inquiry_id = i.id AND status NOT IN ('rejected', 'cancelled', 'superseded')
             ) AS has_offer,
             (
                 SELECT o2.status FROM offers o2
-                WHERE o2.inquiry_id = i.id AND o2.status NOT IN ('rejected', 'cancelled')
+                WHERE o2.inquiry_id = i.id AND o2.status NOT IN ('rejected', 'cancelled', 'superseded')
                 ORDER BY o2.created_at DESC LIMIT 1
             ) AS offer_status,
             i.created_at
@@ -944,9 +944,9 @@ pub(crate) async fn list_items(
           AND ($2::text IS NULL OR c.name ILIKE $2 OR c.email ILIKE $2)
           AND ($3::bool IS NULL OR
                (CASE WHEN $3 THEN EXISTS (
-                   SELECT 1 FROM offers WHERE inquiry_id = i.id AND status NOT IN ('rejected', 'cancelled')
+                   SELECT 1 FROM offers WHERE inquiry_id = i.id AND status NOT IN ('rejected', 'cancelled', 'superseded')
                ) ELSE NOT EXISTS (
-                   SELECT 1 FROM offers WHERE inquiry_id = i.id AND status NOT IN ('rejected', 'cancelled')
+                   SELECT 1 FROM offers WHERE inquiry_id = i.id AND status NOT IN ('rejected', 'cancelled', 'superseded')
                ) END))
         ORDER BY i.created_at DESC
         LIMIT $4 OFFSET $5
@@ -980,9 +980,9 @@ pub(crate) async fn count_items(
           AND ($2::text IS NULL OR c.name ILIKE $2 OR c.email ILIKE $2)
           AND ($3::bool IS NULL OR
                (CASE WHEN $3 THEN EXISTS (
-                   SELECT 1 FROM offers WHERE inquiry_id = i.id AND status NOT IN ('rejected', 'cancelled')
+                   SELECT 1 FROM offers WHERE inquiry_id = i.id AND status NOT IN ('rejected', 'cancelled', 'superseded')
                ) ELSE NOT EXISTS (
-                   SELECT 1 FROM offers WHERE inquiry_id = i.id AND status NOT IN ('rejected', 'cancelled')
+                   SELECT 1 FROM offers WHERE inquiry_id = i.id AND status NOT IN ('rejected', 'cancelled', 'superseded')
                ) END))
         "#,
     )

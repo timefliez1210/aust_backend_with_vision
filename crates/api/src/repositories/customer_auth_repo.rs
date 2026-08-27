@@ -293,7 +293,7 @@ pub(crate) async fn fetch_active_offer_with_status(
         r#"
         SELECT id, status
         FROM offers
-        WHERE inquiry_id = $1 AND status NOT IN ('rejected', 'cancelled')
+        WHERE inquiry_id = $1 AND status NOT IN ('rejected', 'cancelled', 'superseded')
         ORDER BY created_at DESC
         LIMIT 1
         "#,
