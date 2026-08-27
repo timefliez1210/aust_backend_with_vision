@@ -16,7 +16,7 @@ use aust_core::models::TokenClaims;
 use aust_offer_generator::{convert_xlsx_to_pdf, generate_timesheet_xlsx, TimesheetData, TimesheetEntry};
 use crate::repositories::{admin_repo, employee_repo, feedback_repo, review_repo, invoice_reminder_repo, invoice_repo, offer_repo, settings_repo, storage_repo};
 use crate::repositories::settings_repo::PricingSettings;
-use crate::services::{billing_reminder_service, invoice_number, register_export};
+use crate::services::{billing_reminder_service, invoice_number, kva_export, register_export};
 use aust_flash_contact;
 use crate::{ApiError, AppState};
 
@@ -106,6 +106,9 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/rechnungsausgangsbuch/export", get(export_rechnungsausgangsbuch))
         .route("/kva-buch", get(kva_buch))
         .route("/kva-buch/{id}/pdf", get(kva_buch_pdf))
+        .route("/kva-buch/{id}/followup-mute", patch(set_kva_followup_mute))
+        .route("/kva-buch/followup-days", put(set_kva_followup_days))
+        .route("/kva-buch/export", get(export_kva_buch))
         .route("/flash-contacts", get(list_flash_contacts))
         .route("/flash-contacts/{id}/handle", post(handle_flash_contact))
         .route("/settings", get(get_settings))
@@ -1985,6 +1988,9 @@ struct RechnungsausgangItem {
     status: String,
     /// TRUE when the invoice total is negative overall — a Gutschrift.
     is_gutschrift: bool,
+    /// TRUE for a row imported from the historical Rechnungsausgangsbuch. It has no
+    /// PDF to open and no job to click through to; the page marks it as Bestand.
+    is_legacy: bool,
     /// Present when a PDF has been rendered; the register links to it.
     pdf_s3_key: Option<String>,
 }
@@ -2038,7 +2044,7 @@ async fn rechnungsausgangsbuch(
             RechnungsausgangItem {
                 id: r.id,
                 kind: "umzug",
-                inquiry_id: Some(r.inquiry_id),
+                inquiry_id: r.inquiry_id,
                 invoice_number: r.invoice_number,
                 customer_name: r.customer_name,
                 scheduled_date: r.scheduled_date,
@@ -2059,6 +2065,7 @@ async fn rechnungsausgangsbuch(
                 partial_percent: r.partial_percent,
                 status: r.status,
                 is_gutschrift: brutto_cents.is_some_and(|b| b < 0),
+                is_legacy: r.is_legacy,
                 pdf_s3_key: r.pdf_s3_key,
             }
         })
@@ -2097,6 +2104,7 @@ async fn rechnungsausgangsbuch(
             partial_percent: None,
             status: r.status.clone(),
             is_gutschrift: brutto < 0,
+            is_legacy: false,
             pdf_s3_key: r.pdf_s3_key,
         });
     }
@@ -2169,6 +2177,49 @@ struct KvaBuchItem {
     invoice_number: Option<String>,
     /// Present when a KVA PDF has been rendered.
     pdf_s3_key: Option<String>,
+    /// Derived win/loss state: `gewonnen` | `verloren` | `offen` | `unbekannt`.
+    ///
+    /// Read from `inquiries.status`, never from `offers.status` — the latter is
+    /// not maintained (126 of 133 production rows sit at `draft`), so the raw
+    /// `status` field above is kept only for completeness and is not what the
+    /// register displays.
+    lage: String,
+    /// Days since the KVA was issued.
+    age_days: i64,
+    /// Open, past the follow-up threshold, and the move still lies ahead — the
+    /// exact set the Telegram nag fires on.
+    needs_followup: bool,
+    /// Open and past the threshold, but the move date is missing. Cannot be
+    /// pinged (liveness is unprovable) so the UI lists these separately.
+    followup_date_missing: bool,
+    /// Open but the move date has already passed — effectively dead, and the
+    /// reason the raw "offen" total overstates the live pipeline.
+    move_date_passed: bool,
+    followup_muted: bool,
+    followup_last_pinged_on: Option<NaiveDate>,
+}
+
+/// Inquiry statuses that count as a won job.
+const WON_INQUIRY_STATUSES: &[&str] = &[
+    "accepted", "scheduled", "completed", "invoiced", "paid",
+];
+
+/// Inquiry statuses that count as a lost job.
+const LOST_INQUIRY_STATUSES: &[&str] = &["rejected", "cancelled", "expired"];
+
+/// Map an inquiry status onto the KVA-Buch's win/loss vocabulary.
+///
+/// **Why**: `offers.status` is unmaintained, so every statistic in the register
+/// derives from the inquiry instead. Centralised here so the register, the
+/// Nachfassliste and the export can never disagree.
+fn lage_of(inquiry_status: Option<&str>) -> &'static str {
+    match inquiry_status {
+        Some(s) if WON_INQUIRY_STATUSES.contains(&s) => "gewonnen",
+        Some(s) if LOST_INQUIRY_STATUSES.contains(&s) => "verloren",
+        Some(s) if offer_repo::OPEN_INQUIRY_STATUSES.contains(&s) => "offen",
+        Some(_) => "unbekannt",
+        None => "unbekannt",
+    }
 }
 
 /// `GET /api/v1/admin/kva-buch` — Register of all Kostenvoranschläge.
@@ -2182,6 +2233,10 @@ async fn kva_buch(
     Extension(_claims): Extension<TokenClaims>,
 ) -> Result<Json<Vec<KvaBuchItem>>, ApiError> {
     let rows = offer_repo::list_for_kva_buch(&state.db).await?;
+    let threshold_days = settings_repo::get_kva_followup_days(&state.db).await?;
+    let today = chrono::Utc::now()
+        .with_timezone(&chrono_tz::Europe::Berlin)
+        .date_naive();
 
     let items: Vec<KvaBuchItem> = rows
         .into_iter()
@@ -2190,6 +2245,17 @@ async fn kva_buch(
             // way the KVA PDF derives it, so the register agrees with the document.
             let netto = r.price_cents;
             let brutto = (netto as f64 * 1.19).round() as i64;
+
+            let lage = lage_of(r.inquiry_status.as_deref());
+            let is_open = lage == "offen";
+            // The KVA date is its creation day: `offers.sent_at` is populated on
+            // 7 of 133 production rows and `inquiries.offer_sent_at` on none.
+            let kva_date = r.created_at
+                .with_timezone(&chrono_tz::Europe::Berlin)
+                .date_naive();
+            let age_days = (today - kva_date).num_days();
+            let overdue = age_days > threshold_days;
+
             KvaBuchItem {
                 id: r.id,
                 inquiry_id: r.inquiry_id,
@@ -2205,11 +2271,137 @@ async fn kva_buch(
                 created_at: r.created_at,
                 invoice_number: r.invoice_number,
                 pdf_s3_key: r.pdf_storage_key,
+                lage: lage.to_string(),
+                age_days,
+                needs_followup: is_open
+                    && overdue
+                    && !r.followup_muted
+                    && matches!(r.scheduled_date, Some(d) if d > today),
+                followup_date_missing: is_open && overdue && r.scheduled_date.is_none(),
+                move_date_passed: is_open
+                    && matches!(r.scheduled_date, Some(d) if d <= today),
+                followup_muted: r.followup_muted,
+                followup_last_pinged_on: r.followup_last_pinged_on,
             }
         })
         .collect();
 
     Ok(Json(items))
+}
+
+/// Query for `GET /kva-buch/export`.
+#[derive(Debug, Deserialize)]
+struct KvaExportQuery {
+    year: Option<i32>,
+}
+
+/// `GET /api/v1/admin/kva-buch/export` — the KVA register for one year as XLSX.
+///
+/// **Caller**: The "Excel-Export" button on the KVA-Buch page.
+/// **Why**: Same reason as the Rechnungsausgangsbuch export — Alex and his
+/// Steuerberater work in Excel, and a register he cannot get out of the app is a
+/// register he keeps duplicating in a spreadsheet.
+async fn export_kva_buch(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<TokenClaims>,
+    Query(q): Query<KvaExportQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    use axum::http::header;
+    require_admin(&claims)?;
+
+    let year = q.year.unwrap_or_else(|| Utc::now().date_naive().year());
+    let Json(items) = kva_buch(State(state), Extension(claims)).await?;
+
+    let rows: Vec<kva_export::KvaExportRow> = items
+        .iter()
+        .filter(|it| {
+            register_export::berlin_date(it.sent_at.unwrap_or(it.created_at)).year() == year
+        })
+        .map(|it| kva_export::KvaExportRow {
+            offer_number: it.offer_number.clone().unwrap_or_default(),
+            kva_date: Some(register_export::berlin_date(
+                it.sent_at.unwrap_or(it.created_at),
+            )),
+            customer: it.customer_name.clone().unwrap_or_default(),
+            scheduled_date: it.scheduled_date,
+            netto_cents: it.netto_cents,
+            mwst_cents: it.mwst_cents,
+            brutto_cents: it.brutto_cents,
+            lage: match it.lage.as_str() {
+                "gewonnen" => "Gewonnen",
+                "verloren" => "Verloren",
+                "offen" => "Offen",
+                _ => "Unklar",
+            }
+            .to_string(),
+            age_days: it.age_days,
+            invoice_number: it.invoice_number.clone().unwrap_or_default(),
+        })
+        .collect();
+
+    let bytes = kva_export::build_xlsx(year, &rows)?;
+    let filename = format!("KVA-Buch_{year}.xlsx");
+
+    Response::builder()
+        .header(
+            header::CONTENT_TYPE,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{filename}\""),
+        )
+        .body(axum::body::Body::from(bytes))
+        .map_err(|e| ApiError::Internal(format!("Antwort konnte nicht gebaut werden: {e}")))
+}
+
+/// Body for `PATCH /kva-buch/{id}/followup-mute`.
+#[derive(Deserialize)]
+struct FollowupMuteBody {
+    muted: bool,
+}
+
+/// `PATCH /api/v1/admin/kva-buch/{offer_id}/followup-mute` — silence one KVA's nag.
+///
+/// **Caller**: The mute toggle on a Nachfassliste row.
+/// **Why**: Alex needs to drop a single KVA off the follow-up list (customer already
+/// said no by phone, say) without moving the threshold for everything else.
+async fn set_kva_followup_mute(
+    State(state): State<Arc<AppState>>,
+    Extension(_claims): Extension<TokenClaims>,
+    Path(offer_id): Path<Uuid>,
+    Json(body): Json<FollowupMuteBody>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    let found = offer_repo::set_followup_muted(&state.db, offer_id, body.muted).await?;
+    if !found {
+        return Err(ApiError::NotFound("KVA nicht gefunden".into()));
+    }
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// Body for `PUT /kva-buch/followup-days`.
+#[derive(Deserialize)]
+struct FollowupDaysBody {
+    days: i64,
+}
+
+/// `PUT /api/v1/admin/kva-buch/followup-days` — set the follow-up threshold.
+///
+/// **Caller**: The threshold control above the Nachfassliste.
+/// **Why**: The threshold is a stored setting rather than a live-recomputed median
+/// so the Telegram nag stays deterministic; this is how Alex tunes it.
+async fn set_kva_followup_days(
+    State(state): State<Arc<AppState>>,
+    Extension(_claims): Extension<TokenClaims>,
+    Json(body): Json<FollowupDaysBody>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    if body.days < 1 || body.days > 365 {
+        return Err(ApiError::BadRequest(
+            "Nachfass-Frist muss zwischen 1 und 365 Tagen liegen.".into(),
+        ));
+    }
+    settings_repo::set_kva_followup_days(&state.db, body.days).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 /// `GET /api/v1/admin/kva-buch/{offer_id}/pdf` — Download one specific KVA document.
@@ -2857,6 +3049,24 @@ mod tests {
 
     // ── Register parity with Alex's Excel book ──────────────────────────────
 
+    /// Removes every invoice already booked into a synthetic register year.
+    ///
+    /// **Why**: the two register tests below run against the *shared* test database
+    /// (`test_app_state`, not `#[sqlx::test]`) and pick their year from the wall
+    /// clock — `2040 + timestamp % 50`. That bucket repeats, so a second run inside
+    /// the same window collided with its own leftovers on
+    /// `invoices_invoice_number_key` and the test failed for reasons that had
+    /// nothing to do with the code under test. Clearing the year first makes the
+    /// tests idempotent without giving up the isolated-year trick.
+    #[cfg(test)]
+    async fn clear_register_year(pool: &sqlx::PgPool, year: i32) {
+        sqlx::query("DELETE FROM invoices WHERE invoice_number LIKE $1")
+            .bind(format!("{year}-%"))
+            .execute(pool)
+            .await
+            .expect("clear register year");
+    }
+
     /// Seeds a sent invoice on its own inquiry and returns its id.
     #[cfg(test)]
     async fn seed_register_invoice(pool: &sqlx::PgPool, number: &str) -> uuid::Uuid {
@@ -3112,6 +3322,7 @@ mod tests {
 
         // A year of its own, so parallel test data can't interleave into it.
         let year = 2040 + (chrono::Utc::now().timestamp() % 50) as i32;
+        clear_register_year(&pool, year).await;
         let later_number = format!("{year}-26");
         let earlier_number = format!("{year}-25");
 
@@ -3171,6 +3382,8 @@ mod tests {
         let token = generate_test_jwt();
 
         let year = 2050 + (chrono::Utc::now().timestamp() % 40) as i32;
+        clear_register_year(&pool, year).await;
+        clear_register_year(&pool, year + 1).await;
         let in_year = format!("{year}-07");
         let other_year = format!("{}-07", year + 1);
         seed_register_invoice(&pool, &in_year).await;

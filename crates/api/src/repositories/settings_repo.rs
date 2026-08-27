@@ -228,3 +228,47 @@ pub(crate) async fn agent_owns_approval(db: &PgPool) -> bool {
         _ => false,
     }
 }
+
+// ---------------------------------------------------------------------------
+// KVA follow-up
+// ---------------------------------------------------------------------------
+
+/// Settings key holding the follow-up threshold in days.
+const KEY_KVA_FOLLOWUP_DAYS: &str = "kva_followup_days";
+
+/// Fallback when the settings row is missing: the median time from KVA to
+/// decision measured on production in 2026-08.
+pub(crate) const DEFAULT_KVA_FOLLOWUP_DAYS: i64 = 21;
+
+/// How many days a KVA may stay undecided before it lands on the Nachfassliste.
+///
+/// **Caller**: `kva_followup_service`, the KVA-Buch route, the settings page.
+/// **Why**: The threshold is deliberately a stored setting rather than a
+/// live-recomputed median — a moving threshold would make the Telegram nag
+/// non-deterministic and untestable. The computed median is shown alongside it
+/// in the UI so Alex can tune the number himself.
+pub(crate) async fn get_kva_followup_days(db: &PgPool) -> Result<i64, ApiError> {
+    let row: Option<(serde_json::Value,)> =
+        sqlx::query_as("SELECT value FROM settings WHERE key = $1")
+            .bind(KEY_KVA_FOLLOWUP_DAYS)
+            .fetch_optional(db)
+            .await?;
+    Ok(row
+        .and_then(|(v,)| v.as_i64())
+        .filter(|d| *d > 0)
+        .unwrap_or(DEFAULT_KVA_FOLLOWUP_DAYS))
+}
+
+/// Persist the follow-up threshold. Values below 1 are rejected by the caller.
+pub(crate) async fn set_kva_followup_days(db: &PgPool, days: i64) -> Result<(), ApiError> {
+    sqlx::query(
+        "INSERT INTO settings (key, value, updated_at)
+         VALUES ($1, $2, NOW())
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
+    )
+    .bind(KEY_KVA_FOLLOWUP_DAYS)
+    .bind(serde_json::json!(days))
+    .execute(db)
+    .await?;
+    Ok(())
+}

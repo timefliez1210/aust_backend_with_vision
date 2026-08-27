@@ -457,6 +457,15 @@ pub(crate) struct KvaBuchRow {
     pub scheduled_date: Option<NaiveDate>,
     /// Set once the inquiry has an invoice — the KVA became a real job.
     pub invoice_number: Option<String>,
+    /// The inquiry's own status — the ONLY trustworthy win/loss signal.
+    ///
+    /// `offers.status` is not maintained in practice (126 of 133 production rows
+    /// sit at `draft`), so every derived statistic in the KVA-Buch reads this
+    /// instead. `None` only when the inquiry row is missing entirely.
+    pub inquiry_status: Option<String>,
+    /// Follow-up nag state — see `migrations/20260823140000_kva_followup.sql`.
+    pub followup_last_pinged_on: Option<NaiveDate>,
+    pub followup_muted: bool,
 }
 
 /// List every Kostenvoranschlag for the KVA-Buch.
@@ -480,8 +489,11 @@ pub(crate) async fn list_for_kva_buch(pool: &PgPool) -> Result<Vec<KvaBuchRow>, 
             o.valid_until,
             o.sent_at,
             o.created_at,
+            o.followup_last_pinged_on,
+            o.followup_muted,
             c.name AS customer_name,
             i.scheduled_date,
+            i.status AS inquiry_status,
             (SELECT inv.invoice_number FROM invoices inv
               WHERE inv.inquiry_id = o.inquiry_id
               ORDER BY inv.created_at ASC LIMIT 1) AS invoice_number
@@ -494,6 +506,108 @@ pub(crate) async fn list_for_kva_buch(pool: &PgPool) -> Result<Vec<KvaBuchRow>, 
     )
     .fetch_all(pool)
     .await
+}
+
+/// Inquiry statuses that mean the KVA is still undecided — the only ones the
+/// Nachfassliste and the follow-up nag consider.
+///
+/// Deliberately reads `inquiries.status`, not `offers.status`: the latter is not
+/// maintained (see `KvaBuchRow::inquiry_status`).
+pub(crate) const OPEN_INQUIRY_STATUSES: &[&str] = &["offer_sent", "offer_ready"];
+
+/// One KVA that has gone quiet and is still worth chasing.
+#[derive(Debug, FromRow)]
+pub(crate) struct FollowupCandidate {
+    pub id: Uuid,
+    pub offer_number: Option<String>,
+    pub customer_name: Option<String>,
+    pub price_cents: i64,
+    pub created_at: DateTime<Utc>,
+    pub scheduled_date: NaiveDate,
+    pub followup_last_pinged_on: Option<NaiveDate>,
+}
+
+/// Fetch the KVAs eligible for a follow-up ping.
+///
+/// **Caller**: `kva_followup_service::fire_due_followups`
+/// **Why**: Chasing a KVA only earns money when both conditions hold — it has been
+/// quiet longer than the threshold AND the move still lies ahead. A KVA whose
+/// `scheduled_date` has passed is dead; pinging about it is pure noise. On
+/// production 17 of 33 open KVAs are in exactly that state, which is why the
+/// `scheduled_date > today` filter is not optional.
+///
+/// A NULL `scheduled_date` does **not** qualify: "both conditions fit" is strict,
+/// and a KVA without a move date cannot be shown to still be live. Those rows are
+/// surfaced separately in the UI instead of being pinged.
+pub(crate) async fn fetch_followup_candidates(
+    pool: &PgPool,
+    today: NaiveDate,
+    threshold_days: i64,
+) -> Result<Vec<FollowupCandidate>, sqlx::Error> {
+    sqlx::query_as(
+        r#"
+        SELECT
+            o.id,
+            o.offer_number,
+            o.price_cents,
+            o.created_at,
+            o.followup_last_pinged_on,
+            c.name AS customer_name,
+            i.scheduled_date
+        FROM offers o
+        JOIN inquiries i ON i.id = o.inquiry_id
+        LEFT JOIN customers c ON c.id = i.customer_id
+        WHERE o.status <> 'superseded'
+          AND NOT o.followup_muted
+          AND i.status = ANY($3)
+          AND i.scheduled_date IS NOT NULL
+          AND i.scheduled_date > $1
+          -- Exclusive, matching `age_days > threshold_days` in the KVA-Buch route:
+          -- a KVA exactly at the threshold is not yet overdue. The two must agree
+          -- or a row would ping on Telegram without being flagged in the UI.
+          AND (o.created_at AT TIME ZONE 'Europe/Berlin')::date < $1 - ($2 || ' days')::interval
+        ORDER BY o.created_at ASC
+        "#,
+    )
+    .bind(today)
+    .bind(threshold_days.to_string())
+    .bind(OPEN_INQUIRY_STATUSES)
+    .fetch_all(pool)
+    .await
+}
+
+/// Record that a follow-up ping went out for `offer_id` on `today`.
+///
+/// **Caller**: `kva_followup_service::fire_due_followups`, after Telegram accepts.
+pub(crate) async fn mark_followup_pinged(
+    pool: &PgPool,
+    offer_id: Uuid,
+    today: NaiveDate,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE offers SET followup_last_pinged_on = $2 WHERE id = $1")
+        .bind(offer_id)
+        .bind(today)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Silence (or un-silence) follow-up pings for one KVA.
+///
+/// **Caller**: `admin::set_kva_followup_mute` — the mute toggle in the KVA-Buch.
+/// **Why**: Alex needs to drop a single KVA off the Nachfassliste without moving
+/// the threshold for every other one.
+pub(crate) async fn set_followup_muted(
+    pool: &PgPool,
+    offer_id: Uuid,
+    muted: bool,
+) -> Result<bool, sqlx::Error> {
+    let res = sqlx::query("UPDATE offers SET followup_muted = $2 WHERE id = $1")
+        .bind(offer_id)
+        .bind(muted)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() > 0)
 }
 
 /// Fetch all PDF storage keys for an inquiry's offers.

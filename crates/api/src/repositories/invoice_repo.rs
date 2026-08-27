@@ -42,7 +42,8 @@ pub(crate) struct InvoiceRow {
 #[derive(Debug, FromRow)]
 pub(crate) struct RechnungsausgangRow {
     pub id: Uuid,
-    pub inquiry_id: Uuid,
+    /// NULL for rows imported from the historical book — they have no job behind them.
+    pub inquiry_id: Option<Uuid>,
     pub invoice_number: String,
     pub invoice_type: String,
     pub partial_percent: Option<i32>,
@@ -71,6 +72,8 @@ pub(crate) struct RechnungsausgangRow {
     /// recorded: the invoice is settled iff `paid_at` is set. See migration
     /// 20260821100000.
     pub paid_amount_cents: Option<i64>,
+    /// TRUE for a row imported from the spreadsheet: no PDF, no pipeline, no dunning.
+    pub is_legacy: bool,
 }
 
 /// Minimal offer projection for invoice amount calculation.
@@ -406,12 +409,15 @@ pub(crate) async fn mark_paid(
 pub(crate) async fn fetch_inquiry_and_customer(
     pool: &PgPool,
     inv_id: Uuid,
-) -> Result<Option<(Uuid, Option<String>)>, sqlx::Error> {
+) -> Result<Option<(Option<Uuid>, Option<String>)>, sqlx::Error> {
+    // Both joins are LEFT joins: an imported ledger row has no inquiry, and an INNER
+    // JOIN made it invisible to the "Bezahlt" button — the row would have looked like
+    // a missing invoice rather than one that simply has no job behind it.
     sqlx::query_as(
         "SELECT inv.inquiry_id, c.name AS customer_name
          FROM invoices inv
-         JOIN inquiries i ON i.id = inv.inquiry_id
-         LEFT JOIN customers c ON c.id = i.customer_id
+         LEFT JOIN inquiries i ON i.id = inv.inquiry_id
+         LEFT JOIN customers c ON c.id = COALESCE(inv.customer_id, i.customer_id)
          WHERE inv.id = $1",
     )
     .bind(inv_id)
@@ -771,13 +777,17 @@ pub(crate) async fn list_for_rechnungsausgangsbuch(
             inv.notes,
             inv.due_date,
             inv.paid_amount_cents,
+            inv.is_legacy,
             off.price_cents AS offer_netto_cents,
             c.name AS customer_name,
             i.scheduled_date,
             i.end_date
          FROM invoices inv
          LEFT JOIN inquiries i ON i.id = inv.inquiry_id
-         LEFT JOIN customers c ON c.id = i.customer_id
+         -- An imported row names its customer directly; a generated one reaches it
+         -- through the inquiry. COALESCE leaves every pre-existing row resolving
+         -- exactly as it did before `invoices.customer_id` existed.
+         LEFT JOIN customers c ON c.id = COALESCE(inv.customer_id, i.customer_id)
          LEFT JOIN offers off ON off.inquiry_id = inv.inquiry_id
              AND off.id = (SELECT o2.id FROM offers o2
                            WHERE o2.inquiry_id = inv.inquiry_id
@@ -943,7 +953,7 @@ mod tests {
             .find(|r| r.invoice_number == "2026-9010")
             .expect("invoice missing from register");
 
-        assert_eq!(row.inquiry_id, inquiry_id);
+        assert_eq!(row.inquiry_id, Some(inquiry_id));
         assert_eq!(row.invoice_type, "partial_first");
         assert_eq!(row.status, "sent");
         assert!(!row.is_manual);

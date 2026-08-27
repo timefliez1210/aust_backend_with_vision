@@ -209,6 +209,20 @@ pub(crate) async fn mark_invoice_paid(
     invoice_repo::default_payment_method_to_ec(db, id).await?;
     invoice_reminder_repo::close_for_invoice(db, id).await?;
 
+    // A row imported from the historical book has no job behind it: nothing to settle
+    // and nobody to ask for a review — the move happened before the app knew about it.
+    // Booking the payment is still the point, so this is a normal outcome, not an error.
+    let Some(inquiry_id) = inquiry_id else {
+        return Ok(PaidOutcome {
+            kind: "umzug",
+            paid_at,
+            inquiry_id: None,
+            customer_name,
+            inquiry_settled: false,
+            review_prompt: false,
+        });
+    };
+
     // A partial invoice pair only settles the inquiry once both halves are in.
     let inquiry_settled = invoice_repo::count_unpaid(db, inquiry_id).await? == 0;
     if inquiry_settled {

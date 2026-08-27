@@ -84,7 +84,7 @@ pub(crate) fn berlin_date(ts: DateTime<Utc>) -> NaiveDate {
 /// Customer names and Alex's Bemerkungen are free text — an `&` in
 /// "erfi Ernst Fischer GmbH+Co.KG & Söhne" must not produce a file Excel refuses
 /// to open.
-fn esc(s: &str) -> String {
+pub(crate) fn esc(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -104,7 +104,7 @@ fn esc(s: &str) -> String {
 }
 
 /// `A1`-style reference for a 0-based column and 1-based row.
-fn cell_ref(col: usize, row: usize) -> String {
+pub(crate) fn cell_ref(col: usize, row: usize) -> String {
     let mut name = String::new();
     let mut n = col + 1;
     while n > 0 {
@@ -116,7 +116,7 @@ fn cell_ref(col: usize, row: usize) -> String {
 }
 
 /// Style indices into the `cellXfs` table written by [`styles_xml`].
-mod style {
+pub(crate) mod style {
     pub const PLAIN: u32 = 0;
     pub const HEADER: u32 = 1;
     pub const DATE: u32 = 2;
@@ -126,14 +126,14 @@ mod style {
     pub const TOTAL_MONEY: u32 = 6;
 }
 
-enum Cell {
+pub(crate) enum Cell {
     Empty,
     Text(String),
     Number(f64),
     Date(NaiveDate),
 }
 
-fn cell_xml(col: usize, row: usize, cell: &Cell, style: u32) -> String {
+pub(crate) fn cell_xml(col: usize, row: usize, cell: &Cell, style: u32) -> String {
     let r = cell_ref(col, row);
     match cell {
         Cell::Empty => format!(r#"<c r="{r}" s="{style}"/>"#),
@@ -146,11 +146,11 @@ fn cell_xml(col: usize, row: usize, cell: &Cell, style: u32) -> String {
     }
 }
 
-fn money(cents: Option<i64>) -> Cell {
+pub(crate) fn money(cents: Option<i64>) -> Cell {
     cents.map_or(Cell::Empty, |c| Cell::Number(c as f64 / 100.0))
 }
 
-fn date(d: Option<NaiveDate>) -> Cell {
+pub(crate) fn date(d: Option<NaiveDate>) -> Cell {
     d.map_or(Cell::Empty, Cell::Date)
 }
 
@@ -178,24 +178,26 @@ const WORKBOOK_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="
 <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
 </Relationships>"#;
 
-/// Two sheets: the register itself, named after the year to match the tab names in
-/// Alex's workbook, and the monthly summary his Steuerberater reads.
-fn workbook_xml(year: i32) -> String {
+/// Two sheets, named by the caller. The register tab carries the year to match the
+/// tab names in Alex's own workbook; the second is the summary his Steuerberater reads.
+fn workbook_xml(sheet_names: [&str; 2]) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
 <sheets>
-<sheet name="{year}" sheetId="1" r:id="rId1"/>
-<sheet name="Monatsübersicht" sheetId="2" r:id="rId3"/>
+<sheet name="{}" sheetId="1" r:id="rId1"/>
+<sheet name="{}" sheetId="2" r:id="rId3"/>
 </sheets>
-</workbook>"#
+</workbook>"#,
+        esc(sheet_names[0]),
+        esc(sheet_names[1]),
     )
 }
 
 /// Number formats and cell styles.
 ///
 /// Custom `numFmtId`s must start at 164 — everything below is reserved by the spec.
-fn styles_xml() -> String {
+pub(crate) fn styles_xml() -> String {
     r##"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
 <numFmts count="2">
@@ -422,7 +424,7 @@ fn summary_sheet_xml(year: i32, rows: &[ExportRow]) -> String {
     }
     xml.push_str("</row>");
 
-    let mut write_row = |xml: &mut String, n: usize, label: &str, b: &(i64, i64, i64, i64, i64)| {
+    let write_row = |xml: &mut String, n: usize, label: &str, b: &(i64, i64, i64, i64, i64)| {
         xml.push_str(&format!(r#"<row r="{n}">"#));
         xml.push_str(&cell_xml(0, n, &Cell::Text(label.to_string()), style::PLAIN));
         xml.push_str(&cell_xml(1, n, &Cell::Number(b.0 as f64), style::PLAIN));
@@ -460,17 +462,35 @@ fn summary_sheet_xml(year: i32, rows: &[ExportRow]) -> String {
 ///
 /// `rows` must already be in register (number) order — this writes them out as given.
 pub(crate) fn build_xlsx(year: i32, rows: &[ExportRow]) -> Result<Vec<u8>, ApiError> {
+    build_two_sheet_workbook(
+        [&year.to_string(), "Monatsübersicht"],
+        sheet_xml(year, rows),
+        summary_sheet_xml(year, rows),
+    )
+}
+
+/// Pack two prepared worksheet bodies into an XLSX.
+///
+/// **Caller**: [`build_xlsx`], `kva_export::build_xlsx`.
+/// **Why**: The ZIP layout, content types, relationships and style table are the same
+/// for every register we export; only the sheet bodies differ. Keeping one packer
+/// means a fix to the styles or the parts list lands in every export at once.
+pub(crate) fn build_two_sheet_workbook(
+    sheet_names: [&str; 2],
+    sheet1: String,
+    sheet2: String,
+) -> Result<Vec<u8>, ApiError> {
     let mut zip = ZipWriter::new(Cursor::new(Vec::<u8>::new()));
     let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
     let parts: [(&str, String); 7] = [
         ("[Content_Types].xml", CONTENT_TYPES.to_string()),
         ("_rels/.rels", ROOT_RELS.to_string()),
-        ("xl/workbook.xml", workbook_xml(year)),
+        ("xl/workbook.xml", workbook_xml(sheet_names)),
         ("xl/_rels/workbook.xml.rels", WORKBOOK_RELS.to_string()),
         ("xl/styles.xml", styles_xml()),
-        ("xl/worksheets/sheet1.xml", sheet_xml(year, rows)),
-        ("xl/worksheets/sheet2.xml", summary_sheet_xml(year, rows)),
+        ("xl/worksheets/sheet1.xml", sheet1),
+        ("xl/worksheets/sheet2.xml", sheet2),
     ];
 
     for (name, body) in parts {

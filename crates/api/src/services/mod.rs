@@ -13,4 +13,6 @@ pub(crate) mod vision;
 pub mod assistant_bridge;
 pub mod flash_contact_service;
 pub mod vehicle_reminder_service;
+pub mod kva_followup_service;
+pub(crate) mod kva_export;
 pub mod bridge;

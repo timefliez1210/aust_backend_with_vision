@@ -218,6 +218,24 @@ async fn main() -> Result<()> {
     });
     tracing::info!("Vehicle reminder task started");
 
+    // Periodic KVA follow-ups: ping Alex about Kostenvoranschläge that have gone
+    // quiet past the threshold while the move date still lies ahead. Both
+    // conditions must hold — a KVA whose Umzugsdatum has passed is dead.
+    let kva_followup_db = state.db.clone();
+    let kva_followup_tg = state.config.telegram.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60)); // every 1 min
+        loop {
+            interval.tick().await;
+            if let Err(e) = aust_api::services::kva_followup_service::run_followup_check(
+                &kva_followup_db, &kva_followup_tg,
+            ).await {
+                tracing::warn!("KVA follow-up check failed: {e}");
+            }
+        }
+    });
+    tracing::info!("KVA follow-up task started");
+
     // Storage-rental ("Lagerung") monthly billing: generate one invoice per active
     // contract on/after its anniversary day, awaiting Telegram/dashboard approval.
     // Hourly + the storage_invoices UNIQUE(contract, year, month) constraint =
