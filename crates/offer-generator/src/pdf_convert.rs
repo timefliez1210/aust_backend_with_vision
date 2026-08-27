@@ -71,12 +71,13 @@ pub async fn convert_xlsx_to_pdf(xlsx_bytes: &[u8]) -> Result<Vec<u8>, OfferErro
     Ok(pdf_bytes)
 }
 
-/// The Entrümpelung variant of the KVA's second page, embedded at compile time
-/// (same approach as the XLSX template, so no extra file has to reach the image).
+/// The clearing-job variant of the KVA's second page (Entrümpelung and
+/// Haushaltsauflösung share it), embedded at compile time — same approach as the
+/// XLSX template, so no extra file has to reach the image.
 ///
 /// Extracted from the 2025-246 offer; it carries only the boilerplate terms —
 /// no customer name, address, or prices.
-const ENTRUEMPELUNG_PAGE_2: &[u8] = include_bytes!("../../../templates/entruempelung_kva_seite2.pdf");
+const CLEARING_PAGE_2: &[u8] = include_bytes!("../../../templates/entruempelung_kva_seite2.pdf");
 
 /// Marker text that identifies the KVA's terms page. Used to confirm we are
 /// about to replace the right page rather than trusting the index blindly —
@@ -84,9 +85,10 @@ const ENTRUEMPELUNG_PAGE_2: &[u8] = include_bytes!("../../../templates/entruempe
 /// terms are no longer page 2 and substituting by index would destroy the KVA.
 const TERMS_PAGE_MARKER: &str = "Bei etwaigem Mehraufwand";
 
-/// Replace page 2 of a generated KVA with the Entrümpelung terms page.
+/// Replace page 2 of a generated KVA with the clearing-job terms page.
 ///
-/// **Caller**: `offer_builder::run_offer_computation`, for `service_type == "entruempelung"`.
+/// **Caller**: `offer_builder::run_offer_computation`, for the clearing service types
+/// (`entruempelung`, `haushaltsaufloesung`) — see `uses_clearing_terms_page`.
 /// **Why**: the XLSX template's page 2 lists Umzug-specific conditions (Kartons max.
 /// 20 kg, Designermöbel, Tragewege) that do not apply to a clearing job. Umzüge and
 /// every other service type keep the template's own page 2 untouched.
@@ -102,7 +104,7 @@ const TERMS_PAGE_MARKER: &str = "Bei etwaigem Mehraufwand";
 /// - `OfferError::Pdf` if the input has fewer than 2 pages, or page 2 is not the
 ///   terms page (checked via [`TERMS_PAGE_MARKER`]) — substituting blindly would
 ///   corrupt a customer-facing document, so this fails loudly instead
-pub async fn substitute_entruempelung_page_2(pdf_bytes: &[u8]) -> Result<Vec<u8>, OfferError> {
+pub async fn substitute_clearing_page_2(pdf_bytes: &[u8]) -> Result<Vec<u8>, OfferError> {
     let tmp_dir = tempfile::tempdir()
         .map_err(|e| OfferError::Pdf(format!("Failed to create temp dir: {e}")))?;
     let dir = tmp_dir.path();
@@ -156,7 +158,7 @@ pub async fn substitute_entruempelung_page_2(pdf_bytes: &[u8]) -> Result<Vec<u8>
     }
 
     // Swap in the Entrümpelung page, then stitch everything back together.
-    tokio::fs::write(&pages[1], ENTRUEMPELUNG_PAGE_2)
+    tokio::fs::write(&pages[1], CLEARING_PAGE_2)
         .await
         .map_err(|e| OfferError::Pdf(format!("Failed to write substitute page: {e}")))?;
 

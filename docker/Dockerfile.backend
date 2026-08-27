@@ -21,12 +21,16 @@ RUN cargo build --release
 # ---- Runtime stage ----
 FROM debian:bookworm-slim
 
+# fonts-crosextra-carlito is the metric-compatible stand-in for Calibri, the font
+# the KVA/Rechnung templates are laid out in. Without it LibreOffice substitutes a
+# wider face and the signature lines on the KVA's terms page wrap onto a second line.
 RUN echo "deb http://deb.debian.org/debian bookworm main contrib" > /etc/apt/sources.list.d/contrib.list \
     && apt-get update && apt-get install -y \
     ca-certificates \
     curl \
     tzdata \
     libreoffice-calc \
+    fonts-crosextra-carlito \
     poppler-utils \
     ffmpeg \
     libheif-examples \

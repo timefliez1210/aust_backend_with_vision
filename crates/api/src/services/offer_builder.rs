@@ -14,7 +14,7 @@ use aust_core::models::{
 };
 use aust_distance_calculator::{RouteCalculator, RouteRequest};
 use aust_offer_generator::{
-    convert_xlsx_to_pdf, generate_offer_xlsx, parse_floor, substitute_entruempelung_page_2,
+    convert_xlsx_to_pdf, generate_offer_xlsx, parse_floor, substitute_clearing_page_2,
     DetectedItemRow, OfferData,
     OfferLineItem, PricingEngine,
 };
@@ -520,18 +520,19 @@ pub(crate) async fn build_offer_with_overrides(
     let (s3_key, pdf_bytes) =
         match convert_xlsx_to_pdf(&xlsx_bytes).await {
             Ok(pdf_bytes) => {
-                // Entrümpelung gets its own terms page — the template's page 2 lists
-                // Umzug-specific conditions that don't apply to a clearing job.
+                // Clearing jobs get their own terms page — the template's page 2 lists
+                // Umzug-specific conditions that don't apply to them.
                 // Umzüge and all other service types keep the template page.
-                let pdf_bytes = if inquiry.service_type.as_deref() == Some("entruempelung") {
-                    match substitute_entruempelung_page_2(&pdf_bytes).await {
+                let pdf_bytes = if uses_clearing_terms_page(inquiry.service_type.as_deref()) {
+                    match substitute_clearing_page_2(&pdf_bytes).await {
                         Ok(swapped) => swapped,
                         Err(e) => {
                             tracing::error!(
                                 inquiry_id = %inquiry.id,
                                 offer_id = %offer_id,
+                                service_type = ?inquiry.service_type,
                                 error = %e,
-                                "Entrümpelung terms page substitution failed — \
+                                "Clearing terms page substitution failed — \
                                  offer keeps the Umzug terms page"
                             );
                             pdf_bytes
@@ -732,6 +733,18 @@ pub(crate) async fn build_offer_with_overrides(
 /// The admin address editor stores numeric strings ("0", "1", ...) while the public
 /// quote form stores full German labels ("Erdgeschoss", "3. Stock"). Both are handled
 /// so the XLSX always shows a human-readable string.
+/// Does this service type get the clearing-job terms page instead of the Umzug one?
+///
+/// **Caller**: `run_offer_computation`, right after the PDF is rendered.
+/// **Why**: Entrümpelung and Haushaltsauflösung are the same job for the customer —
+/// a property gets cleared — and share one terms page. Only Entrümpelung was checked
+/// here, so every Haushaltsauflösung KVA went out carrying Umzug conditions
+/// (Kartons max. 20 kg, Designermöbel, Tragewege) that describe a job the customer
+/// did not book.
+fn uses_clearing_terms_page(service_type: Option<&str>) -> bool {
+    matches!(service_type, Some("entruempelung" | "haushaltsaufloesung"))
+}
+
 fn format_floor_display(floor: &str) -> String {
     match floor.trim() {
         "0" => "Erdgeschoss".to_string(),
@@ -1364,6 +1377,16 @@ fn detected_item_to_row(item: DetectedItem) -> DetectedItemRow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn both_clearing_service_types_get_the_clearing_terms_page() {
+        assert!(uses_clearing_terms_page(Some("entruempelung")));
+        assert!(uses_clearing_terms_page(Some("haushaltsaufloesung")));
+        // Everything else keeps the template's own Umzug page.
+        assert!(!uses_clearing_terms_page(Some("umzug")));
+        assert!(!uses_clearing_terms_page(Some("lagerung")));
+        assert!(!uses_clearing_terms_page(None));
+    }
 
     /// The Kostenvoranschlag letterhead must carry the Rechnungsadresse.
     ///
