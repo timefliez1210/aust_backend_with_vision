@@ -216,6 +216,12 @@ fn parse_mail_message(message: &mail_parser::Message) -> ParsedEmail {
 
     let message_id = message.message_id().unwrap_or("").to_string();
 
+    // In-Reply-To / References carry the conversation's ancestry. mail-parser hands
+    // these back as either a single Text or a TextList depending on how the sending
+    // client formatted the header, so both shapes have to be flattened.
+    let in_reply_to = header_ids(message, "In-Reply-To").into_iter().next();
+    let references = header_ids(message, "References");
+
     let date = message
         .date()
         .and_then(|d| DateTime::from_timestamp(d.to_timestamp(), 0))
@@ -256,7 +262,92 @@ fn parse_mail_message(message: &mail_parser::Message) -> ParsedEmail {
         body_text,
         body_html,
         message_id,
+        in_reply_to,
+        references,
         date,
         attachments,
+    }
+}
+
+/// Flatten a Message-ID-bearing header into a list of bare ids (angle brackets stripped).
+///
+/// **Caller**: `parse_mail_message`
+/// **Why**: `In-Reply-To` and `References` both hold Message-IDs, but mail-parser
+/// models them as `Text` when there is one and `TextList` when there are several.
+/// Callers want a `Vec<String>` either way. Brackets are stripped because that is how
+/// `email_messages.message_id` is stored (mail-parser's `message_id()` returns the
+/// bare form), so the two must agree for thread lookup to match.
+fn header_ids(message: &mail_parser::Message, name: &str) -> Vec<String> {
+    use mail_parser::HeaderValue;
+    let strip = |s: &str| s.trim().trim_start_matches('<').trim_end_matches('>').to_string();
+    match message.header(name) {
+        Some(HeaderValue::Text(t)) => vec![strip(t)],
+        Some(HeaderValue::TextList(list)) => list.iter().map(|t| strip(t)).collect(),
+        _ => Vec::new(),
+    }
+    .into_iter()
+    .filter(|s| !s.is_empty())
+    .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(raw: &str) -> ParsedEmail {
+        let message = mail_parser::MessageParser::default()
+            .parse(raw.as_bytes())
+            .expect("parse test message");
+        parse_mail_message(&message)
+    }
+
+    const BODY: &str = "\r\nHallo,\r\n\r\nkurze Rückfrage.\r\n";
+
+    #[test]
+    fn a_reply_carries_its_parent_and_ancestry() {
+        let raw = format!(
+            "From: kunde@example.com\r\n\
+             To: angebot@aust-umzuege.de\r\n\
+             Subject: Re: Ihr Umzugsangebot\r\n\
+             Message-ID: <c3@example.com>\r\n\
+             In-Reply-To: <b2@aust-umzuege.de>\r\n\
+             References: <a1@example.com> <b2@aust-umzuege.de>\r\n{BODY}"
+        );
+        let email = parse(&raw);
+
+        // Brackets are stripped because `message_id()` stores the bare form; thread
+        // lookup compares the two directly.
+        assert_eq!(email.in_reply_to.as_deref(), Some("b2@aust-umzuege.de"));
+        assert_eq!(
+            email.references,
+            vec!["a1@example.com".to_string(), "b2@aust-umzuege.de".to_string()]
+        );
+        assert_eq!(email.message_id, "c3@example.com");
+    }
+
+    #[test]
+    fn a_single_reference_is_still_a_list() {
+        // Clients that send exactly one id produce a Text header, not a TextList.
+        let raw = format!(
+            "From: kunde@example.com\r\n\
+             Subject: Re: Angebot\r\n\
+             Message-ID: <two@example.com>\r\n\
+             References: <one@example.com>\r\n{BODY}"
+        );
+        let email = parse(&raw);
+        assert_eq!(email.references, vec!["one@example.com".to_string()]);
+        assert_eq!(email.in_reply_to, None);
+    }
+
+    #[test]
+    fn a_fresh_mail_has_no_ancestry() {
+        let raw = format!(
+            "From: kunde@example.com\r\n\
+             Subject: Anfrage\r\n\
+             Message-ID: <solo@example.com>\r\n{BODY}"
+        );
+        let email = parse(&raw);
+        assert_eq!(email.in_reply_to, None);
+        assert!(email.references.is_empty());
     }
 }

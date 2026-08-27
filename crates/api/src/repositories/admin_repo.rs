@@ -685,12 +685,20 @@ pub(crate) async fn delete_user(pool: &PgPool, id: Uuid) -> Result<u64, sqlx::Er
 #[derive(Debug, FromRow)]
 pub(crate) struct EmailThreadListItem {
     pub id: Uuid,
-    pub customer_id: Uuid,
+    /// `None` for a thread opened by mail we could not attribute to a customer.
+    /// See the `email_threads.customer_id` nullability note in migration
+    /// `20260823160000_email_system.sql`.
+    pub customer_id: Option<Uuid>,
     pub customer_email: Option<String>,
     pub customer_name: Option<String>,
     pub inquiry_id: Option<Uuid>,
     pub subject: Option<String>,
     pub message_count: i64,
+    /// Inbound messages nobody has opened yet — drives the bold row and the badge.
+    pub unread_count: i64,
+    /// Inbound messages not yet marked erledigt — drives the Telegram nag.
+    pub unhandled_count: i64,
+    pub muted: bool,
     pub last_message_at: Option<DateTime<Utc>>,
     pub last_direction: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -708,19 +716,31 @@ pub(crate) async fn list_email_threads(
         SELECT
             et.id,
             et.customer_id,
-            c.email AS customer_email,
+            COALESCE(c.email, et.contact_address) AS customer_email,
             c.name AS customer_name,
             et.inquiry_id,
             et.subject,
-            COUNT(em.id) AS message_count,
+            COUNT(em.id) FILTER (WHERE em.status <> 'discarded') AS message_count,
+            COUNT(em.id) FILTER (
+                WHERE em.direction = 'inbound' AND em.read_at IS NULL
+            ) AS unread_count,
+            COUNT(em.id) FILTER (
+                WHERE em.direction = 'inbound' AND em.handled_at IS NULL
+            ) AS unhandled_count,
+            et.muted,
             MAX(em.created_at) AS last_message_at,
             (SELECT direction FROM email_messages
              WHERE thread_id = et.id ORDER BY created_at DESC LIMIT 1) AS last_direction,
             et.created_at
         FROM email_threads et
-        JOIN customers c ON et.customer_id = c.id
+        LEFT JOIN customers c ON et.customer_id = c.id
         LEFT JOIN email_messages em ON em.thread_id = et.id
         WHERE c.name ILIKE $1 OR c.email ILIKE $1 OR et.subject ILIKE $1
+           OR et.contact_address ILIKE $1
+           OR EXISTS (
+               SELECT 1 FROM email_messages m2
+               WHERE m2.thread_id = et.id AND m2.body_text ILIKE $1
+           )
         GROUP BY et.id, c.email, c.name
         ORDER BY MAX(em.created_at) DESC NULLS LAST
         LIMIT $2 OFFSET $3
@@ -739,8 +759,13 @@ pub(crate) async fn count_email_threads(pool: &PgPool, search: &str) -> Result<i
         r#"
         SELECT COUNT(DISTINCT et.id)
         FROM email_threads et
-        JOIN customers c ON et.customer_id = c.id
+        LEFT JOIN customers c ON et.customer_id = c.id
         WHERE c.name ILIKE $1 OR c.email ILIKE $1 OR et.subject ILIKE $1
+           OR et.contact_address ILIKE $1
+           OR EXISTS (
+               SELECT 1 FROM email_messages m2
+               WHERE m2.thread_id = et.id AND m2.body_text ILIKE $1
+           )
         "#,
     )
     .bind(search)
@@ -753,7 +778,8 @@ pub(crate) async fn count_email_threads(pool: &PgPool, search: &str) -> Result<i
 #[derive(Debug, FromRow)]
 pub(crate) struct EmailThreadDetail {
     pub id: Uuid,
-    pub customer_id: Uuid,
+    pub customer_id: Option<Uuid>,
+    pub muted: bool,
     pub customer_email: Option<String>,
     pub customer_name: Option<String>,
     pub inquiry_id: Option<Uuid>,
@@ -768,10 +794,12 @@ pub(crate) async fn fetch_email_thread(
 ) -> Result<Option<EmailThreadDetail>, sqlx::Error> {
     sqlx::query_as(
         r#"
-        SELECT et.id, et.customer_id, c.email AS customer_email, c.name AS customer_name,
+        SELECT et.id, et.customer_id, et.muted,
+               COALESCE(c.email, et.contact_address) AS customer_email,
+               c.name AS customer_name,
                et.inquiry_id, et.subject, et.created_at
         FROM email_threads et
-        JOIN customers c ON et.customer_id = c.id
+        LEFT JOIN customers c ON et.customer_id = c.id
         WHERE et.id = $1
         "#,
     )
@@ -787,11 +815,19 @@ pub(crate) struct EmailMessageItem {
     pub direction: String,
     pub from_address: String,
     pub to_address: String,
+    pub cc_addresses: Vec<String>,
     pub subject: Option<String>,
     pub body_text: Option<String>,
+    /// Stored since the first migration and never once returned to the frontend,
+    /// so every HTML-only mail rendered as whatever plaintext fallback the sender
+    /// happened to include. Sanitised at the route boundary before it goes out.
+    pub body_html: Option<String>,
     pub llm_generated: bool,
     pub status: String,
+    pub read_at: Option<DateTime<Utc>>,
+    pub handled_at: Option<DateTime<Utc>>,
     pub attachment_keys: Vec<String>,
+    pub attachment_names: Vec<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -802,7 +838,9 @@ pub(crate) async fn fetch_thread_messages(
 ) -> Result<Vec<EmailMessageItem>, sqlx::Error> {
     sqlx::query_as(
         r#"
-        SELECT id, direction, from_address, to_address, subject, body_text, llm_generated, status, attachment_keys, created_at
+        SELECT id, direction, from_address, to_address, cc_addresses, subject,
+               body_text, body_html, llm_generated, status, read_at, handled_at,
+               attachment_keys, attachment_names, created_at
         FROM email_messages
         WHERE thread_id = $1 AND status != 'discarded'
         ORDER BY created_at ASC
@@ -823,17 +861,49 @@ pub(crate) async fn fetch_thread_messages(
 /// stale, superseded one. The LATERAL subquery mirrors `offer_repo::fetch_active_pdf_key`
 /// (excludes 'superseded' too, orders by `created_at DESC LIMIT 1`) so at most one —
 /// the current — offer is ever joined in.
+#[derive(Debug, FromRow)]
+pub(crate) struct DraftForSend {
+    pub thread_id: Uuid,
+    pub subject: Option<String>,
+    pub body_text: Option<String>,
+    /// Resolved recipient: the customer's address, else the thread's
+    /// `contact_address`, else the last inbound sender. `None` only when the
+    /// thread has never had any of the three.
+    pub to_address: Option<String>,
+    pub cc_addresses: Vec<String>,
+    pub bcc_addresses: Vec<String>,
+    /// RFC `Message-ID` of the newest inbound mail in the thread, used as
+    /// `In-Reply-To` so the reply threads in the customer's mail client.
+    pub parent_message_id: Option<String>,
+    pub pdf_storage_key: Option<String>,
+    pub offer_id: Option<Uuid>,
+    pub inquiry_id: Option<Uuid>,
+}
+
 pub(crate) async fn fetch_draft_for_send(
     pool: &PgPool,
     message_id: Uuid,
-) -> Result<Option<(Option<String>, Option<String>, String, Option<String>, Option<Uuid>, Option<Uuid>)>, sqlx::Error> {
+) -> Result<Option<DraftForSend>, sqlx::Error> {
     sqlx::query_as(
         r#"
-        SELECT em.subject, em.body_text, c.email,
+        SELECT em.thread_id, em.subject, em.body_text,
+               COALESCE(
+                   NULLIF(em.to_address, ''),
+                   c.email,
+                   et.contact_address,
+                   (SELECT from_address FROM email_messages
+                    WHERE thread_id = et.id AND direction = 'inbound'
+                    ORDER BY created_at DESC LIMIT 1)
+               ) AS to_address,
+               em.cc_addresses, em.bcc_addresses,
+               (SELECT message_id FROM email_messages
+                WHERE thread_id = et.id AND direction = 'inbound'
+                  AND message_id IS NOT NULL AND message_id <> ''
+                ORDER BY created_at DESC LIMIT 1) AS parent_message_id,
                o.pdf_storage_key, o.id AS offer_id, et.inquiry_id
         FROM email_messages em
         JOIN email_threads et ON em.thread_id = et.id
-        JOIN customers c ON et.customer_id = c.id
+        LEFT JOIN customers c ON et.customer_id = c.id
         LEFT JOIN LATERAL (
             SELECT id, pdf_storage_key
             FROM offers
@@ -892,19 +962,6 @@ pub(crate) async fn mark_message_sent(
     Ok(())
 }
 
-/// Fetch the attachment keys stored for a single email message.
-pub(crate) async fn fetch_message_attachment_keys(
-    pool: &PgPool,
-    message_id: Uuid,
-) -> Result<Option<Vec<String>>, sqlx::Error> {
-    let row: Option<(Vec<String>,)> =
-        sqlx::query_as("SELECT attachment_keys FROM email_messages WHERE id = $1")
-            .bind(message_id)
-            .fetch_optional(pool)
-            .await?;
-    Ok(row.map(|(keys,)| keys))
-}
-
 /// Discard a draft email message.
 pub(crate) async fn discard_draft(pool: &PgPool, message_id: Uuid) -> Result<u64, sqlx::Error> {
     let result = sqlx::query(
@@ -934,16 +991,29 @@ pub(crate) async fn update_draft(
     Ok(result.rows_affected())
 }
 
-/// Fetch thread info for reply (customer_id, email, subject).
+/// Fetch thread info for reply (customer_id, recipient address, subject).
+///
+/// The address falls back through customer → `contact_address` → the last inbound
+/// sender, because a thread may legitimately have no customer attached. It can
+/// still be `None` for a compose-only thread that never received anything; the
+/// caller turns that into a 409 rather than sending to nobody.
 pub(crate) async fn fetch_thread_for_reply(
     pool: &PgPool,
     thread_id: Uuid,
-) -> Result<Option<(Uuid, String, Option<String>)>, sqlx::Error> {
+) -> Result<Option<(Option<Uuid>, Option<String>, Option<String>)>, sqlx::Error> {
     sqlx::query_as(
         r#"
-        SELECT et.customer_id, c.email, et.subject
+        SELECT et.customer_id,
+               COALESCE(
+                   c.email,
+                   et.contact_address,
+                   (SELECT from_address FROM email_messages
+                    WHERE thread_id = et.id AND direction = 'inbound'
+                    ORDER BY created_at DESC LIMIT 1)
+               ) AS email,
+               et.subject
         FROM email_threads et
-        JOIN customers c ON et.customer_id = c.id
+        LEFT JOIN customers c ON et.customer_id = c.id
         WHERE et.id = $1
         "#,
     )
@@ -1014,7 +1084,8 @@ pub(crate) async fn create_compose_thread(
     now: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO email_threads (id, customer_id, subject, created_at) VALUES ($1, $2, $3, $4)",
+        "INSERT INTO email_threads (id, customer_id, contact_address, subject, created_at) \
+         VALUES ($1, $2, (SELECT email FROM customers WHERE id = $2), $3, $4)",
     )
     .bind(id)
     .bind(customer_id)
@@ -1023,6 +1094,204 @@ pub(crate) async fn create_compose_thread(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Mark every inbound message in a thread as read.
+///
+/// **Caller**: `admin_emails::get_email_thread`
+/// **Why**: opening a thread is the read event — there is no separate per-message
+/// open in the UI. Deliberately does *not* touch `handled_at`: reading a mail and
+/// having dealt with it are different claims, and only the second one should
+/// silence the Telegram nag.
+pub(crate) async fn mark_thread_read(pool: &PgPool, thread_id: Uuid) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE email_messages SET read_at = NOW() \
+         WHERE thread_id = $1 AND direction = 'inbound' AND read_at IS NULL",
+    )
+    .bind(thread_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Mark every inbound message in a thread as dealt with.
+///
+/// **Caller**: `admin_emails::send_draft_email`
+/// **Why**: replying *is* handling it. Without this the nag would keep firing on a
+/// thread that had just been answered, and Alex would have to tick it off twice.
+pub(crate) async fn mark_thread_handled(pool: &PgPool, thread_id: Uuid) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE email_messages SET handled_at = NOW(), read_at = COALESCE(read_at, NOW()) \
+         WHERE thread_id = $1 AND direction = 'inbound' AND handled_at IS NULL",
+    )
+    .bind(thread_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Flag or unflag one inbound message as dealt with.
+///
+/// **Caller**: `admin_emails::set_message_handled`
+/// **Why**: `handled_at IS NULL` is what the assistant's unanswered-email reminder
+/// reconciles against, so this is the switch that turns a nag off.
+pub(crate) async fn set_message_handled(
+    pool: &PgPool,
+    message_id: Uuid,
+    handled: bool,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE email_messages SET handled_at = CASE WHEN $2 THEN NOW() ELSE NULL END \
+         WHERE id = $1 AND direction = 'inbound'",
+    )
+    .bind(message_id)
+    .bind(handled)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// The thread a message belongs to.
+///
+/// **Caller**: `admin_emails::upload_draft_attachment`
+/// **Why**: attachment storage keys are namespaced by thread, matching the inbound
+/// layout so one download route serves both directions.
+pub(crate) async fn fetch_message_thread_id(
+    pool: &PgPool,
+    message_id: Uuid,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    let row: Option<(Uuid,)> =
+        sqlx::query_as("SELECT thread_id FROM email_messages WHERE id = $1 AND status = 'draft'")
+            .bind(message_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|(id,)| id))
+}
+
+/// Mute or unmute a thread.
+///
+/// **Caller**: `admin_emails::set_thread_muted`
+/// **Why**: lets a chatty thread stop nagging without pretending its mail has been
+/// answered — the alternative was marking mail handled that plainly was not.
+pub(crate) async fn set_thread_muted(
+    pool: &PgPool,
+    thread_id: Uuid,
+    muted: bool,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query("UPDATE email_threads SET muted = $2, updated_at = NOW() WHERE id = $1")
+        .bind(thread_id)
+        .bind(muted)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Counts for the mailbox badge: unread inbound messages and the threads holding them.
+///
+/// **Caller**: `admin_emails::email_unread_counts`
+/// **Why**: the nav had no indication that mail had arrived at all.
+pub(crate) async fn email_unread_counts(pool: &PgPool) -> Result<(i64, i64, i64), sqlx::Error> {
+    let row: (i64, i64, i64) = sqlx::query_as(
+        r#"
+        SELECT
+            COUNT(*) FILTER (WHERE m.read_at IS NULL),
+            COUNT(DISTINCT m.thread_id) FILTER (WHERE m.read_at IS NULL),
+            COUNT(*) FILTER (WHERE m.handled_at IS NULL AND NOT t.muted)
+        FROM email_messages m
+        JOIN email_threads t ON m.thread_id = t.id
+        WHERE m.direction = 'inbound'
+        "#,
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(row)
+}
+
+/// Attach CC/BCC recipients to an existing draft.
+///
+/// **Caller**: `admin_emails::update_draft_email`
+/// **Why**: kept separate from the subject/body update so an edit that does not
+/// mention recipients cannot silently clear them.
+pub(crate) async fn set_draft_recipients(
+    pool: &PgPool,
+    message_id: Uuid,
+    to_address: Option<&str>,
+    cc: &[String],
+    bcc: &[String],
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE email_messages \
+         SET to_address = COALESCE($2, to_address), cc_addresses = $3, bcc_addresses = $4 \
+         WHERE id = $1 AND status = 'draft'",
+    )
+    .bind(message_id)
+    .bind(to_address)
+    .bind(cc)
+    .bind(bcc)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Record uploaded attachments on a draft.
+///
+/// **Caller**: `admin_emails::upload_draft_attachment`
+/// **Why**: `attachment_keys` and `attachment_names` are positional pairs, so both
+/// arrays have to grow in one statement or a later read pairs the wrong name with
+/// the wrong file.
+pub(crate) async fn append_draft_attachment(
+    pool: &PgPool,
+    message_id: Uuid,
+    key: &str,
+    filename: &str,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE email_messages \
+         SET attachment_keys = attachment_keys || $2::text, \
+             attachment_names = attachment_names || $3::text \
+         WHERE id = $1 AND status = 'draft'",
+    )
+    .bind(message_id)
+    .bind(key)
+    .bind(filename)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Fetch a draft's attachments as (key, display name) pairs.
+///
+/// **Caller**: `admin_emails::send_draft_email`
+/// **Why**: `attachment_names` is empty for rows written before it existed, so the
+/// key's basename is the fallback display name.
+pub(crate) async fn fetch_message_attachments(
+    pool: &PgPool,
+    message_id: Uuid,
+) -> Result<Vec<(String, String)>, sqlx::Error> {
+    let row: Option<(Vec<String>, Vec<String>)> = sqlx::query_as(
+        "SELECT attachment_keys, attachment_names FROM email_messages WHERE id = $1",
+    )
+    .bind(message_id)
+    .fetch_optional(pool)
+    .await?;
+
+    let Some((keys, names)) = row else {
+        return Ok(Vec::new());
+    };
+    Ok(keys
+        .into_iter()
+        .enumerate()
+        .map(|(i, key)| {
+            let name = names
+                .get(i)
+                .filter(|n| !n.is_empty())
+                .cloned()
+                .unwrap_or_else(|| {
+                    key.rsplit('/').next().unwrap_or("anhang").to_string()
+                });
+            (key, name)
+        })
+        .collect())
 }
 
 /// Insert a compose draft message.
@@ -1247,4 +1516,123 @@ pub(crate) async fn fetch_morning_calendar_items(pool: &PgPool) -> Result<Vec<Mo
     )
     .fetch_all(pool)
     .await
+}
+
+// ---------------------------------------------------------------------------
+// Attachable documents (KVA / Rechnung) for an email thread
+// ---------------------------------------------------------------------------
+
+/// One document already generated for this thread's customer that can be hung on a draft.
+///
+/// **Caller**: `admin_emails::list_thread_documents` / `attach_thread_document`
+/// **Why**: the composer's only attachment source was the local file picker, so sending
+/// a KVA or a Rechnung meant downloading the PDF and uploading it straight back.
+#[derive(Debug, Clone)]
+pub(crate) struct ThreadDocument {
+    pub kind: String,
+    pub id: Uuid,
+    pub label: String,
+    pub filename: String,
+    pub storage_key: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Every offer and invoice PDF belonging to this thread's customer (or its linked inquiry).
+///
+/// **Caller**: `admin_emails::list_thread_documents`, `admin_emails::attach_thread_document`
+/// **Why**: a thread is not always linked to the inquiry the document hangs on — mail
+/// often arrives before the Anfrage exists — so the customer, not the inquiry, is the
+/// scope. Rows without a stored PDF are skipped: they are not ready to send.
+///
+/// Newest first, offers and invoices interleaved by creation time.
+pub(crate) async fn fetch_thread_documents(
+    pool: &PgPool,
+    customer_id: Option<Uuid>,
+    inquiry_id: Option<Uuid>,
+) -> Result<Vec<ThreadDocument>, sqlx::Error> {
+    if customer_id.is_none() && inquiry_id.is_none() {
+        return Ok(Vec::new());
+    }
+
+    let offers: Vec<(Uuid, Option<String>, String, String, DateTime<Utc>)> = sqlx::query_as(
+        r#"
+        SELECT o.id,
+               o.offer_number,
+               o.pdf_storage_key,
+               COALESCE(c.last_name, ''),
+               o.created_at
+        FROM offers o
+        JOIN inquiries q ON o.inquiry_id = q.id
+        JOIN customers c ON q.customer_id = c.id
+        WHERE o.pdf_storage_key IS NOT NULL
+          AND (q.customer_id = $1 OR q.id = $2)
+        ORDER BY o.created_at DESC
+        "#,
+    )
+    .bind(customer_id)
+    .bind(inquiry_id)
+    .fetch_all(pool)
+    .await?;
+
+    let invoices: Vec<(Uuid, String, String, String, DateTime<Utc>)> = sqlx::query_as(
+        r#"
+        SELECT i.id,
+               i.invoice_number,
+               i.invoice_type,
+               i.pdf_s3_key,
+               i.created_at
+        FROM invoices i
+        JOIN inquiries q ON i.inquiry_id = q.id
+        WHERE i.pdf_s3_key IS NOT NULL
+          AND (q.customer_id = $1 OR q.id = $2)
+        ORDER BY i.created_at DESC
+        "#,
+    )
+    .bind(customer_id)
+    .bind(inquiry_id)
+    .fetch_all(pool)
+    .await?;
+
+    let mut docs: Vec<ThreadDocument> = Vec::with_capacity(offers.len() + invoices.len());
+
+    for (id, offer_number, key, last_name, created_at) in offers {
+        // The stored object is usually a PDF but older offers kept the XLSX — the
+        // extension has to follow the key or the mail carries a mislabelled file.
+        let ext = if key.ends_with(".xlsx") { "xlsx" } else { "pdf" };
+        let number = offer_number.unwrap_or_default();
+        let filename = crate::repositories::offer_repo::build_offer_filename(&number, &last_name, ext);
+        let label = if number.is_empty() {
+            "KVA (ohne Nummer)".to_string()
+        } else {
+            format!("KVA {number}")
+        };
+        docs.push(ThreadDocument {
+            kind: "offer".into(),
+            id,
+            label,
+            filename,
+            storage_key: key,
+            created_at,
+        });
+    }
+
+    for (id, invoice_number, invoice_type, key, created_at) in invoices {
+        let ext = if key.ends_with(".xlsx") { "xlsx" } else { "pdf" };
+        let suffix = match invoice_type.as_str() {
+            "partial_first" => " (Anzahlung)",
+            "partial_final" => " (Schlussrechnung)",
+            _ => "",
+        };
+        docs.push(ThreadDocument {
+            kind: "invoice".into(),
+            id,
+            label: format!("Rechnung {invoice_number}{suffix}"),
+            filename: format!("Rechnung_{invoice_number}.{ext}"),
+            storage_key: key,
+            created_at,
+        });
+    }
+
+    docs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    Ok(docs)
 }

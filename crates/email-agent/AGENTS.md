@@ -2,7 +2,9 @@
 
 Background service: polls IMAP inbox for customer emails, parses them into inquiries, forwards offers to Telegram for Alex's approval.
 
-> **Currently not deployed in production** — customer inquiries enter via web form or admin dashboard.
+> **Runs in production, inside the `aust_backend` process** — it is not a separate
+> service, so a panic here aborts the whole API (this is what caused the June 2026
+> UTF-8 crash-loop). Inquiries also arrive via web form and the admin dashboard.
 
 ## Processing Flow
 
@@ -41,6 +43,23 @@ The kostenloses-angebot web form sends JSON attached to the email. Key field map
 ## Customer Email Fix
 
 IMAP sender for form submissions is always the company inbox (`<company-inbox>`). After parsing, the processor uses the email from the JSON form data instead — ensures correct customer record.
+
+## Inbound Persistence and Threading
+
+Every inbound mail is written to `email_messages` with `status = 'received'`, and the
+IMAP `\Seen` flag is set **only after that row commits** — flagging a mail read that
+failed to persist drops it out of the `UNSEEN` search permanently and it exists nowhere
+else.
+
+`find_or_create_thread` always returns a thread. Resolution order:
+
+1. `In-Reply-To` / `References` matched against `email_messages.message_id`.
+2. The customer's most recent thread inside 30 days.
+3. A new thread — with `customer_id NULL` and the sender in `contact_address` when the
+   mail cannot be attributed to anyone.
+
+`handled_at IS NULL` (not `status`) is what the assistant's unanswered-email reminder
+reconciles against; see `crates/assistant/src/hooks/reminders.rs`.
 
 ## State Management
 

@@ -118,14 +118,30 @@ impl EmailProcessor {
         self.offer_tx = Some(tx);
     }
 
-    /// Find or create an email thread for a customer.
-    /// Reuses an existing thread if one was created within the last 30 days.
+    /// Resolve the thread an inbound mail belongs to, creating one if needed.
+    ///
+    /// **Why it always returns a thread**: this used to return `Option<Uuid>` and
+    /// `None` whenever the customer could not be resolved (blank address, upsert
+    /// race, DB hiccup) — and the caller then skipped `store_inbound_email`
+    /// entirely while still flagging the mail `\Seen` on the server. The message
+    /// was gone from both the app and the UNSEEN search. A mail we received must
+    /// land somewhere, so an unattributable one now opens a customer-less thread
+    /// carrying the sender in `contact_address`; linking it to a customer later is
+    /// a UI action, not a precondition for keeping the mail.
+    ///
+    /// Resolution order:
+    /// 1. `In-Reply-To` / `References` — the sender's own threading, authoritative.
+    /// 2. The customer's most recent thread inside 30 days — the old heuristic,
+    ///    kept as a fallback for mail that carries no ancestry headers.
+    /// 3. A fresh thread.
     async fn find_or_create_thread(
         &self,
         customer_email: &str,
         subject: &str,
         inquiry: &MovingInquiry,
-    ) -> Option<Uuid> {
+        refs: &[String],
+        fallback_address: &str,
+    ) -> Uuid {
         // Split combined name into first/last for structured DB fields.
         let (first_name, last_name) = inquiry
             .name
@@ -141,82 +157,145 @@ impl EmailProcessor {
             })
             .unwrap_or((None, None));
 
-        // Upsert customer by email — store name/salutation/phone if available.
-        let _ = sqlx::query(
-            r#"
-            INSERT INTO customers (id, email, name, salutation, first_name, last_name, phone, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
-            ON CONFLICT (email) DO UPDATE SET
-                name       = COALESCE(EXCLUDED.name,       customers.name),
-                salutation = COALESCE(EXCLUDED.salutation, customers.salutation),
-                first_name = COALESCE(EXCLUDED.first_name, customers.first_name),
-                last_name  = COALESCE(EXCLUDED.last_name,  customers.last_name),
-                phone      = COALESCE(EXCLUDED.phone,      customers.phone),
-                updated_at = NOW()
-            "#,
-        )
-        .bind(Uuid::now_v7())
-        .bind(customer_email)
-        .bind(&inquiry.name)
-        .bind(&inquiry.salutation)
-        .bind(&first_name)
-        .bind(&last_name)
-        .bind(&inquiry.phone)
-        .execute(&self.db)
-        .await
-        .map_err(|e| warn!("Failed to upsert customer for email tracking: {e}"));
+        // Upsert the customer and resolve their id — skipped for a blank or
+        // malformed sender, which would otherwise insert a junk row keyed on ''.
+        // Threading still works without it; the mail lands on a customer-less thread.
+        let customer_id: Option<Uuid> = if customer_email.contains('@') {
+            let _ = sqlx::query(
+                r#"
+                INSERT INTO customers (id, email, name, salutation, first_name, last_name, phone, created_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+                ON CONFLICT (email) DO UPDATE SET
+                    name       = COALESCE(EXCLUDED.name,       customers.name),
+                    salutation = COALESCE(EXCLUDED.salutation, customers.salutation),
+                    first_name = COALESCE(EXCLUDED.first_name, customers.first_name),
+                    last_name  = COALESCE(EXCLUDED.last_name,  customers.last_name),
+                    phone      = COALESCE(EXCLUDED.phone,      customers.phone),
+                    updated_at = NOW()
+                "#,
+            )
+            .bind(Uuid::now_v7())
+            .bind(customer_email)
+            .bind(&inquiry.name)
+            .bind(&inquiry.salutation)
+            .bind(&first_name)
+            .bind(&last_name)
+            .bind(&inquiry.phone)
+            .execute(&self.db)
+            .await
+            .map_err(|e| warn!("Failed to upsert customer for email tracking: {e}"));
 
-        let customer_id: Uuid = match sqlx::query_as::<_, (Uuid,)>(
-            "SELECT id FROM customers WHERE email = $1",
-        )
-        .bind(customer_email)
-        .fetch_optional(&self.db)
-        .await
-        {
-            Ok(Some((id,))) => id,
-            Ok(None) => {
-                warn!("Customer not found after upsert");
-                return None;
+            match sqlx::query_as::<_, (Uuid,)>(
+                "SELECT id FROM customers WHERE email = $1",
+            )
+            .bind(customer_email)
+            .fetch_optional(&self.db)
+            .await
+            {
+                Ok(row) => row.map(|(id,)| id),
+                Err(e) => {
+                    warn!("Failed to find customer for email tracking: {e}");
+                    None
+                }
             }
-            Err(e) => {
-                warn!("Failed to find customer for email tracking: {e}");
-                return None;
-            }
+        } else {
+            None
         };
 
-        // Find existing thread within 30 days
-        let existing_thread: Option<(Uuid,)> = sqlx::query_as(
-            r#"
-            SELECT id FROM email_threads
-            WHERE customer_id = $1 AND created_at > NOW() - INTERVAL '30 days'
-            ORDER BY created_at DESC LIMIT 1
-            "#,
-        )
-        .bind(customer_id)
-        .fetch_optional(&self.db)
-        .await
-        .unwrap_or(None);
-
-        if let Some((thread_id,)) = existing_thread {
-            return Some(thread_id);
+        // 1. The sender's own threading headers win outright — they identify the
+        //    conversation directly, regardless of age or of who the customer is.
+        if let Some(tid) = self.thread_by_references(refs).await {
+            if let Some(cid) = customer_id {
+                self.adopt_thread_customer(tid, cid).await;
+            }
+            return tid;
         }
 
-        // Create new thread
+        // 2. The customer's most recent thread inside the 30-day window.
+        if let Some(cid) = customer_id {
+            let existing_thread: Option<(Uuid,)> = sqlx::query_as(
+                r#"
+                SELECT id FROM email_threads
+                WHERE customer_id = $1 AND created_at > NOW() - INTERVAL '30 days'
+                ORDER BY created_at DESC LIMIT 1
+                "#,
+            )
+            .bind(cid)
+            .fetch_optional(&self.db)
+            .await
+            .unwrap_or(None);
+
+            if let Some((thread_id,)) = existing_thread {
+                return thread_id;
+            }
+        }
+
+        // 3. A fresh thread. `customer_id` may legitimately be NULL here.
         let thread_id = Uuid::now_v7();
-        match sqlx::query(
-            "INSERT INTO email_threads (id, customer_id, subject, created_at, updated_at) VALUES ($1, $2, $3, NOW(), NOW())",
+        if let Err(e) = sqlx::query(
+            "INSERT INTO email_threads (id, customer_id, contact_address, subject, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, NOW(), NOW())",
         )
         .bind(thread_id)
         .bind(customer_id)
+        .bind(fallback_address)
         .bind(subject)
         .execute(&self.db)
         .await
         {
-            Ok(_) => Some(thread_id),
-            Err(e) => {
-                warn!("Failed to create email thread: {e}");
-                None
-            }
+            // The message insert below will fail on the FK, which is logged there.
+            // Nothing else is safe to do -- we must not swallow the mail silently.
+            warn!("Failed to create email thread {thread_id}: {e}");
+        }
+        thread_id
+    }
+
+    /// Find the thread an inbound mail belongs to via its RFC ancestry headers.
+    ///
+    /// **Caller**: `find_or_create_thread`
+    /// **Why**: `email_messages.message_id` has always been stored and never read.
+    /// Matching any id from `In-Reply-To` + `References` against it recovers the
+    /// real conversation even when it is older than 30 days or when the customer
+    /// writes about two separate jobs in the same month.
+    async fn thread_by_references(&self, refs: &[String]) -> Option<Uuid> {
+        if refs.is_empty() {
+            return None;
+        }
+        // Ordered by created_at DESC so the nearest ancestor wins when a mail
+        // references several messages that ended up in different threads.
+        let row: Option<(Uuid,)> = sqlx::query_as(
+            r#"
+            SELECT thread_id FROM email_messages
+            WHERE message_id = ANY($1)
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(refs)
+        .fetch_optional(&self.db)
+        .await
+        .unwrap_or(None);
+        row.map(|(id,)| id)
+    }
+
+    /// Attach a customer to a thread that does not have one yet.
+    ///
+    /// **Caller**: `find_or_create_thread`
+    /// **Why**: a mail that arrives before we can identify the sender opens a
+    /// customer-less thread. When a later mail in the same conversation *does*
+    /// identify them, the thread should stop being an orphan. Guarded on
+    /// `customer_id IS NULL` so an existing link is never overwritten.
+    async fn adopt_thread_customer(&self, thread_id: Uuid, customer_id: Uuid) {
+        if let Err(e) = sqlx::query(
+            "UPDATE email_threads SET customer_id = $1, updated_at = NOW() \
+             WHERE id = $2 AND customer_id IS NULL",
+        )
+        .bind(customer_id)
+        .bind(thread_id)
+        .execute(&self.db)
+        .await
+        {
+            warn!("Failed to attach customer to thread {thread_id}: {e}");
         }
     }
 
@@ -233,8 +312,12 @@ impl EmailProcessor {
         thread_id: Uuid,
         message_id: Uuid,
         attachments: &[aust_core::models::EmailAttachment],
-    ) -> Vec<String> {
+    ) -> (Vec<String>, Vec<String>) {
         let mut keys = Vec::with_capacity(attachments.len());
+        // Display names, positionally paired with `keys`. The storage key's basename
+        // is "{idx}.{ext}", so without these the sender's own filename was lost and
+        // the dashboard offered downloads called "0.pdf".
+        let mut names = Vec::with_capacity(attachments.len());
         for (idx, att) in attachments.iter().enumerate() {
             let ext = att
                 .filename
@@ -248,15 +331,22 @@ impl EmailProcessor {
                 .upload(&key, att.data.clone().into(), &att.content_type)
                 .await
             {
-                Ok(_) => keys.push(key),
+                Ok(_) => {
+                    keys.push(key);
+                    names.push(att.filename.clone());
+                }
                 Err(e) => warn!("Failed to upload email attachment {key}: {e}"),
             }
         }
-        keys
+        (keys, names)
     }
 
     /// Store an inbound email message in the database.
-    // repository fn — args mirror DB columns for inbound_emails table
+    ///
+    /// Returns `true` only when the row committed. The caller gates the IMAP
+    /// `\Seen` flag on that: flagging a mail read that we failed to persist
+    /// removes it from the UNSEEN search forever, and it exists nowhere else.
+    // repository fn — args mirror DB columns for email_messages
     #[allow(clippy::too_many_arguments)]
     async fn store_inbound_email(
         &self,
@@ -267,8 +357,10 @@ impl EmailProcessor {
         body_text: &str,
         body_html: Option<&str>,
         message_id: &str,
+        in_reply_to: Option<&str>,
+        references: &[String],
         attachments: &[aust_core::models::EmailAttachment],
-    ) {
+    ) -> bool {
         let msg_id = if message_id.is_empty() {
             None
         } else {
@@ -276,12 +368,17 @@ impl EmailProcessor {
         };
 
         let db_id = Uuid::now_v7();
-        let attachment_keys = self.store_attachments(thread_id, db_id, attachments).await;
+        let (attachment_keys, attachment_names) =
+            self.store_attachments(thread_id, db_id, attachments).await;
 
+        // `status = 'received'` is the value the rest of the codebase has always
+        // assumed for unhandled inbound mail — assistant/hooks/reminders.rs filters
+        // on it. Inserts here used to omit `status` entirely and take the column
+        // default 'sent', so that nag matched nothing and never fired once.
         if let Err(e) = sqlx::query(
             r#"
-            INSERT INTO email_messages (id, thread_id, direction, from_address, to_address, subject, body_text, body_html, message_id, llm_generated, attachment_keys, created_at)
-            VALUES ($1, $2, 'inbound', $3, $4, $5, $6, $7, $8, false, $9, NOW())
+            INSERT INTO email_messages (id, thread_id, direction, from_address, to_address, subject, body_text, body_html, message_id, in_reply_to, reference_ids, llm_generated, status, attachment_keys, attachment_names, created_at)
+            VALUES ($1, $2, 'inbound', $3, $4, $5, $6, $7, $8, $9, $10, false, 'received', $11, $12, NOW())
             "#,
         )
         .bind(db_id)
@@ -292,12 +389,25 @@ impl EmailProcessor {
         .bind(body_text)
         .bind(body_html)
         .bind(msg_id)
+        .bind(in_reply_to)
+        .bind(references)
         .bind(&attachment_keys)
+        .bind(&attachment_names)
         .execute(&self.db)
         .await
         {
             warn!("Failed to store inbound email: {e}");
+            return false;
         }
+
+        // Keep the thread's own timestamp in step — the dashboard's recent-activity
+        // feed orders on `email_threads.updated_at`, not on the message rows.
+        let _ = sqlx::query("UPDATE email_threads SET updated_at = NOW() WHERE id = $1")
+            .bind(thread_id)
+            .execute(&self.db)
+            .await;
+
+        true
     }
 
     /// Store an outbound email message in the database.
@@ -455,23 +565,36 @@ impl EmailProcessor {
         // If date is fully booked, send capacity question to Alex via Telegram
         let inquiry_snapshot = inquiry.clone();
 
-        // Store inbound email in database (after inquiry borrow is released)
+        // Store inbound email in database (after inquiry borrow is released).
+        // `refs` puts In-Reply-To ahead of the References chain so the nearest
+        // ancestor is tried first.
+        let mut refs: Vec<String> = email.in_reply_to.clone().into_iter().collect();
+        refs.extend(email.references.iter().cloned());
+
         let thread_id = self
-            .find_or_create_thread(&customer_email_final, &email.subject, &inquiry_snapshot)
+            .find_or_create_thread(
+                &customer_email_final,
+                &email.subject,
+                &inquiry_snapshot,
+                &refs,
+                &email.from,
+            )
             .await;
-        if let Some(tid) = thread_id {
-            self.store_inbound_email(
-                tid,
+        let stored = self
+            .store_inbound_email(
+                thread_id,
                 &customer_email_final,
                 &email.to,
                 &email.subject,
                 &email.body_text,
                 email.body_html.as_deref(),
                 &email.message_id,
+                email.in_reply_to.as_deref(),
+                &email.references,
                 &email.attachments,
             )
             .await;
-        }
+        let thread_id = Some(thread_id);
 
         if let Some(ref avail) = availability
             && !avail.requested_date_available {
@@ -530,8 +653,16 @@ impl EmailProcessor {
             }
         }
 
-        // Mark as read
-        if !email.message_id.is_empty()
+        // Mark as read on the server — but only once the message is safely in the
+        // database. `\Seen` drops it out of the UNSEEN search permanently, so
+        // flagging a mail we failed to store loses it outright (this is how the
+        // Timo-Riechers mail went missing in June).
+        if !stored {
+            warn!(
+                "Inbound email not persisted — leaving it unread on the server for the next poll (subject: {})",
+                email.subject
+            );
+        } else if !email.message_id.is_empty()
             && let Err(e) = self.imap.mark_as_read(&email.message_id).await {
                 warn!("Failed to mark email as read: {e}");
             }

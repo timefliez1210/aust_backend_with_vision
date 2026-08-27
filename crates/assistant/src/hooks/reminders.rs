@@ -64,6 +64,12 @@ async fn owner_chat(pool: &PgPool) -> Result<Option<i64>> {
 
 /// Ensure there's exactly one active recurring reminder per unhandled inbound
 /// email, and deactivate reminders whose email has since been handled.
+/// Gated on `handled_at IS NULL`, not on `status`. The original filter was
+/// `status = 'received'` — a value no insert path ever wrote, since inbound rows
+/// omitted `status` and took the column's `'sent'` default. The nag matched zero
+/// rows and had never fired in production. `handled_at` is set explicitly by the
+/// admin UI, so "unanswered" now means what it says, and a muted thread opts out
+/// without having to lie about the mail being dealt with.
 async fn reconcile_email_reminders(pool: &PgPool) -> Result<()> {
     // Auto-cancel: email no longer unhandled → turn its reminder off.
     sqlx::query(
@@ -72,9 +78,11 @@ async fn reconcile_email_reminders(pool: &PgPool) -> Result<()> {
         WHERE source = 'email' AND active
           AND NOT EXISTS (
               SELECT 1 FROM email_messages m
+              JOIN email_threads t ON m.thread_id = t.id
               WHERE m.id = agent_reminders.source_ref
                 AND m.direction = 'inbound'
-                AND m.status = 'received'
+                AND m.handled_at IS NULL
+                AND NOT t.muted
           )
         "#,
     )
@@ -96,7 +104,8 @@ async fn reconcile_email_reminders(pool: &PgPool) -> Result<()> {
                            THEN ' — von ' || m.from_address ELSE '' END,
                NOW(), 'recurring', $2, 'email', m.id
         FROM email_messages m
-        WHERE m.direction = 'inbound' AND m.status = 'received'
+        JOIN email_threads t ON m.thread_id = t.id
+        WHERE m.direction = 'inbound' AND m.handled_at IS NULL AND NOT t.muted
           AND NOT EXISTS (
               SELECT 1 FROM agent_reminders r
               WHERE r.source = 'email' AND r.source_ref = m.id AND r.active

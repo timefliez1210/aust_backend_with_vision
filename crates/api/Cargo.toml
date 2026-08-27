@@ -36,6 +36,7 @@ base64 = { workspace = true }
 bytes = { workspace = true }
 zip = { workspace = true }
 lettre = { workspace = true }
+ammonia = { workspace = true }
 reqwest = { workspace = true }
 rand = { workspace = true }
 hex = { workspace = true }

@@ -52,6 +52,21 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/emails/messages/{id}/discard", post(admin_emails::discard_draft_email))
         .route("/emails/{id}/reply", post(admin_emails::reply_to_thread))
         .route("/emails/{id}/inquiry", patch(admin_emails::link_thread_to_inquiry))
+        .route("/emails/unread", get(admin_emails::email_unread_counts))
+        .route("/emails/{id}/mute", patch(admin_emails::set_thread_muted))
+        .route(
+            "/emails/messages/{id}/handled",
+            patch(admin_emails::set_message_handled),
+        )
+        .route(
+            "/emails/messages/{id}/attachments",
+            post(admin_emails::upload_draft_attachment),
+        )
+        .route(
+            "/emails/messages/{id}/attachments/document",
+            post(admin_emails::attach_thread_document),
+        )
+        .route("/emails/{id}/documents", get(admin_emails::list_thread_documents))
         .route("/emails/compose", post(admin_emails::compose_email))
         .route(
             "/emails/messages/{id}/attachments/{idx}",
@@ -1678,6 +1693,15 @@ pub(crate) fn mime_from_ext(ext: &str) -> &'static str {
         "webp" => "image/webp",
         "pdf"  => "application/pdf",
         "mp4"  => "video/mp4",
+        // Types the outbound email composer can now carry as attachments.
+        "txt"  => "text/plain",
+        "csv"  => "text/csv",
+        "doc"  => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls"  => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "zip"  => "application/zip",
+        "heic" => "image/heic",
         _      => "application/octet-stream",
     }
 }
@@ -3190,5 +3214,19 @@ mod tests {
             !sheet.contains(&other_year),
             "the export must be scoped to one year — the next year's invoice leaked in"
         );
+    }
+}
+
+#[cfg(test)]
+mod router_tests {
+    /// The admin router builds without a route conflict.
+    ///
+    /// `/emails/messages/{id}/attachments/{idx}` and the literal
+    /// `/emails/messages/{id}/attachments/document` sit on the same segment, which is
+    /// exactly the shape axum panics on when it is not allowed — so the assembly is
+    /// worth asserting rather than discovering at boot.
+    #[test]
+    fn admin_router_has_no_conflicting_routes() {
+        let _ = super::router();
     }
 }

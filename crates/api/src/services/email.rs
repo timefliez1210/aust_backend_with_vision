@@ -1,6 +1,119 @@
 use lettre::message::{header::ContentType, Attachment, MultiPart, SinglePart};
 use lettre::Message;
 
+/// One attachment to hang on an outbound message.
+pub struct OutboundAttachment {
+    pub filename: String,
+    pub content_type: String,
+    pub data: Vec<u8>,
+}
+
+/// Everything needed to build one outbound message.
+///
+/// **Why a struct**: the two builders below took eight positional `&str`s between
+/// them and still could not express CC, BCC, more than one attachment, or a
+/// threading header. Adding those as further parameters would have made the call
+/// sites unreadable and easy to transpose.
+pub struct OutboundEmail<'a> {
+    pub from_address: &'a str,
+    pub from_name: &'a str,
+    pub to: &'a str,
+    pub cc: &'a [String],
+    pub bcc: &'a [String],
+    pub subject: &'a str,
+    pub body: &'a str,
+    /// RFC `Message-ID` this mail answers. Set it and the customer's mail client
+    /// files the reply into the existing conversation instead of opening a new
+    /// one — the admin send path never did this, so every reply from the
+    /// dashboard started a fresh thread on their side.
+    pub in_reply_to: Option<&'a str>,
+    pub attachments: Vec<OutboundAttachment>,
+}
+
+impl<'a> OutboundEmail<'a> {
+    /// Minimal message: one recipient, no CC/BCC, no attachments, no threading.
+    pub fn new(
+        from_address: &'a str,
+        from_name: &'a str,
+        to: &'a str,
+        subject: &'a str,
+        body: &'a str,
+    ) -> Self {
+        Self {
+            from_address,
+            from_name,
+            to,
+            cc: &[],
+            bcc: &[],
+            subject,
+            body,
+            in_reply_to: None,
+            attachments: Vec::new(),
+        }
+    }
+}
+
+/// Build an outbound message with any combination of CC/BCC, attachments and threading.
+///
+/// **Caller**: `admin_emails::send_draft_email`
+/// **Why `Result<_, String>`**: a bad CC address is user input from the compose form,
+/// not a programming error, and `lettre::error::Error` has no variant that can say
+/// *which* address failed to parse.
+pub fn build_message(mail: &OutboundEmail<'_>) -> Result<Message, String> {
+    let from_mailbox: lettre::message::Mailbox =
+        format!("{} <{}>", mail.from_name, mail.from_address)
+            .parse()
+            .map_err(|e| format!("Ungültige Absenderadresse: {e}"))?;
+
+    let to_mailbox: lettre::message::Mailbox = mail
+        .to
+        .parse()
+        .map_err(|e| format!("Ungültige Empfängeradresse '{}': {e}", mail.to))?;
+
+    let mut builder = Message::builder()
+        .from(from_mailbox)
+        .to(to_mailbox)
+        .subject(mail.subject);
+
+    for addr in mail.cc.iter().filter(|a| !a.trim().is_empty()) {
+        let mailbox: lettre::message::Mailbox = addr
+            .parse()
+            .map_err(|e| format!("Ungültige CC-Adresse '{addr}': {e}"))?;
+        builder = builder.cc(mailbox);
+    }
+    for addr in mail.bcc.iter().filter(|a| !a.trim().is_empty()) {
+        let mailbox: lettre::message::Mailbox = addr
+            .parse()
+            .map_err(|e| format!("Ungültige BCC-Adresse '{addr}': {e}"))?;
+        builder = builder.bcc(mailbox);
+    }
+
+    if let Some(parent) = mail.in_reply_to.filter(|s| !s.trim().is_empty()) {
+        builder = builder
+            .in_reply_to(parent.to_string())
+            .references(parent.to_string());
+    }
+
+    if mail.attachments.is_empty() {
+        return builder
+            .body(mail.body.to_string())
+            .map_err(|e| format!("E-Mail-Aufbau fehlgeschlagen: {e}"));
+    }
+
+    let mut multipart = MultiPart::mixed().singlepart(SinglePart::plain(mail.body.to_string()));
+    for att in &mail.attachments {
+        let content_type = ContentType::parse(&att.content_type)
+            .unwrap_or_else(|_| ContentType::parse("application/octet-stream").unwrap());
+        multipart = multipart.singlepart(
+            Attachment::new(att.filename.clone()).body(att.data.clone(), content_type),
+        );
+    }
+
+    builder
+        .multipart(multipart)
+        .map_err(|e| format!("E-Mail-Aufbau fehlgeschlagen: {e}"))
+}
+
 /// Build a plain text email message without attachments.
 pub fn build_plain_email(
     from_address: &str,

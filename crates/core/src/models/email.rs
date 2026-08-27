@@ -99,6 +99,15 @@ pub struct ParsedEmail {
     /// SMTP `Message-ID` used for deduplication (prevents reprocessing the
     /// same email across multiple poll cycles).
     pub message_id: String,
+    /// RFC 5322 `In-Reply-To` — the Message-ID of the mail this one answers.
+    ///
+    /// **Why**: inbound threading used to match on customer + a 30-day window,
+    /// which merged unrelated conversations and split long ones. This is the
+    /// authoritative link the sender's mail client already gives us.
+    pub in_reply_to: Option<String>,
+    /// RFC 5322 `References` — the full ancestry chain, oldest first. Used as a
+    /// fallback when `In-Reply-To` is absent or points at a mail we never saw.
+    pub references: Vec<String>,
     pub date: DateTime<Utc>,
     /// All MIME attachments; the JSON form attachment and any photos/videos
     /// sent by the customer are found here.

@@ -92,6 +92,9 @@ jsonwebtoken = "9"
 # Validation
 validator = { version = "0.19", features = ["derive"] }
 
+# HTML sanitisation (inbound email bodies are untrusted)
+ammonia = "4"
+
 # ZIP archive manipulation
 zip = "2"
 

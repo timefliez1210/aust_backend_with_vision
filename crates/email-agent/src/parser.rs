@@ -858,6 +858,8 @@ mod tests {
             body_text: "some text body".to_string(),
             body_html: None,
             message_id: "test@test".to_string(),
+            in_reply_to: None,
+            references: Vec::new(),
             date: chrono::Utc::now(),
             attachments: vec![EmailAttachment {
                 filename: "form-data.json".to_string(),
@@ -924,6 +926,8 @@ mod tests {
             body_text: body.to_string(),
             body_html: None,
             message_id: "test@test".to_string(),
+            in_reply_to: None,
+            references: Vec::new(),
             date: chrono::Utc::now(),
             attachments: vec![],
         };
@@ -973,6 +977,8 @@ mod tests {
             body_text: "some text body".to_string(),
             body_html: None,
             message_id: "test@test".to_string(),
+            in_reply_to: None,
+            references: Vec::new(),
             date: chrono::Utc::now(),
             attachments: vec![EmailAttachment {
                 filename: "form-data.json".to_string(),
