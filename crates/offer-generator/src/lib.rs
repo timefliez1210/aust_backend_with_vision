@@ -1,5 +1,6 @@
 pub mod error;
 
+mod fonts;
 mod invoice_xlsx;
 mod pdf_convert;
 mod pricing;
@@ -9,6 +10,7 @@ mod xlsx;
 mod zip_util;
 
 pub use error::OfferError;
+pub use fonts::check_template_fonts;
 pub use invoice_xlsx::{generate_invoice_xlsx, ExtraService, InvoiceData, InvoiceLineItem, InvoiceType};
 pub use pdf_convert::{convert_xlsx_to_pdf, substitute_clearing_page_2};
 pub use pricing::{parse_floor, PricingEngine};

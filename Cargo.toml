@@ -20,6 +20,7 @@ aust-assistant = { workspace = true }
 aust-core = { workspace = true }
 aust-flash-contact = { workspace = true }
 aust-email-agent = { workspace = true }
+aust-offer-generator = { workspace = true }
 aust-llm-providers = { workspace = true }
 aust-storage = { workspace = true }
 aust-volume-estimator = { workspace = true }

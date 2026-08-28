@@ -531,6 +531,7 @@ dependencies = [
  "aust-email-agent",
  "aust-flash-contact",
  "aust-llm-providers",
+ "aust-offer-generator",
  "aust-storage",
  "aust-volume-estimator",
  "axum",

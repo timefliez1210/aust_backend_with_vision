@@ -32,6 +32,15 @@ async fn main() -> Result<()> {
     config.validate().map_err(|e| anyhow::anyhow!("Configuration error: {e}"))?;
     tracing::info!("Configuration loaded");
 
+    // The KVA templates are laid out in Calibri metrics. Without a compatible face
+    // LibreOffice re-wraps their text boxes and every generated KVA ships with a
+    // broken terms page, so say so at boot instead of leaving it to be discovered
+    // in a customer's PDF.
+    match aust_offer_generator::check_template_fonts() {
+        Ok(family) => tracing::info!("KVA rendering font: {family}"),
+        Err(message) => tracing::error!("{message}"),
+    }
+
     // Create database pool
     let db = create_pool(&config.database.url, config.database.max_connections).await?;
     tracing::info!("Database pool created");

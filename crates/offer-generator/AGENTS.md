@@ -60,6 +60,29 @@ If `detected_items` is non-empty, a second sheet is created with item name, volu
 
 `convert_xlsx_to_pdf()` writes XLSX to temp file, invokes LibreOffice headless (`--convert-to pdf`), reads resulting PDF. Falls back to serving XLSX directly if LibreOffice unavailable.
 
+### Terms Page (page 2) — Read Before Editing
+
+Page 2 of the KVA is **not** in the sheet cells: it is one large text box in
+`xl/drawings/drawing1.xml` inside `templates/offer_template.xlsx`. Its signature
+"lines" are runs of underscore characters padded with spaces, so whether they fit
+depends on the rendering font *and* the text box width. Two consequences:
+
+- The image must carry a Calibri-metric font (`fonts-crosextra-carlito`, installed in
+  `docker/Dockerfile.backend`). Without it fontconfig substitutes a wider face and every
+  terms page re-wraps. `check_template_fonts()` logs the resolved family at startup.
+- The box renders ~376–386pt wide, **not** the ~436pt its `<a:ext cx>` implies. Any
+  line longer than that wraps. The current rules are 23 underscores + 23 spaces +
+  28 underscores (336.6pt in Carlito at 11pt).
+
+Clearing jobs (`entruempelung`, `haushaltsaufloesung`) do not use this page at all —
+`substitute_clearing_page_2()` swaps in `templates/entruempelung_kva_seite2.pdf`, a
+static PDF that cannot reflow.
+
+**After any template edit run `./scripts/check-templates.sh`.** It renders both terms
+pages with production's LibreOffice and fonts (inside `aust_backend:latest`) and fails
+if a signature rule wrapped or expected text disappeared. Editing the template and
+eyeballing the XML is not enough — both times this page broke, the XML looked fine.
+
 ## Rate Back-Calculation (Telegram Edit Flow)
 
 When Alex overrides the total price:
@@ -78,5 +101,6 @@ rate = labor_netto / (persons × hours)
 |---|---|
 | Pricing formula or rates | `CompanyConfig` in core, `PricingEngine::with_rate()` call sites, `ServicePrices.from_pricing()`, XLSX template pricing cells, unit tests |
 | XLSX template (rows, columns) | `xlsx.rs` row/col references, line item max (12), `offer_builder.rs` line item output order, `generate_offer_xlsx()` |
+| Anything in the template's drawing/terms page | `./scripts/check-templates.sh` (renders it in the prod image and checks the signature rules) |
 | Line item order or max items | XLSX rows 31–42, `warn!` threshold at line_items.len() > 12, `ServicePrices` config values |
 | `build_line_items()` or service prices | foto-angebot form submission, admin dashboard service toggles, `Services` struct in core |
