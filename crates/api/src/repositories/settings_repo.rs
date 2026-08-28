@@ -236,9 +236,10 @@ pub(crate) async fn agent_owns_approval(db: &PgPool) -> bool {
 /// Settings key holding the follow-up threshold in days.
 const KEY_KVA_FOLLOWUP_DAYS: &str = "kva_followup_days";
 
-/// Fallback when the settings row is missing: the median time from KVA to
-/// decision measured on production in 2026-08.
-pub(crate) const DEFAULT_KVA_FOLLOWUP_DAYS: i64 = 21;
+/// Fallback when the settings row is missing. 6 days on Alex's request
+/// (2026-08-28): waiting for the median decision time (21 days) meant chasing
+/// customers who had already booked elsewhere.
+pub(crate) const DEFAULT_KVA_FOLLOWUP_DAYS: i64 = 6;
 
 /// How many days a KVA may stay undecided before it lands on the Nachfassliste.
 ///

@@ -5,8 +5,8 @@
 //! qualifies only when **both** conditions hold:
 //!
 //!   1. it has been undecided longer than the follow-up threshold
-//!      (`settings.kva_followup_days`, default 21 — the observed median time from
-//!      KVA to decision), and
+//!      (`settings.kva_followup_days`, default 6 — long enough not to nag, short
+//!      enough to land before the customer books someone else), and
 //!   2. the `scheduled_date` still lies in the future.
 //!
 //! The second condition is what keeps this useful. On production 17 of 33 open
@@ -386,7 +386,7 @@ mod tests {
         let future = today + chrono::Duration::days(30);
 
         let threshold = settings_repo::get_kva_followup_days(&pool).await.unwrap();
-        assert_eq!(threshold, 21, "migration should seed the default threshold");
+        assert_eq!(threshold, 6, "migration should seed the default threshold");
 
         seed_kva(&pool, "offer_sent", threshold, Some(future)).await;
         fire_due_followups(&pool, &test_tg_config(), &mock_url, today)
@@ -406,18 +406,18 @@ mod tests {
     async fn threshold_setting_is_honoured(pool: sqlx::PgPool) {
         let (mock_url, calls) = mock_telegram_server().await;
         let today = today();
-        seed_kva(&pool, "offer_sent", 10, Some(today + chrono::Duration::days(30))).await;
+        seed_kva(&pool, "offer_sent", 4, Some(today + chrono::Duration::days(30))).await;
 
         fire_due_followups(&pool, &test_tg_config(), &mock_url, today)
             .await
             .unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 0, "10 days is under the default 21");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "4 days is under the default 6");
 
-        settings_repo::set_kva_followup_days(&pool, 7).await.unwrap();
+        settings_repo::set_kva_followup_days(&pool, 3).await.unwrap();
         fire_due_followups(&pool, &test_tg_config(), &mock_url, today)
             .await
             .unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "threshold lowered to 7 → now overdue");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "threshold lowered to 3 → now overdue");
     }
 
     /// One ping, then silence until the repeat interval — the nag must not go daily.
