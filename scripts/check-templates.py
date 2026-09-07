@@ -12,6 +12,7 @@ as binary zips and their text boxes reflow silently, so what has to be pinned is
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 # A signature rule that fits reads "____   ____" on one line. When the line is too
@@ -65,6 +66,82 @@ def check_terms_page(pdf: Path, page: int, label: str) -> list[str]:
     return problems
 
 
+# --- Logo -----------------------------------------------------------------
+#
+# The letterhead logo is a picture anchored to a spreadsheet column plus an
+# offset, so where it lands depends on the *renderer's* column widths. In the
+# production image Calibri falls back to Carlito, the columns come out wider,
+# and the picture was pushed past the right print margin — customers received
+# KVAs reading "Aust Umzüg" (reported 2026-09-07). The host's LibreOffice never
+# showed it, which is exactly why this check renders inside the image.
+#
+# The logo is the only coloured element in the top quarter of the page, so it
+# can be found by looking for saturated pixels there.
+RENDER_DPI = 100
+PAGE_MARGIN_IN = 0.7          # <pageMargins right="0.7"> in the template
+LOGO_MIN_CLEARANCE_PT = 8.0   # keep a visible gap, not a hairline
+
+
+def _render_page1_ppm(pdf: Path) -> tuple[int, int, bytes]:
+    """Rasterise page 1 as raw RGB. PPM keeps this dependency-free (no Pillow).
+
+    pdftoppm writes nothing when asked for stdout in some poppler builds, so the
+    page goes through a temp file instead.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        prefix = Path(tmp) / "page"
+        subprocess.run(
+            ["pdftoppm", "-singlefile", "-r", str(RENDER_DPI),
+             "-f", "1", "-l", "1", str(pdf), str(prefix)],
+            check=True,
+            capture_output=True,
+        )
+        raw = prefix.with_suffix(".ppm").read_bytes()
+    if not raw.startswith(b"P6"):
+        raise RuntimeError("pdftoppm did not return a P6 PPM")
+    fields, pos = [], 2
+    while len(fields) < 3:          # width, height, maxval
+        while raw[pos : pos + 1].isspace():
+            pos += 1
+        if raw[pos : pos + 1] == b"#":
+            pos = raw.index(b"\n", pos) + 1
+            continue
+        end = pos
+        while not raw[end : end + 1].isspace():
+            end += 1
+        fields.append(int(raw[pos:end]))
+        pos = end
+    width, height, _ = fields
+    return width, height, raw[pos + 1 :]
+
+
+def check_logo(pdf: Path, label: str) -> list[str]:
+    """Return problems with the letterhead logo (empty when it fits)."""
+    width, height, pixels = _render_page1_ppm(pdf)
+    band = height // 4                      # letterhead only; skips the orange banner
+    right_ink = -1
+    for y in range(band):
+        row = y * width * 3
+        for x in range(width):
+            i = row + x * 3
+            r, g, b = pixels[i], pixels[i + 1], pixels[i + 2]
+            if max(r, g, b) - min(r, g, b) > 40:   # coloured, not black text
+                right_ink = max(right_ink, x)
+
+    if right_ink < 0:
+        return [f"{label}: no logo found in the top quarter of page 1"]
+
+    printable_right = width - PAGE_MARGIN_IN * RENDER_DPI
+    clearance_pt = (printable_right - right_ink) / RENDER_DPI * 72
+    if clearance_pt < LOGO_MIN_CLEARANCE_PT:
+        return [
+            f"{label}: the logo reaches {clearance_pt:.1f}pt of the right print margin "
+            f"(needs {LOGO_MIN_CLEARANCE_PT:.0f}pt) — it is clipped or about to be. "
+            f"Shrink the picture in xl/drawings/drawing1.xml; do not move it."
+        ]
+    return []
+
+
 def main() -> int:
     if len(sys.argv) != 3:
         print("usage: check-templates.py OFFER_TEMPLATE_PDF CLEARING_PAGE_PDF", file=sys.stderr)
@@ -74,6 +151,7 @@ def main() -> int:
     problems = []
     problems += check_terms_page(offer_pdf, 2, "offer_template.xlsx page 2 (Umzug terms)")
     problems += check_terms_page(clearing_pdf, 1, "entruempelung_kva_seite2.pdf (clearing terms)")
+    problems += check_logo(offer_pdf, "offer_template.xlsx page 1 (logo)")
 
     if problems:
         print("Template layout check FAILED:")
@@ -81,7 +159,7 @@ def main() -> int:
             print(f"  - {p}")
         return 1
 
-    print("Template layout check OK (both terms pages render with intact signature rules)")
+    print("Template layout check OK (signature rules intact, logo inside the print area)")
     return 0
 
 
