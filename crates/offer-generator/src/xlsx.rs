@@ -73,6 +73,17 @@ pub struct OfferData {
     pub dest_city: String,
     /// Destination floor description (cell F28).
     pub dest_floor_info: String,
+    /// Intermediate stop (Zwischenstopp) street + house number, printed between
+    /// the Belade- and Entladestelle blocks (cell C26). Empty when the move has
+    /// no stop — the label at C25 is then left blank too.
+    #[serde(default)]
+    pub stop_street: String,
+    /// Intermediate stop postal code + city (cell C26, second line).
+    #[serde(default)]
+    pub stop_city: String,
+    /// Intermediate stop floor description (cell C26, third line).
+    #[serde(default)]
+    pub stop_floor_info: String,
     /// Estimated move volume in cubic metres (used in the "Umzugspauschale" label at A29).
     pub volume_m3: f64,
     /// Number of workers — written to cell J50 so the labor formula `G38 = E38*F38*J50` works.
@@ -347,6 +358,9 @@ fn address_block_cell(cell: &str, street: &str, city: &str, floor: &str) -> (Str
 /// conservative (i.e. erring taller) proxy for proportional address text.
 const ADDR_WIDTH_ORIGIN: f64 = 24.5;
 const ADDR_WIDTH_DEST: f64 = 28.8;
+/// Excel column-width units of the Zwischenstopp block, which occupies the free
+/// column C between the two address blocks (template `<col min="3" max="3" width="27.72">`).
+const ADDR_WIDTH_STOP: f64 = 27.72;
 /// Point height of one text line in the address block (matches template row 26).
 const ADDR_LINE_HEIGHT: f64 = 15.0;
 
@@ -468,6 +482,28 @@ fn build_cell_modifications(data: &OfferData) -> CellModResult {
     for cell in ["A27", "A28", "F27", "F28"] {
         mods.push((cell.into(), CellValue::Text(String::new())));
     }
+    // Zwischenstopp — printed between the two blocks in the free column C, with
+    // its own bold label in C25 mirroring "Beladestelle:"/"Entladestelle:".
+    // Written only when the move actually has a stop; otherwise both cells are
+    // blanked so no template preset leaks through.
+    let has_stop = [&data.stop_street, &data.stop_city, &data.stop_floor_info]
+        .iter()
+        .any(|s| !s.trim().is_empty());
+    if has_stop {
+        mods.push((
+            "C25".into(),
+            CellValue::StyledText("Zwischenstopp:".to_string(), "35"),
+        ));
+        mods.push(address_block_cell(
+            "C26",
+            &data.stop_street,
+            &data.stop_city,
+            &data.stop_floor_info,
+        ));
+    } else {
+        mods.push(("C25".into(), CellValue::Text(String::new())));
+        mods.push(("C26".into(), CellValue::Text(String::new())));
+    }
     // A26/F26 are *merged* cells (A26:B26, F26:G26). Excel/LibreOffice never
     // auto-grow a row to fit wrapped text in a merged cell, so a 2–3 line
     // address overflowed downward through the hidden rows 27/28 and collided
@@ -485,7 +521,17 @@ fn build_cell_modifications(data: &OfferData) -> CellModResult {
         &data.dest_floor_info,
         ADDR_WIDTH_DEST,
     );
-    row_heights.push((26, origin_lines.max(dest_lines) as f64 * ADDR_LINE_HEIGHT));
+    let stop_lines = address_block_lines(
+        &data.stop_street,
+        &data.stop_city,
+        &data.stop_floor_info,
+        ADDR_WIDTH_STOP,
+    );
+    let stop_lines = if has_stop { stop_lines } else { 0 };
+    row_heights.push((
+        26,
+        origin_lines.max(dest_lines).max(stop_lines) as f64 * ADDR_LINE_HEIGHT,
+    ));
     // The template carries hidden mirror formulas I9:I12/L9:L12 (=A25..A28 /
     // =F25..F28) outside the print area. With the multi-line A26/F26 block,
     // I10/L10 would render three lines tall and blow up letter-address row 10
@@ -1751,6 +1797,9 @@ mod tests {
             dest_street: "Zielstr. 5".to_string(),
             dest_city: "30159 Hannover".to_string(),
             dest_floor_info: "EG".to_string(),
+            stop_street: String::new(),
+            stop_city: String::new(),
+            stop_floor_info: String::new(),
             volume_m3: 20.0,
             persons: 3,
             estimated_hours: 4.0,
@@ -1800,6 +1849,9 @@ mod tests {
             dest_street: "Goethestraße 52".to_string(),
             dest_city: "31135 Hildesheim".to_string(),
             dest_floor_info: "EG".to_string(),
+            stop_street: String::new(),
+            stop_city: String::new(),
+            stop_floor_info: String::new(),
             volume_m3: 40.0,
             persons: 5,
             estimated_hours: 21.0,
@@ -1864,6 +1916,9 @@ mod tests {
             dest_street: "Im Katthagen 18".to_string(),
             dest_city: "31061 Alfeld".to_string(),
             dest_floor_info: "Erdgeschoss".to_string(),
+            stop_street: String::new(),
+            stop_city: String::new(),
+            stop_floor_info: String::new(),
             volume_m3: 7.5,
             persons: 1,
             estimated_hours: 13.0,

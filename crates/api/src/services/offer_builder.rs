@@ -391,7 +391,7 @@ pub(crate) async fn build_offer_with_overrides(
     let customer = ctx.customer;
     let origin = ctx.origin;
     let destination = ctx.destination;
-    let _stop_address = ctx.stop_address;
+    let stop_address = ctx.stop_address;
     let detected_items = ctx.detected_items;
     let pricing_result = ctx.pricing_result;
     let line_items = ctx.line_items;
@@ -433,6 +433,17 @@ pub(crate) async fn build_offer_with_overrides(
         .map(format_city)
         .unwrap_or_default();
     let dest_floor_info = destination
+        .as_ref()
+        .and_then(|a| a.floor.as_deref())
+        .map(format_floor_display)
+        .unwrap_or_default();
+
+    // Zwischenstopp — an optional intermediate address (storage, second pickup).
+    // It is printed on the KVA between the Belade- and Entladestelle, so it needs
+    // the same street/city/floor formatting as the two other blocks.
+    let stop_street = stop_address.as_ref().map(format_street).unwrap_or_default();
+    let stop_city = stop_address.as_ref().map(format_city).unwrap_or_default();
+    let stop_floor_info = stop_address
         .as_ref()
         .and_then(|a| a.floor.as_deref())
         .map(format_floor_display)
@@ -498,6 +509,9 @@ pub(crate) async fn build_offer_with_overrides(
         dest_street: dest_street.clone(),
         dest_city: dest_city.clone(),
         dest_floor_info: dest_floor_info.clone(),
+        stop_street: stop_street.clone(),
+        stop_city: stop_city.clone(),
+        stop_floor_info: stop_floor_info.clone(),
         volume_m3: volume,
         persons: pricing_result.estimated_helpers,
         estimated_hours: pricing_result.estimated_hours,
