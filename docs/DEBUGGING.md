@@ -60,7 +60,7 @@ ssh root@<vps> 'docker compose -f /opt/aust/docker-compose.yml restart backend' 
 
 **Symptom**: Offer PDF has incorrect netto totals, or line items that should be zero are contributing to the sum.
 
-**Root cause**: The XLSX template has preset non-zero values in the E (quantity) and F (unit price) columns of the line-item rows (31-50, 20 slots since the template's row-31-42 range was extended). If the generator writes new items without first clearing these presets, the old values persist and sum into the totals formula (`G52`, previously `G44` before the extension).
+**Root cause**: The XLSX template ships preset non-zero values in the E (quantity) and F (unit price) columns of the 20 line-item rows, 31-50. If the generator writes new items without clearing those presets first, the old values survive and sum into the netto total in `G52`.
 
 **Fix**: The generator must set all line-item rows' columns E and F to 0 before writing any line item. Verify in `crates/offer-generator/src/xlsx.rs` that the clear loop (currently `for row in 31..=50`) runs before the write loop.
 

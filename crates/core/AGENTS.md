@@ -115,5 +115,5 @@ All configurable via `config/*.toml` with `serde(default)`:
 | `InquiryStatus` enum | `can_transition_to()`, admin frontend `INQUIRY_STATUS_LABELS`, `inquiries.rs` PATCH handler status validation |
 | `CompanyConfig` struct | `PricingEngine::with_rate()` calls, `ServicePrices::from_pricing()` (in `crates/api/src/services/offer_builder.rs`), offer generator, all unit tests using `PricingEngine::new()` |
 | `Services` struct | `build_line_items()` in offer builder, XLSX line items, foto-angebot form, admin service toggles |
-| `EstimationMethod` enum | `volume.rs` string conversion, submission handlers in `crates/api/src/routes/submissions.rs`, DB CHECK constraint, offer builder `parse_detected_items()`, vision service |
+| `EstimationMethod` enum | `volume.rs` string conversion, the 5 submission handlers, `parse_detected_items()` in the offer builder, the vision service — `volume_estimations.method` is a plain VARCHAR with no CHECK constraint, so nothing rejects a typo |
 | `services/traits.rs` trait signatures | matching impl in `crates/api/src/services/bridge/`, any `crates/assistant` tool calling that method |

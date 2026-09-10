@@ -95,7 +95,7 @@ or the local `/estimate/video`.
 
 | If you change... | ...also verify |
 |---|---|
-| New estimation method or `EstimationMethod` | `volume.rs` enum variants + `from_str()`/`as_str()`, `submissions.rs` handler dispatch, DB CHECK constraint (needs migration), `offer_builder.rs` `parse_detected_items()` |
+| New estimation method or `EstimationMethod` | `volume.rs` enum variants plus `from_str()`/`as_str()`, `submissions.rs` handler dispatch, `parse_detected_items()` in `offer_builder.rs` — the DB column is an unconstrained VARCHAR, so a typo is stored silently |
 | Response format or `DetectedItem` schema (`app/models/schemas.py`) | `offer_builder.rs` item sheet generation, `volume.rs` deserialization structs, frontend estimation items table |
 | Model weights or inference pipeline | GPU memory management in `model_loader.py` (L4 24GB budget), Modal deployment config, processing time estimates |
 | `RE_CATALOG` entries | `crates/volume-estimator/src/re_catalogue.txt` (kept in sync manually — no shared source of truth across Python/Rust) |

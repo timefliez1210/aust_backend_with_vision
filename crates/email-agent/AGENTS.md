@@ -54,10 +54,6 @@ Key field mappings (hyphenated form shown; see `parser.rs` for the aliases):
 | `zusatzleistungen` | services (comma-separated German names) |
 | `nachricht` | notes |
 
-## Customer Email Fix
-
-IMAP sender for form submissions is always the company inbox (`<company-inbox>`). After parsing, the processor uses the email from the JSON form data instead — ensures correct customer record.
-
 ## Inbound Persistence and Threading
 
 Every inbound mail is written to `email_messages` with `status = 'received'`, and the
@@ -81,12 +77,9 @@ reconciles against; see `crates/assistant/src/hooks/reminders.rs`.
 - `pending_drafts: HashMap<String, PendingDraft>` — awaiting Telegram approval
 - `editing_draft: Option<PendingDraft>` — current draft in edit mode
 
-## External Connections
-
-IMAP (polling), SMTP (sending), Telegram Bot API, LLM provider, Calendar service.
 ## ⚠️ Connected Changes
 
-| If you change... | ...along change... |
+| If you change... | ...also verify |
 |---|---|
 | Email parser / `ParsedInquiry` | `submissions.rs` form parsing (shares field names like `halteverbot-auszug`), `inquiry_builder.rs` field mapping |
 | Telegram approval flow | `telegram_service.rs` callback data, `offer_pipeline.rs` auto-offer, `orchestrator.rs` event handling |

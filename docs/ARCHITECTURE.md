@@ -202,8 +202,7 @@ Sheet "Tabelle1":
   J58      Number of persons, written only when a labor line item exists
            (referenced by that row's own IF(...) formula, not a fixed row)
 
-  Line items (rows 31-50, 20 slots — extended from the original 12 (31-42);
-  generator hides ALL then reveals active):
+  Line items (rows 31-50, 20 slots; generator hides all, then reveals active):
     First:  Fahrkostenpauschale (always, flat ORS round-trip amount)
     Then:   Demontage (if disassembly), Montage (if assembly)
             Halteverbotszone (1-2 count)

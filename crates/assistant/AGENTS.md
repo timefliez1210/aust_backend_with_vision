@@ -85,33 +85,27 @@ No dedicated `TEST_DATABASE_URL` convention in this crate. Two patterns coexist:
   regression. Don't assume a green run here means the DB path was exercised; check for `DATABASE_URL`.
 - Tool-level unit tests use `tools::testing::mock_bundle()` (mocks every `ServiceBundle` trait) and need no DB at all.
 
-## Status
+## Open phases
 
-| Phase | Status | Description |
-|-------|--------|-------------|
-| 0 | Done | Foundation — soul, memory, registry, driver |
-| 1 | Done | Telegram → `driver::process_turn` via `assistant_bridge` |
-| 2 | Done | Real offer drafting + 88 tools wired through `ServiceBundle` |
-| 3 | Done | Confirmation keyboards (`Tool::summarize` + `ctx.confirmed`), event consumer, retention sweepers |
-| 4 | Deferred | Embedding-based episode clustering (Ollama Cloud has no embedding model) |
-| 5 | TODO | Train LinfaPredictor on offer_observations (min 50 rows) |
-| 6 | TODO | WhisperTranscriber — real voice input |
+Phases 0-3 shipped: soul, memory, registry, driver, Telegram wiring, real offer
+drafting, confirmation keyboards, event consumer and retention sweepers.
+
+- **Phase 4 deferred** — embedding-based episode clustering, because Ollama Cloud
+  offers no embedding model.
+- **Phase 5 TODO** — train `LinfaPredictor` on `offer_observations` (needs 50+ rows).
+- **Phase 6 TODO** — `WhisperTranscriber` for real voice input.
 
 ## Known partial wires
 
 - `SendInvoice`, `SendOfferToCustomer`, `UpdatePricing` return `AssistantError::NotWired`
   on confirm — the PDF-send pipeline (S3 fetch + SMTP attach) is plumbed through the legacy
   route handler, not yet exposed via `InvoiceService`/`OfferService`, and `SettingsService::update_pricing`
-  has no implementation yet. `SendEmail` and `SendPaymentReminder` are now fully wired
-  (`EmailService::send`, `InvoiceService::send_dunning`) — they were NotWired stubs when this
-  file was last written and have since shipped.
+  has no implementation yet.
 - `apply_nl_override` is rule-based (LLM variant deferred).
 - `post_action::reflect` and `hooks::consolidate` are not scheduled — and
   would need to route through `pending_memory_proposals` before being safe
   to schedule (auto-store at confidence ≥ 0.7 currently bypasses B6's
   Confirm gate on `remember`).
-- `agent_owns_approval=true` (`events/handlers.rs::handle_offer_ready`) used to tell
-  Alex to tap "/approve <id>"/"/deny <id>" even though no such command parser or
-  inline button existed — **fixed (B4)**: the notification now honestly hands off
-  to the admin panel instead of a phantom command. The underlying send itself is
-  still not wired (see `SendOfferToCustomer` above) — only the message text was fixed.
+- `agent_owns_approval=true` (`events/handlers.rs::handle_offer_ready`) hands the
+  offer approval off to the admin panel. The send itself is still not wired, see
+  `SendOfferToCustomer` above.

@@ -39,9 +39,8 @@ ZIP-read/rewrite plumbing this and the other `*_xlsx.rs` generators build on.
 
 ### Template Cell Map
 
-The template was extended from 12 to 20 line-item slots on 2026-09-08, which shifted
-everything below the item block down by 8 rows. **G44 and J50 are stale references —
-the live cells are G52 and J58.**
+Older notes and comments name G44 and J50. Those are dead: the item block grew from
+12 slots to 20, pushing everything under it down 8 rows.
 
 | Cell/Row | Content |
 |----------|---------|
@@ -68,7 +67,7 @@ through the stop too (see `crates/distance-calculator/AGENTS.md`).
 
 ### Print Area
 
-Set to `'Tabelle1'!$A$1:$H$120` — columns I-P (internal calculations) are excluded from PDF. Unchanged by the 12→20 line-item extension.
+Set to `'Tabelle1'!$A$1:$H$120`, so columns I-P (internal calculations) stay out of the PDF.
 
 ### Items Sheet ("Erfasste Gegenstände")
 
@@ -107,9 +106,8 @@ The logo is a picture anchored to a spreadsheet column plus an offset in
 `xl/drawings/drawing1.xml`, so where it lands depends on the *renderer's* column
 widths, not the host's. In the production image Calibri falls back to Carlito,
 the columns render wider, and the picture was pushed past the right print margin —
-customers received KVAs reading "Aust Umzüg" (2026-09-07 incident, fixed 614507d).
-**The fix is to shrink the picture, never to move its anchor** — moving it fixes the
-symptom for one column-width outcome and breaks it for the next. `check-templates.py`
+customers received KVAs reading "Aust Umzüg". **Shrink the picture, never move its
+anchor** — moving it fixes one column-width outcome and breaks the next. `check-templates.py`
 rasterises page 1, finds the logo as the only saturated-color element in the top
 quarter, and fails unless its right edge stays 8pt clear of the print margin.
 

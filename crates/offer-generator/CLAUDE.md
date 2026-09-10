@@ -6,6 +6,6 @@ Pricing engine (configurable rates) + XLSX template manipulation + LibreOffice P
 
 **Pricing**: All rates in `CompanyConfig` (€30/hr labor, €25 assembly, €100 parking ban, €30 packing, €50 Saturday, €1/km travel). `PricingEngine::with_rate()` + `ServicePrices::from_pricing()`.
 
-**XLSX**: Rows 31-42 for line items (max 12, `warn!` if exceeded). Template cells documented in AGENTS.md.
+**XLSX**: rows 31-50 for line items (max 20, `warn!` if exceeded). Cell map in AGENTS.md.
 
 See [AGENTS.md](AGENTS.md) for: formula, cell map, rate back-calculation, line items.

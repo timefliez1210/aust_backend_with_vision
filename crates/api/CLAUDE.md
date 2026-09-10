@@ -2,7 +2,7 @@
 
 > **Full context**: [AGENTS.md](AGENTS.md)
 
-Axum HTTP server with JWT middleware. 19 route files, 18 repos, 10 services.
+Axum HTTP server with JWT middleware. 22 route files, 21 repos, 18 service modules.
 
 **Architecture**: `routes/ → repositories/ → PostgreSQL`. Business logic in `services/`.
 

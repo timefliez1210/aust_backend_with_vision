@@ -8,4 +8,4 @@ Background service: IMAP polling → parse email → create inquiry → offer �
 
 **Key**: Customer email comes from parsed form data, NOT the IMAP sender.
 
-See [AGENTS.md](AGENTS.md) for: JSON field mappings, state management, external connections.
+See [AGENTS.md](AGENTS.md) for: JSON field mappings, threading, char-boundary safety.

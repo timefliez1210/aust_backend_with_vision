@@ -6,36 +6,36 @@ The main backend crate. Axum HTTP server with JWT middleware, 22 route files, 21
 
 ### Routes (`src/routes/`)
 
-| File | Purpose | Size |
-|------|---------|------|
-| `submissions.rs` | Public form submissions (photo, mobile, AR, video, manual) | 92KB |
-| `admin.rs` | Dashboard, employees, notes, feedback, timesheets | 67KB |
-| `invoices.rs` | Invoice CRUD + XLSX generation | 47KB |
-| `inquiry_actions.rs` | Estimation triggers, offer generation, employee assignments | 29KB |
-| `inquiries.rs` | Inquiry CRUD, status transitions, PDF download, delete | 29KB |
-| `calendar.rs` | Calendar schedule, availability, bookings | 13KB |
-| `calendar_items.rs` | Calendar item CRUD (non-inquiry work blocks) | 22KB |
-| `customer.rs` | Customer-facing endpoints (OTP auth, inquiry list) | 19KB |
-| `employee.rs` | Employee CRUD, document upload/download, hours | 26KB |
-| `admin_customers.rs` | Admin customer CRUD, address update | 17KB |
-| `admin_emails.rs` | Email thread CRUD, drafts, send | 17KB |
-| `auth.rs` | JWT login/refresh | 17KB |
-| `estimates.rs` | Volume estimation CRUD + image serving | 36KB |
-| `distance.rs` | ORS distance calculation endpoint | 2KB |
-| `flash_contact.rs` | Public `POST /flash-contact` callback form, own rate limiter | 3KB |
-| `health.rs` | Health/readiness checks | 1KB |
-| `shared.rs` | Shared route utilities | 2KB |
-| `offers.rs` | Minimal offer route stub | 0.4KB |
-| `agent_activity.rs` | Admin view of the assistant's `agent_actions` audit log, `/admin/agent-activity` | 25KB |
-| `inquiry_appointments.rs` | CRUD for lightweight non-crew appointments (e.g. Besichtigung) on an inquiry, `/inquiries/{id}/appointments` | 16KB |
-| `storage.rs` | Storage-rental ("Lagerung") admin routes, `/admin/storage` — contracts + auto-generated monthly invoices, brutto-in/netto-stored at the boundary | 12KB |
-| `vehicles.rs` | Vehicle fleet CRUD + reminders (TÜV, Ölwechsel, ...), `/admin/vehicles` | 7KB |
+| File | Purpose |
+|------|---------|
+| `submissions.rs` | Public form submissions (photo, mobile, AR, video, manual) |
+| `admin.rs` | Dashboard, employees, notes, feedback, timesheets |
+| `invoices.rs` | Invoice CRUD + XLSX generation |
+| `inquiry_actions.rs` | Estimation triggers, offer generation, employee assignments |
+| `inquiries.rs` | Inquiry CRUD, status transitions, PDF download, delete |
+| `calendar.rs` | Calendar schedule, availability, bookings |
+| `calendar_items.rs` | Calendar item CRUD (non-inquiry work blocks) |
+| `customer.rs` | Customer-facing endpoints (OTP auth, inquiry list) |
+| `employee.rs` | Employee CRUD, document upload/download, hours |
+| `admin_customers.rs` | Admin customer CRUD, address update |
+| `admin_emails.rs` | Email thread CRUD, drafts, send |
+| `auth.rs` | JWT login/refresh |
+| `estimates.rs` | Volume estimation CRUD + image serving |
+| `distance.rs` | ORS distance calculation endpoint |
+| `flash_contact.rs` | Public `POST /flash-contact` callback form, own rate limiter |
+| `health.rs` | Health/readiness checks |
+| `shared.rs` | Shared route utilities |
+| `offers.rs` | Minimal offer route stub |
+| `agent_activity.rs` | Admin view of the assistant's `agent_actions` audit log, `/admin/agent-activity` |
+| `inquiry_appointments.rs` | CRUD for lightweight non-crew appointments (e.g. Besichtigung) on an inquiry, `/inquiries/{id}/appointments` |
+| `storage.rs` | Storage-rental ("Lagerung") admin routes, `/admin/storage` — contracts + auto-generated monthly invoices, brutto-in/netto-stored at the boundary |
+| `vehicles.rs` | Vehicle fleet CRUD + reminders (TÜV, Ölwechsel, ...), `/admin/vehicles` |
 
 ### Repositories (`src/repositories/`)
 
 | File | Key Tables | Notes |
 |------|-----------|-------|
-| `inquiry_repo.rs` | `inquiries`, `inquiry_employees` | 37KB — largest, most complex |
+| `inquiry_repo.rs` | `inquiries`, `inquiry_employees` | The largest and most complex repo |
 | `employee_repo.rs` | `employees`, `inquiry_employees` | Document keys use `resolve_doc_column()` allowlist |
 | `admin_repo.rs` | Aggregation queries (dashboard, orders) | |
 | `calendar_repo.rs` | `inquiries`, `calendar_items`, employee assignments | Schedule queries use `generate_series` to expand multi-day spans |
@@ -61,7 +61,7 @@ The main backend crate. Axum HTTP server with JWT middleware, 22 route files, 21
 
 | File | Purpose |
 |------|---------|
-| `offer_builder.rs` | **71KB** — full offer generation pipeline. Calls pricing engine, builds line items, generates XLSX/PDF, inserts offer. Race-condition safe via DB unique constraint. |
+| `offer_builder.rs` | The full offer-generation pipeline, and the largest file in the crate. Calls pricing engine, builds line items, generates XLSX/PDF, inserts offer. Race-condition safe via DB unique constraint. |
 | `inquiry_builder.rs` | Canonical response builder — assembles inquiry detail from 6+ repo calls |
 | `telegram_service.rs` | Telegram approval bot (✅ Approve / ✏️ Edit / ❌ Deny) |
 | `offer_pipeline.rs` | Auto-offer trigger: check readiness → calculate distance → generate offer |
@@ -70,7 +70,7 @@ The main backend crate. Axum HTTP server with JWT middleware, 22 route files, 21
 | `otp_service.rs` | Shared OTP request/verify logic, used by both customer and employee auth flows |
 | `vision.rs` | Vision service client (photo, depth, video) |
 | `flash_contact_service.rs` | Flash-contact reminder cron (`run_reminder_check`) — sends the delayed Telegram ping via the flash-contact bot token |
-| `invoice_number.rs` | Invoice number format `YYYY-N` — parse, format, ordering |
+| `invoice_number.rs` | Invoice numbers: parse, format (`YYYY-NN`, two-digit minimum), and the register sort order |
 | `kva_export.rs` | XLSX export for the KVA-Buch; mirrors `register_export`'s workbook plumbing |
 | `kva_followup_service.rs` | Nachfassen cron for Kostenvoranschläge — 60s tick spawned in `src/main.rs`, pings Telegram |
 | `register_export.rs` | Rechnungsausgangsbuch → XLSX, handed to the Steuerberater |
@@ -147,13 +147,12 @@ All pricing constants are in `CompanyConfig`:
 
 ## ⚠️ Connected Changes
 
+The repo-wide table is in the [root AGENTS.md](../../AGENTS.md#-connected-changes--touch-one-check-these).
+Specific to this crate:
+
 | If you change... | ...also verify |
 |---|---|
-| Inquiry status machine | `can_transition_to()`, admin frontend status labels (`INQUIRY_STATUS_LABELS`), `inquiry_repo.rs` status query, `inquiries.rs` PATCH handler status validation |
-| `CompanyConfig` pricing | `PricingEngine::with_rate()`, `ServicePrices::from_pricing()`, offer XLSX template pricing cells, unit tests |
-| `Services` struct flags | `build_line_items()` in offer_builder, XLSX rows 31–42, foto-angebot form, frontend service toggles |
-| `inquiry_employees` schema (add/remove columns) | `calendar_item_employees` mirror, `calendar_repo` schedule queries, `employee_repo` hours queries, admin employee panel |
-| `offers` unique constraint | `offer_pipeline.rs` race guard, `offer_builder.rs` insert catch block, `offer_repo.rs` fetch_active_id |
-| DB migration | `test_helpers.rs` factory functions, integration tests, manual `deploy.sh` step |
-| `EstimationMethod` enum | `volume.rs`, all 5 submission handlers in `submissions.rs`, offer_builder `parse_detected_items()`, DB CHECK constraint migration |
-| Address schema | `merge_address_parts()` in all 5 submission handlers, offer PDF address block, XLSX cells A8-A11, frontend address editor |
+| Inquiry status handling | `can_transition_to()` in core, the PATCH validation in `inquiries.rs`, `inquiry_repo.rs` status queries, `INQUIRY_STATUS_LABELS` in the frontend |
+| `inquiry_employees` columns | the `calendar_item_employees` mirror, `calendar_repo` schedule queries, `employee_repo` hours queries, the admin employee panel |
+| The `offers` unique constraint | the race guard in `offer_pipeline.rs`, the insert catch in `offer_builder.rs`, `offer_repo.rs::fetch_active_id` |
+| Address handling | `merge_address_parts()` in all 5 submission handlers, the offer PDF address block, XLSX cells A8-A11, the frontend address editor |

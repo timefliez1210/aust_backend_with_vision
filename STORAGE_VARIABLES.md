@@ -135,7 +135,7 @@ Formal invoice document attached to a completed inquiry.
 |--------|------|-------|
 | `id` | UUID | PK |
 | `inquiry_id` | UUID | FK → inquiries |
-| `invoice_number` | TEXT | Unique invoice number, format `YYYY-NNNN` (e.g. "2026-0087"), restarting at `-0001` each January — see `invoice_number_counters` below |
+| `invoice_number` | TEXT | Unique invoice number, format `YYYY-NN` (e.g. "2026-87"), zero-padded to a two-digit minimum and restarting at `-01` each January — see `invoice_number_counters` below |
 | `invoice_type` | VARCHAR(20) | "full", "partial_first" (Anzahlung), "partial_final" (Restbetrag) |
 | `partial_group_id` | UUID | Links the two invoices in a partial pair |
 | `partial_percent` | INTEGER | Downpayment percentage (e.g. 30) — only on partial_first |
@@ -581,7 +581,7 @@ Long-lived DB-backed session tokens for authenticated employees (worker portal).
 | `invoice_number_seq` | `{seq}{year}` e.g. "12026" | Legacy — superseded by `invoice_number_counters` (migration `20260821100000`) for new allocations. Left in place, unused, rather than dropped. |
 
 Current invoice numbering is per-calendar-year via the `invoice_number_counters` table
-(see above), format `YYYY-NNNN`, restarting at `-0001` every January.
+(see above), format `YYYY-NN`, restarting at `-01` every January.
 
 ---
 

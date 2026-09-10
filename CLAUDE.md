@@ -20,6 +20,7 @@ Moving company automation: inquiry → estimation → offer → scheduling → i
 - [crates/volume-estimator/AGENTS.md](crates/volume-estimator/AGENTS.md) — Vision client
 - [crates/flash-contact/AGENTS.md](crates/flash-contact/AGENTS.md) — Quick-callback form + reminders
 - [crates/flash-contact-bot/AGENTS.md](crates/flash-contact-bot/AGENTS.md) — Its standalone Telegram bot
-- [frontend/AGENTS.md](frontend/AGENTS.md) — SvelteKit admin dashboard
+- [frontend/AGENTS.md](frontend/AGENTS.md) — SvelteKit marketing site, admin dashboard, worker portal
+- [app/AGENTS.md](app/AGENTS.md) — Customer capture app (Capacitor, on-device LiDAR)
 - [services/vision/AGENTS.md](services/vision/AGENTS.md) — Python ML pipeline
 - [tests/e2e/AGENTS.md](tests/e2e/AGENTS.md) — Playwright end-to-end suite (`scripts/staging.sh`)
