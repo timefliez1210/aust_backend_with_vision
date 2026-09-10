@@ -207,9 +207,13 @@ pub(crate) struct ScheduleJobRow {
     pub job_date: Option<NaiveDate>,
     pub status: String,
     pub origin_street: Option<String>,
+    /// Kept separate from `street`, which holds the street name alone: without
+    /// this the worker sees a road, not a door to knock on.
+    pub origin_house_number: Option<String>,
     pub origin_city: Option<String>,
     pub origin_postal_code: Option<String>,
     pub destination_street: Option<String>,
+    pub destination_house_number: Option<String>,
     pub destination_city: Option<String>,
     pub destination_postal_code: Option<String>,
     pub estimated_volume_m3: Option<f64>,
@@ -235,12 +239,14 @@ pub(crate) async fn fetch_schedule_jobs(
             ie.inquiry_id,
             ie.job_date AS job_date,
             i.status,
-            oa.street      AS origin_street,
-            oa.city        AS origin_city,
-            oa.postal_code AS origin_postal_code,
-            da.street      AS destination_street,
-            da.city        AS destination_city,
-            da.postal_code AS destination_postal_code,
+            oa.street       AS origin_street,
+            oa.house_number AS origin_house_number,
+            oa.city         AS origin_city,
+            oa.postal_code  AS origin_postal_code,
+            da.street       AS destination_street,
+            da.house_number AS destination_house_number,
+            da.city         AS destination_city,
+            da.postal_code  AS destination_postal_code,
             i.estimated_volume_m3,
             COALESCE(c.first_name || ' ' || c.last_name, c.name) AS customer_name,
             c.phone AS customer_phone,
@@ -278,6 +284,10 @@ pub(crate) struct CalendarItemRow {
     pub title: String,
     pub location: Option<String>,
     pub category: String,
+    /// A Termin may stand alone (`customer_id` null), but when it belongs to a
+    /// customer the crew must be able to ring them straight from the card.
+    pub customer_name: Option<String>,
+    pub customer_phone: Option<String>,
     pub scheduled_date: Option<NaiveDate>,
     pub status: String,
     pub actual_hours: Option<f64>,
@@ -301,6 +311,8 @@ pub(crate) async fn fetch_schedule_items(
             ci.title,
             ci.location,
             ci.category,
+            COALESCE(c.first_name || ' ' || c.last_name, c.name) AS customer_name,
+            c.phone AS customer_phone,
             cie.job_date AS scheduled_date,
             ci.status,
             COALESCE(cie.actual_hours::float8,
@@ -311,6 +323,7 @@ pub(crate) async fn fetch_schedule_items(
             ci.employee_notes
         FROM calendar_item_employees cie
         JOIN calendar_items ci ON ci.id = cie.calendar_item_id
+        LEFT JOIN customers c ON c.id = ci.customer_id
         WHERE cie.employee_id = $1
           AND cie.job_date BETWEEN $2 AND $3
           AND ci.status NOT IN ('cancelled')
@@ -338,6 +351,7 @@ pub(crate) struct ScheduleAppointmentJobRow {
     /// Display location: structured address if present, else free-text.
     pub location: Option<String>,
     pub customer_name: Option<String>,
+    pub customer_phone: Option<String>,
     pub actual_hours: Option<f64>,
     pub employee_notes: Option<String>,
 }
@@ -368,6 +382,7 @@ pub(crate) async fn fetch_schedule_appointments(
                 a.location
             ) AS location,
             COALESCE(c.first_name || ' ' || c.last_name, c.name) AS customer_name,
+            c.phone AS customer_phone,
             COALESCE(iae.actual_hours::float8,
                  CASE WHEN iae.clock_out IS NOT NULL AND iae.clock_in IS NOT NULL
                       THEN (aust_shift_hours(iae.clock_in, iae.clock_out)
@@ -378,7 +393,14 @@ pub(crate) async fn fetch_schedule_appointments(
         JOIN inquiry_appointments a ON a.id = iae.appointment_id
         JOIN inquiries  i ON i.id = a.inquiry_id
         JOIN customers  c ON c.id = i.customer_id
-        LEFT JOIN addresses ad ON ad.id = a.address_id
+        -- A Zusatztermin rarely carries its own address: the admin picker for it
+        -- does not exist yet, so `address_id` is null on every row in production
+        -- and `location` is often blank too. Falling back to the move's start
+        -- address is what leaves the crew with something to drive to.
+        LEFT JOIN addresses ad ON ad.id = COALESCE(
+            a.address_id,
+            CASE WHEN NULLIF(TRIM(a.location), '') IS NULL THEN i.origin_address_id END
+        )
         WHERE iae.employee_id = $1
           AND a.scheduled_date BETWEEN $2 AND $3
           AND a.status <> 'cancelled'
@@ -462,13 +484,14 @@ pub(crate) async fn fetch_pending_hours(
             NULL::uuid             AS appointment_id,
             cie.job_date           AS job_date,
             ci.title               AS title,
-            NULL::text             AS customer_name,
+            COALESCE(c.first_name || ' ' || c.last_name, c.name) AS customer_name,
             NULL::text             AS origin_city,
             NULL::text             AS destination_city,
             ci.location            AS location,
             ci.start_time          AS start_time
         FROM calendar_item_employees cie
         JOIN calendar_items ci ON ci.id = cie.calendar_item_id
+        LEFT JOIN customers c ON c.id = ci.customer_id
         WHERE cie.employee_id = $1
           AND cie.job_date < $2
           AND cie.job_date >= $3
@@ -484,13 +507,21 @@ pub(crate) async fn fetch_pending_hours(
             a.id                   AS appointment_id,
             a.scheduled_date       AS job_date,
             a.kind                 AS title,
-            NULL::text             AS customer_name,
+            COALESCE(c.first_name || ' ' || c.last_name, c.name) AS customer_name,
             NULL::text             AS origin_city,
             NULL::text             AS destination_city,
-            a.location             AS location,
+            COALESCE(
+                NULLIF(TRIM(a.location), ''),
+                NULLIF(TRIM(CONCAT_WS(', ',
+                    NULLIF(TRIM(CONCAT_WS(' ', oa.street, oa.house_number)), ''),
+                    NULLIF(TRIM(CONCAT_WS(' ', oa.postal_code, oa.city)), ''))), '')
+            )                      AS location,
             a.start_time           AS start_time
         FROM inquiry_appointment_employees iae
         JOIN inquiry_appointments a ON a.id = iae.appointment_id
+        JOIN inquiries i ON i.id = a.inquiry_id
+        JOIN customers c ON c.id = i.customer_id
+        LEFT JOIN addresses oa ON oa.id = i.origin_address_id
         WHERE iae.employee_id = $1
           AND a.scheduled_date < $2
           AND a.scheduled_date >= $3
@@ -746,15 +777,25 @@ pub(crate) struct JobInquiryRow {
     pub status: String,
     pub estimated_volume_m3: Option<f64>,
     pub origin_street: Option<String>,
+    pub origin_house_number: Option<String>,
     pub origin_city: Option<String>,
     pub origin_postal_code: Option<String>,
     pub origin_floor: Option<String>,
     pub origin_elevator: Option<bool>,
     pub destination_street: Option<String>,
+    pub destination_house_number: Option<String>,
     pub destination_city: Option<String>,
     pub destination_postal_code: Option<String>,
     pub destination_floor: Option<String>,
     pub destination_elevator: Option<bool>,
+    // The Zwischenstopp. A move that collects from a second address strands the
+    // crew if only the two endpoints reach them.
+    pub stop_street: Option<String>,
+    pub stop_house_number: Option<String>,
+    pub stop_city: Option<String>,
+    pub stop_postal_code: Option<String>,
+    pub stop_floor: Option<String>,
+    pub stop_elevator: Option<bool>,
     pub customer_name: Option<String>,
     pub customer_phone: Option<String>,
     pub employee_notes: Option<String>,
@@ -775,16 +816,24 @@ pub(crate) async fn fetch_job_inquiry(
             i.start_time,
             i.status,
             i.estimated_volume_m3,
-            oa.street      AS origin_street,
-            oa.city        AS origin_city,
-            oa.postal_code AS origin_postal_code,
-            oa.floor       AS origin_floor,
-            oa.elevator    AS origin_elevator,
-            da.street      AS destination_street,
-            da.city        AS destination_city,
-            da.postal_code AS destination_postal_code,
-            da.floor       AS destination_floor,
-            da.elevator    AS destination_elevator,
+            oa.street       AS origin_street,
+            oa.house_number AS origin_house_number,
+            oa.city         AS origin_city,
+            oa.postal_code  AS origin_postal_code,
+            oa.floor        AS origin_floor,
+            oa.elevator     AS origin_elevator,
+            da.street       AS destination_street,
+            da.house_number AS destination_house_number,
+            da.city         AS destination_city,
+            da.postal_code  AS destination_postal_code,
+            da.floor        AS destination_floor,
+            da.elevator     AS destination_elevator,
+            sa.street       AS stop_street,
+            sa.house_number AS stop_house_number,
+            sa.city         AS stop_city,
+            sa.postal_code  AS stop_postal_code,
+            sa.floor        AS stop_floor,
+            sa.elevator     AS stop_elevator,
             COALESCE(c.first_name || ' ' || c.last_name, c.name) AS customer_name,
             c.phone  AS customer_phone,
             i.employee_notes
@@ -792,6 +841,7 @@ pub(crate) async fn fetch_job_inquiry(
         JOIN customers c ON i.customer_id = c.id
         LEFT JOIN addresses oa ON i.origin_address_id      = oa.id
         LEFT JOIN addresses da ON i.destination_address_id = da.id
+        LEFT JOIN addresses sa ON i.stop_address_id        = sa.id
         WHERE i.id = $1
         "#,
     )
@@ -896,6 +946,8 @@ pub(crate) struct ItemDetailRow {
     pub title: String,
     pub category: String,
     pub location: Option<String>,
+    pub customer_name: Option<String>,
+    pub customer_phone: Option<String>,
     pub description: Option<String>,
     pub start_time: Option<NaiveTime>,
     pub end_time: Option<NaiveTime>,
@@ -918,11 +970,14 @@ pub(crate) async fn fetch_item_detail(
                ci.title,
                ci.category,
                ci.location,
+               COALESCE(c.first_name || ' ' || c.last_name, c.name) AS customer_name,
+               c.phone AS customer_phone,
                ci.description,
                ci.start_time,
                ci.end_time,
                ci.employee_notes
         FROM calendar_items ci
+        LEFT JOIN customers c ON c.id = ci.customer_id
         WHERE ci.id = $1
         "#,
     )
@@ -1027,6 +1082,14 @@ pub(crate) struct AppointmentDetailRow {
     pub address_postal_code: Option<String>,
     pub address_floor: Option<String>,
     pub address_elevator: Option<bool>,
+    /// True when the address above was borrowed from the linked move's start
+    /// address rather than set on the Zusatztermin itself, so the worker portal
+    /// can say where the address came from instead of implying it was chosen.
+    pub address_from_inquiry: bool,
+    // The linked move's own endpoints, always shown: a Zusatztermin is a step
+    // inside a move, and the crew needs the whole route regardless.
+    pub inquiry_origin: Option<String>,
+    pub inquiry_destination: Option<String>,
     // Linked inquiry's customer contact
     pub customer_name: Option<String>,
     pub customer_phone: Option<String>,
@@ -1056,13 +1119,29 @@ pub(crate) async fn fetch_appointment_detail(
                ad.postal_code  AS address_postal_code,
                ad.floor        AS address_floor,
                ad.elevator     AS address_elevator,
+               (a.address_id IS NULL AND ad.id IS NOT NULL) AS address_from_inquiry,
+               NULLIF(TRIM(CONCAT_WS(', ',
+                   NULLIF(TRIM(CONCAT_WS(' ', oa.street, oa.house_number)), ''),
+                   NULLIF(TRIM(CONCAT_WS(' ', oa.postal_code, oa.city)), ''))), '')
+                   AS inquiry_origin,
+               NULLIF(TRIM(CONCAT_WS(', ',
+                   NULLIF(TRIM(CONCAT_WS(' ', da.street, da.house_number)), ''),
+                   NULLIF(TRIM(CONCAT_WS(' ', da.postal_code, da.city)), ''))), '')
+                   AS inquiry_destination,
                COALESCE(c.first_name || ' ' || c.last_name, c.name) AS customer_name,
                c.phone AS customer_phone,
                a.inquiry_id
         FROM inquiry_appointments a
         JOIN inquiries i ON i.id = a.inquiry_id
         JOIN customers c ON c.id = i.customer_id
-        LEFT JOIN addresses ad ON ad.id = a.address_id
+        LEFT JOIN addresses oa ON oa.id = i.origin_address_id
+        LEFT JOIN addresses da ON da.id = i.destination_address_id
+        -- Same fallback as the schedule list: without an own address_id and
+        -- without free-text, the move's start address is the only real answer.
+        LEFT JOIN addresses ad ON ad.id = COALESCE(
+            a.address_id,
+            CASE WHEN NULLIF(TRIM(a.location), '') IS NULL THEN i.origin_address_id END
+        )
         WHERE a.id = $1
         "#,
     )
@@ -1214,6 +1293,7 @@ pub(crate) async fn fetch_hours_entries(
             ci.status                  AS status
         FROM calendar_item_employees cie
         JOIN calendar_items ci ON ci.id = cie.calendar_item_id
+        LEFT JOIN customers c ON c.id = ci.customer_id
         WHERE cie.employee_id = $1
           AND cie.job_date BETWEEN $2 AND $3
           AND ci.status NOT IN ('cancelled')
@@ -1775,6 +1855,7 @@ pub(crate) async fn fetch_admin_calendar_item_hours(
                ci.status
         FROM calendar_item_employees cie
         JOIN calendar_items ci ON ci.id = cie.calendar_item_id
+        LEFT JOIN customers c ON c.id = ci.customer_id
         WHERE cie.employee_id = $1
           AND cie.job_date BETWEEN $2 AND $3
           AND ci.status NOT IN ('cancelled')
@@ -1851,7 +1932,14 @@ pub(crate) async fn fetch_admin_appointment_hours(
         JOIN inquiry_appointments a ON a.id = iae.appointment_id
         JOIN inquiries  i ON i.id = a.inquiry_id
         JOIN customers  c ON c.id = i.customer_id
-        LEFT JOIN addresses ad ON ad.id = a.address_id
+        -- A Zusatztermin rarely carries its own address: the admin picker for it
+        -- does not exist yet, so `address_id` is null on every row in production
+        -- and `location` is often blank too. Falling back to the move's start
+        -- address is what leaves the crew with something to drive to.
+        LEFT JOIN addresses ad ON ad.id = COALESCE(
+            a.address_id,
+            CASE WHEN NULLIF(TRIM(a.location), '') IS NULL THEN i.origin_address_id END
+        )
         WHERE iae.employee_id = $1
           AND a.scheduled_date BETWEEN $2 AND $3
           AND a.status <> 'cancelled'
@@ -2203,7 +2291,203 @@ pub(crate) async fn delete_all_sessions(pool: &PgPool, employee_id: Uuid) -> Res
 
 #[cfg(test)]
 mod tests {
-    
+    use super::*;
+    use crate::test_helpers;
+    use sqlx::PgPool;
+
+    /// Seeds a customer, a fully addressed move and one employee on it, and
+    /// returns (inquiry_id, employee_id, job_date).
+    async fn seed_move(pool: &PgPool) -> (Uuid, Uuid, NaiveDate) {
+        let customer_id = test_helpers::insert_test_customer(pool).await;
+        sqlx::query("UPDATE customers SET phone = '05121 999888' WHERE id = $1")
+            .bind(customer_id)
+            .execute(pool)
+            .await
+            .expect("set phone");
+
+        let origin = test_helpers::insert_test_address_full(
+            pool, "Brühl", Some("33"), "Hildesheim", "31134", Some(3), Some(false), Some(false),
+        )
+        .await;
+        let dest = test_helpers::insert_test_address_full(
+            pool, "Gluckweg", Some("30"), "Sarstedt", "31157", Some(1), Some(true), Some(false),
+        )
+        .await;
+
+        let inquiry_id = test_helpers::insert_test_inquiry_full(
+            pool, customer_id, origin, dest, "accepted", "termin", None,
+        )
+        .await;
+
+        let job_date = NaiveDate::from_ymd_opt(2031, 9, 14).expect("valid date");
+        sqlx::query("UPDATE inquiries SET scheduled_date = $2 WHERE id = $1")
+            .bind(inquiry_id)
+            .bind(job_date)
+            .execute(pool)
+            .await
+            .expect("schedule inquiry");
+
+        let employee_id = test_helpers::insert_test_employee(pool, "Dmytro", "Koren").await;
+        test_helpers::insert_test_inquiry_employee(pool, inquiry_id, employee_id, job_date, 8.0)
+            .await;
+
+        (inquiry_id, employee_id, job_date)
+    }
+
+    /// The crew complained they never saw a full address. `addresses.street` holds
+    /// the street name alone, so projecting it without `house_number` handed the
+    /// worker a road with no door on it.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_job_carries_its_house_numbers(pool: PgPool) {
+        let (_, employee_id, day) = seed_move(&pool).await;
+
+        let rows = fetch_schedule_jobs(&pool, employee_id, day, day).await.expect("schedule");
+        let job = rows.first().expect("the assigned job must be listed");
+        assert_eq!(job.origin_house_number.as_deref(), Some("33"));
+        assert_eq!(job.destination_house_number.as_deref(), Some("30"));
+        assert_eq!(job.customer_phone.as_deref(), Some("05121 999888"));
+    }
+
+    /// Same gap on the detail page, plus the Zwischenstopp, which never reached
+    /// the worker at all even when the office had entered one.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_job_detail_carries_house_numbers_and_the_stop(pool: PgPool) {
+        let (inquiry_id, _, _) = seed_move(&pool).await;
+        let stop = test_helpers::insert_test_address_full(
+            &pool, "Sedanstr.", Some("8"), "Hildesheim", "31134", None, None, Some(false),
+        )
+        .await;
+        sqlx::query("UPDATE inquiries SET stop_address_id = $2 WHERE id = $1")
+            .bind(inquiry_id)
+            .bind(stop)
+            .execute(&pool)
+            .await
+            .expect("set stop");
+
+        let row = fetch_job_inquiry(&pool, inquiry_id).await.expect("query").expect("row");
+        assert_eq!(row.origin_house_number.as_deref(), Some("33"));
+        assert_eq!(row.destination_house_number.as_deref(), Some("30"));
+        assert_eq!(row.stop_street.as_deref(), Some("Sedanstr."));
+        assert_eq!(row.stop_house_number.as_deref(), Some("8"));
+        assert_eq!(row.stop_city.as_deref(), Some("Hildesheim"));
+    }
+
+    /// A Zusatztermin has no address picker in the admin UI yet, so `address_id`
+    /// is null on every row in production and `location` is frequently blank too.
+    /// The worker portal then showed a start time and nothing else. The move's own
+    /// start address is the answer, and the route is sent alongside it.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn an_addressless_appointment_borrows_the_move_address(pool: PgPool) {
+        let (inquiry_id, employee_id, day) = seed_move(&pool).await;
+
+        let appt_id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO inquiry_appointments (id, inquiry_id, kind, scheduled_date, start_time, status)
+             VALUES ($1, $2, 'halteverbot', $3, '07:30', 'scheduled')",
+        )
+        .bind(appt_id)
+        .bind(inquiry_id)
+        .bind(day)
+        .execute(&pool)
+        .await
+        .expect("insert appointment");
+
+        sqlx::query(
+            "INSERT INTO inquiry_appointment_employees (appointment_id, employee_id)
+             VALUES ($1, $2)",
+        )
+        .bind(appt_id)
+        .bind(employee_id)
+        .execute(&pool)
+        .await
+        .expect("assign employee");
+
+        let row = fetch_appointment_detail(&pool, appt_id).await.expect("query").expect("row");
+        assert_eq!(row.address_street.as_deref(), Some("Brühl"));
+        assert_eq!(row.address_house_number.as_deref(), Some("33"));
+        assert_eq!(row.address_city.as_deref(), Some("Hildesheim"));
+        assert!(row.address_from_inquiry, "the address was borrowed, so say so");
+        assert_eq!(row.inquiry_origin.as_deref(), Some("Brühl 33, 31134 Hildesheim"));
+        assert_eq!(row.inquiry_destination.as_deref(), Some("Gluckweg 30, 31157 Sarstedt"));
+        assert_eq!(row.customer_phone.as_deref(), Some("05121 999888"));
+
+        let listed = fetch_schedule_appointments(&pool, employee_id, day, day)
+            .await
+            .expect("schedule");
+        let appt = listed.first().expect("the Zusatztermin must be listed");
+        assert_eq!(appt.location.as_deref(), Some("Brühl 33, 31134 Hildesheim"));
+        assert_eq!(appt.customer_phone.as_deref(), Some("05121 999888"));
+    }
+
+    /// An explicit free-text location on the Zusatztermin wins: the office typed
+    /// it because the work is somewhere other than the move's start address.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn an_appointment_with_its_own_location_keeps_it(pool: PgPool) {
+        let (inquiry_id, _, day) = seed_move(&pool).await;
+
+        let appt_id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO inquiry_appointments (id, inquiry_id, kind, scheduled_date, location, status)
+             VALUES ($1, $2, 'halteverbot', $3, 'Kaiserstr. 32, 31134 Hildesheim', 'scheduled')",
+        )
+        .bind(appt_id)
+        .bind(inquiry_id)
+        .bind(day)
+        .execute(&pool)
+        .await
+        .expect("insert appointment");
+
+        let row = fetch_appointment_detail(&pool, appt_id).await.expect("query").expect("row");
+        assert!(row.address_street.is_none(), "must not overwrite a typed location");
+        assert!(!row.address_from_inquiry);
+        assert_eq!(row.location.as_deref(), Some("Kaiserstr. 32, 31134 Hildesheim"));
+    }
+
+    /// A Termin hung off a customer showed neither their name nor their number,
+    /// so the crew had no way to ring ahead.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_termin_carries_its_customer(pool: PgPool) {
+        let customer_id = test_helpers::insert_test_customer(&pool).await;
+        sqlx::query("UPDATE customers SET phone = '05121 111222' WHERE id = $1")
+            .bind(customer_id)
+            .execute(&pool)
+            .await
+            .expect("set phone");
+
+        let item_id = Uuid::now_v7();
+        let day = NaiveDate::from_ymd_opt(2031, 9, 11).expect("valid date");
+        sqlx::query(
+            "INSERT INTO calendar_items (id, title, category, location, scheduled_date, customer_id, start_time)
+             VALUES ($1, 'Kartons ausliefern', 'intern', 'Sedanstr. 8, 31134 Hildesheim', $2, $3, '09:00')",
+        )
+        .bind(item_id)
+        .bind(day)
+        .bind(customer_id)
+        .execute(&pool)
+        .await
+        .expect("insert calendar item");
+
+        let employee_id = test_helpers::insert_test_employee(&pool, "Maxim", "Ion").await;
+        sqlx::query(
+            "INSERT INTO calendar_item_employees (calendar_item_id, employee_id, job_date)
+             VALUES ($1, $2, $3)",
+        )
+        .bind(item_id)
+        .bind(employee_id)
+        .bind(day)
+        .execute(&pool)
+        .await
+        .expect("assign employee");
+
+        let rows = fetch_schedule_items(&pool, employee_id, day, day).await.expect("schedule");
+        let item = rows.first().expect("the Termin must be listed");
+        assert!(item.customer_name.is_some(), "the crew must know whose Termin this is");
+        assert_eq!(item.customer_phone.as_deref(), Some("05121 111222"));
+
+        let detail = fetch_item_detail(&pool, item_id).await.expect("query").expect("row");
+        assert_eq!(detail.customer_phone.as_deref(), Some("05121 111222"));
+    }
+
 
     /// Verify that fetch_document_key does NOT append _key to the column name.
     /// The bug was a double _key suffix (arbeitsvertrag_key_key) that made all

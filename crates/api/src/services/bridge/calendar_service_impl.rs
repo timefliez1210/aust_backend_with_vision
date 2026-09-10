@@ -392,6 +392,21 @@ impl CalendarService for CalendarServiceImpl {
 
         // Update inquiry scheduled_date, status and (when supplied) times. NULL
         // start/end leave the existing values intact via COALESCE.
+        // Capture the day the job currently sits on before moving it. Anyone
+        // already on the crew is pinned to that day in `inquiry_employees`, and
+        // the row does not follow the job on its own: a move done here used to
+        // leave the whole crew standing on the old date, where the worker app
+        // showed them a job that was no longer there and showed them nothing on
+        // the day it had moved to. Only `update_fields` shifted the crew, so a
+        // move made through this path silently stranded it.
+        let old_date: Option<NaiveDate> =
+            sqlx::query_scalar("SELECT scheduled_date FROM inquiries WHERE id = $1")
+                .bind(inquiry_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(super::map_sqlx)?
+                .flatten();
+
         sqlx::query(
             r#"
             UPDATE inquiries SET
@@ -410,6 +425,34 @@ impl CalendarService for CalendarServiceImpl {
         .execute(&self.pool)
         .await
         .map_err(super::map_sqlx)?;
+
+        // Carry the existing crew across by the same delta the job moved. Rows
+        // that already carry recorded work stay put: those hours are historical
+        // fact about a day somebody actually worked. A row that would land on a
+        // day the same worker already holds is skipped rather than merged.
+        if let Some(old) = old_date.filter(|old| *old != date) {
+            sqlx::query(
+                r#"
+                UPDATE inquiry_employees
+                SET job_date = job_date + ($2::date - $3::date)
+                WHERE inquiry_id = $1
+                  AND clock_in IS NULL AND clock_out IS NULL AND actual_hours IS NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM inquiry_employees other
+                      WHERE other.inquiry_id  = inquiry_employees.inquiry_id
+                        AND other.employee_id = inquiry_employees.employee_id
+                        AND other.job_date    = inquiry_employees.job_date
+                                                + ($2::date - $3::date)
+                  )
+                "#,
+            )
+            .bind(inquiry_id)
+            .bind(date)
+            .bind(old)
+            .execute(&self.pool)
+            .await
+            .map_err(super::map_sqlx)?;
+        }
 
         // Assign employees (use existing inquiry_employees table), carrying the
         // job's shift times onto each crew row when provided.
@@ -976,6 +1019,80 @@ mod tests {
     async fn try_pool() -> Option<PgPool> {
         let url = std::env::var("DATABASE_URL").ok()?;
         sqlx::PgPool::connect(&url).await.ok()
+    }
+
+    /// Regression (2026-09-10): moving a scheduled job through this path left the
+    /// crew standing on the old day. The workers assigned to a Grünebaum move that
+    /// slid from the 15th to the 14th reported the job had vanished from their app
+    /// entirely — it had not, it was still sitting on the 15th while the job itself
+    /// was on the 14th. `update_fields` shifted the crew; this path never did.
+    #[tokio::test]
+    async fn rescheduling_carries_the_crew_to_the_new_day() {
+        let Some(pool) = try_pool().await else { return };
+
+        let customer_id = Uuid::now_v7();
+        sqlx::query("INSERT INTO customers (id, name, email) VALUES ($1, $2, $3)")
+            .bind(customer_id)
+            .bind("Grünebaum")
+            .bind(format!("{customer_id}@test.de"))
+            .execute(&pool)
+            .await
+            .expect("insert customer");
+
+        let inquiry_id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO inquiries (id, customer_id, status, source) VALUES ($1, $2, 'accepted', 'test')",
+        )
+        .bind(inquiry_id)
+        .bind(customer_id)
+        .execute(&pool)
+        .await
+        .expect("insert inquiry");
+
+        let employee_id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO employees (id, first_name, last_name, email)
+             VALUES ($1, 'Dmytro', 'Koren', $2)",
+        )
+        .bind(employee_id)
+        .bind(format!("{employee_id}@test.de"))
+        .execute(&pool)
+        .await
+        .expect("insert employee");
+
+        let svc = CalendarServiceImpl::new(pool.clone());
+        let first = NaiveDate::from_ymd_opt(2031, 9, 15).expect("valid date");
+        let moved = NaiveDate::from_ymd_opt(2031, 9, 14).expect("valid date");
+
+        svc.schedule_inquiry(inquiry_id, first, vec![employee_id], None, None, None)
+            .await
+            .expect("first scheduling");
+
+        // The move slips a day. No crew list is passed, exactly as it happens when
+        // only the date is being corrected.
+        svc.schedule_inquiry(inquiry_id, moved, vec![], None, None, None)
+            .await
+            .expect("reschedule");
+
+        let days: Vec<NaiveDate> = sqlx::query_scalar(
+            "SELECT job_date FROM inquiry_employees WHERE inquiry_id = $1 AND employee_id = $2",
+        )
+        .bind(inquiry_id)
+        .bind(employee_id)
+        .fetch_all(&pool)
+        .await
+        .expect("read crew");
+
+        assert_eq!(
+            days,
+            vec![moved],
+            "the crew must travel with the job, not stay on the day it left"
+        );
+
+        sqlx::query("DELETE FROM inquiry_employees WHERE inquiry_id = $1").bind(inquiry_id).execute(&pool).await.ok();
+        sqlx::query("DELETE FROM inquiries WHERE id = $1").bind(inquiry_id).execute(&pool).await.ok();
+        sqlx::query("DELETE FROM employees WHERE id = $1").bind(employee_id).execute(&pool).await.ok();
+        sqlx::query("DELETE FROM customers WHERE id = $1").bind(customer_id).execute(&pool).await.ok();
     }
 
     /// Regression (2026-07-13): a Besichtigung created via create_inquiry_appointment
