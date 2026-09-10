@@ -65,7 +65,7 @@ Each row links its own AGENTS.md — read that one before working in that area.
 
 ## Where code goes
 
-All SQL lives in `crates/api/src/repositories/*_repo.rs`.  
+New SQL belongs in `crates/api/src/repositories/*_repo.rs` (some handlers still carry inline queries as debt).  
 All business logic lives in `crates/api/src/services/`.  
 Route handlers are thin orchestration — they call repo + service functions.
 

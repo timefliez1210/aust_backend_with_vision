@@ -1,8 +1,11 @@
-//! Repository for `inquiry_appointments` — lightweight, possibly non-consecutive
-//! appointments linked to an inquiry (e.g. a Besichtigung before the move).
+//! Repository for `inquiry_appointments` — separately dated, possibly
+//! non-consecutive entries linked to an inquiry: a Besichtigung before the move, a
+//! Halteverbotszone being put up the evening before.
 //!
-//! Not crew/hours tracked: at most one optional assignee. The move itself lives
-//! on `inquiries.scheduled_date .. end_date`; these are separate dated entries.
+//! These carry a full crew with hours (migration 20260722120000): paid labour, one
+//! row per employee in `inquiry_appointment_employees`. That junction has no
+//! `job_date` — an appointment is exactly one day, so several visits are several
+//! rows. The move itself lives on `inquiries.scheduled_date .. end_date`.
 
 use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use sqlx::PgPool;

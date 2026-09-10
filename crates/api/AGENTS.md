@@ -83,7 +83,9 @@ The main backend crate. Axum HTTP server with JWT middleware, 22 route files, 21
 ## Critical Patterns
 
 ### Repository Pattern
-ALL SQL goes in `src/repositories/*_repo.rs`. Route handlers never contain inline `sqlx::query`. If you need a new query, add a function to the appropriate repo module.
+New SQL goes in `src/repositories/*_repo.rs` — if you need a query, add a function to the appropriate repo module rather than inlining it.
+
+Two sets of files do not follow this and are not being converted opportunistically: `services/bridge/`, the deliberate exception backing the assistant's `ServiceBundle`, and a residue of inline queries in `routes/admin.rs`, `routes/admin_emails.rs`, `routes/calendar_items.rs`, `routes/agent_activity.rs`, `routes/inquiries.rs` and `routes/health.rs`. Treat those as debt, not as precedent.
 
 ### Scheduling Model (single code path)
 Multi-day appointments are expressed via `inquiries.end_date` (NULL = same day as `scheduled_date`) and `calendar_items.end_date`. Employee assignments live in one flat table per entity type:

@@ -313,7 +313,7 @@ pub(crate) async fn fetch_schedule_calendar_items(
 
 /// Fetch all employee assignments for an inquiry, ordered by job_date then name.
 ///
-/// **Caller**: `calendar::get_inquiry_employees`
+/// **Caller**: `inquiry_actions::list_inquiry_employees`, `inquiries::generate_travel_expenses`
 pub(crate) async fn fetch_inquiry_employees(
     pool: &PgPool,
     inquiry_id: Uuid,
@@ -345,7 +345,7 @@ pub(crate) async fn fetch_inquiry_employees(
 /// Replace the SET of employee assignments for an inquiry, preserving stored
 /// time/hour/cost values on rows that survive the replacement.
 ///
-/// **Caller**: `calendar::put_inquiry_employees`
+/// **Caller**: `inquiries::put_inquiry_employees`
 ///
 /// **Why not DELETE-all + INSERT**: the inquiry page auto-fires this PUT right
 /// after field-level saves, with UI default times in the payload. Full-replace
@@ -433,7 +433,7 @@ pub(crate) async fn put_inquiry_employees(
 
 /// Fetch all employee assignments for a calendar item, ordered by job_date then name.
 ///
-/// **Caller**: `calendar::get_calendar_item_employees`
+/// **Caller**: `calendar_items::list_item_employees`
 pub(crate) async fn fetch_calendar_item_employees(
     pool: &PgPool,
     calendar_item_id: Uuid,
@@ -466,7 +466,7 @@ pub(crate) async fn fetch_calendar_item_employees(
 /// stored time/hour/cost values on rows that survive the replacement.
 /// Same rationale as [`put_inquiry_employees`] — full-replace wiped entered hours.
 ///
-/// **Caller**: `calendar::put_calendar_item_employees`
+/// **Caller**: `calendar_items::put_item_employees`
 pub(crate) async fn put_calendar_item_employees(
     pool: &PgPool,
     calendar_item_id: Uuid,

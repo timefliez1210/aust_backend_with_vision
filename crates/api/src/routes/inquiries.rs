@@ -928,8 +928,10 @@ struct BulkEmployeeAssignmentBody {
 /// `PUT /api/v1/inquiries/{id}/employees` — Full-replace all employee assignments.
 ///
 /// **Caller**: Admin calendar side panel (multi-day scheduling).
-/// **Why**: Atomic replace of the entire assignment set — deletes all existing rows for this
-///          inquiry and inserts the provided flat array (one row per employee per job_date).
+/// **Why**: Atomic replace of the entire assignment set — one row per employee per
+///          job_date. It removes only the rows no longer in the array and updates the
+///          rest in place; deleting everything and re-inserting is what wiped entered
+///          hours on 2026-06-10.
 async fn put_inquiry_employees(
     State(state): State<Arc<AppState>>,
     Extension(_claims): Extension<TokenClaims>,
