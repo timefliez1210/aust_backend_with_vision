@@ -307,7 +307,7 @@ pub(crate) async fn update_appointment_employee(
                     WHEN COALESCE($3, clock_in) IS NOT NULL
                          AND COALESCE($4, clock_out) IS NOT NULL
                     THEN ROUND((
-                        EXTRACT(EPOCH FROM (COALESCE($4, clock_out) - COALESCE($3, clock_in))) / 3600.0
+                        aust_shift_hours(COALESCE($3, clock_in), COALESCE($4, clock_out))
                         - COALESCE($7, break_minutes, 0) / 60.0
                     )::numeric, 2)::float8
                     ELSE actual_hours
@@ -359,19 +359,31 @@ pub(crate) struct AppointmentEmployeeInput {
     pub meal_deduction: Option<String>,
 }
 
-/// Full-replace an appointment's crew in a single transaction: drop all existing
-/// rows, then insert the supplied set. `actual_hours` is the explicit override,
-/// or derived from clock times minus break when both clock times are present.
+/// Replace an appointment's crew in a single transaction. `actual_hours` is the
+/// explicit override, or derived from clock times minus break when both are present.
+///
+/// Only employees dropped from the set are deleted; the ones that stay are updated in
+/// place. This used to delete every row and re-insert, which is the pattern the other
+/// two junctions abandoned after the 2026-06-10 wipe: the insert never carried
+/// `employee_clock_in`/`employee_clock_out`/`employee_break_minutes`, so adding one
+/// person to the crew of a Halteverbot appointment erased the hours every other person
+/// had already punched from their phone. Those three columns are the worker's own
+/// record and are never written here.
 pub(crate) async fn put_appointment_employees(
     pool: &PgPool,
     appointment_id: Uuid,
     inputs: &[AppointmentEmployeeInput],
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
-    sqlx::query("DELETE FROM inquiry_appointment_employees WHERE appointment_id = $1")
-        .bind(appointment_id)
-        .execute(&mut *tx)
-        .await?;
+    let keep: Vec<Uuid> = inputs.iter().map(|i| i.employee_id).collect();
+    sqlx::query(
+        "DELETE FROM inquiry_appointment_employees
+          WHERE appointment_id = $1 AND employee_id <> ALL($2)",
+    )
+    .bind(appointment_id)
+    .bind(&keep)
+    .execute(&mut *tx)
+    .await?;
     for i in inputs {
         sqlx::query(
             r#"
@@ -383,10 +395,23 @@ pub(crate) async fn put_appointment_employees(
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
                     COALESCE($9,
                         CASE WHEN $6 IS NOT NULL AND $7 IS NOT NULL
-                             THEN ROUND((EXTRACT(EPOCH FROM ($7 - $6)) / 3600.0
+                             THEN ROUND((aust_shift_hours($6, $7)
                                          - COALESCE($8, 0) / 60.0)::numeric, 2)::float8
                              ELSE NULL END),
                     $10, $11, $12, $13, $14)
+            ON CONFLICT (appointment_id, employee_id) DO UPDATE SET
+                notes               = EXCLUDED.notes,
+                start_time          = EXCLUDED.start_time,
+                end_time            = EXCLUDED.end_time,
+                clock_in            = EXCLUDED.clock_in,
+                clock_out           = EXCLUDED.clock_out,
+                break_minutes       = EXCLUDED.break_minutes,
+                actual_hours        = EXCLUDED.actual_hours,
+                transport_mode      = EXCLUDED.transport_mode,
+                travel_costs_cents  = EXCLUDED.travel_costs_cents,
+                accommodation_cents = EXCLUDED.accommodation_cents,
+                misc_costs_cents    = EXCLUDED.misc_costs_cents,
+                meal_deduction      = EXCLUDED.meal_deduction
             "#,
         )
         .bind(appointment_id)
@@ -675,6 +700,71 @@ mod tests {
         delete(&pool, inquiry_id, appt).await.expect("delete appt");
         assert!(fetch_appointment_employees(&pool, appt).await.expect("crew").is_empty());
     }
+    /// Adding one person to the crew must not erase what everyone else already
+    /// punched. The old full-delete-and-reinsert never carried the worker-app columns,
+    /// so a Halteverbot appointment lost its logged hours on every crew re-save.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn re_saving_the_crew_keeps_the_workers_own_punch(pool: PgPool) {
+        let inquiry_id = seed_inquiry(&pool).await;
+        let a = test_helpers::insert_test_employee(&pool, "Anna", "A").await;
+        let b = test_helpers::insert_test_employee(&pool, "Bert", "B").await;
+        let appt = create(
+            &pool,
+            inquiry_id,
+            &AppointmentInput { scheduled_date: Some(date(2026, 7, 11)), ..Default::default() },
+        )
+        .await
+        .expect("create");
+
+        put_appointment_employees(
+            &pool,
+            appt,
+            &[AppointmentEmployeeInput { employee_id: a, ..Default::default() }],
+        )
+        .await
+        .expect("put a");
+
+        // Anna clocks in and out from the worker app.
+        sqlx::query(
+            "UPDATE inquiry_appointment_employees
+                SET employee_clock_in = $2, employee_clock_out = $3, employee_break_minutes = 30
+              WHERE appointment_id = $1",
+        )
+        .bind(appt)
+        .bind(chrono::Utc::now() - chrono::Duration::hours(9))
+        .bind(chrono::Utc::now())
+        .execute(&pool)
+        .await
+        .expect("worker punch");
+
+        // Bert joins the crew; Anna stays on it.
+        put_appointment_employees(
+            &pool,
+            appt,
+            &[
+                AppointmentEmployeeInput { employee_id: a, ..Default::default() },
+                AppointmentEmployeeInput { employee_id: b, ..Default::default() },
+            ],
+        )
+        .await
+        .expect("put a + b");
+
+        let (punched, brk): (Option<chrono::DateTime<chrono::Utc>>, Option<i32>) = sqlx::query_as(
+            "SELECT employee_clock_in, employee_break_minutes
+               FROM inquiry_appointment_employees
+              WHERE appointment_id = $1 AND employee_id = $2",
+        )
+        .bind(appt)
+        .bind(a)
+        .fetch_one(&pool)
+        .await
+        .expect("read anna");
+
+        assert!(punched.is_some(), "Anna's clock-in was wiped by the crew re-save");
+        assert_eq!(brk, Some(30), "Anna's break was wiped by the crew re-save");
+        assert_eq!(fetch_appointment_employees(&pool, appt).await.unwrap().len(), 2);
+    }
+
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn put_crew_full_replaces(pool: PgPool) {

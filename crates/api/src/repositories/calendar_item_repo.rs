@@ -295,7 +295,7 @@ pub(crate) async fn update_item_employee(
                     WHEN COALESCE($3, clock_in) IS NOT NULL
                          AND COALESCE($4, clock_out) IS NOT NULL
                     THEN ROUND((
-                        EXTRACT(EPOCH FROM (COALESCE($4, clock_out) - COALESCE($3, clock_in))) / 3600.0
+                        aust_shift_hours(COALESCE($3, clock_in), COALESCE($4, clock_out))
                         - COALESCE($7, break_minutes, 0) / 60.0
                     )::numeric, 2)::float8
                     ELSE actual_hours
@@ -354,7 +354,7 @@ pub(crate) async fn fetch_item_employee(
                COALESCE(MAX(cie.break_minutes), 0)::int AS break_minutes,
                SUM(COALESCE(cie.actual_hours,
                             CASE WHEN cie.clock_out IS NOT NULL AND cie.clock_in IS NOT NULL
-                                 THEN (EXTRACT(EPOCH FROM (cie.clock_out - cie.clock_in)) / 3600.0
+                                 THEN (aust_shift_hours(cie.clock_in, cie.clock_out)
                                        - COALESCE(cie.break_minutes, 0) / 60.0)
                                  ELSE NULL END))::float8 AS actual_hours,
                STRING_AGG(cie.notes, '; ' ORDER BY cie.job_date) AS notes,
@@ -420,7 +420,7 @@ pub(crate) async fn fetch_item_employees(
                COALESCE(MAX(cie.break_minutes), 0)::int AS break_minutes,
                SUM(COALESCE(cie.actual_hours,
                             CASE WHEN cie.clock_out IS NOT NULL AND cie.clock_in IS NOT NULL
-                                 THEN (EXTRACT(EPOCH FROM (cie.clock_out - cie.clock_in)) / 3600.0
+                                 THEN (aust_shift_hours(cie.clock_in, cie.clock_out)
                                        - COALESCE(cie.break_minutes, 0) / 60.0)
                                  ELSE NULL END))::float8 AS actual_hours,
                STRING_AGG(cie.notes, '; ' ORDER BY cie.job_date) AS notes,

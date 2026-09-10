@@ -764,6 +764,7 @@ pub(crate) async fn update_assignment(
         body.transport_mode.as_deref(),
         body.travel_costs_cents,
         body.accommodation_cents,
+        body.misc_costs_cents,
         body.meal_deduction.as_deref(),
     )
     .await?;

@@ -219,7 +219,7 @@ pub(crate) async fn fetch_schedule_jobs(
             c.phone AS customer_phone,
             COALESCE(ie.actual_hours::float8,
                  CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
-                      THEN (EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0
+                      THEN (aust_shift_hours(ie.clock_in, ie.clock_out)
                             - COALESCE(ie.break_minutes, 0) / 60.0)::float8
                       ELSE NULL END) AS actual_hours,
             i.employee_notes
@@ -278,7 +278,7 @@ pub(crate) async fn fetch_schedule_items(
             ci.status,
             COALESCE(cie.actual_hours::float8,
                  CASE WHEN cie.clock_out IS NOT NULL AND cie.clock_in IS NOT NULL
-                      THEN (EXTRACT(EPOCH FROM (cie.clock_out - cie.clock_in)) / 3600.0
+                      THEN (aust_shift_hours(cie.clock_in, cie.clock_out)
                             - COALESCE(cie.break_minutes, 0) / 60.0)::float8
                       ELSE NULL END) AS actual_hours,
             ci.employee_notes
@@ -343,7 +343,7 @@ pub(crate) async fn fetch_schedule_appointments(
             COALESCE(c.first_name || ' ' || c.last_name, c.name) AS customer_name,
             COALESCE(iae.actual_hours::float8,
                  CASE WHEN iae.clock_out IS NOT NULL AND iae.clock_in IS NOT NULL
-                      THEN (EXTRACT(EPOCH FROM (iae.clock_out - iae.clock_in)) / 3600.0
+                      THEN (aust_shift_hours(iae.clock_in, iae.clock_out)
                             - COALESCE(iae.break_minutes, 0) / 60.0)::float8
                       ELSE NULL END) AS actual_hours,
             a.employee_notes
@@ -1155,7 +1155,7 @@ pub(crate) async fn fetch_hours_entries(
             da.city                              AS destination_city,
             COALESCE(ie.actual_hours::float8,
                  CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
-                      THEN (EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0
+                      THEN (aust_shift_hours(ie.clock_in, ie.clock_out)
                             - COALESCE(ie.break_minutes, 0) / 60.0)::float8
                       ELSE NULL END)             AS actual_hours,
             i.status                             AS status
@@ -1181,7 +1181,7 @@ pub(crate) async fn fetch_hours_entries(
             NULL::text                 AS destination_city,
             COALESCE(cie.actual_hours::float8,
                  CASE WHEN cie.clock_out IS NOT NULL AND cie.clock_in IS NOT NULL
-                      THEN (EXTRACT(EPOCH FROM (cie.clock_out - cie.clock_in)) / 3600.0
+                      THEN (aust_shift_hours(cie.clock_in, cie.clock_out)
                             - COALESCE(cie.break_minutes, 0) / 60.0)::float8
                       ELSE NULL END)   AS actual_hours,
             ci.status                  AS status
@@ -1205,7 +1205,7 @@ pub(crate) async fn fetch_hours_entries(
             NULL::text                 AS destination_city,
             COALESCE(iae.actual_hours::float8,
                  CASE WHEN iae.clock_out IS NOT NULL AND iae.clock_in IS NOT NULL
-                      THEN (EXTRACT(EPOCH FROM (iae.clock_out - iae.clock_in)) / 3600.0
+                      THEN (aust_shift_hours(iae.clock_in, iae.clock_out)
                             - COALESCE(iae.break_minutes, 0) / 60.0)::float8
                       ELSE NULL END)   AS actual_hours,
             a.status                   AS status
@@ -1395,7 +1395,7 @@ pub(crate) async fn fetch_month_hours(
         FROM (
             SELECT COALESCE(ie.actual_hours::float8,
                         CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
-                             THEN (EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0
+                             THEN (aust_shift_hours(ie.clock_in, ie.clock_out)
                                    - COALESCE(ie.break_minutes, 0) / 60.0)::float8
                              ELSE NULL END) AS actual_hours
             FROM inquiry_employees ie
@@ -1406,7 +1406,7 @@ pub(crate) async fn fetch_month_hours(
             UNION ALL
             SELECT COALESCE(cie.actual_hours::float8,
                         CASE WHEN cie.clock_out IS NOT NULL AND cie.clock_in IS NOT NULL
-                             THEN (EXTRACT(EPOCH FROM (cie.clock_out - cie.clock_in)) / 3600.0
+                             THEN (aust_shift_hours(cie.clock_in, cie.clock_out)
                                    - COALESCE(cie.break_minutes, 0) / 60.0)::float8
                              ELSE NULL END) AS actual_hours
             FROM calendar_item_employees cie
@@ -1417,7 +1417,7 @@ pub(crate) async fn fetch_month_hours(
             UNION ALL
             SELECT COALESCE(iae.actual_hours::float8,
                         CASE WHEN iae.clock_out IS NOT NULL AND iae.clock_in IS NOT NULL
-                             THEN (EXTRACT(EPOCH FROM (iae.clock_out - iae.clock_in)) / 3600.0
+                             THEN (aust_shift_hours(iae.clock_in, iae.clock_out)
                                    - COALESCE(iae.break_minutes, 0) / 60.0)::float8
                              ELSE NULL END) AS actual_hours
             FROM inquiry_appointment_employees iae
@@ -1605,7 +1605,7 @@ pub(crate) async fn fetch_admin_assignments(
                ie.job_date AS booking_date,
                COALESCE(ie.actual_hours::float8,
                     CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
-                         THEN (EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0
+                         THEN (aust_shift_hours(ie.clock_in, ie.clock_out)
                                - COALESCE(ie.break_minutes, 0) / 60.0)::float8
                          ELSE NULL END) AS actual_hours,
                ie.notes,
@@ -1670,7 +1670,7 @@ pub(crate) async fn fetch_admin_hours(
                COALESCE(ie.break_minutes, 0) AS break_minutes,
                COALESCE(ie.actual_hours::float8,
                     CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
-                         THEN (EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0
+                         THEN (aust_shift_hours(ie.clock_in, ie.clock_out)
                                - COALESCE(ie.break_minutes, 0) / 60.0)::float8
                          ELSE NULL END) AS actual_hours,
                ie.employee_clock_in,
@@ -1739,7 +1739,7 @@ pub(crate) async fn fetch_admin_calendar_item_hours(
                COALESCE(cie.break_minutes, 0) AS break_minutes,
                COALESCE(cie.actual_hours::float8,
                     CASE WHEN cie.clock_out IS NOT NULL AND cie.clock_in IS NOT NULL
-                         THEN (EXTRACT(EPOCH FROM (cie.clock_out - cie.clock_in)) / 3600.0
+                         THEN (aust_shift_hours(cie.clock_in, cie.clock_out)
                                - COALESCE(cie.break_minutes, 0) / 60.0)::float8
                          ELSE NULL END) AS actual_hours,
                cie.employee_clock_in,
@@ -1813,7 +1813,7 @@ pub(crate) async fn fetch_admin_appointment_hours(
                COALESCE(iae.break_minutes, 0) AS break_minutes,
                COALESCE(iae.actual_hours::float8,
                     CASE WHEN iae.clock_out IS NOT NULL AND iae.clock_in IS NOT NULL
-                         THEN (EXTRACT(EPOCH FROM (iae.clock_out - iae.clock_in)) / 3600.0
+                         THEN (aust_shift_hours(iae.clock_in, iae.clock_out)
                                - COALESCE(iae.break_minutes, 0) / 60.0)::float8
                          ELSE NULL END) AS actual_hours,
                iae.employee_clock_in,

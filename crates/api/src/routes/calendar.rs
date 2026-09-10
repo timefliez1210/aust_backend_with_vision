@@ -386,7 +386,12 @@ async fn get_schedule(
         let day_inquiries = inquiry_map.remove(&current).unwrap_or_default();
         let day_cal_items = cal_item_map.remove(&current).unwrap_or_default();
         let day_appointments = appointment_map.remove(&current).unwrap_or_default();
-        let booked = day_inquiries.len() as i32;
+        // Count what `calendar_repo::count_active_on_date` counts — the availability
+        // endpoint that actually gates booking. Counting only inquiries here meant a
+        // day holding one move and three Termine reported booked: 1 on the schedule and
+        // booked: 4 on availability, and the schedule's `available` flag went with the
+        // wrong number.
+        let booked = (day_inquiries.len() + day_cal_items.len()) as i32;
         let remaining = (capacity - booked).max(0);
 
         entries.push(ScheduleEntry {

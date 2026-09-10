@@ -29,6 +29,33 @@ pub struct CalendarServiceImpl {
 }
 
 impl CalendarServiceImpl {
+    /// The dates an employee is actually rostered on for one parent, in order.
+    ///
+    /// Covers a move and a Termin. A Zusatztermin is one day by construction — its
+    /// junction has no `job_date` at all — so it never needs a day selector.
+    async fn assigned_days(
+        &self,
+        parent_id: Uuid,
+        employee_id: Uuid,
+    ) -> Result<Vec<chrono::NaiveDate>, ServiceError> {
+        let rows: Vec<(chrono::NaiveDate,)> = sqlx::query_as(
+            r#"
+            SELECT job_date FROM inquiry_employees
+             WHERE inquiry_id = $1 AND employee_id = $2
+            UNION
+            SELECT job_date FROM calendar_item_employees
+             WHERE calendar_item_id = $1 AND employee_id = $2
+            ORDER BY 1
+            "#,
+        )
+        .bind(parent_id)
+        .bind(employee_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(super::map_sqlx)?;
+        Ok(rows.into_iter().map(|(d,)| d).collect())
+    }
+
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
@@ -686,6 +713,21 @@ impl CalendarService for CalendarServiceImpl {
             FROM inquiry_employees ie
             JOIN employees e ON e.id = ie.employee_id
             WHERE ie.inquiry_id = $1
+            UNION ALL
+            -- A Zusatztermin (Halteverbot aufbauen, Besichtigung) carries a paid crew
+            -- too. It was missing here, so the assistant saw an empty crew for one —
+            -- and since set_employee_schedule returns its result through this function,
+            -- a successful write to an appointment read back as "no crew".
+            -- The junction has no job_date: an appointment is exactly one day, so the
+            -- date comes from the appointment itself.
+            SELECT e.id, e.first_name, e.last_name, a.scheduled_date,
+                   iae.start_time, iae.end_time, iae.planned_hours::float8,
+                   iae.clock_in, iae.clock_out, iae.break_minutes, iae.actual_hours::float8,
+                   'zusatztermin'::text
+            FROM inquiry_appointment_employees iae
+            JOIN inquiry_appointments a ON a.id = iae.appointment_id
+            JOIN employees e ON e.id = iae.employee_id
+            WHERE iae.appointment_id = $1
             ORDER BY last_name, first_name
             "#,
         )
@@ -726,20 +768,34 @@ impl CalendarService for CalendarServiceImpl {
         // Resolve the job date: explicit arg wins, otherwise the inquiry's own
         // scheduled_date. This is what stops crew rows from being stranded on a
         // stale date (the 2026-05-27 vs 2026-06-12 Schauer bug).
-        let inq: Option<(Option<NaiveDate>,)> =
-            sqlx::query_as("SELECT scheduled_date FROM inquiries WHERE id = $1")
+        let inq: Option<(Option<NaiveDate>, Option<NaiveDate>)> =
+            sqlx::query_as("SELECT scheduled_date, end_date FROM inquiries WHERE id = $1")
                 .bind(inquiry_id)
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(super::map_sqlx)?;
-        let scheduled = inq
-            .ok_or_else(|| ServiceError::NotFound(format!("Anfrage {inquiry_id}")))?
-            .0;
-        let job_date = date.or(scheduled).ok_or_else(|| {
+        let (scheduled, end) = inq
+            .ok_or_else(|| ServiceError::NotFound(format!("Anfrage {inquiry_id}")))?;
+        let first = date.or(scheduled).ok_or_else(|| {
             ServiceError::Validation(
                 "Anfrage hat kein geplantes Datum — bitte Datum angeben.".to_string(),
             )
         })?;
+
+        // A crew is booked for the whole job, not for its first morning. Writing only
+        // one date and deleting the employee's rows on every other date stripped days 2
+        // and 3 of a Mon-Wed move the moment anyone confirmed the crew. An explicit
+        // `date` still means that one day; without one, the crew covers the job's whole
+        // window.
+        let last = if date.is_some() {
+            first
+        } else {
+            end.filter(|e| *e >= first).unwrap_or(first)
+        };
+        let job_dates: Vec<NaiveDate> = std::iter::successors(Some(first), |d| {
+            d.succ_opt().filter(|next| *next <= last)
+        })
+        .collect();
 
         // Replace the crew SET while preserving rows that stay assigned —
         // DELETE-all + re-INSERT wiped entered clock times/hours on existing
@@ -755,36 +811,38 @@ impl CalendarService for CalendarServiceImpl {
         .execute(&mut *tx)
         .await
         .map_err(super::map_sqlx)?;
-        // Stale rows on OTHER dates (the original stranded-date bug) are only
+        // Stale rows OUTSIDE the job's dates (the original stranded-date bug) are only
         // removed when they carry no recorded hours — rows with clock data are
-        // historical fact and stay (multi-day inquiries).
+        // historical fact and stay.
         sqlx::query(
             r#"
             DELETE FROM inquiry_employees
-            WHERE inquiry_id = $1 AND employee_id = ANY($2) AND job_date <> $3
+            WHERE inquiry_id = $1 AND employee_id = ANY($2) AND job_date <> ALL($3)
               AND clock_in IS NULL AND clock_out IS NULL AND actual_hours IS NULL
             "#,
         )
         .bind(inquiry_id)
         .bind(&crew)
-        .bind(job_date)
+        .bind(&job_dates)
         .execute(&mut *tx)
         .await
         .map_err(super::map_sqlx)?;
         for employee_id in &crew {
-            sqlx::query(
-                r#"
-                INSERT INTO inquiry_employees (inquiry_id, employee_id, job_date)
-                VALUES ($1, $2, $3)
-                ON CONFLICT (inquiry_id, employee_id, job_date) DO NOTHING
-                "#,
-            )
-            .bind(inquiry_id)
-            .bind(employee_id)
-            .bind(job_date)
-            .execute(&mut *tx)
-            .await
-            .map_err(super::map_sqlx)?;
+            for day in &job_dates {
+                sqlx::query(
+                    r#"
+                    INSERT INTO inquiry_employees (inquiry_id, employee_id, job_date)
+                    VALUES ($1, $2, $3)
+                    ON CONFLICT (inquiry_id, employee_id, job_date) DO NOTHING
+                    "#,
+                )
+                .bind(inquiry_id)
+                .bind(employee_id)
+                .bind(day)
+                .execute(&mut *tx)
+                .await
+                .map_err(super::map_sqlx)?;
+            }
         }
         tx.commit().await.map_err(super::map_sqlx)?;
 
@@ -803,10 +861,36 @@ impl CalendarService for CalendarServiceImpl {
         // actual_hours self-heals from the effective post-update clock times +
         // break (same derivation as the admin PATCH paths in inquiry_repo /
         // calendar_item_repo).
+        //
+        // `patch.job_date` selects WHICH day is being edited; it never moves a row.
+        // Without it this wrote every day of a multi-day job at once — setting one
+        // clock-in on day 2 of a Mon-Wed move rewrote all three days — and when a date
+        // was supplied it tried to force all three rows onto it, aborting on the
+        // (inquiry, employee, job_date) unique key. Moving crew between dates is
+        // rescheduling, which shifts the whole job.
+        let days = self.assigned_days(parent_id, employee_id).await?;
+        if patch.job_date.is_none() && days.len() > 1 {
+            let list: Vec<String> = days.iter().map(|d| d.format("%d.%m.%Y").to_string()).collect();
+            return Err(ServiceError::Validation(format!(
+                "Dieser Einsatz geht über mehrere Tage ({}). Bitte den Tag angeben, der geändert werden soll.",
+                list.join(", ")
+            )));
+        }
+        if let Some(day) = patch.job_date
+            && !days.is_empty()
+            && !days.contains(&day)
+        {
+            let list: Vec<String> = days.iter().map(|d| d.format("%d.%m.%Y").to_string()).collect();
+            return Err(ServiceError::Validation(format!(
+                "Der Mitarbeiter ist am {} nicht eingeteilt (eingeteilt: {}).",
+                day.format("%d.%m.%Y"),
+                list.join(", ")
+            )));
+        }
+
         let inq = sqlx::query(
             r#"
             UPDATE inquiry_employees SET
-                job_date      = COALESCE($3, job_date),
                 start_time    = COALESCE($4, start_time),
                 end_time      = COALESCE($5, end_time),
                 planned_hours = COALESCE($6::numeric, planned_hours),
@@ -817,13 +901,14 @@ impl CalendarService for CalendarServiceImpl {
                     WHEN COALESCE($7, clock_in) IS NOT NULL
                          AND COALESCE($8, clock_out) IS NOT NULL
                     THEN ROUND((
-                        EXTRACT(EPOCH FROM (COALESCE($8, clock_out) - COALESCE($7, clock_in))) / 3600.0
+                        aust_shift_hours(COALESCE($7, clock_in), COALESCE($8, clock_out))
                         - COALESCE($9, break_minutes, 0) / 60.0
                     )::numeric, 2)::float8
                     ELSE actual_hours
                 END,
                 updated_at    = NOW()
             WHERE inquiry_id = $1 AND employee_id = $2
+              AND ($3::date IS NULL OR job_date = $3)
             "#,
         )
         .bind(parent_id)
@@ -842,7 +927,6 @@ impl CalendarService for CalendarServiceImpl {
         let cal = sqlx::query(
             r#"
             UPDATE calendar_item_employees SET
-                job_date      = COALESCE($3, job_date),
                 start_time    = COALESCE($4, start_time),
                 end_time      = COALESCE($5, end_time),
                 planned_hours = COALESCE($6::numeric, planned_hours),
@@ -853,12 +937,13 @@ impl CalendarService for CalendarServiceImpl {
                     WHEN COALESCE($7, clock_in) IS NOT NULL
                          AND COALESCE($8, clock_out) IS NOT NULL
                     THEN ROUND((
-                        EXTRACT(EPOCH FROM (COALESCE($8, clock_out) - COALESCE($7, clock_in))) / 3600.0
+                        aust_shift_hours(COALESCE($7, clock_in), COALESCE($8, clock_out))
                         - COALESCE($9, break_minutes, 0) / 60.0
                     )::numeric, 2)::float8
                     ELSE actual_hours
                 END
             WHERE calendar_item_id = $1 AND employee_id = $2
+              AND ($3::date IS NULL OR job_date = $3)
             "#,
         )
         .bind(parent_id)

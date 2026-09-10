@@ -432,9 +432,7 @@ pub(crate) async fn update_fields(
             sqlx::query(
                 r#"
                 CREATE TEMP TABLE _moved_crew ON COMMIT DROP AS
-                SELECT id, inquiry_id, employee_id, job_date,
-                       planned_hours, notes, start_time, end_time, break_minutes
-                FROM inquiry_employees
+                SELECT * FROM inquiry_employees
                 WHERE inquiry_id = $1
                   AND clock_in IS NULL AND clock_out IS NULL AND actual_hours IS NULL
                 "#,
@@ -442,6 +440,18 @@ pub(crate) async fn update_fields(
             .bind(id)
             .execute(&mut *tx)
             .await?;
+
+            // Shift the stashed copies, then put them back verbatim. The stash is
+            // SELECT * and the re-insert is SELECT m.* precisely so a column added to
+            // this table later cannot be silently dropped by a move: the nine-column
+            // list this replaced discarded the worker's own punch
+            // (employee_clock_in/out), the break they entered, and every travel-expense
+            // field, so moving a job by a day erased hours a worker had already logged.
+            sqlx::query("UPDATE _moved_crew SET job_date = job_date + ($1::date - $2::date)")
+                .bind(new_sd)
+                .bind(old_sd)
+                .execute(&mut *tx)
+                .await?;
 
             sqlx::query(
                 r#"
@@ -457,21 +467,13 @@ pub(crate) async fn update_fields(
             sqlx::query(
                 r#"
                 INSERT INTO inquiry_employees
-                    (id, inquiry_id, employee_id, job_date,
-                     planned_hours, notes, start_time, end_time, break_minutes)
-                SELECT m.id, m.inquiry_id, m.employee_id,
-                       m.job_date + ($2::date - $3::date),
-                       m.planned_hours, m.notes, m.start_time, m.end_time, m.break_minutes
-                FROM _moved_crew m
+                SELECT m.* FROM _moved_crew m
                 JOIN inquiries i ON i.id = m.inquiry_id
-                WHERE m.job_date + ($2::date - $3::date)
+                WHERE m.job_date
                       BETWEEN i.scheduled_date AND COALESCE(i.end_date, i.scheduled_date)
                 ON CONFLICT (inquiry_id, employee_id, job_date) DO NOTHING
                 "#,
             )
-            .bind(id)
-            .bind(new_sd)
-            .bind(old_sd)
             .execute(&mut *tx)
             .await?;
         }
@@ -670,6 +672,7 @@ pub(crate) async fn update_employee_assignment(
     transport_mode: Option<&str>,
     travel_costs_cents: Option<i64>,
     accommodation_cents: Option<i64>,
+    misc_costs_cents: Option<i64>,
     meal_deduction: Option<&str>,
 ) -> Result<u64, sqlx::Error> {
     // actual_hours: explicit override wins; otherwise derive from the EFFECTIVE
@@ -693,7 +696,7 @@ pub(crate) async fn update_employee_assignment(
                     WHEN COALESCE($3, clock_in) IS NOT NULL
                          AND COALESCE($4, clock_out) IS NOT NULL
                     THEN ROUND((
-                        EXTRACT(EPOCH FROM (COALESCE($4, clock_out) - COALESCE($3, clock_in))) / 3600.0
+                        aust_shift_hours(COALESCE($3, clock_in), COALESCE($4, clock_out))
                         - COALESCE($7, break_minutes, 0) / 60.0
                     )::numeric, 2)::float8
                     ELSE actual_hours
@@ -703,6 +706,7 @@ pub(crate) async fn update_employee_assignment(
             transport_mode = COALESCE($11, transport_mode),
             travel_costs_cents = COALESCE($12, travel_costs_cents),
             accommodation_cents = COALESCE($13, accommodation_cents),
+            misc_costs_cents = COALESCE($15, misc_costs_cents),
             meal_deduction = COALESCE($14, meal_deduction)
         WHERE inquiry_id = $1
           AND employee_id = $2
@@ -723,6 +727,7 @@ pub(crate) async fn update_employee_assignment(
     .bind(travel_costs_cents)
     .bind(accommodation_cents)
     .bind(meal_deduction)
+    .bind(misc_costs_cents)
     .execute(pool)
     .await?;
 
@@ -764,7 +769,7 @@ pub(crate) async fn fetch_updated_assignment(
                COALESCE(MAX(ie.break_minutes), 0)::int AS break_minutes,
                SUM(COALESCE(ie.actual_hours::float8,
                         CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
-                             THEN (EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0
+                             THEN (aust_shift_hours(ie.clock_in, ie.clock_out)
                                    - COALESCE(ie.break_minutes, 0) / 60.0)::float8
                              ELSE NULL END))::float8 AS actual_hours,
                STRING_AGG(ie.notes, '; ' ORDER BY ie.job_date) AS notes,
@@ -848,7 +853,7 @@ pub(crate) async fn fetch_employee_assignments_snapshot(
                COALESCE(ie.break_minutes, 0)::int AS break_minutes,
                COALESCE(ie.actual_hours::float8,
                     CASE WHEN ie.clock_out IS NOT NULL AND ie.clock_in IS NOT NULL
-                         THEN (EXTRACT(EPOCH FROM (ie.clock_out - ie.clock_in)) / 3600.0
+                         THEN (aust_shift_hours(ie.clock_in, ie.clock_out)
                                - COALESCE(ie.break_minutes, 0) / 60.0)::float8
                          ELSE NULL END) AS actual_hours,
                -- `employee_clock_*` is the worker's self-reported punch: purely informational,
@@ -858,7 +863,7 @@ pub(crate) async fn fetch_employee_assignments_snapshot(
                ie.employee_clock_in,
                ie.employee_clock_out,
                CASE WHEN ie.employee_clock_out IS NOT NULL AND ie.employee_clock_in IS NOT NULL
-                    THEN (EXTRACT(EPOCH FROM (ie.employee_clock_out - ie.employee_clock_in)) / 3600.0)::float8
+                    THEN (aust_shift_hours(ie.employee_clock_in, ie.employee_clock_out))::float8
                     ELSE NULL END AS employee_actual_hours,
                ie.notes,
                ie.job_date,
@@ -1103,6 +1108,37 @@ mod tests {
 
         assert_eq!(start, chrono::NaiveTime::from_hms_opt(8, 0, 0).unwrap());
         assert_eq!(end, chrono::NaiveTime::from_hms_opt(16, 30, 0).unwrap());
+    }
+
+    /// A Nachtumzug clocking 22:00 to 06:00 is eight hours, not minus sixteen.
+    ///
+    /// `clock_in`/`clock_out` are TIME, and TIME - TIME goes negative across midnight,
+    /// so every one of the 24 inline copies of that subtraction produced a negative
+    /// figure that flowed into the timesheets. `aust_shift_hours` adds the missing day.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn an_overnight_shift_is_positive_hours(pool: sqlx::PgPool) {
+        let cases = [
+            // in, out, break minutes, expected hours
+            ((22, 0), (6, 0), 30, 7.5),   // crosses midnight
+            ((8, 0), (16, 30), 30, 8.0),  // the ordinary workday, unchanged
+            ((23, 30), (0, 30), 0, 1.0),  // just past midnight
+        ];
+        for ((ih, im), (oh, om), brk, expected) in cases {
+            let (got,): (f64,) = sqlx::query_as(
+                "SELECT ROUND(aust_shift_hours($1, $2) - $3::numeric / 60.0, 2)::float8",
+            )
+            .bind(chrono::NaiveTime::from_hms_opt(ih, im, 0).unwrap())
+            .bind(chrono::NaiveTime::from_hms_opt(oh, om, 0).unwrap())
+            .bind(brk)
+            .fetch_one(&pool)
+            .await
+            .expect("shift hours");
+
+            assert!(
+                (got - expected).abs() < 0.001,
+                "{ih:02}:{im:02}-{oh:02}:{om:02} with a {brk}min break: expected {expected}, got {got}"
+            );
+        }
     }
 
     /// Same guarantee for Termine (`calendar_items`), whose `start_time` is also

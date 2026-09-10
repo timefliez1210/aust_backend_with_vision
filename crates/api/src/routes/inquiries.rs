@@ -832,11 +832,18 @@ async fn generate_travel_expenses(
     };
     let reason = inquiry.notes.clone().unwrap_or_else(|| "Umzug".into());
 
-    // 5. Aggregate per-employee travel fields (take from first row, they're the same across days)
+    // 5. Aggregate per-employee travel fields across the job's days.
+    //
+    // These are entered per day in the crew panel — two hotel nights on a three-day
+    // move are two rows — so reading only the first row, as this used to on the
+    // assumption that the values repeat, under-reported everything after day one.
     let first = &emp_rows[0];
-    let travel_costs_eur = first.travel_costs_cents.map(|c| c as f64 / 100.0).unwrap_or(0.0);
-    let accommodation_eur = first.accommodation_cents.map(|c| c as f64 / 100.0).unwrap_or(0.0);
-    let misc_costs_eur = first.misc_costs_cents.map(|c| c as f64 / 100.0).unwrap_or(0.0);
+    let sum_eur = |pick: fn(&_) -> Option<i64>| -> f64 {
+        emp_rows.iter().filter_map(pick).sum::<i64>() as f64 / 100.0
+    };
+    let travel_costs_eur = sum_eur(|r: &_| r.travel_costs_cents);
+    let accommodation_eur = sum_eur(|r: &_| r.accommodation_cents);
+    let misc_costs_eur = sum_eur(|r: &_| r.misc_costs_cents);
 
     // 6. Meal deductions (simplified). Stored values from the admin UI:
     //    "breakfast" | "lunch" | "dinner" | "breakfast_lunch" | "breakfast_dinner"

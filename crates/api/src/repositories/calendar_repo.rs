@@ -393,6 +393,12 @@ pub(crate) async fn put_inquiry_employees(
                 end_time            = COALESCE(inquiry_employees.end_time, EXCLUDED.end_time),
                 clock_in            = COALESCE(inquiry_employees.clock_in, EXCLUDED.clock_in),
                 clock_out           = COALESCE(inquiry_employees.clock_out, EXCLUDED.clock_out),
+                -- The break is NOT NULL, so the COALESCE(existing, EXCLUDED) shape the
+                -- other columns use could never let a new value through; leaving it out
+                -- of this list entirely made changing a break from 0,5 h to 0,25 h on an
+                -- existing assignment a silent no-op. The panel always sends a concrete
+                -- number, so the incoming one wins.
+                break_minutes       = EXCLUDED.break_minutes,
                 actual_hours        = COALESCE(inquiry_employees.actual_hours, EXCLUDED.actual_hours),
                 transport_mode      = COALESCE(inquiry_employees.transport_mode, EXCLUDED.transport_mode),
                 travel_costs_cents  = COALESCE(inquiry_employees.travel_costs_cents, EXCLUDED.travel_costs_cents),
@@ -501,6 +507,12 @@ pub(crate) async fn put_calendar_item_employees(
                 end_time            = COALESCE(calendar_item_employees.end_time, EXCLUDED.end_time),
                 clock_in            = COALESCE(calendar_item_employees.clock_in, EXCLUDED.clock_in),
                 clock_out           = COALESCE(calendar_item_employees.clock_out, EXCLUDED.clock_out),
+                -- The break is NOT NULL, so the COALESCE(existing, EXCLUDED) shape the
+                -- other columns use could never let a new value through; leaving it out
+                -- of this list entirely made changing a break from 0,5 h to 0,25 h on an
+                -- existing assignment a silent no-op. The panel always sends a concrete
+                -- number, so the incoming one wins.
+                break_minutes       = EXCLUDED.break_minutes,
                 actual_hours        = COALESCE(calendar_item_employees.actual_hours, EXCLUDED.actual_hours),
                 transport_mode      = COALESCE(calendar_item_employees.transport_mode, EXCLUDED.transport_mode),
                 travel_costs_cents  = COALESCE(calendar_item_employees.travel_costs_cents, EXCLUDED.travel_costs_cents),

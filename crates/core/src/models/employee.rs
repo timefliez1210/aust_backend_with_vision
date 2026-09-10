@@ -92,6 +92,11 @@ pub struct UpdateAssignment {
     pub travel_costs_cents: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub accommodation_cents: Option<i64>,
+    /// Sonstige Kosten. The handler echoed this field back in its response while the
+    /// update path had no such parameter at all, so every value the admin typed
+    /// looked saved and was not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub misc_costs_cents: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub meal_deduction: Option<String>,
 }

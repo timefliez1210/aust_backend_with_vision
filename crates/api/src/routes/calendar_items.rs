@@ -458,9 +458,7 @@ async fn update_item(
             sqlx::query(
                 r#"
                 CREATE TEMP TABLE _moved_cal_crew ON COMMIT DROP AS
-                SELECT id, calendar_item_id, employee_id, job_date,
-                       planned_hours, notes, start_time, end_time, break_minutes
-                FROM calendar_item_employees
+                SELECT * FROM calendar_item_employees
                 WHERE calendar_item_id = $1
                   AND clock_in IS NULL AND clock_out IS NULL AND actual_hours IS NULL
                 "#,
@@ -468,6 +466,16 @@ async fn update_item(
             .bind(id)
             .execute(&mut *tx)
             .await?;
+
+            // Shift the stashed copies, then put them back verbatim. SELECT * on both
+            // ends so a column added later cannot be dropped by a move — the explicit
+            // nine-column list this replaced discarded the worker's own punch, their
+            // break, and every travel-expense field.
+            sqlx::query("UPDATE _moved_cal_crew SET job_date = job_date + ($1::date - $2::date)")
+                .bind(new_sd)
+                .bind(old_sd)
+                .execute(&mut *tx)
+                .await?;
 
             sqlx::query(
                 r#"
@@ -483,21 +491,13 @@ async fn update_item(
             sqlx::query(
                 r#"
                 INSERT INTO calendar_item_employees
-                    (id, calendar_item_id, employee_id, job_date,
-                     planned_hours, notes, start_time, end_time, break_minutes)
-                SELECT m.id, m.calendar_item_id, m.employee_id,
-                       m.job_date + ($2::date - $3::date),
-                       m.planned_hours, m.notes, m.start_time, m.end_time, m.break_minutes
-                FROM _moved_cal_crew m
+                SELECT m.* FROM _moved_cal_crew m
                 JOIN calendar_items c ON c.id = m.calendar_item_id
-                WHERE m.job_date + ($2::date - $3::date)
+                WHERE m.job_date
                       BETWEEN c.scheduled_date AND COALESCE(c.end_date, c.scheduled_date)
                 ON CONFLICT (calendar_item_id, employee_id, job_date) DO NOTHING
                 "#,
             )
-            .bind(id)
-            .bind(new_sd)
-            .bind(old_sd)
             .execute(&mut *tx)
             .await?;
         }
