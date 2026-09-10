@@ -47,6 +47,10 @@ pub(crate) struct RechnungsausgangRow {
     pub invoice_number: String,
     pub invoice_type: String,
     pub partial_percent: Option<i32>,
+    /// The older twin of `partial_percent`. Rows written before the final invoice
+    /// started carrying `partial_percent` have only this one, and the PDF path already
+    /// falls back to it — the register has to as well or the two disagree.
+    pub deposit_percent: Option<i16>,
     pub status: String,
     pub is_manual: bool,
     pub extra_services: serde_json::Value,
@@ -201,7 +205,7 @@ pub(crate) async fn insert_partial_first(
     group_id: Uuid,
     percent: i32,
     base_netto_cents: i64,
-    pdf_s3_key: &str,
+    pdf_s3_key: Option<&str>,
     created_at: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
@@ -239,7 +243,7 @@ pub(crate) async fn insert_partial_final(
     percent: i32,
     first_id: Uuid,
     base_netto_cents: i64,
-    pdf_s3_key: &str,
+    pdf_s3_key: Option<&str>,
     created_at: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
@@ -305,7 +309,7 @@ pub(crate) async fn insert_full(
     inquiry_id: Uuid,
     invoice_number: &str,
     base_netto_cents: i64,
-    pdf_s3_key: &str,
+    pdf_s3_key: Option<&str>,
     created_at: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
@@ -766,6 +770,7 @@ pub(crate) async fn list_for_rechnungsausgangsbuch(
             inv.invoice_number,
             inv.invoice_type,
             inv.partial_percent,
+            inv.deposit_percent,
             inv.status,
             inv.is_manual,
             inv.extra_services,
@@ -793,6 +798,7 @@ pub(crate) async fn list_for_rechnungsausgangsbuch(
          LEFT JOIN offers off ON off.inquiry_id = inv.inquiry_id
              AND off.id = (SELECT o2.id FROM offers o2
                            WHERE o2.inquiry_id = inv.inquiry_id
+                             AND o2.status NOT IN ('rejected', 'cancelled', 'superseded')
                            ORDER BY o2.created_at DESC LIMIT 1)
          ORDER BY inv.invoice_number ASC",
     )

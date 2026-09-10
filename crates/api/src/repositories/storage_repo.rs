@@ -329,6 +329,11 @@ pub(crate) async fn mark_invoice_rejected(pool: &PgPool, id: Uuid) -> Result<(),
 
 /// Row for the shared Rechnungsausgangsbuch (invoice register). Storage invoices
 /// share the invoice-number sequence and must appear in the legal register.
+///
+/// Cancelled rows are included. The number is drawn from the shared sequence before
+/// the row is inserted, and rejecting the invoice only flips its status — so hiding
+/// it left the register reading 51, 53 with nothing explaining 52. A storno belongs
+/// in the book; the caller renders it at 0,00 € so no total moves.
 #[derive(Debug, Clone, FromRow)]
 pub(crate) struct StorageRegisterRow {
     pub id: Uuid,
@@ -359,8 +364,7 @@ pub(crate) async fn list_for_register(pool: &PgPool) -> Result<Vec<StorageRegist
                 si.paid_amount_cents
          FROM storage_invoices si
          JOIN storage_contracts sc ON sc.id = si.contract_id
-         JOIN customers c ON c.id = sc.customer_id
-         WHERE si.status <> 'cancelled'",
+         JOIN customers c ON c.id = sc.customer_id",
     )
     .fetch_all(pool)
     .await

@@ -163,10 +163,20 @@ impl InvoiceService for InvoiceServiceImpl {
             ("xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         };
         let s3_key = format!("invoices/{inv_id}/rechnung.{ext}");
-        self.storage
-            .upload(&s3_key, bytes::Bytes::from(pdf), mime)
-            .await
-            .map_err(|e| ServiceError::External(anyhow::anyhow!("Storage upload failed: {e}")))?;
+        // The number is already off the sequence and cannot be handed back, so an S3
+        // failure must not abort: that would leave a permanent gap in the register.
+        // The row is written without a document and `ensure_invoice_pdf` rebuilds it.
+        let stored_key = match self.storage.upload(&s3_key, bytes::Bytes::from(pdf), mime).await {
+            Ok(_) => Some(s3_key.as_str()),
+            Err(e) => {
+                tracing::error!(
+                    invoice_id = %inv_id,
+                    invoice_number = %invoice_num,
+                    "Invoice upload failed; keeping the numbered row so the register stays gapless: {e}"
+                );
+                None
+            }
+        };
 
         invoice_repo::insert_full(
             &self.pool,
@@ -174,7 +184,7 @@ impl InvoiceService for InvoiceServiceImpl {
             inquiry_id,
             &invoice_num,
             offer.price_cents,
-            &s3_key,
+            stored_key,
             now,
         )
         .await
@@ -368,27 +378,52 @@ impl InvoiceService for InvoiceServiceImpl {
         .map_err(super::map_sqlx)?;
 
         // 2. Check whether cumulative payments cover the invoice total.
-        //    We join against `invoices.price_cents` (brutto) as the authoritative total.
-        let (total_paid, invoice_total): (i64, i64) = sqlx::query_as(
-            r#"
-            SELECT COALESCE(SUM(pr.amount_cents), 0)::bigint,
-                   COALESCE(i.price_cents, 0)::bigint
-            FROM payment_records pr
-            JOIN invoices i ON i.id = pr.invoice_id
-            WHERE pr.invoice_id = $1
-            GROUP BY i.price_cents
-            "#,
+        //    `invoices` has no price column — the total is derived from the invoice's
+        //    own stored fields, exactly as the register derives it, so an Anzahlung is
+        //    settled at its own 30% and not at the whole job. The previous version
+        //    joined a non-existent `invoices.price_cents`, so this statement always
+        //    failed *after* the payment row was written: the payment was stored and the
+        //    tool reported an error.
+        let (total_paid,): (i64,) = sqlx::query_as(
+            "SELECT COALESCE(SUM(amount_cents), 0)::bigint FROM payment_records WHERE invoice_id = $1",
         )
         .bind(invoice_id)
-        .fetch_optional(&self.pool)
+        .fetch_one(&self.pool)
         .await
-        .map_err(super::map_sqlx)?
-        .unwrap_or((amount_cents, 0));
+        .map_err(super::map_sqlx)?;
 
-        // 3. If fully paid, mark the invoice.
+        let invoice_total = match invoice_repo::fetch_by_id(&self.pool, invoice_id)
+            .await
+            .map_err(super::map_sqlx)?
+        {
+            Some(row) => {
+                let offer_netto = invoice_repo::fetch_offer_netto(&self.pool, row.inquiry_id)
+                    .await
+                    .map_err(super::map_sqlx)?;
+                crate::routes::invoices::compute_invoice_amounts(
+                    crate::routes::invoices::InvoiceAmountInput {
+                        invoice_type: &row.invoice_type,
+                        partial_percent: row.partial_percent,
+                        deposit_percent: row.deposit_percent,
+                        is_manual: row.is_manual,
+                        extra_services: &row.extra_services,
+                        line_items_json: row.line_items_json.as_ref(),
+                        base_netto_cents: row.base_netto_cents,
+                        offer_netto_cents: offer_netto,
+                    },
+                )
+                .total_brutto_cents
+            }
+            None => 0,
+        };
+
+        // 3. If fully paid, mark the invoice — status and `paid_at` together. Stamping
+        //    only the status left the register with a paid row and an empty Bezahlt-Datum,
+        //    and the dunning ladder reads that timestamp.
         if invoice_total > 0 && total_paid >= invoice_total {
-            sqlx::query("UPDATE invoices SET status = 'paid' WHERE id = $1")
+            sqlx::query("UPDATE invoices SET status = 'paid', paid_at = COALESCE(paid_at, $2) WHERE id = $1")
                 .bind(invoice_id)
+                .bind(Utc::now())
                 .execute(&self.pool)
                 .await
                 .map_err(super::map_sqlx)?;

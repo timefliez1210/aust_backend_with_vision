@@ -37,6 +37,14 @@ pub(crate) struct ExportRow {
     pub offen_cents: Option<i64>,
     pub payment_method: String,
     pub notes: String,
+    /// Number reserved but the invoice was never issued. The row is printed, because
+    /// the number exists and the register has to account for it, but it is left out
+    /// of the totals — which is exactly what the on-screen register does.
+    pub is_draft: bool,
+    /// Booked as settled (`paid`). A Teilzahlung that happens to cover the full amount
+    /// is NOT settled: recording one deliberately leaves the invoice open, so only this
+    /// flag may print the word "Bezahlt".
+    pub is_settled: bool,
 }
 
 /// Render a Leistungszeitraum the way Alex writes it.
@@ -288,17 +296,27 @@ fn sheet_xml(year: i32, rows: &[ExportRow]) -> String {
     let (mut sum_netto, mut sum_mwst, mut sum_brutto, mut sum_offen) = (0i64, 0i64, 0i64, 0i64);
     for (i, r) in rows.iter().enumerate() {
         let n = i + 5;
-        sum_netto += r.netto_cents.unwrap_or(0);
-        sum_mwst += r.mwst_cents.unwrap_or(0);
-        sum_brutto += r.brutto_cents.unwrap_or(0);
-        sum_offen += r.offen_cents.unwrap_or(0);
+        // Drafts are printed but never counted. Summing them made the export disagree
+        // with the register on screen, which shows them under the footer as "noch nicht
+        // versendete Entwürfe" and leaves them out of every total.
+        if !r.is_draft {
+            sum_netto += r.netto_cents.unwrap_or(0);
+            sum_mwst += r.mwst_cents.unwrap_or(0);
+            sum_brutto += r.brutto_cents.unwrap_or(0);
+            sum_offen += r.offen_cents.unwrap_or(0);
+        }
 
-        // Alex's Offene-Zahlungen column carries the word "Bezahlt" once nothing is
-        // outstanding, and the amount while something is. That word is what he scans
-        // the column for, so the export keeps it rather than printing 0,00 €.
-        let (offen_cell, offen_style) = match r.offen_cents {
-            Some(0) => (Cell::Text("Bezahlt".to_string()), style::PLAIN),
-            other => (money(other), style::MONEY),
+        // Alex's Offene-Zahlungen column carries the word "Bezahlt" once the invoice is
+        // settled, and the amount while something is outstanding. That word is what he
+        // scans the column for, so the export keeps it rather than printing 0,00 €.
+        //
+        // It keys off settlement, not off a zero balance: a Teilzahlung entered for the
+        // full amount zeroes the balance while deliberately leaving the invoice open, and
+        // printing "Bezahlt" there showed a settled row with an empty Bezahlt-Datum while
+        // the Mahnungen kept going out.
+        let (offen_cell, offen_style) = match (r.is_settled, r.offen_cents) {
+            (true, _) => (Cell::Text("Bezahlt".to_string()), style::PLAIN),
+            (false, other) => (money(other), style::MONEY),
         };
 
         let cells: [(Cell, u32); 12] = [
@@ -586,6 +604,8 @@ mod tests {
                 offen_cents: Some(0),
                 payment_method: "EC".into(),
                 notes: String::new(),
+                is_draft: false,
+                is_settled: true,
             },
             ExportRow {
                 invoice_number: "2026-02".into(),
@@ -600,6 +620,8 @@ mod tests {
                 offen_cents: Some(127_330),
                 payment_method: "EC".into(),
                 notes: "stand 20.08.26 keine überweisung".into(),
+                is_draft: false,
+                is_settled: false,
             },
         ]
     }
@@ -676,6 +698,63 @@ mod tests {
         let xml = summary_sheet_xml(2026, &rows);
         assert!(xml.contains("ohne Monat"), "an out-of-year row needs its own line");
         assert!(xml.contains("<v>2678</v>"), "total must include it: 1488 + 1070 + 120");
+    }
+
+    /// A reserved number that was never sent is printed but must not be counted, or the
+    /// exported Summe disagrees with the register on screen, which shows drafts under
+    /// the footer and leaves them out of every total.
+    /// A Teilzahlung covering the whole amount zeroes the balance but deliberately
+    /// leaves the invoice open, so the column must show 0,00 € — not the word Bezahlt,
+    /// which would claim a settlement that never happened while Mahnungen keep going out.
+    #[test]
+    fn a_full_teilzahlung_is_not_bezahlt() {
+        let mut rows = sample_rows();
+        rows.push(ExportRow {
+            invoice_number: "2026-04".into(),
+            customer: "Voll angezahlt, nicht gebucht".into(),
+            netto_cents: Some(115_336),
+            brutto_cents: Some(137_249),
+            offen_cents: Some(0),
+            sent_at: Some(d(2026, 3, 1)),
+            is_settled: false,
+            ..Default::default()
+        });
+        let xml = sheet_xml(2026, &rows);
+        // ">Bezahlt<" is the cell value; the "Bezahlt am" header does not match it.
+        let settled_marks = xml.matches(">Bezahlt<").count();
+        assert_eq!(
+            settled_marks, 1,
+            "only the one genuinely settled sample row may read Bezahlt"
+        );
+    }
+
+    #[test]
+    fn draft_rows_are_listed_but_not_summed() {
+        let mut rows = sample_rows();
+        rows.push(ExportRow {
+            invoice_number: "2026-03".into(),
+            customer: "Noch nicht versendet".into(),
+            netto_cents: Some(500_00),
+            mwst_cents: Some(95_00),
+            brutto_cents: Some(595_00),
+            offen_cents: Some(595_00),
+            is_draft: true,
+            ..Default::default()
+        });
+        let xml = sheet_xml(2026, &rows);
+        assert!(xml.contains("Noch nicht versendet"), "the draft row must still be printed");
+
+        // The netto total of the two issued rows, unchanged by the draft.
+        let issued_netto = (148_800 + 107_000) as f64 / 100.0;
+        assert!(
+            xml.contains(&format!("<v>{issued_netto}</v>")),
+            "the totals row must read the issued netto only ({issued_netto})"
+        );
+        let with_draft = (issued_netto * 100.0 + 500_00 as f64) / 100.0;
+        assert!(
+            !xml.contains(&format!("<v>{with_draft}</v>")),
+            "the draft must not reach the total"
+        );
     }
 
     #[test]

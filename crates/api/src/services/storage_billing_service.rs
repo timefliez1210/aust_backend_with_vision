@@ -258,6 +258,16 @@ pub async fn approve_and_send(
         )
     })?;
 
+    // Same guard as the core invoice send path: when LibreOffice fails the bytes are
+    // an XLSX, and mailing that named ".pdf" gives the customer an unopenable file.
+    if !pdf_bytes.starts_with(b"%PDF") {
+        return Err(ApiError::BadRequest(
+            "Die Lagerrechnung liegt nicht als PDF vor (PDF-Konvertierung fehlgeschlagen). \
+             Bitte erneut erzeugen."
+                .into(),
+        ));
+    }
+
     let greeting = customer.formal_greeting();
     let period = format!("{} {}", german_month(invoice.period_month as u32), invoice.period_year);
     let num = &invoice.invoice_number;

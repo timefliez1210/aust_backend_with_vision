@@ -11,7 +11,10 @@ mod zip_util;
 
 pub use error::OfferError;
 pub use fonts::check_template_fonts;
-pub use invoice_xlsx::{generate_invoice_xlsx, ExtraService, InvoiceData, InvoiceLineItem, InvoiceType};
+pub use invoice_xlsx::{
+    generate_invoice_xlsx, ExtraService, InvoiceData, InvoiceLineItem, InvoiceType,
+    MAX_LINE_ITEMS as MAX_INVOICE_LINE_ITEMS,
+};
 pub use pdf_convert::{convert_xlsx_to_pdf, substitute_clearing_page_2};
 pub use pricing::{parse_floor, PricingEngine};
 pub use timesheet_xlsx::{generate_timesheet_xlsx, TimesheetData, TimesheetEntry};

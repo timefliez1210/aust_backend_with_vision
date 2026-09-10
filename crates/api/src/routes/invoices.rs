@@ -25,7 +25,7 @@ use crate::ApiError;
 use crate::AppState;
 use aust_offer_generator::{
     convert_xlsx_to_pdf, generate_invoice_xlsx, InvoiceData, InvoiceLineItem, InvoiceType,
-    OfferLineItem,
+    OfferLineItem, MAX_INVOICE_LINE_ITEMS,
 };
 
 // ---------------------------------------------------------------------------
@@ -353,27 +353,20 @@ async fn create_invoice(
             .map_err(|e| ApiError::Internal(format!("Invoice XLSX error: {e}")))?;
         let final_pdf = generate_pdf_bytes(&final_xlsx).await;
 
-        // Upload PDFs to S3
-        let first_key = upload_invoice_pdf(
-            &*state.storage,
-            first_id,
-            &first_pdf,
-        )
-        .await?;
-        let final_key = upload_invoice_pdf(
-            &*state.storage,
-            final_id,
-            &final_pdf,
-        )
-        .await?;
+        // Upload PDFs to S3. A failure here must not abort: the two numbers are already
+        // drawn from the sequence and nothing can hand them back, so aborting would leave
+        // a permanent hole in the Rechnungsausgangsbuch. The rows go in without a PDF
+        // instead, and `ensure_invoice_pdf` rebuilds the document on the first download.
+        let first_key = attach_or_defer_pdf(&*state.storage, first_id, &first_pdf, &first_num).await;
+        let final_key = attach_or_defer_pdf(&*state.storage, final_id, &final_pdf, &final_num).await;
 
         // Insert both rows atomically so a partial failure can't leave an orphaned first row
         let mut tx = state.db.begin().await?;
         invoice_repo::insert_partial_first(
-            &mut tx, first_id, inquiry_id, &first_num, group_id, percent as i32, offer_netto, &first_key, now,
+            &mut tx, first_id, inquiry_id, &first_num, group_id, percent as i32, offer_netto, first_key.as_deref(), now,
         ).await?;
         invoice_repo::insert_partial_final(
-            &mut tx, final_id, inquiry_id, &final_num, group_id, percent as i32, first_id, offer_netto, &final_key, now,
+            &mut tx, final_id, inquiry_id, &final_num, group_id, percent as i32, first_id, offer_netto, final_key.as_deref(), now,
         ).await?;
         tx.commit().await?;
 
@@ -450,9 +443,12 @@ async fn create_invoice(
         let xlsx = generate_invoice_xlsx(&data)
             .map_err(|e| ApiError::Internal(format!("Invoice XLSX error: {e}")))?;
         let pdf = generate_pdf_bytes(&xlsx).await;
-        let s3_key = upload_invoice_pdf(&*state.storage, inv_id, &pdf).await?;
+        // Same reasoning as the partial pair: the number is already spent, so an S3
+        // failure must not throw it away. Insert the row and let the self-heal on
+        // download supply the PDF.
+        let s3_key = attach_or_defer_pdf(&*state.storage, inv_id, &pdf, &invoice_num).await;
 
-        invoice_repo::insert_full(&state.db, inv_id, inquiry_id, &invoice_num, offer_netto, &s3_key, now).await?;
+        invoice_repo::insert_full(&state.db, inv_id, inquiry_id, &invoice_num, offer_netto, s3_key.as_deref(), now).await?;
 
         // Emit invoice.issued domain event (non-fatal). Include customer_name +
         // brutto_cents so the handler's Telegram notification is populated.
@@ -666,7 +662,20 @@ async fn update_invoice(
     if let Some(ref extras) = req.extra_services {
         if row.invoice_type == "partial_first" {
             return Err(ApiError::BadRequest(
-                "Extra services can only be added to full or partial_final invoices".into(),
+                "Zusatzleistungen können nur zu Voll- oder Schlussrechnungen hinzugefügt werden".into(),
+            ));
+        }
+
+        // A manual invoice renders from its own line-item table. This branch rebuilds
+        // the document from the KVA, which would silently replace every hand-typed
+        // position — and leave `is_manual` set, so the register would keep totalling
+        // the stored items while the PDF showed something else entirely. The extra
+        // belongs in the manual table as another row.
+        if row.is_manual {
+            return Err(ApiError::BadRequest(
+                "Diese Rechnung ist manuell erstellt — Zusatzleistungen bitte direkt \
+                 als Position in der Rechnungstabelle eintragen."
+                    .into(),
             ));
         }
 
@@ -692,8 +701,11 @@ async fn update_invoice(
 
         // Regenerate PDF with updated extras
         // Stored base amount keeps manual-price invoices (no active offer) editable.
-        let invoice_context = load_invoice_context(&state.db, inquiry_id, row.base_netto_cents).await?;
-        let today = now.date_naive();
+        let mut invoice_context = load_invoice_context(&state.db, inquiry_id, row.base_netto_cents).await?;
+        pin_price_to_invoice_base(&mut invoice_context, row.base_netto_cents);
+        // Adding a Zusatzleistung changes what the invoice bills, not when it was issued:
+        // keep the original Rechnungsdatum so the document and the register agree.
+        let today = row.created_at.date_naive();
 
         let inv_type = match row.invoice_type.as_str() {
             "partial_final" => InvoiceType::PartialFinal,
@@ -892,6 +904,18 @@ async fn send_invoice(
         "Kunde hat keine E-Mail-Adresse — Rechnung kann nicht per E-Mail versendet werden".into(),
     ))?;
 
+    // A failed LibreOffice conversion is stored as an .xlsx under the same column
+    // (`upload_invoice_pdf` picks the extension from the bytes). Attaching that as
+    // "Rechnung_2026-52.pdf" hands the customer a file no reader can open, so stop
+    // here instead: the PDF can be rebuilt from the dashboard.
+    if !pdf_bytes.starts_with(b"%PDF") {
+        return Err(ApiError::BadRequest(
+            "Die Rechnung liegt nicht als PDF vor (PDF-Konvertierung fehlgeschlagen). \
+             Bitte die Rechnung neu erzeugen und erneut senden."
+                .into(),
+        ));
+    }
+
     let display_name = customer_name.as_deref().unwrap_or("Kunde");
     let invoice_num = &row.invoice_number;
     let subject = req.subject.unwrap_or_else(|| {
@@ -962,6 +986,23 @@ struct InvoiceContext {
     service_street: String,
     service_city: String,
     moving_date: Option<chrono::NaiveDate>,
+}
+
+/// Pin a loaded context to the amount the invoice was created with.
+///
+/// **Callers**: the two regeneration paths — the extras patch and
+/// `regenerate_invoice_pdf`.
+/// **Why**: A KVA is regenerated in place, so its price can change after an invoice
+/// was issued from it. `compute_invoice_amounts` reports `base_netto_cents`, the
+/// figure frozen at creation, but the PDF was re-rendered from whatever the offer
+/// says *now* — so a self-heal or a number correction silently reprinted the
+/// invoice at a different total than the register and the invoice card show.
+/// The stored base wins on every rebuild. Rows predating the column have none,
+/// and for those the live offer remains the only price available.
+fn pin_price_to_invoice_base(ctx: &mut InvoiceContext, base_netto_cents: Option<i64>) {
+    if let Some(base) = base_netto_cents {
+        ctx.offer.price_cents = base;
+    }
 }
 
 /// Load all data needed for invoice generation from the database.
@@ -1233,6 +1274,28 @@ async fn build_final_line_items(
         }
     }
 
+    // The deduction is what turns the full KVA amount into the balance actually owed,
+    // so it must reach the page. The template prints MAX_INVOICE_LINE_ITEMS rows and
+    // drops the rest, and this line is appended last — a KVA that already fills the
+    // sheet used to push it off, billing the customer the full amount while the API
+    // and the register reported the correct balance. Collapse the itemisation to make
+    // room rather than lose the deduction.
+    if items.len() + 1 > MAX_INVOICE_LINE_ITEMS {
+        let lump: f64 = items.iter().map(|it| it.unit_price * it.quantity).sum();
+        tracing::warn!(
+            items = items.len(),
+            max = MAX_INVOICE_LINE_ITEMS,
+            "Schlussrechnung itemisation collapsed to one line so the Anzahlung deduction fits"
+        );
+        items = vec![InvoiceLineItem {
+            pos: 1,
+            description: format!("Umzugsdienstleistung gemäß Angebot Nr. {kva_nr}"),
+            quantity: 1.0,
+            unit_price: lump,
+            remark: None,
+        }];
+    }
+
     // Append deduction line (negative)
     let deduction_pos = items.len() as u32 + 1;
     items.push(InvoiceLineItem {
@@ -1379,8 +1442,14 @@ async fn regenerate_invoice_pdf(
     // absence) is already reflected in the invoice's stored amounts, and we cannot
     // safely invent a price.
     // Stored base amount keeps manual-price invoices (no active offer) regenerable.
-    let ctx = load_invoice_context(&state.db, row.inquiry_id, row.base_netto_cents).await?;
-    let today = Utc::now().date_naive();
+    let mut ctx = load_invoice_context(&state.db, row.inquiry_id, row.base_netto_cents).await?;
+    pin_price_to_invoice_base(&mut ctx, row.base_netto_cents);
+    let ctx = ctx;
+    // The Rechnungsdatum is the day the invoice was issued, not the day it happens to be
+    // rebuilt. Using today's date meant a February invoice self-healed in September came
+    // back reading September — a date change on a document already in the customer's
+    // hands, and one the register (which shows created_at) never agreed with.
+    let today = row.created_at.date_naive();
 
     // Manual invoices render from their stored line items — NEVER recomputed from
     // the offer, which would clobber Alex's hand edits. This is the guard that makes
@@ -1410,7 +1479,10 @@ async fn regenerate_invoice_pdf(
 
     let (inv_type, items) = match row.invoice_type.as_str() {
         "partial_first" => {
-            let pct = row.partial_percent.unwrap_or(0);
+            let pct = row
+                .partial_percent
+                .or_else(|| row.deposit_percent.map(i32::from))
+                .unwrap_or(0);
             let offer_brutto = (ctx.offer.price_cents as f64 * 1.19).round() as i64;
             let first_brutto = (offer_brutto as f64 * pct as f64 / 100.0).round() as i64;
             let first_netto = (first_brutto as f64 / 1.19).round() as i64;
@@ -1489,6 +1561,33 @@ async fn regenerate_invoice_pdf(
     Ok(())
 }
 
+/// Upload an invoice document, returning `None` instead of failing.
+///
+/// **Callers**: the three create paths in `create_invoice`.
+/// **Why**: An invoice number comes off a Postgres sequence, and `nextval` cannot be
+/// undone. Uploading before the row existed meant an S3 outage returned 500 and took
+/// the number with it, leaving a gap in a register that has to be gapless. The row is
+/// now written whatever S3 does; `ensure_invoice_pdf` regenerates the missing document
+/// the first time anyone downloads it.
+async fn attach_or_defer_pdf(
+    storage: &dyn aust_storage::StorageProvider,
+    inv_id: Uuid,
+    bytes: &[u8],
+    invoice_number: &str,
+) -> Option<String> {
+    match upload_invoice_pdf(storage, inv_id, bytes).await {
+        Ok(key) => Some(key),
+        Err(e) => {
+            tracing::error!(
+                invoice_id = %inv_id,
+                invoice_number = %invoice_number,
+                "Invoice document upload failed; the row is kept so the number stays in the register and the PDF is rebuilt on download: {e}"
+            );
+            None
+        }
+    }
+}
+
 /// Upload invoice PDF (or XLSX fallback) to S3 and return the storage key.
 async fn upload_invoice_pdf(
     storage: &dyn aust_storage::StorageProvider,
@@ -1525,7 +1624,13 @@ async fn upload_invoice_pdf(
 /// sites now go through the same arithmetic.
 pub(crate) struct InvoiceAmountInput<'a> {
     pub invoice_type: &'a str,
+    /// The Anzahlung split. `None` on rows predating it — pass `deposit_percent`
+    /// alongside so the fallback the PDF path uses applies here too.
     pub partial_percent: Option<i32>,
+    /// `invoices.deposit_percent`: the older twin of `partial_percent`, used only when
+    /// that one is NULL. Without it a legacy pair showed the Anzahlung at 0,00 € and the
+    /// Schlussrechnung at the full job while its PDF showed the correct 30/70 split.
+    pub deposit_percent: Option<i16>,
     pub is_manual: bool,
     /// Raw `invoices.extra_services` JSONB.
     pub extra_services: &'a serde_json::Value,
@@ -1544,6 +1649,15 @@ pub(crate) struct InvoiceAmounts {
     pub total_brutto_cents: i64,
     pub extra_services: Vec<ExtraServiceRequest>,
     pub manual_items: Vec<ManualLineItem>,
+}
+
+/// The Anzahlung split for an invoice, falling back to the older `deposit_percent`
+/// column exactly as the PDF path does.
+fn resolved_percent(input: &InvoiceAmountInput<'_>) -> i32 {
+    input
+        .partial_percent
+        .or_else(|| input.deposit_percent.map(i32::from))
+        .unwrap_or(0)
 }
 
 /// Compute an invoice's netto/brutto totals from its own stored fields.
@@ -1596,13 +1710,13 @@ pub(crate) fn compute_invoice_amounts(input: InvoiceAmountInput<'_>) -> InvoiceA
     } else {
         match input.invoice_type {
             "partial_first" => {
-                let pct = input.partial_percent.unwrap_or(0) as f64;
+                let pct = resolved_percent(&input) as f64;
                 let first_brutto = (offer_brutto as f64 * pct / 100.0).round() as i64;
                 let first_netto = (first_brutto as f64 / 1.19).round() as i64;
                 (first_netto, first_brutto) // no extras on partial_first
             }
             "partial_final" => {
-                let pct = input.partial_percent.unwrap_or(0) as f64;
+                let pct = resolved_percent(&input) as f64;
                 let first_brutto = (offer_brutto as f64 * pct / 100.0).round() as i64;
                 let first_netto = (first_brutto as f64 / 1.19).round() as i64;
                 let final_netto = offer_netto_cents - first_netto;
@@ -1628,6 +1742,7 @@ fn build_invoice_response(row: InvoiceRow, offer_netto_cents: i64) -> InvoiceRes
     let amounts = compute_invoice_amounts(InvoiceAmountInput {
         invoice_type: &row.invoice_type,
         partial_percent: row.partial_percent,
+        deposit_percent: row.deposit_percent,
         is_manual: row.is_manual,
         extra_services: &row.extra_services,
         line_items_json: row.line_items_json.as_ref(),
@@ -1702,6 +1817,7 @@ mod tests {
         InvoiceAmountInput {
             invoice_type,
             partial_percent,
+            deposit_percent: None,
             is_manual: false,
             extra_services,
             line_items_json: None,
@@ -1772,12 +1888,53 @@ mod tests {
 
     /// Pre-migration rows have no `base_netto_cents`; the active offer price is the
     /// documented fallback and must still produce a total.
+    /// A pair written before the final invoice carried `partial_percent` has only the
+    /// older `deposit_percent`. Reading 0 there put the Anzahlung at 0,00 € and the
+    /// Schlussrechnung at the whole job, while the PDF for the same row, which already
+    /// had this fallback, showed the correct split.
+    #[test]
+    fn legacy_rows_take_the_split_from_deposit_percent() {
+        let none = serde_json::json!([]);
+        let first = compute_invoice_amounts(InvoiceAmountInput {
+            invoice_type: "partial_first",
+            partial_percent: None,
+            deposit_percent: Some(30),
+            is_manual: false,
+            extra_services: &none,
+            line_items_json: None,
+            base_netto_cents: Some(100_000),
+            offer_netto_cents: 0,
+        });
+        let final_ = compute_invoice_amounts(InvoiceAmountInput {
+            invoice_type: "partial_final",
+            partial_percent: None,
+            deposit_percent: Some(30),
+            is_manual: false,
+            extra_services: &none,
+            line_items_json: None,
+            base_netto_cents: Some(100_000),
+            offer_netto_cents: 0,
+        });
+        let offer_brutto = (100_000f64 * 1.19).round() as i64;
+        assert_eq!(
+            first.total_brutto_cents,
+            (offer_brutto as f64 * 0.30).round() as i64,
+            "Anzahlung must be 30% of brutto, not 0"
+        );
+        assert_eq!(
+            first.total_brutto_cents + final_.total_brutto_cents,
+            offer_brutto,
+            "the two halves must still add up to the job"
+        );
+    }
+
     #[test]
     fn register_amounts_fall_back_to_the_offer_when_no_base_is_stored() {
         let none = serde_json::json!([]);
         let amounts = compute_invoice_amounts(InvoiceAmountInput {
             invoice_type: "full",
             partial_percent: None,
+            deposit_percent: None,
             is_manual: false,
             extra_services: &none,
             line_items_json: None,

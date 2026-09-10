@@ -42,7 +42,7 @@ The main backend crate. Axum HTTP server with JWT middleware, 22 route files, 21
 | `customer_repo.rs` | `customers` | |
 | `offer_repo.rs` | `offers` | Unique partial index `offers_inquiry_active_unique` prevents duplicate active offers |
 | `estimation_repo.rs` | `volume_estimations` | |
-| `invoice_repo.rs` | `invoices`, `invoice_line_items` | |
+| `invoice_repo.rs` | `invoices` (hand-edited positions live in its `line_items_json` column; there is no line-items table) | |
 | `address_repo.rs` | `addresses` | |
 | `customer_auth_repo.rs` | `customer_sessions`, OTP | |
 | `email_repo.rs` | `email_threads`, `email_messages` | |

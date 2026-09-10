@@ -58,7 +58,12 @@ const LINE_ITEM_START_ROW: u32 = 31;
 /// The totals block (rows 51–54) sits immediately after and must NOT be hidden.
 const LINE_ITEM_END_ROW: u32 = 50;
 /// Maximum number of line item rows.
-const MAX_LINE_ITEMS: usize = 20;
+/// The invoice template's line-item capacity: rows 31 to 50.
+///
+/// Callers that append a mandatory row (the Anzahlung deduction on a
+/// Schlussrechnung) have to leave space for it — anything past this is not
+/// printed and not totalled.
+pub const MAX_LINE_ITEMS: usize = 20;
 
 // ---------------------------------------------------------------------------
 // Public data types

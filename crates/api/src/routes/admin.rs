@@ -2014,6 +2014,7 @@ async fn rechnungsausgangsbuch(
             let amounts = compute_invoice_amounts(InvoiceAmountInput {
                 invoice_type: &r.invoice_type,
                 partial_percent: r.partial_percent,
+                deposit_percent: r.deposit_percent,
                 is_manual: r.is_manual,
                 extra_services: &r.extra_services,
                 line_items_json: r.line_items_json.as_ref(),
@@ -2054,7 +2055,15 @@ async fn rechnungsausgangsbuch(
                 brutto_cents,
                 sent_at: r.sent_at,
                 created_at: r.created_at,
-                due_date: r.due_date,
+                // `invoices.due_date` is readable but no code path ever writes it, so the
+                // Fälligkeit column was empty for every core invoice. Derive it from the
+                // payment term the invoice email actually states — seven days from
+                // dispatch, the same date `send_invoice` schedules the first Mahnung for,
+                // and the same rule the Lagerung rows below already use. A stored value
+                // still wins, so setting the column by hand keeps working.
+                due_date: r
+                    .due_date
+                    .or_else(|| r.sent_at.map(|s| (s + chrono::Duration::days(7)).date_naive())),
                 paid_at: r.paid_at,
                 offene_zahlungen_cents: offen,
                 is_settled: settled,
@@ -2075,9 +2084,13 @@ async fn rechnungsausgangsbuch(
     // legal register. Merge them in and re-sort so the ledger stays sequential.
     let storage_rows = storage_repo::list_for_register(&state.db).await?;
     for r in storage_rows {
-        let netto = r.netto_cents;
+        // A rejected storage invoice already holds a number from the shared sequence,
+        // so it stays in the register to account for that number — but it is not owed
+        // and must not reach any total, so it shows as a 0,00 € storno.
+        let cancelled = r.status == "cancelled";
+        let netto = if cancelled { 0 } else { r.netto_cents };
         let brutto = (netto as f64 * 1.19).round() as i64;
-        let paid = r.status == "paid";
+        let paid = r.status == "paid" || cancelled;
         items.push(RechnungsausgangItem {
             id: r.id,
             kind: "lagerung",
@@ -2097,7 +2110,7 @@ async fn rechnungsausgangsbuch(
             paid_at: r.paid_at,
             offene_zahlungen_cents: open_amount_cents(paid, Some(brutto), r.paid_amount_cents),
             is_settled: paid,
-            paid_amount_cents: r.paid_amount_cents,
+            paid_amount_cents: if cancelled { None } else { r.paid_amount_cents },
             payment_method: r.payment_method,
             notes: r.notes,
             invoice_type: "lagerung".to_string(),
@@ -2117,6 +2130,19 @@ async fn rechnungsausgangsbuch(
     });
 
     Ok(Json(items))
+}
+
+/// Is this register row a reserved number rather than an issued invoice?
+///
+/// Mirrors `isDraft` in the frontend's register helper, which the on-screen totals
+/// use: a row that has been sent or paid is issued whatever its status column says,
+/// and those two timestamps are the authoritative signal. The Excel export summed
+/// every row, so its Summe disagreed with the register the export is a copy of.
+fn register_is_draft(row: &RechnungsausgangItem) -> bool {
+    if row.sent_at.is_some() || row.paid_at.is_some() {
+        return false;
+    }
+    matches!(row.status.as_str(), "draft" | "ready" | "pending_approval")
 }
 
 /// How much of an invoice is still outstanding, in cents.
@@ -2597,6 +2623,8 @@ async fn export_rechnungsausgangsbuch(
             offen_cents: it.offene_zahlungen_cents,
             payment_method: it.payment_method.clone().unwrap_or_default(),
             notes: it.notes.clone().unwrap_or_default(),
+            is_draft: register_is_draft(it),
+            is_settled: it.is_settled,
         })
         .collect();
 
