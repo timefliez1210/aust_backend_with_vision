@@ -205,6 +205,9 @@ pub(crate) async fn fetch_profile(
 pub(crate) struct ScheduleJobRow {
     pub inquiry_id: Uuid,
     pub job_date: Option<NaiveDate>,
+    /// When this worker starts. Their own shift time on the assignment wins over
+    /// the job's, because a crew is not always asked to arrive together.
+    pub start_time: Option<NaiveTime>,
     pub status: String,
     pub origin_street: Option<String>,
     /// Kept separate from `street`, which holds the street name alone: without
@@ -238,6 +241,7 @@ pub(crate) async fn fetch_schedule_jobs(
         SELECT
             ie.inquiry_id,
             ie.job_date AS job_date,
+            COALESCE(ie.start_time, i.start_time) AS start_time,
             i.status,
             oa.street       AS origin_street,
             oa.house_number AS origin_house_number,
@@ -289,6 +293,7 @@ pub(crate) struct CalendarItemRow {
     pub customer_name: Option<String>,
     pub customer_phone: Option<String>,
     pub scheduled_date: Option<NaiveDate>,
+    pub start_time: Option<NaiveTime>,
     pub status: String,
     pub actual_hours: Option<f64>,
     pub employee_notes: Option<String>,
@@ -314,6 +319,7 @@ pub(crate) async fn fetch_schedule_items(
             COALESCE(c.first_name || ' ' || c.last_name, c.name) AS customer_name,
             c.phone AS customer_phone,
             cie.job_date AS scheduled_date,
+            COALESCE(cie.start_time, ci.start_time) AS start_time,
             ci.status,
             COALESCE(cie.actual_hours::float8,
                  CASE WHEN cie.clock_out IS NOT NULL AND cie.clock_in IS NOT NULL
@@ -347,6 +353,7 @@ pub(crate) struct ScheduleAppointmentJobRow {
     /// Free-text kind (e.g. "halteverbot"), used as the entry title.
     pub kind: String,
     pub scheduled_date: Option<NaiveDate>,
+    pub start_time: Option<NaiveTime>,
     pub status: String,
     /// Display location: structured address if present, else free-text.
     pub location: Option<String>,
@@ -374,6 +381,7 @@ pub(crate) async fn fetch_schedule_appointments(
             a.inquiry_id,
             a.kind,
             a.scheduled_date,
+            COALESCE(iae.start_time, a.start_time) AS start_time,
             a.status,
             COALESCE(
                 NULLIF(TRIM(CONCAT_WS(', ',
@@ -2320,7 +2328,7 @@ mod tests {
         .await;
 
         let job_date = NaiveDate::from_ymd_opt(2031, 9, 14).expect("valid date");
-        sqlx::query("UPDATE inquiries SET scheduled_date = $2 WHERE id = $1")
+        sqlx::query("UPDATE inquiries SET scheduled_date = $2, start_time = '08:00' WHERE id = $1")
             .bind(inquiry_id)
             .bind(job_date)
             .execute(pool)
@@ -2346,6 +2354,89 @@ mod tests {
         assert_eq!(job.origin_house_number.as_deref(), Some("33"));
         assert_eq!(job.destination_house_number.as_deref(), Some("30"));
         assert_eq!(job.customer_phone.as_deref(), Some("05121 999888"));
+    }
+
+    /// The schedule carried no start time at all, so the handler could only order a
+    /// month by date and two entries on one day came back in whichever order their
+    /// source query was appended. Every source projects the hour now, and a worker's
+    /// own shift time on the assignment beats the entry's, because a crew is not
+    /// always asked to arrive together.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn every_schedule_source_projects_its_start_time(pool: PgPool) {
+        let (inquiry_id, employee_id, day) = seed_move(&pool).await;
+
+        let jobs = fetch_schedule_jobs(&pool, employee_id, day, day).await.expect("jobs");
+        assert_eq!(
+            jobs.first().expect("job listed").start_time,
+            NaiveTime::from_hms_opt(8, 0, 0),
+            "falls back to the job's own start time"
+        );
+
+        sqlx::query("UPDATE inquiry_employees SET start_time = '06:30' WHERE inquiry_id = $1")
+            .bind(inquiry_id)
+            .execute(&pool)
+            .await
+            .expect("set the worker's own shift start");
+
+        let jobs = fetch_schedule_jobs(&pool, employee_id, day, day).await.expect("jobs");
+        assert_eq!(
+            jobs.first().expect("job listed").start_time,
+            NaiveTime::from_hms_opt(6, 30, 0),
+            "the worker's own shift time wins over the job's"
+        );
+
+        let appt_id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO inquiry_appointments (id, inquiry_id, kind, scheduled_date, start_time, status)
+             VALUES ($1, $2, 'halteverbot', $3, '07:30', 'scheduled')",
+        )
+        .bind(appt_id)
+        .bind(inquiry_id)
+        .bind(day)
+        .execute(&pool)
+        .await
+        .expect("insert appointment");
+        sqlx::query(
+            "INSERT INTO inquiry_appointment_employees (appointment_id, employee_id) VALUES ($1, $2)",
+        )
+        .bind(appt_id)
+        .bind(employee_id)
+        .execute(&pool)
+        .await
+        .expect("assign employee");
+
+        let appts = fetch_schedule_appointments(&pool, employee_id, day, day).await.expect("appts");
+        assert_eq!(
+            appts.first().expect("appointment listed").start_time,
+            NaiveTime::from_hms_opt(7, 30, 0)
+        );
+
+        let item_id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO calendar_items (id, title, category, scheduled_date, start_time)
+             VALUES ($1, 'Kartons ausliefern', 'intern', $2, '14:00')",
+        )
+        .bind(item_id)
+        .bind(day)
+        .execute(&pool)
+        .await
+        .expect("insert calendar item");
+        sqlx::query(
+            "INSERT INTO calendar_item_employees (calendar_item_id, employee_id, job_date)
+             VALUES ($1, $2, $3)",
+        )
+        .bind(item_id)
+        .bind(employee_id)
+        .bind(day)
+        .execute(&pool)
+        .await
+        .expect("assign employee");
+
+        let items = fetch_schedule_items(&pool, employee_id, day, day).await.expect("items");
+        assert_eq!(
+            items.first().expect("Termin listed").start_time,
+            NaiveTime::from_hms_opt(14, 0, 0)
+        );
     }
 
     /// Same gap on the detail page, plus the Zwischenstopp, which never reached

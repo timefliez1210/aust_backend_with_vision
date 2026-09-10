@@ -260,6 +260,9 @@ struct ScheduleJob {
     location: Option<String>,
     category: Option<String>,
     job_date: Option<NaiveDate>,
+    /// When the worker is due to start. Drives the ordering within a day and is
+    /// shown on the card, so two entries on one date read in the order they happen.
+    start_time: Option<NaiveTime>,
     status: String,
     origin_street: Option<String>,
     origin_house_number: Option<String>,
@@ -324,6 +327,7 @@ async fn get_schedule(
                 location: None,
                 category: None,
                 job_date: r.job_date,
+                start_time: r.start_time,
                 status: r.status,
                 origin_street: r.origin_street,
                 origin_house_number: r.origin_house_number,
@@ -368,6 +372,7 @@ async fn get_schedule(
             location: r.location,
             category: Some(r.category),
             job_date: r.scheduled_date,
+            start_time: r.start_time,
             status: r.status,
             origin_street: None,
             origin_house_number: None,
@@ -415,6 +420,7 @@ async fn get_schedule(
             location: r.location,
             category: None,
             job_date: r.scheduled_date,
+            start_time: r.start_time,
             status: r.status,
             origin_street: None,
             origin_house_number: None,
@@ -433,15 +439,32 @@ async fn get_schedule(
         });
     }
 
-    // Sort combined list by date ascending, nulls last
-    entries.sort_by(|a, b| match (a.job_date, b.job_date) {
-        (None, None) => std::cmp::Ordering::Equal,
-        (None, _) => std::cmp::Ordering::Greater,
-        (_, None) => std::cmp::Ordering::Less,
-        (Some(da), Some(db)) => da.cmp(&db),
-    });
+    sort_schedule_entries(&mut entries);
 
     Ok(Json(entries))
+}
+
+/// Orders a worker's month by day, then by the hour they are due to start.
+///
+/// **Caller**: `get_schedule`, once the three sources have been concatenated.
+/// **Why**: Moves, Termine and Zusatztermine are each fetched by their own query,
+/// each ordered by date, and then appended one after another. Within a single day
+/// that left the order determined by which query the entry came from, so a 14:00
+/// Termin could sit above an 08:00 move. A worker reading down the card had no way
+/// to tell which one came first.
+///
+/// An entry with no date, and within a day one with no time, sorts last: nothing
+/// is known about when it happens, and unknown is not early.
+fn sort_schedule_entries(entries: &mut [ScheduleJob]) {
+    fn key(e: &ScheduleJob) -> (bool, Option<NaiveDate>, bool, Option<NaiveTime>) {
+        (
+            e.job_date.is_none(),
+            e.job_date,
+            e.start_time.is_none(),
+            e.start_time,
+        )
+    }
+    entries.sort_by(|a, b| key(a).cmp(&key(b)));
 }
 
 /// `GET /employee/pending-hours` — past assignments the worker still owes hours for.
@@ -1277,6 +1300,88 @@ mod tests {
     // 2026-06-15 is in CEST (UTC+2): a UTC h:m renders as (h+2):m in Berlin.
     fn dt(h: u32, m: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 6, 15, h, m, 0).unwrap()
+    }
+
+    /// Builds a schedule entry with only the fields the ordering looks at.
+    fn entry(kind: &str, date: Option<(i32, u32, u32)>, time: Option<(u32, u32)>) -> ScheduleJob {
+        ScheduleJob {
+            entry_type: kind.to_string(),
+            inquiry_id: None,
+            calendar_item_id: None,
+            appointment_id: None,
+            title: None,
+            location: None,
+            category: None,
+            job_date: date.map(|(y, m, d)| NaiveDate::from_ymd_opt(y, m, d).expect("valid date")),
+            start_time: time.map(|(h, m)| NaiveTime::from_hms_opt(h, m, 0).expect("valid time")),
+            status: "scheduled".to_string(),
+            origin_street: None,
+            origin_house_number: None,
+            origin_city: None,
+            origin_postal_code: None,
+            destination_street: None,
+            destination_house_number: None,
+            destination_city: None,
+            destination_postal_code: None,
+            estimated_volume_m3: None,
+            customer_name: None,
+            customer_phone: None,
+            actual_hours: None,
+            colleague_names: vec![],
+            employee_notes: None,
+        }
+    }
+
+    /// Reported 2026-09-10: a worker with two entries on one day saw the later one
+    /// listed first. The three sources are concatenated in a fixed order — moves,
+    /// then Termine, then Zusatztermine — and the old sort compared only the date,
+    /// so within a day the source decided the order rather than the clock.
+    #[test]
+    fn a_day_reads_in_the_order_the_work_happens() {
+        let mut entries = vec![
+            entry("job", Some((2026, 9, 14)), Some((8, 0))),
+            entry("item", Some((2026, 9, 11)), Some((14, 0))),
+            entry("appointment", Some((2026, 9, 11)), Some((7, 30))),
+            entry("item", Some((2026, 9, 14)), Some((16, 0))),
+        ];
+
+        sort_schedule_entries(&mut entries);
+
+        let order: Vec<_> = entries
+            .iter()
+            .map(|e| (e.job_date.expect("date"), e.start_time.expect("time")))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                (NaiveDate::from_ymd_opt(2026, 9, 11).unwrap(), NaiveTime::from_hms_opt(7, 30, 0).unwrap()),
+                (NaiveDate::from_ymd_opt(2026, 9, 11).unwrap(), NaiveTime::from_hms_opt(14, 0, 0).unwrap()),
+                (NaiveDate::from_ymd_opt(2026, 9, 14).unwrap(), NaiveTime::from_hms_opt(8, 0, 0).unwrap()),
+                (NaiveDate::from_ymd_opt(2026, 9, 14).unwrap(), NaiveTime::from_hms_opt(16, 0, 0).unwrap()),
+            ],
+            "entries must read down the day in clock order"
+        );
+    }
+
+    /// Nothing is known about when an untimed entry happens, so it goes to the
+    /// bottom of its day rather than to the top of it.
+    #[test]
+    fn an_untimed_entry_sorts_last_within_its_day() {
+        let mut entries = vec![
+            entry("item", Some((2026, 9, 14)), None),
+            entry("job", Some((2026, 9, 14)), Some((8, 0))),
+            entry("item", None, None),
+            entry("job", Some((2026, 9, 15)), Some((9, 0))),
+        ];
+
+        sort_schedule_entries(&mut entries);
+
+        let shape: Vec<_> = entries.iter().map(|e| (e.job_date, e.start_time)).collect();
+        assert_eq!(shape[0].1, NaiveTime::from_hms_opt(8, 0, 0), "the timed entry leads its day");
+        assert!(shape[1].1.is_none(), "the untimed entry follows it, same day");
+        assert_eq!(shape[1].0, NaiveDate::from_ymd_opt(2026, 9, 14));
+        assert_eq!(shape[2].0, NaiveDate::from_ymd_opt(2026, 9, 15));
+        assert!(shape[3].0.is_none(), "an undated entry sorts after every dated one");
     }
 
     #[test]
