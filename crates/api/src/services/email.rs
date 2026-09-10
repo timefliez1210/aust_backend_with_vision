@@ -1,6 +1,21 @@
 use lettre::message::{header::ContentType, Attachment, MultiPart, SinglePart};
 use lettre::Message;
 
+/// Wrap a bare Message-ID in the angle brackets RFC 5322 requires.
+///
+/// Inbound ids are stored bare (`imap_client::header_ids` strips the brackets so thread
+/// lookup can match), but `In-Reply-To` and `References` are written as raw header text.
+/// Emitting `In-Reply-To: abc@host` is not a valid msg-id, and Gmail and Outlook simply
+/// do not thread on it — every reply opened a new conversation on the customer's side.
+fn as_msg_id(raw: &str) -> String {
+    let t = raw.trim();
+    if t.starts_with('<') && t.ends_with('>') {
+        t.to_string()
+    } else {
+        format!("<{t}>")
+    }
+}
+
 /// One attachment to hang on an outbound message.
 pub struct OutboundAttachment {
     pub filename: String,
@@ -89,9 +104,8 @@ pub fn build_message(mail: &OutboundEmail<'_>) -> Result<Message, String> {
     }
 
     if let Some(parent) = mail.in_reply_to.filter(|s| !s.trim().is_empty()) {
-        builder = builder
-            .in_reply_to(parent.to_string())
-            .references(parent.to_string());
+        let msg_id = as_msg_id(parent);
+        builder = builder.in_reply_to(msg_id.clone()).references(msg_id);
     }
 
     if mail.attachments.is_empty() {

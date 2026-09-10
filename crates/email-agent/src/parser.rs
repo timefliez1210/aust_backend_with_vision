@@ -1,7 +1,7 @@
 use aust_core::models::{InquirySource, MovingInquiry, ParsedEmail};
 use chrono::NaiveDate;
 use serde::Deserialize;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 /// Raw JSON form data from the "Kostenloses Angebot" Netlify form, sent as a
@@ -111,10 +111,7 @@ impl EmailParser {
         let body = &email.body_text;
         let source = self.detect_source(body);
 
-        info!(
-            "Parsing email from {} as {:?} source",
-            email.from, source
-        );
+        info!("Parsing email as {:?} source", source);
 
         let has_photos = email
             .attachments
@@ -160,18 +157,32 @@ impl EmailParser {
                 || a.filename.ends_with(".json")
         })?;
 
-        let json_str = std::str::from_utf8(&json_attachment.data).ok()?;
-        let form: FormSubmission = match serde_json::from_str(json_str) {
+        // A form attachment that is not valid UTF-8 used to return None here and fall
+        // through to text-parsing a body that carries no fields, producing an empty
+        // inquiry rather than a visible failure. Latin-1 output does happen, so decode
+        // lossily and let the JSON parser be the thing that decides.
+        let json_str = match std::str::from_utf8(&json_attachment.data) {
+            Ok(s) => std::borrow::Cow::Borrowed(s),
+            Err(_) => {
+                warn!("JSON form attachment is not valid UTF-8 — decoding lossily");
+                String::from_utf8_lossy(&json_attachment.data)
+            }
+        };
+        let form: FormSubmission = match serde_json::from_str(&json_str) {
             Ok(f) => f,
             Err(e) => {
-                debug!("JSON attachment parse failed: {e}");
+                warn!("JSON form attachment did not parse: {e}");
                 return None;
             }
         };
 
+        // Names and addresses stay out of the log (root AGENTS.md). What matters here
+        // is which form arrived and whether the fields that drive the pipeline are set.
         info!(
-            "Parsed JSON form attachment: name={:?}, email={:?}, form={:?}",
-            form.name, form.email, form.form_name
+            "Parsed JSON form attachment: form={:?}, has_name={}, has_email={}",
+            form.form_name,
+            form.name.is_some(),
+            form.email.is_some()
         );
 
         let has_photos = email
@@ -327,7 +338,7 @@ impl EmailParser {
             .or_else(|| extract_section_field(body, "Kontaktdaten", "Email"))
             .or_else(|| extract_email_from_body(body, &email.from));
 
-        debug!("Extracted form_email={:?} (from={})", form_email, email.from);
+        debug!("Extracted a form email address: {}", form_email.is_some());
 
         let phone = extract_field(body, "Telefon");
         let scheduled_date = extract_field(body, "Wunschtermin").and_then(|d| parse_date(&d));
@@ -378,8 +389,13 @@ impl EmailParser {
             .or_else(|| extract_field(body, "Bemerkung"));
 
         debug!(
-            "Parsed quote form: name={:?}, departure={:?}, arrival={:?}, volume={:?}, parking_ban_dep={:?}, parking_ban_arr={:?}",
-            name, departure_address, arrival_address, volume_m3, departure_parking_ban, arrival_parking_ban
+            "Parsed quote form: has_name={}, has_departure={}, has_arrival={}, volume={:?}, parking_ban_dep={:?}, parking_ban_arr={:?}",
+            name.is_some(),
+            departure_address.is_some(),
+            arrival_address.is_some(),
+            volume_m3,
+            departure_parking_ban,
+            arrival_parking_ban
         );
 
         MovingInquiry {
@@ -852,6 +868,7 @@ mod tests {
         }"#;
 
         let email = ParsedEmail {
+            uid: None,
             from: "umzug@example.com".to_string(),
             to: "umzug@example.com".to_string(),
             subject: "Neue Angebotsanfrage".to_string(),
@@ -920,6 +937,7 @@ mod tests {
             Nachricht: Bitte um Angebot\n";
 
         let email = ParsedEmail {
+            uid: None,
             from: "form@aust-umzuege.de".to_string(),
             to: "umzug@example.com".to_string(),
             subject: "Neue Angebotsanfrage".to_string(),
@@ -971,6 +989,7 @@ mod tests {
     fn make_json_email(json: &str) -> ParsedEmail {
         use aust_core::models::EmailAttachment;
         ParsedEmail {
+            uid: None,
             from: "umzug@example.com".to_string(),
             to: "umzug@example.com".to_string(),
             subject: "Neue Angebotsanfrage".to_string(),

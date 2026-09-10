@@ -112,6 +112,15 @@ pub struct ParsedEmail {
     /// All MIME attachments; the JSON form attachment and any photos/videos
     /// sent by the customer are found here.
     pub attachments: Vec<EmailAttachment>,
+    /// IMAP UID of the message on the server, when it was fetched from one.
+    ///
+    /// **Why**: flagging a mail `\Seen` used to search by Message-ID, which IMAP
+    /// matches as a substring and returns unordered — and a mail with no Message-ID
+    /// header could not be flagged at all, so it was reprocessed on every poll: a new
+    /// row, a new Telegram alert, a new LLM call, every few minutes. A UID names exactly
+    /// one message.
+    #[serde(default)]
+    pub uid: Option<u32>,
 }
 
 /// A single decoded MIME attachment from an email.

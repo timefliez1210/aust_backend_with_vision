@@ -419,11 +419,12 @@ impl EmailProcessor {
         subject: &str,
         body_text: &str,
         llm_generated: bool,
+        message_id: Option<&str>,
     ) {
         if let Err(e) = sqlx::query(
             r#"
-            INSERT INTO email_messages (id, thread_id, direction, from_address, to_address, subject, body_text, llm_generated, created_at)
-            VALUES ($1, $2, 'outbound', $3, $4, $5, $6, $7, NOW())
+            INSERT INTO email_messages (id, thread_id, direction, from_address, to_address, subject, body_text, llm_generated, message_id, created_at)
+            VALUES ($1, $2, 'outbound', $3, $4, $5, $6, $7, $8, NOW())
             "#,
         )
         .bind(Uuid::now_v7())
@@ -433,6 +434,7 @@ impl EmailProcessor {
         .bind(subject)
         .bind(body_text)
         .bind(llm_generated)
+        .bind(message_id)
         .execute(&self.db)
         .await
         {
@@ -468,10 +470,9 @@ impl EmailProcessor {
     /// Process a single incoming email.
     async fn process_incoming_email(&mut self, email: ParsedEmail) {
         let customer_email = email.from.clone();
-        info!(
-            "Processing email from {} — subject: {}",
-            customer_email, email.subject
-        );
+        // No sender address and no subject in the log: both are customer data, and a
+        // subject routinely carries a name (root AGENTS.md).
+        info!("Processing inbound email ({} attachments)", email.attachments.len());
 
         // Notify Alex about the new email
         {
@@ -634,8 +635,14 @@ impl EmailProcessor {
                 .await
             {
                 Ok(response) => {
+                    // `customer_email_final` comes from the parsed inquiry, not from the
+                    // envelope. A web-form submission is always sent by
+                    // angebot@aust-umzuege.de with the real address inside the JSON, so
+                    // addressing the draft to `email.from` mailed our own inbox: the
+                    // customer never heard back, and the reply landed in INBOX unseen and
+                    // was processed as a fresh inquiry.
                     self.submit_draft_for_approval(
-                        &customer_email,
+                        &customer_email_final,
                         response,
                         email.message_id.clone(),
                         thread_id,
@@ -646,7 +653,7 @@ impl EmailProcessor {
                     error!("Failed to generate response (thread {thread_id:?}): {e}");
                     let tg = self.telegram.lock().await;
                     tg.send_status_message(&format!(
-                        "Fehler bei Antwort-Generierung für {customer_email}: {e}"
+                        "Fehler bei Antwort-Generierung: {e}"
                     ))
                     .await;
                 }
@@ -659,13 +666,24 @@ impl EmailProcessor {
         // Timo-Riechers mail went missing in June).
         if !stored {
             warn!(
-                "Inbound email not persisted — leaving it unread on the server for the next poll (subject: {})",
-                email.subject
+                "Inbound email not persisted — leaving it unread on the server for the next poll (uid: {:?})",
+                email.uid
             );
-        } else if !email.message_id.is_empty()
-            && let Err(e) = self.imap.mark_as_read(&email.message_id).await {
+        } else if let Some(uid) = email.uid {
+            // By UID, not by Message-ID. The old search matched the header as a substring
+            // and returned an unordered set, so a shorter id that is a prefix of another
+            // could flag the wrong mail; and a message with no Message-ID header at all
+            // was never flagged, so every poll reprocessed it from scratch — another row,
+            // another Telegram alert, another LLM call, another InquiryComplete.
+            if let Err(e) = self.imap.mark_uid_as_read(uid).await {
                 warn!("Failed to mark email as read: {e}");
             }
+        } else if !email.message_id.is_empty() {
+            // No UID: the mail did not come from the IMAP poller (tests, replay).
+            if let Err(e) = self.imap.mark_as_read(&email.message_id).await {
+                warn!("Failed to mark email as read: {e}");
+            }
+        }
     }
 
     /// Send a draft response to Telegram for approval.
@@ -1221,18 +1239,21 @@ impl EmailProcessor {
             )
             .await
         {
-            Ok(status) => {
+            Ok(sent) => {
                 info!(
-                    "Email sent (thread {:?}, msg {:?}): {status}",
-                    draft.thread_id, draft.db_message_id
+                    "Email sent (thread {:?}, msg {:?}): {}",
+                    draft.thread_id, draft.db_message_id, sent.status
                 );
 
-                // Update draft status to 'sent' in DB (or insert if no draft was stored)
+                // Store the id the mail actually went out with, so a reply carrying it in
+                // In-Reply-To can be threaded by ancestry instead of by the 30-day
+                // same-customer heuristic.
                 if let Some(msg_id) = draft.db_message_id {
                     let _ = sqlx::query(
-                        "UPDATE email_messages SET status = 'sent' WHERE id = $1",
+                        "UPDATE email_messages SET status = 'sent', message_id = $2 WHERE id = $1",
                     )
                     .bind(msg_id)
+                    .bind(&sent.message_id)
                     .execute(&self.db)
                     .await;
                 } else if let Some(thread_id) = draft.thread_id {
@@ -1243,6 +1264,7 @@ impl EmailProcessor {
                         &draft.subject,
                         &draft.body,
                         true,
+                        Some(&sent.message_id),
                     )
                     .await;
                 }

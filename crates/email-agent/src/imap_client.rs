@@ -10,6 +10,14 @@ use tokio_native_tls::TlsConnector;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use tracing::{debug, error, info, warn};
 
+/// How many messages one poll pulls down.
+///
+/// Each is fetched whole, attachments included, into memory in the main backend
+/// process. The poll interval is short, so a backlog drains over a few cycles instead of
+/// arriving all at once.
+const MAX_MESSAGES_PER_POLL: usize = 25;
+
+
 type ImapSession =
     async_imap::Session<tokio_util::compat::Compat<tokio_native_tls::TlsStream<TcpStream>>>;
 
@@ -82,8 +90,22 @@ impl ImapClient {
 
         info!("Found {} unread messages", unseen.len());
 
-        // Build sequence set from message IDs
-        let seq_set: String = unseen
+        // Cap one poll's worth. Every message is pulled in full — bodies, photos, video
+        // attachments — into a Vec held in the main backend process, so a backlog of
+        // large mails could take the whole backend down with it. The rest stay UNSEEN
+        // and come back on the next poll.
+        let mut seqs: Vec<u32> = unseen.iter().copied().collect();
+        seqs.sort_unstable();
+        if seqs.len() > MAX_MESSAGES_PER_POLL {
+            warn!(
+                "Fetching {} of {} unread messages this cycle; the rest follow next poll",
+                MAX_MESSAGES_PER_POLL,
+                seqs.len()
+            );
+            seqs.truncate(MAX_MESSAGES_PER_POLL);
+        }
+
+        let seq_set: String = seqs
             .iter()
             .map(|id| id.to_string())
             .collect::<Vec<_>>()
@@ -91,24 +113,34 @@ impl ImapClient {
 
         // Fetch full message data (RFC822) using PEEK to avoid marking as read
         let mut fetch_stream = session
-            .fetch(&seq_set, "(BODY.PEEK[] FLAGS)")
+            .fetch(&seq_set, "(UID BODY.PEEK[] FLAGS)")
             .await
             .map_err(|e| EmailError::Imap(format!("Fetch failed: {e}")))?;
 
         let mut emails = Vec::new();
+        let mut unparseable: Vec<u32> = Vec::new();
         let parser = MessageParser::default();
 
         while let Some(result) = fetch_stream.next().await {
             match result {
                 Ok(fetch) => {
+                    let uid = fetch.uid;
                     if let Some(body) = fetch.body() {
                         match parser.parse(body) {
                             Some(message) => {
-                                let parsed = parse_mail_message(&message);
+                                let mut parsed = parse_mail_message(&message);
+                                parsed.uid = uid;
                                 emails.push(parsed);
                             }
                             None => {
+                                // Dropping it silently meant refetching the whole message,
+                                // attachments included, on every poll forever. Nothing can
+                                // be done with a message the parser rejects, so record it
+                                // and let the caller flag it.
                                 warn!("Failed to parse email message (seq {})", fetch.message);
+                                if let Some(uid) = uid {
+                                    unparseable.push(uid);
+                                }
                             }
                         }
                     }
@@ -120,6 +152,15 @@ impl ImapClient {
         }
 
         drop(fetch_stream);
+
+        // Flag anything the parser could not read, so the next poll does not fetch it
+        // again. It is already in the database's hands as far as we can take it.
+        for uid in &unparseable {
+            if let Err(e) = store_seen_by_uid(&mut session, *uid).await {
+                warn!("Could not flag unparseable message (uid {uid}): {e}");
+            }
+        }
+
         session.logout().await.ok();
 
         info!("Successfully fetched {} emails", emails.len());
@@ -127,6 +168,23 @@ impl ImapClient {
     }
 
     /// Mark a message as read (add \Seen flag) by its IMAP message ID header.
+    /// Flag one message read by its UID.
+    ///
+    /// **Why**: `mark_as_read` searches by Message-ID, which IMAP matches as a
+    /// *substring* and returns as an unordered set — an id that is a prefix of another
+    /// could flag the wrong mail and lose it. A UID names exactly one message and is
+    /// stable across the session, so the caller flags the message it actually read.
+    pub async fn mark_uid_as_read(&self, uid: u32) -> Result<(), EmailError> {
+        let mut session = self.connect().await?;
+        session
+            .select("INBOX")
+            .await
+            .map_err(|e| EmailError::Imap(format!("Failed to select INBOX: {e}")))?;
+        let result = store_seen_by_uid(&mut session, uid).await;
+        session.logout().await.ok();
+        result
+    }
+
     pub async fn mark_as_read(&self, message_id: &str) -> Result<(), EmailError> {
         let mut session = self.connect().await?;
 
@@ -184,6 +242,19 @@ impl ImapClient {
     }
 }
 
+
+/// Set the `Seen` flag on one message addressed by UID.
+///
+/// Shared by the poll loop (for messages the parser rejected) and `mark_uid_as_read`.
+async fn store_seen_by_uid(session: &mut ImapSession, uid: u32) -> Result<(), EmailError> {
+    let mut store_stream = session
+        .uid_store(uid.to_string(), r"+FLAGS (\Seen)")
+        .await
+        .map_err(|e| EmailError::Imap(format!("UID store flags failed: {e}")))?;
+    while store_stream.next().await.is_some() {}
+    drop(store_stream);
+    Ok(())
+}
 fn parse_mail_message(message: &mail_parser::Message) -> ParsedEmail {
     let from = message
         .from()
@@ -256,6 +327,7 @@ fn parse_mail_message(message: &mail_parser::Message) -> ParsedEmail {
     }
 
     ParsedEmail {
+        uid: None,
         from,
         to,
         subject,

@@ -53,15 +53,6 @@ pub(crate) async fn fetch_user_by_email_lower(
 
 /// Check whether a user with the given ID exists.
 ///
-/// **Caller**: `refresh_token` handler
-/// **Why**: Validates that the user referenced in a refresh token still exists.
-pub(crate) async fn user_exists(pool: &PgPool, user_id: Uuid) -> Result<bool, sqlx::Error> {
-    let row: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM users WHERE id = $1")
-        .bind(user_id)
-        .fetch_optional(pool)
-        .await?;
-    Ok(row.is_some())
-}
 
 /// Check whether a user with the given email already exists.
 ///

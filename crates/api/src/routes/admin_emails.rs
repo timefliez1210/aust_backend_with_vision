@@ -678,18 +678,22 @@ pub(super) async fn download_message_attachment(
         }
     })?;
 
-    let filename = display_name.as_str();
+    // The name comes verbatim off an inbound MIME part, so a sender chooses it. A quote
+    // breaks out of the header value and a CR/LF makes it an invalid HeaderValue, which
+    // the `.unwrap()` below turned into a panic — and this agent runs inside the main
+    // backend process. The upload path already sanitises; this one did not.
+    let filename = sanitize_filename(&display_name);
     let ext = filename.rsplit('.').next().unwrap_or("bin");
     let ct = mime_from_ext(ext);
 
-    Ok(Response::builder()
+    Response::builder()
         .header(header::CONTENT_TYPE, ct)
         .header(
             header::CONTENT_DISPOSITION,
             format!("attachment; filename=\"{filename}\""),
         )
         .body(axum::body::Body::from(data))
-        .unwrap())
+        .map_err(|e| ApiError::Internal(format!("Antwort konnte nicht erstellt werden: {e}")))
 }
 
 /// Send a plain-text email via SMTP using the configured outbound email credentials.
