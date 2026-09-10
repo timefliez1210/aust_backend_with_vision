@@ -191,13 +191,35 @@ pub(crate) async fn fetch_valid_reset(
         SELECT id, otp_hash
         FROM admin_password_resets
         WHERE user_id = $1 AND used_at IS NULL AND expires_at > now()
+          AND attempts < $2
         ORDER BY created_at DESC
         LIMIT 1
         "#,
     )
     .bind(user_id)
+    .bind(crate::services::otp_service::MAX_OTP_ATTEMPTS)
     .fetch_optional(pool)
     .await
+}
+
+/// Count one failed guess against every reset code currently live for this user.
+///
+/// **Caller**: `reset_password_verify`, on every rejected code.
+/// **Why**: The code is six digits and lives fifteen minutes. With no counter it can be
+/// ground down for a known administrator address, and success sets an arbitrary new
+/// password — full takeover with no credential to start from.
+pub(crate) async fn record_failed_reset_attempt(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE admin_password_resets SET attempts = attempts + 1
+          WHERE user_id = $1 AND used_at IS NULL AND expires_at > now()",
+    )
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// Mark a password reset token as used (within a transaction).

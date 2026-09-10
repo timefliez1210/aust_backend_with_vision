@@ -115,9 +115,13 @@ fn validate_vehicle(body: &VehicleBody) -> Result<(&str, &str), ApiError> {
 /// `DELETE /admin/vehicles/{id}` — delete a vehicle and its reminders.
 async fn delete_vehicle(
     State(state): State<Arc<AppState>>,
-    Extension(_claims): Extension<TokenClaims>,
+    Extension(claims): Extension<TokenClaims>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
+    // Fleet administration, and it cascades to the vehicle's reminders. Not part of
+    // the Bürokraft remit (offers, crew assignment, calendar).
+    crate::routes::admin::require_admin(&claims)?;
+
     let rows = vehicle_repo::delete_vehicle(&state.db, id).await?;
     if rows == 0 {
         return Err(ApiError::NotFound("Fahrzeug nicht gefunden".into()));
@@ -171,9 +175,12 @@ async fn update_reminder(
 /// `DELETE /admin/vehicles/{id}/reminders/{rid}` — remove a reminder.
 async fn delete_reminder(
     State(state): State<Arc<AppState>>,
-    Extension(_claims): Extension<TokenClaims>,
+    Extension(claims): Extension<TokenClaims>,
     Path((id, rid)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, ApiError> {
+    // Same reasoning as `delete_vehicle`.
+    crate::routes::admin::require_admin(&claims)?;
+
     let rows = vehicle_repo::delete_reminder(&state.db, id, rid).await?;
     if rows == 0 {
         return Err(ApiError::NotFound("Erinnerung nicht gefunden".into()));

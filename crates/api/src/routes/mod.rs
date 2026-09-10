@@ -37,19 +37,27 @@ pub fn auth_public_router() -> Router<Arc<AppState>> {
         .nest("/employee", employee::auth_router())
 }
 
-/// Non-auth public routes (no authentication, no rate limiting).
+/// Non-auth public routes that carry no rate limit.
 ///
-/// **Why**: Image/video proxy and form submissions need high throughput and have their
-///          own abuse-resistance (S3 key guessing is impractical; submissions require
-///          valid data). Merging them with auth routes would over-restrict legitimate
-///          traffic if the rate limit is accidentally hit.
+/// **Why**: The media proxy is hit once per `<img>` on a dashboard page, so a per-IP
+/// limit here would throttle one admin loading one estimation. It serves only
+/// `estimates/` keys (see `estimates::serve_image`).
 pub fn public_api_router() -> Router<Arc<AppState>> {
     Router::new()
-        .nest("/submit", submissions::submit_router())
         .nest("/estimates", estimates::public_router())
         .nest("/media", estimates::public_router())
         .route("/distance/calculate", post(distance::calculate))
         .merge(flash_contact::router())
+}
+
+/// Unauthenticated form submissions, kept separate so `lib.rs` can rate-limit them.
+///
+/// **Why**: These five endpoints create customers and inquiries and kick off paid
+/// vision and LLM work, and they take uploads. Unlimited and unauthenticated, one
+/// caller can fill the dashboard with junk inquiries and run up the model bill. A real
+/// customer submits once, so the limit can be tight.
+pub fn submit_api_router() -> Router<Arc<AppState>> {
+    Router::new().nest("/submit", submissions::submit_router())
 }
 
 /// Protected API routes (require admin JWT).

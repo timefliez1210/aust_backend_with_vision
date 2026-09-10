@@ -395,9 +395,15 @@ async fn main() -> Result<()> {
     tracing::info!("Starting server on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    // with_connect_info so the rate limiter can see who actually opened the socket.
+    // Without it there is no peer address at all and the limiter had to believe
+    // X-Forwarded-For, which the caller writes.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
 
     tracing::info!("Server shut down cleanly");
     Ok(())

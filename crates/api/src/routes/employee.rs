@@ -46,6 +46,8 @@ pub fn protected_router() -> Router<Arc<AppState>> {
         .route("/appointments/{id}", get(get_appointment_detail))
         .route("/appointments/{id}/clock", axum::routing::patch(patch_appointment_clock))
         .route("/hours", get(get_hours))
+        .route("/auth/logout", post(logout))
+        .route("/auth/logout-all", post(logout_everywhere))
 }
 
 // ---------------------------------------------------------------------------
@@ -79,20 +81,23 @@ impl OtpBackend for EmployeeOtpBackend {
         &self,
         pool: &PgPool,
         email: &str,
-        code: &str,
+        code_hash: &str,
         expires_at: DateTime<Utc>,
     ) -> Result<(), sqlx::Error> {
-        employee_repo::insert_otp(pool, email, code, expires_at).await
+        employee_repo::insert_otp(pool, email, code_hash, expires_at).await
     }
 
-    async fn find_valid_otp(
+    async fn find_live_otps(
         &self,
         pool: &PgPool,
         email: &str,
-        code: &str,
         now: DateTime<Utc>,
-    ) -> Result<Option<Uuid>, sqlx::Error> {
-        employee_repo::find_valid_otp(pool, email, code, now).await
+    ) -> Result<Vec<(Uuid, String)>, sqlx::Error> {
+        employee_repo::find_live_otps(pool, email, now).await
+    }
+
+    async fn record_failed_attempt(&self, pool: &PgPool, email: &str) -> Result<u64, sqlx::Error> {
+        employee_repo::record_failed_otp_attempt(pool, email).await
     }
 
     async fn mark_otp_used(&self, pool: &PgPool, otp_id: Uuid) -> Result<(), sqlx::Error> {
@@ -1196,6 +1201,31 @@ async fn fetch_estimation_items(
         .collect();
 
     Ok(items)
+}
+
+
+/// `POST /api/v1/employee/auth/logout` — end this session.
+///
+/// **Caller**: Worker portal "Abmelden".
+/// **Why**: Sessions last 30 days and nothing deleted them, so a token from a lost or
+/// shared phone stayed usable for a month.
+async fn logout(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<EmployeeClaims>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    employee_repo::delete_session(&state.db, &claims.token).await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// `POST /api/v1/employee/auth/logout-all` — end every session for this employee.
+///
+/// **Caller**: Worker portal "Auf allen Geräten abmelden".
+async fn logout_everywhere(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<EmployeeClaims>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let revoked = employee_repo::delete_all_sessions(&state.db, claims.employee_id).await?;
+    Ok(Json(serde_json::json!({ "ok": true, "revoked": revoked })))
 }
 
 #[cfg(test)]

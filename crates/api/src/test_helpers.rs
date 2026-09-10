@@ -144,6 +144,7 @@ pub fn generate_test_jwt() -> String {
         role: aust_core::models::UserRole::Admin,
         exp: (Utc::now().timestamp() + 86400) as usize,
         iat: Utc::now().timestamp() as usize,
+            typ: aust_core::models::TokenType::Access,
     };
 
     encode(

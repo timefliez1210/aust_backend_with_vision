@@ -13,7 +13,7 @@ use argon2::{
 use serde::Serialize;
 use validator::Validate;
 
-use aust_core::models::{AuthToken, CreateUser, LoginRequest, TokenClaims, UserRole};
+use aust_core::models::{AuthToken, CreateUser, LoginRequest, TokenClaims, TokenType, UserRole};
 
 use crate::repositories::auth_repo;
 use crate::{ApiError, AppState};
@@ -77,6 +77,7 @@ fn create_tokens(
         role,
         iat: now,
         exp: now + (expiry_hours as usize * 3600),
+        typ: TokenType::Access,
     };
 
     let access_token = encode(
@@ -93,6 +94,7 @@ fn create_tokens(
         role,
         iat: now,
         exp: now + (7 * 24 * 3600),
+        typ: TokenType::Refresh,
     };
 
     let refresh_token = encode(
@@ -199,16 +201,17 @@ async fn refresh_token(
 
     let claims = token_data.claims;
 
-    // Verify user still exists
-    let exists = auth_repo::user_exists(&state.db, claims.sub).await?;
-    if !exists {
-        return Err(ApiError::Unauthorized("Benutzer nicht gefunden".into()));
-    }
+    // Re-read the account rather than trusting the token's own claims. Re-signing
+    // `claims.role` meant a demoted or revoked administrator could refresh admin rights
+    // indefinitely — the only thing that ever expired was the token, never the privilege.
+    let user = auth_repo::fetch_user_by_id(&state.db, claims.sub)
+        .await?
+        .ok_or_else(|| ApiError::Unauthorized("Benutzer nicht gefunden".into()))?;
 
     let token = create_tokens(
-        claims.sub,
-        &claims.email,
-        claims.role,
+        user.id,
+        &user.email,
+        UserRole::from_db_str(&user.role),
         secret,
         state.config.auth.jwt_expiry_hours,
     )?;
@@ -249,7 +252,7 @@ struct RegisterResponse {
     role: UserRole,
 }
 
-/// `POST /api/v1/auth/register` — Register a new admin user (protected, requires existing JWT).
+/// `POST /api/v1/auth/register` — Create a user account. Admin only.
 ///
 /// **Caller**: Axum protected router / admin dashboard "Neuen Benutzer anlegen" form.
 /// **Why**: Creates a new user with a hashed password. The `CreateUser` struct is validated
@@ -265,11 +268,18 @@ struct RegisterResponse {
 ///
 /// # Errors
 /// - `400` if validation fails (bad email format, short password, duplicate email)
+/// - `403` if the caller is not an administrator
 /// - `500` on DB or hashing failures
 async fn register(
     State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<TokenClaims>,
     Json(request): Json<CreateUser>,
 ) -> Result<Json<RegisterResponse>, ApiError> {
+    // Creating accounts is an admin action, and the role comes from the request body.
+    // The JWT layer only proves *some* valid token; without this any Bürokraft could
+    // POST {"role":"admin"} and mint themselves a full administrator.
+    crate::routes::admin::require_admin(&claims)?;
+
     request
         .validate()
         .map_err(|e| ApiError::Validation(e.to_string()))?;
@@ -471,9 +481,18 @@ async fn reset_password_verify(
     let parsed_hash = PasswordHash::new(&reset.otp_hash)
         .map_err(|_| ApiError::Internal("OTP-Hash ungültig".into()))?;
 
-    Argon2::default()
+    if Argon2::default()
         .verify_password(body.otp.trim().as_bytes(), &parsed_hash)
-        .map_err(|_| ApiError::Validation("Ungültiger oder abgelaufener Code".into()))?;
+        .is_err()
+    {
+        // Count the miss. Once a code reaches MAX_OTP_ATTEMPTS `fetch_valid_reset` stops
+        // returning it, so the six-digit space cannot be ground down inside the fifteen
+        // minutes it lives.
+        auth_repo::record_failed_reset_attempt(&state.db, user.id).await?;
+        return Err(ApiError::Validation(
+            "Ungültiger oder abgelaufener Code".into(),
+        ));
+    }
 
     // Mark token used and update password in a transaction
     let new_hash = hash_password(&body.new_password)?;

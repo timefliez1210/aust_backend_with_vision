@@ -61,44 +61,71 @@ pub(crate) async fn count_recent_otps(
 pub(crate) async fn insert_otp(
     pool: &PgPool,
     email: &str,
-    code: &str,
+    code_hash: &str,
     expires_at: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO employee_otps (email, code, expires_at) VALUES ($1, $2, $3)",
     )
     .bind(email)
-    .bind(code)
+    .bind(code_hash)
     .bind(expires_at)
     .execute(pool)
     .await?;
     Ok(())
 }
 
-/// Find a valid (unused, non-expired) employee OTP.
+/// Every code still live for this address: id and Argon2 hash, newest first.
 ///
-/// **Caller**: `employee::verify_otp`
-/// **Why**: Validates the OTP code during verification.
-pub(crate) async fn find_valid_otp(
+/// **Caller**: `otp_service::handle_verify_otp`, which verifies the submitted code
+/// against each hash.
+/// **Why**: The code used to be stored and matched in plaintext, so a read-only replica,
+/// a backup or a dump handed out working login codes. It is hashed now, and a salted
+/// hash cannot be looked up by equality — the candidates come back and the service
+/// checks them.
+///
+/// `attempts` is bounded by `MAX_OTP_ATTEMPTS` and issuance is rate-limited, so this is
+/// a handful of rows at most.
+pub(crate) async fn find_live_otps(
     pool: &PgPool,
     email: &str,
-    code: &str,
     now: DateTime<Utc>,
-) -> Result<Option<Uuid>, sqlx::Error> {
-    let row: Option<(Uuid,)> = sqlx::query_as(
+) -> Result<Vec<(Uuid, String)>, sqlx::Error> {
+    sqlx::query_as(
         r#"
-        SELECT id FROM employee_otps
-        WHERE email = $1 AND code = $2 AND used = FALSE AND expires_at > $3
+        SELECT id, code FROM employee_otps
+        WHERE email = $1 AND used = FALSE AND expires_at > $2
+          AND attempts < $3
         ORDER BY created_at DESC
-        LIMIT 1
         "#,
     )
     .bind(email)
-    .bind(code)
     .bind(now)
-    .fetch_optional(pool)
+    .bind(crate::services::otp_service::MAX_OTP_ATTEMPTS)
+    .fetch_all(pool)
+    .await
+}
+
+/// Count one failed guess against every code currently live for this address.
+///
+/// **Caller**: `employee::verify_otp`, on every rejected code.
+/// **Why**: Without a counter the six-digit space is grindable inside the code's own
+/// ten-minute window. The count sits on the code, so the lockout dies with it and
+/// nobody can be locked out for longer than their own code would have lasted.
+///
+/// Returns the number of live codes that were counted against.
+pub(crate) async fn record_failed_otp_attempt(
+    pool: &PgPool,
+    email: &str,
+) -> Result<u64, sqlx::Error> {
+    let res = sqlx::query(
+        "UPDATE employee_otps SET attempts = attempts + 1
+          WHERE email = $1 AND used = FALSE AND expires_at > NOW()",
+    )
+    .bind(email)
+    .execute(pool)
     .await?;
-    Ok(row.map(|(id,)| id))
+    Ok(res.rows_affected())
 }
 
 /// Mark an employee OTP as used.
@@ -2147,6 +2174,31 @@ pub(crate) async fn clear_document_key(
         .execute(pool)
         .await?;
     Ok(())
+}
+
+
+/// Revoke one session by its token — "abmelden" on this device.
+///
+/// **Caller**: `employee::logout`
+/// **Why**: Sessions live 30 days and nothing ever deleted one, so a token taken from a
+/// lost or shared phone stayed valid for a month with no way to cut it off.
+pub(crate) async fn delete_session(pool: &PgPool, token: &str) -> Result<u64, sqlx::Error> {
+    let res = sqlx::query("DELETE FROM employee_sessions WHERE token = $1")
+        .bind(token)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
+/// Revoke every session for one account — "überall abmelden".
+///
+/// **Caller**: `employee::logout_everywhere`
+pub(crate) async fn delete_all_sessions(pool: &PgPool, employee_id: Uuid) -> Result<u64, sqlx::Error> {
+    let res = sqlx::query("DELETE FROM employee_sessions WHERE employee_id = $1")
+        .bind(employee_id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
 }
 
 #[cfg(test)]

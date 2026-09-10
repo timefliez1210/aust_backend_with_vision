@@ -93,11 +93,23 @@ pub fn create_router(state: AppState) -> Router {
         },
     ));
 
+    // Submissions get their own, looser bucket: five per IP per hour. A customer
+    // submits one inquiry; anything past that is someone filling the dashboard with
+    // junk and running up the vision and LLM bill.
+    let submit_limiter = Arc::new(middleware::RateLimiter::new(5, Duration::from_secs(3600)));
+    let submit_routes = routes::submit_api_router().layer(axum::middleware::from_fn(
+        move |req: Request, next: Next| {
+            let limiter = submit_limiter.clone();
+            async move { middleware::apply_rate_limit(limiter, req, next).await }
+        },
+    ));
+
     Router::new()
         .merge(routes::health::router())
         .nest(
             "/api/v1",
             routes::public_api_router()
+                .merge(submit_routes)
                 .merge(auth_routes)
                 .merge(protected_api)
                 .merge(admin_routes)

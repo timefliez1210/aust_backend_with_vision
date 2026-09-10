@@ -9,7 +9,7 @@ use jsonwebtoken::{decode, DecodingKey, Validation};
 use serde::Serialize;
 use std::sync::Arc;
 
-use aust_core::models::TokenClaims;
+use aust_core::models::{TokenClaims, TokenType};
 
 use crate::AppState;
 
@@ -56,6 +56,15 @@ pub async fn require_auth(
         tracing::debug!("JWT validation failed: {e}");
         unauthorized("Ungültiges oder abgelaufenes Token")
     })?;
+
+    // A refresh token is only good for exchanging at /auth/refresh. The two used to be
+    // byte-identical apart from expiry, so a leaked refresh token was a seven-day admin
+    // session on every route here.
+    if token_data.claims.typ != TokenType::Access {
+        return Err(unauthorized(
+            "Refresh-Token kann nicht als Zugriffstoken verwendet werden",
+        ));
+    }
 
     request.extensions_mut().insert(token_data.claims);
     Ok(next.run(request).await)

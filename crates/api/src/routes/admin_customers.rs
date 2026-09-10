@@ -609,9 +609,13 @@ pub(super) async fn add_customer_address(
 /// address_id alone can't reach another customer's entry.
 pub(super) async fn delete_customer_address(
     State(state): State<Arc<AppState>>,
-    Extension(_claims): Extension<TokenClaims>,
+    Extension(claims): Extension<TokenClaims>,
     Path((id, addr_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // Destroys customer data. `delete_customer` next door is admin-only; deleting one
+    // of their addresses was not, which let any authenticated user prune the book.
+    crate::routes::admin::require_admin(&claims)?;
+
     let rows = customer_address_repo::delete(&state.db, id, addr_id).await?;
     if rows == 0 {
         return Err(ApiError::NotFound(format!("Adresse {addr_id} nicht gefunden")));

@@ -26,6 +26,8 @@ pub fn protected_router() -> Router<Arc<AppState>> {
         .route("/inquiries/{id}/accept", post(accept_inquiry))
         .route("/inquiries/{id}/reject", post(reject_inquiry))
         .route("/inquiries/{id}/pdf", get(download_inquiry_pdf))
+        .route("/auth/logout", post(logout))
+        .route("/auth/logout-all", post(logout_everywhere))
 }
 
 /// Public auth routes (no token required).
@@ -63,20 +65,23 @@ impl OtpBackend for CustomerOtpBackend {
         &self,
         pool: &PgPool,
         email: &str,
-        code: &str,
+        code_hash: &str,
         expires_at: DateTime<Utc>,
     ) -> Result<(), sqlx::Error> {
-        customer_auth_repo::insert_otp(pool, email, code, expires_at).await
+        customer_auth_repo::insert_otp(pool, email, code_hash, expires_at).await
     }
 
-    async fn find_valid_otp(
+    async fn find_live_otps(
         &self,
         pool: &PgPool,
         email: &str,
-        code: &str,
         now: DateTime<Utc>,
-    ) -> Result<Option<Uuid>, sqlx::Error> {
-        customer_auth_repo::find_valid_otp(pool, email, code, now).await
+    ) -> Result<Vec<(Uuid, String)>, sqlx::Error> {
+        customer_auth_repo::find_live_otps(pool, email, now).await
+    }
+
+    async fn record_failed_attempt(&self, pool: &PgPool, email: &str) -> Result<u64, sqlx::Error> {
+        customer_auth_repo::record_failed_otp_attempt(pool, email).await
     }
 
     async fn mark_otp_used(&self, pool: &PgPool, otp_id: Uuid) -> Result<(), sqlx::Error> {
@@ -608,4 +613,28 @@ async fn notify_admin_telegram(config: &aust_core::config::TelegramConfig, text:
     if let Err(e) = client.post(&api_url).json(&payload).send().await {
         tracing::error!("Failed to send Telegram notification: {e}");
     }
+}
+
+/// `POST /api/v1/customer/auth/logout` — end this session.
+///
+/// **Caller**: Customer app "Abmelden".
+/// **Why**: Sessions last 30 days and nothing deleted them, so a token from a lost
+/// phone stayed usable for a month.
+async fn logout(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<CustomerClaims>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    customer_auth_repo::delete_session(&state.db, &claims.token).await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// `POST /api/v1/customer/auth/logout-all` — end every session for this customer.
+///
+/// **Caller**: Customer app "Auf allen Geräten abmelden".
+async fn logout_everywhere(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<CustomerClaims>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let revoked = customer_auth_repo::delete_all_sessions(&state.db, claims.customer_id).await?;
+    Ok(Json(serde_json::json!({ "ok": true, "revoked": revoked })))
 }

@@ -1,5 +1,5 @@
 use axum::{
-    extract::Request,
+    extract::{ConnectInfo, Request},
     http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
@@ -8,7 +8,7 @@ use axum::{
 use serde_json::json;
 use std::{
     collections::HashMap,
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -78,24 +78,59 @@ impl RateLimiter {
     }
 }
 
+/// Is this peer allowed to tell us who the real client is?
+///
+/// In production the only thing that ever connects to this process is Apache on the
+/// same host, reached over loopback or the Docker bridge. Anything arriving from a
+/// public address is talking to us directly and its headers are just user input.
+fn is_trusted_proxy(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        IpAddr::V6(v6) => v6.is_loopback() || v6.is_unique_local() || v6.is_unicast_link_local(),
+    }
+}
+
+/// The client IP as reported by a trusted proxy: the LAST entry in `X-Forwarded-For`.
+///
+/// Each proxy appends the address it received the connection from, so the rightmost
+/// entry is the one our own proxy observed. Everything to its left was supplied by the
+/// caller and can say anything at all.
+fn forwarded_client_ip(request: &Request) -> Option<IpAddr> {
+    request
+        .headers()
+        .get_all("X-Forwarded-For")
+        .iter()
+        .filter_map(|h| h.to_str().ok())
+        .flat_map(|s| s.split(','))
+        .filter_map(|ip| ip.trim().parse::<IpAddr>().ok())
+        .next_back()
+}
+
 /// Extracts the real client IP from the request.
 ///
 /// **Caller**: `apply_rate_limit()`.
-/// **Why**: In production the backend sits behind Apache which sets `X-Forwarded-For`.
-///          Reading the socket address would always yield Apache's loopback IP, making
-///          rate limiting by-IP ineffective.
+/// **Why**: In production the backend sits behind Apache, so the socket address is
+/// always the proxy and the real client is in `X-Forwarded-For`.
 ///
-/// Falls back to `0.0.0.0` if neither header nor ConnectInfo is present, which will
-/// cause all unresolvable requests to share a single bucket — acceptable since
-/// legitimate traffic always carries `X-Forwarded-For` in production.
+/// The header is only believed when the connection came from a trusted proxy, and then
+/// only its rightmost entry. Trusting the leftmost value unconditionally, as this used
+/// to, let the caller choose their own bucket: a new `X-Forwarded-For` per request and
+/// the limit on `/auth/login`, `/customer/auth/*` and `/employee/auth/*` was gone.
+///
+/// Falls back to `0.0.0.0` when there is no peer address and no usable header, which
+/// puts those requests in one shared bucket — the safe direction to fail.
 fn extract_client_ip(request: &Request) -> IpAddr {
-    request
-        .headers()
-        .get("X-Forwarded-For")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .and_then(|ip| ip.trim().parse::<IpAddr>().ok())
-        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| addr.ip());
+
+    match peer {
+        Some(peer) if is_trusted_proxy(peer) => forwarded_client_ip(request).unwrap_or(peer),
+        // A direct connection from the internet: the socket is the only honest source.
+        Some(peer) => peer,
+        None => forwarded_client_ip(request).unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+    }
 }
 
 /// Tower middleware that enforces the rate limit on the request.
@@ -132,4 +167,54 @@ pub async fn apply_rate_limit(
     }
 
     next.run(request).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::extract::ConnectInfo;
+
+    fn req(peer: Option<&str>, xff: Option<&str>) -> Request {
+        let mut r = Request::new(axum::body::Body::empty());
+        if let Some(p) = peer {
+            let addr: SocketAddr = p.parse().unwrap();
+            r.extensions_mut().insert(ConnectInfo(addr));
+        }
+        if let Some(v) = xff {
+            r.headers_mut().insert("X-Forwarded-For", v.parse().unwrap());
+        }
+        r
+    }
+
+    /// The header is user input. Believing its leftmost value let a caller pick their
+    /// own bucket and walk straight past the limit on every auth endpoint.
+    #[test]
+    fn a_direct_caller_cannot_choose_their_own_bucket() {
+        let ip = extract_client_ip(&req(Some("203.0.113.9:5555"), Some("1.2.3.4")));
+        assert_eq!(ip.to_string(), "203.0.113.9", "the socket is the only honest source");
+    }
+
+    /// Behind the real proxy the client is the entry our own proxy appended — the last
+    /// one. Anything to its left was written by the caller.
+    #[test]
+    fn behind_the_proxy_the_rightmost_entry_wins() {
+        let ip = extract_client_ip(&req(Some("127.0.0.1:5555"), Some("1.2.3.4, 198.51.100.7")));
+        assert_eq!(ip.to_string(), "198.51.100.7");
+    }
+
+    /// A spoofed chain from a trusted proxy still resolves to what the proxy saw.
+    #[test]
+    fn a_spoofed_chain_collapses_to_the_observed_client() {
+        let a = extract_client_ip(&req(Some("127.0.0.1:5555"), Some("9.9.9.9, 198.51.100.7")));
+        let b = extract_client_ip(&req(Some("127.0.0.1:5555"), Some("8.8.8.8, 198.51.100.7")));
+        assert_eq!(a, b, "rotating the spoofed prefix must not change the bucket");
+    }
+
+    /// No header from the proxy at all: fall back to the proxy itself rather than to a
+    /// single shared bucket.
+    #[test]
+    fn a_trusted_peer_without_a_header_is_used_as_is() {
+        let ip = extract_client_ip(&req(Some("127.0.0.1:5555"), None));
+        assert_eq!(ip.to_string(), "127.0.0.1");
+    }
 }

@@ -43,6 +43,14 @@ pub(crate) struct VerifyRequest {
 // ---------------------------------------------------------------------------
 // OTP backend trait
 // ---------------------------------------------------------------------------
+/// Wrong guesses a login code tolerates before it stops being valid.
+///
+/// Five is enough to survive fat fingers and a code read off the wrong mail, and it
+/// cuts the six-digit search from a million to five per issued code. The counter lives
+/// on the code, so hitting the limit costs the real user one "neuen Code anfordern"
+/// rather than a lockout of their address.
+pub(crate) const MAX_OTP_ATTEMPTS: i32 = 5;
+
 
 /// Abstracts the repo-specific OTP operations so the generic handler can work
 /// for both customers and employees.
@@ -70,23 +78,29 @@ pub(crate) trait OtpBackend: Send + Sync {
         email: &str,
     ) -> impl std::future::Future<Output = Result<i64, sqlx::Error>> + Send;
 
-    /// Persist a new OTP code.
+    /// Persist a new OTP. `code_hash` is an Argon2 hash, never the plaintext.
     fn insert_otp(
         &self,
         pool: &PgPool,
         email: &str,
-        code: &str,
+        code_hash: &str,
         expires_at: DateTime<Utc>,
     ) -> impl std::future::Future<Output = Result<(), sqlx::Error>> + Send;
 
-    /// Find a valid (unused, non-expired) OTP. Returns the row ID.
-    fn find_valid_otp(
+    /// Every code still live for this address: id and Argon2 hash, newest first.
+    fn find_live_otps(
         &self,
         pool: &PgPool,
         email: &str,
-        code: &str,
         now: DateTime<Utc>,
-    ) -> impl std::future::Future<Output = Result<Option<Uuid>, sqlx::Error>> + Send;
+    ) -> impl std::future::Future<Output = Result<Vec<(Uuid, String)>, sqlx::Error>> + Send;
+
+    /// Count one failed guess against every code currently live for this address.
+    fn record_failed_attempt(
+        &self,
+        pool: &PgPool,
+        email: &str,
+    ) -> impl std::future::Future<Output = Result<u64, sqlx::Error>> + Send;
 
     /// Mark an OTP row as used.
     fn mark_otp_used(
@@ -160,7 +174,9 @@ pub(crate) async fn handle_request_otp(
         };
 
         let expires_at = Utc::now() + chrono::Duration::minutes(10);
-        backend.insert_otp(pool, &email, &code, expires_at).await?;
+        // Only the hash is stored; the plaintext leaves in the mail below and nowhere else.
+        let code_hash = hash_otp(&code)?;
+        backend.insert_otp(pool, &email, &code_hash, expires_at).await?;
 
         let subject = backend.otp_email_subject();
         let body_text = format!(
@@ -216,10 +232,23 @@ pub(crate) async fn handle_verify_otp(
     }
 
     let now = Utc::now();
-    let otp_id = backend
-        .find_valid_otp(pool, &email, &code, now)
-        .await?
-        .ok_or_else(|| ApiError::Unauthorized("Ungültiger oder abgelaufener Code".into()))?;
+    let candidates = backend.find_live_otps(pool, &email, now).await?;
+    let matched = candidates
+        .into_iter()
+        .find(|(_, hash)| verify_otp_hash(&code, hash));
+
+    let otp_id = match matched {
+        Some((id, _)) => id,
+        None => {
+            // Count the miss against every code still live for this address. Once a code
+            // reaches MAX_OTP_ATTEMPTS it stops being returned as a candidate, so the
+            // six-digit space is no longer grindable inside the ten-minute window.
+            backend.record_failed_attempt(pool, &email).await?;
+            return Err(ApiError::Unauthorized(
+                "Ungültiger oder abgelaufener Code".into(),
+            ));
+        }
+    };
 
     backend.mark_otp_used(pool, otp_id).await?;
 
@@ -230,6 +259,36 @@ pub(crate) async fn handle_verify_otp(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Hash a login code for storage.
+///
+/// **Caller**: `handle_request_otp`, before the code is persisted.
+/// **Why**: The code was stored in plaintext, so a read-only replica, a nightly backup
+/// or a dump handed out working login codes for every address in the table. Argon2 with
+/// a random salt, the same treatment the admin password reset already gave its code.
+pub(crate) fn hash_otp(code: &str) -> Result<String, ApiError> {
+    use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
+    use argon2::Argon2;
+
+    let salt = SaltString::generate(&mut OsRng);
+    Argon2::default()
+        .hash_password(code.as_bytes(), &salt)
+        .map(|h| h.to_string())
+        .map_err(|e| ApiError::Internal(format!("Code konnte nicht gespeichert werden: {e}")))
+}
+
+/// Does this submitted code match a stored hash?
+///
+/// A malformed stored value simply fails to match rather than erroring, so one bad row
+/// cannot lock an address out of logging in.
+fn verify_otp_hash(code: &str, stored: &str) -> bool {
+    use argon2::password_hash::{PasswordHash, PasswordVerifier};
+    use argon2::Argon2;
+
+    PasswordHash::new(stored)
+        .map(|parsed| Argon2::default().verify_password(code.as_bytes(), &parsed).is_ok())
+        .unwrap_or(false)
+}
 
 /// Generate a secure 64-character hex session token.
 ///

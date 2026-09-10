@@ -28,47 +28,71 @@ pub(crate) async fn count_recent_otps(
 pub(crate) async fn insert_otp(
     pool: &PgPool,
     email: &str,
-    code: &str,
+    code_hash: &str,
     expires_at: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO customer_otps (email, code, expires_at) VALUES ($1, $2, $3)",
     )
     .bind(email)
-    .bind(code)
+    .bind(code_hash)
     .bind(expires_at)
     .execute(pool)
     .await?;
     Ok(())
 }
 
-/// Find a valid (unused, non-expired) OTP by email and code.
+/// Every code still live for this address: id and Argon2 hash, newest first.
 ///
-/// **Caller**: `customer::verify_otp`
-/// **Why**: Validates the OTP code during verification.
+/// **Caller**: `otp_service::handle_verify_otp`, which verifies the submitted code
+/// against each hash.
+/// **Why**: The code used to be stored and matched in plaintext, so a read-only replica,
+/// a backup or a dump handed out working login codes. It is hashed now, and a salted
+/// hash cannot be looked up by equality — the candidates come back and the service
+/// checks them.
 ///
-/// # Returns
-/// The OTP row ID if found, `None` otherwise.
-pub(crate) async fn find_valid_otp(
+/// `attempts` is bounded by `MAX_OTP_ATTEMPTS` and issuance is rate-limited, so this is
+/// a handful of rows at most.
+pub(crate) async fn find_live_otps(
     pool: &PgPool,
     email: &str,
-    code: &str,
     now: DateTime<Utc>,
-) -> Result<Option<Uuid>, sqlx::Error> {
-    let row: Option<(Uuid,)> = sqlx::query_as(
+) -> Result<Vec<(Uuid, String)>, sqlx::Error> {
+    sqlx::query_as(
         r#"
-        SELECT id FROM customer_otps
-        WHERE email = $1 AND code = $2 AND used = FALSE AND expires_at > $3
+        SELECT id, code FROM customer_otps
+        WHERE email = $1 AND used = FALSE AND expires_at > $2
+          AND attempts < $3
         ORDER BY created_at DESC
-        LIMIT 1
         "#,
     )
     .bind(email)
-    .bind(code)
     .bind(now)
-    .fetch_optional(pool)
+    .bind(crate::services::otp_service::MAX_OTP_ATTEMPTS)
+    .fetch_all(pool)
+    .await
+}
+
+/// Count one failed guess against every code currently live for this address.
+///
+/// **Caller**: `customer::verify_otp`, on every rejected code.
+/// **Why**: Without a counter the six-digit space is grindable inside the code's own
+/// ten-minute window. The count sits on the code, so the lockout dies with it and
+/// nobody can be locked out for longer than their own code would have lasted.
+///
+/// Returns the number of live codes that were counted against.
+pub(crate) async fn record_failed_otp_attempt(
+    pool: &PgPool,
+    email: &str,
+) -> Result<u64, sqlx::Error> {
+    let res = sqlx::query(
+        "UPDATE customer_otps SET attempts = attempts + 1
+          WHERE email = $1 AND used = FALSE AND expires_at > NOW()",
+    )
+    .bind(email)
+    .execute(pool)
     .await?;
-    Ok(row.map(|(id,)| id))
+    Ok(res.rows_affected())
 }
 
 /// Mark an OTP as used.
@@ -337,4 +361,104 @@ pub(crate) async fn check_inquiry_ownership(
     .fetch_optional(pool)
     .await?;
     Ok(row.is_some())
+}
+
+
+/// Revoke one session by its token — "abmelden" on this device.
+///
+/// **Caller**: `customer::logout`
+/// **Why**: Sessions live 30 days and nothing ever deleted one, so a token taken from a
+/// lost or shared phone stayed valid for a month with no way to cut it off.
+pub(crate) async fn delete_session(pool: &PgPool, token: &str) -> Result<u64, sqlx::Error> {
+    let res = sqlx::query("DELETE FROM customer_sessions WHERE token = $1")
+        .bind(token)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
+/// Revoke every session for one account — "überall abmelden".
+///
+/// **Caller**: `customer::logout_everywhere`
+pub(crate) async fn delete_all_sessions(pool: &PgPool, customer_id: Uuid) -> Result<u64, sqlx::Error> {
+    let res = sqlx::query("DELETE FROM customer_sessions WHERE customer_id = $1")
+        .bind(customer_id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::otp_service::{hash_otp, MAX_OTP_ATTEMPTS};
+
+    /// Five wrong guesses kill the code. Without this the six-digit space is grindable
+    /// inside the ten minutes the code lives, and success hands out a 30-day session
+    /// carrying the customer's inquiries, addresses and offer PDFs.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_code_dies_after_too_many_wrong_guesses(pool: PgPool) {
+        let email = "kundin@example.de";
+        let expires = Utc::now() + chrono::Duration::minutes(10);
+        let hash = hash_otp("123456").expect("hash");
+        insert_otp(&pool, email, &hash, expires).await.expect("insert otp");
+
+        // The right code works while the budget lasts.
+        for _ in 0..MAX_OTP_ATTEMPTS {
+            assert_eq!(
+                find_live_otps(&pool, email, Utc::now()).await.expect("lookup").len(),
+                1,
+                "the real code must stay a candidate below the limit"
+            );
+            record_failed_otp_attempt(&pool, email).await.expect("record miss");
+        }
+
+        // One guess past the limit and even the right code is dead.
+        assert!(
+            find_live_otps(&pool, email, Utc::now()).await.expect("lookup").is_empty(),
+            "the code must stop being a candidate once the attempt budget is spent"
+        );
+    }
+
+    /// The lockout is per code, so requesting a new one restores access — an attacker
+    /// grinding an address cannot lock its owner out for longer than a code's own life.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_fresh_code_is_not_affected_by_the_old_ones_misses(pool: PgPool) {
+        let email = "kundin@example.de";
+        let expires = Utc::now() + chrono::Duration::minutes(10);
+        let first = hash_otp("111111").expect("hash");
+        insert_otp(&pool, email, &first, expires).await.expect("insert first");
+        for _ in 0..MAX_OTP_ATTEMPTS {
+            record_failed_otp_attempt(&pool, email).await.expect("record miss");
+        }
+
+        let second = hash_otp("222222").expect("hash");
+        insert_otp(&pool, email, &second, expires).await.expect("insert second");
+        assert_eq!(
+            find_live_otps(&pool, email, Utc::now()).await.expect("lookup").len(),
+            1,
+            "a newly requested code must be a candidate again"
+        );
+    }
+
+    /// The column must never hold a code anyone could read back out. A replica, a
+    /// nightly backup or a dump used to be a list of working login codes.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_stored_code_is_a_hash_not_the_code(pool: PgPool) {
+        let email = "kundin@example.de";
+        let hash = hash_otp("424242").expect("hash");
+        insert_otp(&pool, email, &hash, Utc::now() + chrono::Duration::minutes(10))
+            .await
+            .expect("insert otp");
+
+        let (stored,): (String,) =
+            sqlx::query_as("SELECT code FROM customer_otps WHERE email = $1")
+                .bind(email)
+                .fetch_one(&pool)
+                .await
+                .expect("read back");
+
+        assert!(!stored.contains("424242"), "the plaintext code reached the database");
+        assert!(stored.starts_with("$argon2"), "expected an Argon2 hash, got {stored}");
+    }
 }

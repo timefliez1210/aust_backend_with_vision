@@ -841,10 +841,32 @@ async fn delete_estimate(
 ///
 /// # Errors
 /// - `500` if the S3 download fails (key not found returns the storage provider's error)
+/// Storage keys this unauthenticated route may serve.
+///
+/// The handler streams back whatever key it is given, and it is mounted with no auth so
+/// `<img>` tags work — which meant anyone who could name a key could fetch it. The
+/// bucket also holds `employees/` (identity documents, contracts), `invoices/`,
+/// `storage-invoices/`, `offers/` and `emails/` (attachments), and those keys travel in
+/// dashboard URLs, API responses and mail. Only estimation media is served here.
+///
+/// Rejects any traversal or absolute form outright rather than trying to normalise it.
+fn is_public_media_key(key: &str) -> bool {
+    const PUBLIC_PREFIXES: [&str; 1] = ["estimates/"];
+
+    if key.starts_with('/') || key.contains("..") || key.contains('\\') {
+        return false;
+    }
+    PUBLIC_PREFIXES.iter().any(|p| key.starts_with(p))
+}
+
 async fn serve_image(
     State(state): State<Arc<AppState>>,
     Path(key): Path<String>,
 ) -> Result<impl axum::response::IntoResponse, ApiError> {
+    if !is_public_media_key(&key) {
+        return Err(ApiError::NotFound("Bild nicht gefunden.".into()));
+    }
+
     let file_bytes = state
         .storage
         .download(&key)

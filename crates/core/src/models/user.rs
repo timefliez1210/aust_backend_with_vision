@@ -121,4 +121,23 @@ pub struct TokenClaims {
     pub exp: usize,
     /// Issued-at timestamp (Unix seconds).
     pub iat: usize,
+    /// What this token is for. Access and refresh tokens used to be byte-identical
+    /// apart from expiry, so a leaked refresh token was a seven-day admin session on
+    /// every route. The auth middleware now refuses anything but an access token.
+    ///
+    /// Defaults to `Access` so tokens issued before this field existed keep working
+    /// until they expire.
+    #[serde(default)]
+    pub typ: TokenType,
+}
+
+/// What a signed token may be used for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TokenType {
+    /// Presented as `Authorization: Bearer` to reach protected routes.
+    #[default]
+    Access,
+    /// Only good for exchanging at `/auth/refresh`.
+    Refresh,
 }

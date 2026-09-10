@@ -17,6 +17,8 @@ use crate::AppState;
 pub struct CustomerClaims {
     pub customer_id: Uuid,
     pub email: String,
+    /// The session token this request arrived with, so logout can revoke exactly it.
+    pub token: String,
 }
 
 #[derive(Serialize)]
@@ -76,9 +78,12 @@ pub async fn require_customer_auth(
     let (customer_id, email) =
         row.ok_or_else(|| unauthorized("Ungültiges oder abgelaufenes Token"))?;
 
-    request
-        .extensions_mut()
-        .insert(CustomerClaims { customer_id, email });
+    let token = token.to_string();
+    request.extensions_mut().insert(CustomerClaims {
+        customer_id,
+        email,
+        token,
+    });
 
     Ok(next.run(request).await)
 }

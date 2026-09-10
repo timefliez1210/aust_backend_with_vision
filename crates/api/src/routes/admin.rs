@@ -900,11 +900,16 @@ fn paid_export_fields(
 /// touching the recorded worked hours. Replaces the whole month's override set.
 async fn put_employee_hours_adjustments(
     State(state): State<Arc<AppState>>,
-    Extension(_claims): Extension<TokenClaims>,
+    Extension(claims): Extension<TokenClaims>,
     Path(id): Path<Uuid>,
     Query(query): Query<std::collections::HashMap<String, String>>,
     Json(body): Json<Vec<employee_repo::HoursAdjustmentInput>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // Rewrites a month of paid hours, which feeds the hours export and the wages.
+    // The JWT layer only proves a valid session; without this a Bürokraft could edit
+    // anyone's payroll, while editing the employee record itself is admin-only.
+    require_admin(&claims)?;
+
     let month_str = query
         .get("month")
         .cloned()
@@ -934,10 +939,14 @@ async fn put_employee_hours_adjustments(
 /// irreversible; the recorded hours become the paid hours.
 async fn cleanup_hours_adjustments(
     State(state): State<Arc<AppState>>,
-    Extension(_claims): Extension<TokenClaims>,
+    Extension(claims): Extension<TokenClaims>,
     Path(id): Path<Uuid>,
     Query(query): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // Permanently overwrites recorded clock times with the paid values. Irreversible,
+    // and payroll, so it belongs with the other admin-only employee operations.
+    require_admin(&claims)?;
+
     let month_str = query
         .get("month")
         .cloned()

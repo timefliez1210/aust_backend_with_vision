@@ -17,6 +17,8 @@ use crate::AppState;
 pub struct EmployeeClaims {
     pub employee_id: Uuid,
     pub email: String,
+    /// The session token this request arrived with, so logout can revoke exactly it.
+    pub token: String,
 }
 
 #[derive(Serialize)]
@@ -81,9 +83,12 @@ pub async fn require_employee_auth(
     let (employee_id, email) =
         row.ok_or_else(|| unauthorized("Ungültiges oder abgelaufenes Token"))?;
 
-    request
-        .extensions_mut()
-        .insert(EmployeeClaims { employee_id, email });
+    let token = token.to_string();
+    request.extensions_mut().insert(EmployeeClaims {
+        employee_id,
+        email,
+        token,
+    });
 
     Ok(next.run(request).await)
 }
