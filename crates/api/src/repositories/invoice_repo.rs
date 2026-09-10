@@ -119,7 +119,8 @@ pub(crate) async fn fetch_active_offer(
     inquiry_id: Uuid,
 ) -> Result<Option<ActiveOfferRow>, sqlx::Error> {
     sqlx::query_as(
-        "SELECT price_cents, offer_number, line_items_json, persons FROM offers WHERE inquiry_id = $1
+        "SELECT price_cents, offer_number, line_items_json, persons FROM offers
+         WHERE inquiry_id = $1 AND status NOT IN ('rejected', 'cancelled', 'superseded')
          ORDER BY created_at DESC LIMIT 1",
     )
     .bind(inquiry_id)
@@ -735,7 +736,8 @@ pub(crate) async fn fetch_offer_netto(
     inquiry_id: Uuid,
 ) -> Result<i64, sqlx::Error> {
     let row: Option<(i64,)> =
-        sqlx::query_as("SELECT price_cents FROM offers WHERE inquiry_id = $1 ORDER BY created_at DESC LIMIT 1")
+        sqlx::query_as("SELECT price_cents FROM offers WHERE inquiry_id = $1 AND status NOT IN ('rejected', 'cancelled', 'superseded')
+              ORDER BY created_at DESC LIMIT 1")
             .bind(inquiry_id)
             .fetch_optional(pool)
             .await?;

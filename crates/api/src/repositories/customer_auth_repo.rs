@@ -163,7 +163,7 @@ pub(crate) async fn list_customer_inquiries(
             oa.city AS origin_city,
             da.city AS destination_city,
             q.estimated_volume_m3,
-            (SELECT o.price_cents FROM offers o WHERE o.inquiry_id = q.id ORDER BY o.created_at DESC LIMIT 1)
+            (SELECT o.price_cents FROM offers o WHERE o.inquiry_id = q.id AND o.status NOT IN ('rejected', 'cancelled', 'superseded') ORDER BY o.created_at DESC LIMIT 1)
         FROM inquiries q
         LEFT JOIN addresses oa ON q.origin_address_id = oa.id
         LEFT JOIN addresses da ON q.destination_address_id = da.id

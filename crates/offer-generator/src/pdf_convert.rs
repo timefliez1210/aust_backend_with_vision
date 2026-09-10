@@ -36,7 +36,15 @@ pub async fn convert_xlsx_to_pdf(xlsx_bytes: &[u8]) -> Result<Vec<u8>, OfferErro
         .await
         .map_err(|e| OfferError::Pdf(format!("Failed to write temp xlsx: {e}")))?;
 
+    // LibreOffice keeps a single user profile per user and locks it while running,
+    // so two conversions started at the same moment fight over it: the second one
+    // either blocks or exits 0 having written nothing. Two KVAs being rendered at
+    // once is entirely normal here (a form submission auto-generates while Alex
+    // regenerates another in the dashboard), so give every conversion a throwaway
+    // profile inside its own temp dir and let them run in parallel.
+    let profile_dir = tmp_dir.path().join("lo-profile");
     let output = Command::new("libreoffice")
+        .arg(format!("-env:UserInstallation=file://{}", profile_dir.display()))
         .arg("--headless")
         .arg("--calc")
         .arg("--convert-to")

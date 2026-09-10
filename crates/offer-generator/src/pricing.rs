@@ -140,21 +140,27 @@ impl PricingEngine {
     }
 }
 
-/// Parse a German floor string to a numeric floor number.
+/// Parse a stored floor string to a numeric floor number.
 ///
-/// **Caller**: `crates/api/src/routes/offers.rs` (converts form field values to
-///             `u32` before passing to `PricingEngine::calculate`)
-/// **Why**: The Austrian moving form uses German-language dropdown values for
-/// floor selection. This function bridges the human-readable labels to the
-/// numeric values the pricing engine needs.
+/// **Caller**: `offer_builder::run_offer_computation`, on `addresses.floor`.
+/// **Why**: Every extra floor without a lift adds a helper to the crew, so a floor
+/// this function fails to read is a KVA priced as if the flat were on the ground
+/// floor. Three UIs write this column in three different shapes and all of them
+/// have to be understood here:
 ///
-/// # Parameters
-/// - `floor_str` — a German floor label, e.g. `"Erdgeschoss"`, `"3. Stock"`,
-///   `"Hochparterre"`, or `"Höher als 6. Stock"`
+/// | Written by | Looks like |
+/// |---|---|
+/// | public quote form (`kostenloses-angebot`) | `"Erdgeschoss"`, `"3. Stock"`, `"Höher"` |
+/// | admin address editor | `"-1"`, `"0"`, `"1"` … `"5"` |
+/// | admin "Anfrage anlegen" modal | `"EG"`, `"1. OG"` … `"5. OG"`, `"DG"`, `"UG"` |
+///
+/// Only the first shape used to parse; the other two silently read as 0 and
+/// undercharged every lift-less upper-floor job booked through the dashboard.
 ///
 /// # Returns
-/// A `u32` floor index where 0 = ground floor, 1 = first floor above ground, etc.
-/// Unknown strings return `0` (treated as ground floor) — never panics.
+/// A `u32` floor index where 0 = ground floor (and anything below it, since a
+/// cellar is one flight either way), 1 = first floor above ground. Unknown strings
+/// return `0` — never panics.
 ///
 /// # Examples
 /// ```
@@ -162,23 +168,39 @@ impl PricingEngine {
 /// assert_eq!(parse_floor("Erdgeschoss"), 0);
 /// assert_eq!(parse_floor("Hochparterre"), 0);
 /// assert_eq!(parse_floor("3. Stock"), 3);
+/// assert_eq!(parse_floor("3"), 3);
+/// assert_eq!(parse_floor("2. OG"), 2);
+/// assert_eq!(parse_floor("EG"), 0);
+/// assert_eq!(parse_floor("Höher"), 7);
 /// assert_eq!(parse_floor("Höher als 6. Stock"), 7);
 /// ```
 pub fn parse_floor(floor_str: &str) -> u32 {
     let s = floor_str.trim();
     match s {
-        "Erdgeschoss" => 0,
-        "Hochparterre" => 0,
-        "Höher als 6. Stock" => 7,
-        _ => {
-            // Try "N. Stock" pattern
-            if let Some(num_str) = s.strip_suffix(". Stock") {
-                num_str.trim().parse::<u32>().unwrap_or(0)
-            } else {
-                0
-            }
-        }
+        "Erdgeschoss" | "EG" | "Hochparterre" | "Parterre" => return 0,
+        // A cellar is a flight of stairs like any other, but the crew formula only
+        // counts floors *above* the first, so it stays at 0.
+        "Keller" | "UG" | "Untergeschoss" => return 0,
+        // Dachgeschoss has no number attached to it; treat it as the worst case the
+        // dropdown can express, one above its highest numbered floor.
+        "DG" | "Dachgeschoss" => return 6,
+        // The public form's select sends the *value* "Höher", not the label.
+        "Höher" | "Höher als 6. Stock" => return 7,
+        _ => {}
     }
+
+    // "3", "-1" — the admin address editor stores the bare number.
+    if let Ok(n) = s.parse::<i64>() {
+        return n.max(0) as u32;
+    }
+
+    // "3. Stock", "3. OG", "3.OG", "3 OG" — anything that starts with the number.
+    let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if !digits.is_empty() {
+        return digits.parse::<u32>().unwrap_or(0);
+    }
+
+    0
 }
 
 /// Delegates to [`PricingEngine::new`] so `PricingEngine` can be used with
@@ -421,6 +443,51 @@ mod tests {
     #[test]
     fn parse_floor_unknown_string() {
         assert_eq!(parse_floor("random"), 0);
+    }
+
+    /// The admin address editor stores the bare number. Reading these as 0 priced
+    /// every lift-less upper-floor job booked through the dashboard as ground floor.
+    #[test]
+    fn parse_floor_admin_numeric_values() {
+        assert_eq!(parse_floor("-1"), 0);
+        for n in 0..=5u32 {
+            assert_eq!(parse_floor(&n.to_string()), n, "numeric floor {n}");
+        }
+    }
+
+    /// The "Anfrage anlegen" modal stores OG labels.
+    #[test]
+    fn parse_floor_og_labels() {
+        assert_eq!(parse_floor("EG"), 0);
+        assert_eq!(parse_floor("UG"), 0);
+        assert_eq!(parse_floor("DG"), 6);
+        for n in 1..=5u32 {
+            assert_eq!(parse_floor(&format!("{n}. OG")), n, "{n}. OG");
+            assert_eq!(parse_floor(&format!("{n}.OG")), n, "{n}.OG");
+        }
+    }
+
+    /// The public form's select sends the *value* "Höher", never the label.
+    #[test]
+    fn parse_floor_hoeher_value_not_label() {
+        assert_eq!(parse_floor("Höher"), 7);
+        assert_eq!(parse_floor("Höher als 6. Stock"), 7);
+    }
+
+    /// A 3rd floor without a lift must add helpers regardless of which UI wrote it.
+    #[test]
+    fn every_stored_floor_shape_prices_the_same() {
+        let engine = PricingEngine::new();
+        let helpers_for = |floor: &str| {
+            let mut input = base_input();
+            input.floor_origin = Some(parse_floor(floor));
+            input.has_elevator_origin = Some(false);
+            engine.calculate(&input).estimated_helpers
+        };
+        // 10 m³ → base 2, third floor without a lift → +2 → 4.
+        for shape in ["3. Stock", "3", "3. OG"] {
+            assert_eq!(helpers_for(shape), 4, "floor written as {shape:?}");
+        }
     }
 
     // Proptest: parse_floor and pricing never panic

@@ -14,7 +14,7 @@ use aust_core::models::{
 };
 use aust_distance_calculator::{RouteCalculator, RouteRequest};
 use aust_offer_generator::{
-    convert_xlsx_to_pdf, generate_offer_xlsx, parse_floor, substitute_clearing_page_2,
+    convert_xlsx_to_pdf, generate_offer_xlsx, parse_floor, substitute_clearing_page_2, MAX_LINE_ITEMS,
     DetectedItemRow, OfferData,
     OfferLineItem, PricingEngine,
 };
@@ -267,6 +267,12 @@ pub(crate) async fn run_offer_computation(
                 result.push(make_insurance());
             } else if li.quantity > 0.0 {
                 result.push(li.clone());
+            } else if li.flat_total.is_some() && !li.description.trim().is_empty() {
+                // A Pauschale carries its whole price in `flat_total` and leaves Menge
+                // empty, so the quantity test above threw it away: every flat row the
+                // admin added by hand vanished from the regenerated KVA unless it
+                // happened to be named "Fahrkostenpauschale", which has its own branch.
+                result.push(li.clone());
             }
         }
         result
@@ -304,13 +310,33 @@ pub(crate) async fn run_offer_computation(
         )
     };
 
-    let line_items: Vec<OfferLineItem> = line_items
+    let mut line_items: Vec<OfferLineItem> = line_items
         .into_iter()
         .map(|mut li| {
             if li.is_labor { li.unit_price = rate_override; }
             li
         })
         .collect();
+
+    // The template prints MAX_LINE_ITEMS rows and its total sums exactly those rows.
+    // Summing the full list here would store a price the printed KVA never shows, and
+    // the invoice is derived from the stored price — so the customer would be billed
+    // for rows that are not on the document they signed. Drop the overflow here
+    // instead, where it is logged once with the descriptions that were lost.
+    if line_items.len() > MAX_LINE_ITEMS {
+        let dropped: Vec<&str> = line_items[MAX_LINE_ITEMS..]
+            .iter()
+            .map(|li| li.description.as_str())
+            .collect();
+        tracing::error!(
+            inquiry_id = %inquiry_id,
+            dropped = ?dropped,
+            "KVA has {} line items but only {MAX_LINE_ITEMS} fit the template; the rest are dropped from both the PDF and the price",
+            line_items.len()
+        );
+        line_items.truncate(MAX_LINE_ITEMS);
+    }
+    let line_items = line_items;
 
     let actual_netto: f64 = line_items.iter().map(|item| {
         if let Some(ft) = item.flat_total {
@@ -755,22 +781,6 @@ pub(crate) async fn build_offer_with_overrides(
     })
 }
 
-/// Format a `Services` struct into a human-readable German string for Telegram display.
-///
-/// **Caller**: `build_offer_with_overrides` — used to populate the `services` field in
-/// `TelegramSummary`.
-/// **Why**: The Telegram caption shows a summary of selected additional services so Alex
-/// can verify the offer includes the correct extras.
-///
-/// # Parameters
-/// - `services` — structured `Services` flags from the inquiry
-///
-/// # Returns
-/// Maps a stored floor value to a German display label for the offer PDF.
-///
-/// The admin address editor stores numeric strings ("0", "1", ...) while the public
-/// quote form stores full German labels ("Erdgeschoss", "3. Stock"). Both are handled
-/// so the XLSX always shows a human-readable string.
 /// Does this service type get the clearing-job terms page instead of the Umzug one?
 ///
 /// **Caller**: `run_offer_computation`, right after the PDF is rendered.
@@ -783,21 +793,34 @@ fn uses_clearing_terms_page(service_type: Option<&str>) -> bool {
     matches!(service_type, Some("entruempelung" | "haushaltsaufloesung"))
 }
 
+/// Map a stored floor value to a German display label for the offer PDF.
+///
+/// This is display only. The *pricing* side of the same column is `parse_floor` in
+/// `aust-offer-generator`, and the two have to agree on which shapes exist: three
+/// UIs write this column, in numeric, "N. Stock" and "N. OG" form.
 fn format_floor_display(floor: &str) -> String {
-    match floor.trim() {
-        "0" => "Erdgeschoss".to_string(),
-        "-1" => "Keller".to_string(),
-        "1" => "1. OG".to_string(),
-        "2" => "2. OG".to_string(),
-        "3" => "3. OG".to_string(),
-        "4" => "4. OG".to_string(),
-        "5" => "5. OG".to_string(),
-        other => other.to_string(), // pass-through for "Erdgeschoss", "3. Stock", etc.
+    let s = floor.trim();
+    match s {
+        "0" => return "Erdgeschoss".to_string(),
+        "-1" => return "Keller".to_string(),
+        // The public form's select sends the value, not the label the customer read.
+        "Höher" => return "Höher als 6. Stock".to_string(),
+        _ => {}
     }
+    // Any other bare number, so a 6th floor does not print as a lone "6".
+    if let Ok(n) = s.parse::<u32>() {
+        return format!("{n}. OG");
+    }
+    s.to_string() // already a label: "Erdgeschoss", "3. Stock", "2. OG", "DG"
 }
 
-/// Comma-separated string of active services in German, e.g.
-/// `"Verpackungsservice, Montage, Halteverbot Beladestelle"`. Empty string when no flags are set.
+/// Format a `Services` struct into a human-readable German string for Telegram display.
+///
+/// **Caller**: `build_offer_with_overrides`, to populate the `services` field of
+/// `TelegramSummary` so Alex can see the extras before approving the KVA.
+///
+/// Comma-separated and German, e.g. `"Verpackungsservice, Montage, Halteverbot
+/// Beladestelle"`. Empty string when no flags are set.
 fn format_services_display(services: &Services) -> String {
     let mut parts = Vec::new();
     if services.packing {

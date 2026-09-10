@@ -214,7 +214,7 @@ pub(crate) async fn fetch_offer_prices(
 ) -> Result<Vec<(Uuid, i64)>, sqlx::Error> {
     sqlx::query_as(
         "SELECT inquiry_id, price_cents FROM offers \
-         WHERE inquiry_id = ANY($1) AND status != 'rejected' \
+         WHERE inquiry_id = ANY($1) AND status NOT IN ('rejected', 'cancelled', 'superseded') \
          ORDER BY created_at DESC",
     )
     .bind(inquiry_ids)

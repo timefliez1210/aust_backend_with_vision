@@ -484,11 +484,11 @@ pub(crate) async fn list_orders_single_status(
                q.estimated_volume_m3,
                q.status,
                q.scheduled_date,
-               (SELECT ROUND(o.price_cents * 1.19)::bigint FROM offers o WHERE o.inquiry_id = q.id ORDER BY o.created_at DESC LIMIT 1) AS offer_price_brutto,
+               (SELECT ROUND(o.price_cents * 1.19)::bigint FROM offers o WHERE o.inquiry_id = q.id AND o.status NOT IN ('rejected', 'cancelled', 'superseded') ORDER BY o.created_at DESC LIMIT 1) AS offer_price_brutto,
                q.scheduled_date AS booking_date,
                q.created_at,
                (SELECT COUNT(DISTINCT employee_id)::bigint FROM inquiry_employees WHERE inquiry_id = q.id) AS employees_assigned,
-               (SELECT o.persons FROM offers o WHERE o.inquiry_id = q.id ORDER BY o.created_at DESC LIMIT 1) AS employees_quoted
+               (SELECT o.persons FROM offers o WHERE o.inquiry_id = q.id AND o.status NOT IN ('rejected', 'cancelled', 'superseded') ORDER BY o.created_at DESC LIMIT 1) AS employees_quoted
         FROM inquiries q
         JOIN customers c ON q.customer_id = c.id
         LEFT JOIN addresses oa ON q.origin_address_id = oa.id
@@ -524,11 +524,11 @@ pub(crate) async fn list_orders_all_statuses(
                q.estimated_volume_m3,
                q.status,
                q.scheduled_date,
-               (SELECT ROUND(o.price_cents * 1.19)::bigint FROM offers o WHERE o.inquiry_id = q.id ORDER BY o.created_at DESC LIMIT 1) AS offer_price_brutto,
+               (SELECT ROUND(o.price_cents * 1.19)::bigint FROM offers o WHERE o.inquiry_id = q.id AND o.status NOT IN ('rejected', 'cancelled', 'superseded') ORDER BY o.created_at DESC LIMIT 1) AS offer_price_brutto,
                q.scheduled_date AS booking_date,
                q.created_at,
                (SELECT COUNT(DISTINCT employee_id)::bigint FROM inquiry_employees WHERE inquiry_id = q.id) AS employees_assigned,
-               (SELECT o.persons FROM offers o WHERE o.inquiry_id = q.id ORDER BY o.created_at DESC LIMIT 1) AS employees_quoted
+               (SELECT o.persons FROM offers o WHERE o.inquiry_id = q.id AND o.status NOT IN ('rejected', 'cancelled', 'superseded') ORDER BY o.created_at DESC LIMIT 1) AS employees_quoted
         FROM inquiries q
         JOIN customers c ON q.customer_id = c.id
         LEFT JOIN addresses oa ON q.origin_address_id = oa.id
@@ -1473,7 +1473,7 @@ pub(crate) async fn fetch_morning_inquiries(pool: &PgPool) -> Result<Vec<Morning
                 WHERE rr.inquiry_id = i.id
                   AND rr.status IN ('sent', 'skipped')
             )                                               AS has_review_request,
-            (SELECT price_cents FROM offers o WHERE o.inquiry_id = i.id ORDER BY o.created_at DESC LIMIT 1) AS offer_price_cents
+            (SELECT o.price_cents FROM offers o WHERE o.inquiry_id = i.id AND o.status NOT IN ('rejected', 'cancelled', 'superseded') ORDER BY o.created_at DESC LIMIT 1) AS offer_price_cents
         FROM inquiries i
         LEFT JOIN customers c                ON c.id = i.customer_id
         LEFT JOIN last_inquiry_days ld       ON ld.inquiry_id = i.id

@@ -17,7 +17,7 @@ pub use pricing::{parse_floor, PricingEngine};
 pub use timesheet_xlsx::{generate_timesheet_xlsx, TimesheetData, TimesheetEntry};
 pub use travel_expense_xlsx::{generate_travel_expense_xlsx, TravelExpenseData};
 pub use xlsx::{
-    generate_offer_xlsx, DetectedItemRow, OfferData, OfferLineItem,
+    generate_offer_xlsx, DetectedItemRow, OfferData, OfferLineItem, MAX_LINE_ITEMS,
     hide_row, unhide_row, set_cell_value as offer_set_cell_value,
     strip_formula_cached_values, format_number, xml_escape, CellValue as OfferCellValue,
 };

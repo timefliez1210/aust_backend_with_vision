@@ -213,6 +213,13 @@ pub enum CellValue {
 // Public API
 // ---------------------------------------------------------------------------
 
+/// The number of line-item slots the template has: rows 31 to 50 inclusive.
+///
+/// Anything past this is not printed, so callers must cap their own totals to the
+/// same number — a KVA whose stored price counts rows the customer cannot see on
+/// the page is a bill for a document nobody signed.
+pub const MAX_LINE_ITEMS: usize = 20;
+
 /// Generate a complete XLSX offer document from the embedded template and offer data.
 ///
 /// **Caller**: `crates/api/src/routes/offers.rs` — called from both the initial
@@ -595,16 +602,17 @@ fn build_cell_modifications(data: &OfferData) -> CellModResult {
 
     // 2. Write items sequentially starting at row 31
     // L1: warn when line items exceed template capacity
-    if data.line_items.len() > 20 {
-        tracing::warn!(
+    if data.line_items.len() > MAX_LINE_ITEMS {
+        tracing::error!(
             offer_number = %data.offer_number,
             total_items = data.line_items.len(),
-            max_items = 20,
-            "Offer has {} line items but template only has 20 slots (rows 31-50). Excess items will be truncated in PDF.",
-            data.line_items.len()
+            max_items = MAX_LINE_ITEMS,
+            "Offer has {} line items but the template only has {} slots (rows 31-50); the extra rows are not printed",
+            data.line_items.len(),
+            MAX_LINE_ITEMS
         );
     }
-    let max_items = 20.min(data.line_items.len()); // template has 20 slots (31-50)
+    let max_items = MAX_LINE_ITEMS.min(data.line_items.len());
     for (i, item) in data.line_items.iter().take(max_items).enumerate() {
         let row = 31 + i as u32;
         let color = 1 - i % 2; // 1 = blue (first row), 0 = white
@@ -2159,6 +2167,34 @@ mod tests {
             !has_sheet2,
             "sheet2.xml should NOT exist when detected_items is empty"
         );
+    }
+
+    /// The template has exactly `MAX_LINE_ITEMS` slots and its total sums only those,
+    /// so the 21st item is not printed. Callers cap their own totals to match; this
+    /// test pins the number they cap to.
+    #[test]
+    fn overflow_items_are_not_printed() {
+        let mut data = minimal_offer_data();
+        data.line_items = (0..MAX_LINE_ITEMS + 5)
+            .map(|i| OfferLineItem {
+                description: format!("Posten {i}"),
+                quantity: 1.0,
+                unit_price: 10.0,
+                is_labor: false,
+                flat_total: None,
+                remark: None,
+            })
+            .collect();
+        let bytes = generate_offer_xlsx(&data).expect("generate should succeed");
+        let xml = read_xlsx_sheet1(&bytes);
+
+        // The last slot is filled, the overflow is nowhere on the sheet.
+        assert!(xml.contains(&format!("Posten {}", MAX_LINE_ITEMS - 1)), "last slot empty");
+        for i in MAX_LINE_ITEMS..MAX_LINE_ITEMS + 5 {
+            assert!(!xml.contains(&format!("Posten {i}")), "item {i} was printed");
+        }
+        // And the total still sums the slot range, not a grown one.
+        assert!(xml.contains("SUM(G31:G50)"), "totals formula changed");
     }
 
     #[test]
