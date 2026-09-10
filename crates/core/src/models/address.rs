@@ -17,7 +17,7 @@ pub struct Address {
     pub city: String,
     /// Postal code (PLZ), optional for free-text addresses parsed from email.
     pub postal_code: Option<String>,
-    /// Country name (default: `"Österreich"`).
+    /// Country name (default: `"Deutschland"`).
     pub country: String,
     /// Floor number or description (e.g., `"2. Stock"`, `"Erdgeschoss"`).
     /// Used by the pricing engine to calculate floor surcharges.
@@ -43,7 +43,7 @@ pub struct CreateAddress {
     #[validate(length(min = 1, message = "Stadt darf nicht leer sein"))]
     pub city: String,
     pub postal_code: Option<String>,
-    /// Defaults to `"Österreich"` when not supplied.
+    /// Defaults to `"Deutschland"` when not supplied.
     #[serde(default = "default_country")]
     pub country: String,
     pub floor: Option<String>,
@@ -51,8 +51,13 @@ pub struct CreateAddress {
     pub needs_parking_ban: bool,
 }
 
+/// The company is in Hildesheim and every job is a German one.
+///
+/// The database default was corrected in migration 20260225120000; this one was not, so
+/// an address created through `CreateAddress` without an explicit country still got
+/// "Österreich" while one inserted straight into the table got "Deutschland".
 fn default_country() -> String {
-    "Österreich".to_string()
+    "Deutschland".to_string()
 }
 
 /// WGS-84 coordinate pair returned by the geocoder.
@@ -128,4 +133,21 @@ pub struct DistanceResult {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(default)]
     pub geometry: Vec<[f64; 2]>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The database default was corrected to Deutschland in migration 20260225120000.
+    /// This one lagged, so which country an address ended up with depended on whether it
+    /// was created through the API or inserted directly.
+    #[test]
+    fn a_new_address_defaults_to_germany() {
+        let addr: CreateAddress = serde_json::from_str(
+            r#"{"street":"Borsigstr 6","city":"31135 Hildesheim"}"#,
+        )
+        .expect("deserialize");
+        assert_eq!(addr.country, "Deutschland");
+    }
 }

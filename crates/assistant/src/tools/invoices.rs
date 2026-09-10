@@ -1,7 +1,6 @@
 //! Invoice tools: list, get, reminders, status, payment, send, void.
 
 use async_trait::async_trait;
-use chrono::NaiveDate;
 use serde_json::{json, Value};
 
 use crate::error::Result;
@@ -170,14 +169,23 @@ impl Tool for RecordPayment {
 
     async fn execute(&self, ctx: &ToolCtx, args: &Value) -> Result<Value> {
         let invoice_id = parse_uuid(args, "invoice_id", self.name())?;
-        let amount = args["amount_cents"].as_i64().unwrap_or(0);
-        let date: NaiveDate = args["date"]
-            .as_str()
-            .and_then(|s| s.parse().ok())
-            .ok_or_else(|| crate::error::AssistantError::ArgValidation {
+        // `unwrap_or(0)` booked a payment of nothing and reported success: the invoice
+        // stayed open and kept dunning while Alex had been told the money was recorded.
+        // A JSON number that is not an integer (1200.0) fails `as_i64`, and so does the
+        // unvalidated payload of a retried tool call.
+        let amount = args["amount_cents"].as_i64().ok_or_else(|| {
+            crate::error::AssistantError::ArgValidation {
                 tool: self.name().to_string(),
-                message: "date must be YYYY-MM-DD".to_string(),
-            })?;
+                message: "amount_cents must be a whole number of cents".to_string(),
+            }
+        })?;
+        if amount <= 0 {
+            return Err(crate::error::AssistantError::ArgValidation {
+                tool: self.name().to_string(),
+                message: "amount_cents must be greater than zero".to_string(),
+            });
+        }
+        let date = super::parse_date(args, "date", self.name())?;
         let method = parse_str(args, "method", self.name())?;
         let ref_text = args["ref_text"].as_str();
         let payment_id = ctx.services.invoices.record_payment(invoice_id, amount, date, method, ref_text).await?;

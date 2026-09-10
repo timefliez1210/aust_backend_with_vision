@@ -131,6 +131,47 @@ impl CustomerService for CustomerServiceImpl {
             (None, None) => company.map(str::to_string),
         };
 
+        // Retrying a create — Josie repeats a tool call, Alex asks twice — used to add a
+        // second row for the same person, and a later inquiry then attached to whichever
+        // one the lookup happened to find. An email identifies a customer, so reuse the
+        // existing record instead of making a twin.
+        //
+        // Only when an email was actually given: walk-in customers have none, and
+        // collapsing all of them into one row would be far worse than a duplicate.
+        if let Some(addr) = email.map(str::trim).filter(|e| !e.is_empty()) {
+            let existing: Option<(
+                Uuid,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            )> = sqlx::query_as(
+                r#"
+                SELECT id, salutation, first_name, last_name, email, phone, customer_type, company_name
+                FROM customers
+                WHERE lower(email) = lower($1)
+                ORDER BY created_at ASC
+                LIMIT 1
+                "#,
+            )
+            .bind(addr)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(super::map_sqlx)?;
+
+            if let Some((id, salutation, first_name, last_name, email, phone, customer_type, company_name)) =
+                existing
+            {
+                tracing::info!(customer_id = %id, "create_customer matched an existing record by email");
+                return Ok(row_to_snapshot(
+                    id, salutation, first_name, last_name, email, phone, customer_type, company_name,
+                ));
+            }
+        }
+
         let id = Uuid::now_v7();
         let now = chrono::Utc::now();
 

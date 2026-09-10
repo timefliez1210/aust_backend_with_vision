@@ -7,7 +7,10 @@ use uuid::Uuid;
 
 use crate::error::{AssistantError, Result};
 use crate::roles::Role;
-use super::{parse_date, parse_str, parse_time_opt, parse_uuid, pending_confirmation, Safety, Tool, ToolCtx};
+use super::{
+    parse_date, parse_date_opt, parse_str, parse_time_opt, parse_uuid, parse_uuid_list,
+    pending_confirmation, Safety, Tool, ToolCtx,
+};
 
 // ── GetCalendar ───────────────────────────────────────────────────────────────
 
@@ -234,8 +237,8 @@ impl Tool for UpdateCalendarItem {
         let patch = aust_core::services::CalendarItemPatch {
             title: p["title"].as_str().map(str::to_string),
             category: p["category"].as_str().map(str::to_string),
-            scheduled_date: p["scheduled_date"].as_str().and_then(|s| s.parse::<NaiveDate>().ok()),
-            end_date: p["end_date"].as_str().and_then(|s| s.parse::<NaiveDate>().ok()),
+            scheduled_date: parse_date_opt(p, "scheduled_date", self.name())?,
+            end_date: parse_date_opt(p, "end_date", self.name())?,
             notes: p["notes"].as_str().map(str::to_string),
             start_time: parse_time_opt(p["start_time"].as_str()),
             end_time: parse_time_opt(p["end_time"].as_str()),
@@ -311,10 +314,7 @@ impl Tool for ScheduleInquiry {
     async fn execute(&self, ctx: &ToolCtx, args: &Value) -> Result<Value> {
         let inquiry_id = parse_uuid(args, "inquiry_id", self.name())?;
         let date = parse_date(args, "date", self.name())?;
-        let crew: Vec<Uuid> = args["crew"]
-            .as_array()
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().and_then(|s| s.parse().ok())).collect())
-            .unwrap_or_default();
+        let crew: Vec<Uuid> = parse_uuid_list(args, "crew", self.name())?.unwrap_or_default();
         let notes = args["notes"].as_str();
         let start_time = parse_time_opt(args["start_time"].as_str());
         let end_time = parse_time_opt(args["end_time"].as_str());
@@ -353,10 +353,7 @@ impl Tool for SetInquiryCrew {
 
     async fn execute(&self, ctx: &ToolCtx, args: &Value) -> Result<Value> {
         let inquiry_id = parse_uuid(args, "inquiry_id", self.name())?;
-        let crew: Vec<Uuid> = args["crew"]
-            .as_array()
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().and_then(|s| s.parse().ok())).collect())
-            .unwrap_or_default();
+        let crew: Vec<Uuid> = parse_uuid_list(args, "crew", self.name())?.unwrap_or_default();
         let date = args["date"].as_str().and_then(|s| s.parse::<NaiveDate>().ok());
         let crew = ctx.services.calendar.set_inquiry_crew(inquiry_id, crew, date).await?;
         let count = crew.len();
@@ -390,10 +387,8 @@ impl Tool for ReassignTermin {
 
     async fn execute(&self, ctx: &ToolCtx, args: &Value) -> Result<Value> {
         let termin_id = parse_uuid(args, "termin_id", self.name())?;
-        let new_date = args["new_date"].as_str().and_then(|s| s.parse::<NaiveDate>().ok());
-        let new_crew: Option<Vec<Uuid>> = args["new_crew"]
-            .as_array()
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().and_then(|s| s.parse().ok())).collect());
+        let new_date = parse_date_opt(args, "new_date", self.name())?;
+        let new_crew: Option<Vec<Uuid>> = parse_uuid_list(args, "new_crew", self.name())?;
         let item = ctx.services.calendar.reassign_termin(termin_id, new_date, new_crew).await?;
         Ok(serde_json::to_value(&item)?)
     }

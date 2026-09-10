@@ -21,6 +21,10 @@ pub(crate) struct InvoiceReminderRow {
     pub remind_after: NaiveDate,
     pub customer_name: Option<String>,
     pub customer_email: Option<String>,
+    /// The reminder's own state: `pending`, `sent`, `snoozed` or `closed`.
+    pub status: String,
+    /// The invoice's state. A `paid` invoice must never be dunned again.
+    pub invoice_status: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -126,7 +130,9 @@ pub(crate) async fn fetch_due(db: &PgPool) -> Result<Vec<InvoiceReminderRow>, Ap
             ir.level,
             ir.remind_after,
             c.name      AS customer_name,
-            c.email     AS customer_email
+            c.email     AS customer_email,
+            ir.status   AS status,
+            i.status    AS invoice_status
         FROM invoice_reminders ir
         JOIN invoices   i   ON i.id  = ir.invoice_id
         JOIN inquiries  inq ON inq.id = i.inquiry_id
@@ -142,7 +148,11 @@ pub(crate) async fn fetch_due(db: &PgPool) -> Result<Vec<InvoiceReminderRow>, Ap
     .map_err(ApiError::Database)
 }
 
-/// Fetch a single reminder row (for action handler).
+/// Fetch a single reminder row by id, whatever its state.
+///
+/// **Caller**: `billing_reminder_service::send_dunning`, which checks the state itself
+/// — unlike `fetch_due`, this deliberately returns closed reminders and paid invoices
+/// so the caller can say *why* it is refusing rather than reporting "not found".
 pub(crate) async fn fetch_one(db: &PgPool, id: Uuid) -> Result<Option<InvoiceReminderRow>, ApiError> {
     sqlx::query_as::<_, InvoiceReminderRow>(
         r#"
@@ -154,7 +164,9 @@ pub(crate) async fn fetch_one(db: &PgPool, id: Uuid) -> Result<Option<InvoiceRem
             ir.level,
             ir.remind_after,
             c.name      AS customer_name,
-            c.email     AS customer_email
+            c.email     AS customer_email,
+            ir.status   AS status,
+            i.status    AS invoice_status
         FROM invoice_reminders ir
         JOIN invoices   i   ON i.id  = ir.invoice_id
         JOIN inquiries  inq ON inq.id = i.inquiry_id

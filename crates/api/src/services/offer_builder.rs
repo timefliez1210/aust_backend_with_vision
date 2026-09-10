@@ -962,7 +962,7 @@ pub(crate) fn detect_salutation_and_greeting(name: &str) -> (String, String) {
 /// Build the Fahrkostenpauschale (flat travel cost) line item.
 ///
 /// **Caller**: `build_offer_with_overrides` — always the first non-labor line item.
-/// **Why**: Austrian moving companies charge a flat travel fee based on the full round-trip
+/// **Why**: The flat travel fee is based on the full round-trip
 /// distance from the company depot, including any intermediate stop. This function calls
 /// OpenRouteService to calculate the exact route rather than doubling the stored one-way
 /// `distance_km`.

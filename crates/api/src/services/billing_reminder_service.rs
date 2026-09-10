@@ -102,6 +102,22 @@ pub(crate) async fn send_dunning(
         .await?
         .ok_or_else(|| ApiError::NotFound("Erinnerung nicht gefunden".into()))?;
 
+    // A reminder id survives in the assistant's session history long after the ladder
+    // has moved on. Sending on a stale one posted a "1. Mahnung" to a customer who had
+    // already paid, because this path checked nothing that `fetch_due` checks.
+    if row.invoice_status == "paid" {
+        return Err(ApiError::BadRequest(format!(
+            "Rechnung {} ist bereits bezahlt — keine Mahnung",
+            row.invoice_number
+        )));
+    }
+    if row.status != "pending" {
+        return Err(ApiError::BadRequest(format!(
+            "Mahnstufe für Rechnung {} ist nicht offen (Status: {})",
+            row.invoice_number, row.status
+        )));
+    }
+
     let email = row
         .customer_email
         .as_deref()
@@ -302,6 +318,12 @@ pub(crate) async fn decide_review_request(
 ) -> Result<ReviewRequestOutcome, ApiError> {
     match action {
         "now" => {
+            // Sending was not idempotent: asking twice mailed the customer two review
+            // requests. A request already recorded as sent is not sent again.
+            if review_repo::fetch_status(db, inquiry_id).await?.as_deref() == Some("sent") {
+                return Ok(ReviewRequestOutcome { status: "sent", remind_after: None });
+            }
+
             let customer = customer_repo::fetch_by_inquiry_id(db, inquiry_id).await?;
             let email = customer
                 .email

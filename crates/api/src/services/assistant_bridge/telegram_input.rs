@@ -279,11 +279,23 @@ async fn handle_confirm(
 
     match driver::resume_confirmed(pool, llm, registry, services, params).await {
         Ok(result) => {
-            // Prefer a tool-supplied human summary; otherwise show a clean generic
-            // confirmation rather than dumping the raw result JSON at Alex.
-            let body = match result["summary"].as_str() {
-                Some(s) => format!("✅ Bestätigt: {s}"),
-                None => "✅ Erledigt.".to_string(),
+            // A tool that could not do what was asked reports it in-band as
+            // {"ok": false, "message": ...} rather than erroring — SMTP refused the
+            // address, the reminder was already closed, the customer has no email.
+            // That shape carries no "summary", so it used to fall through to
+            // "✅ Erledigt." and Alex was told an email had gone out that never did.
+            let body = if result["ok"].as_bool() == Some(false) {
+                let why = result["message"]
+                    .as_str()
+                    .unwrap_or("Grund unbekannt");
+                format!("⚠️ Nicht ausgeführt: {why}")
+            } else {
+                // Prefer a tool-supplied human summary; otherwise show a clean generic
+                // confirmation rather than dumping the raw result JSON at Alex.
+                match result["summary"].as_str() {
+                    Some(s) => format!("✅ Bestätigt: {s}"),
+                    None => "✅ Erledigt.".to_string(),
+                }
             };
 
             // Update the original message to remove keyboard.
@@ -313,7 +325,11 @@ async fn handle_cancel(
     pending_id: Uuid,
     pending: &aust_assistant::confirmation::PendingAction,
 ) {
-    if let Err(e) = confirmation::resolve(pool, pending_id, Resolution::Canceled).await {
+    // Chat-scoped, like the confirm path: an action queued in one authorised chat is
+    // not another chat's to resolve. Cancel used the unscoped resolve.
+    if let Err(e) =
+        confirmation::resolve_from_chat(pool, pending_id, Resolution::Canceled, chat_id).await
+    {
         warn!("cancel pending_action {pending_id}: {e}");
     }
 

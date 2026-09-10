@@ -103,9 +103,14 @@ type DetailRow = (
 /// `200 OK` with `{ items: [...], next_cursor? }`.
 pub async fn list_activity(
     State(state): State<Arc<AppState>>,
-    Extension(_claims): Extension<TokenClaims>,
+    Extension(claims): Extension<TokenClaims>,
     Query(q): Query<ListActivityQuery>,
 ) -> Result<Json<ListActivityResponse>, ApiError> {
+    // The log holds raw tool arguments and results — send_email bodies, customer
+    // contact details, invoice amounts. It is an audit trail of the owner's own agent,
+    // not general staff reading.
+    crate::routes::admin::require_admin(&claims)?;
+
     let limit = q.limit.unwrap_or(100).clamp(1, 500);
     // Fetch one extra row so we know whether there is a next page.
     let fetch_limit = limit + 1;
@@ -198,9 +203,12 @@ pub struct ActivityDetail {
 /// `200 OK` with `ActivityDetail` JSON, or `404` if not found.
 pub async fn get_activity(
     State(state): State<Arc<AppState>>,
-    Extension(_claims): Extension<TokenClaims>,
+    Extension(claims): Extension<TokenClaims>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ActivityDetail>, ApiError> {
+    // Same reasoning as `list_activity`: raw arguments and results.
+    crate::routes::admin::require_admin(&claims)?;
+
     let row: Option<DetailRow> = sqlx::query_as(
             r#"
             SELECT id, session_id, tool_name, args, result, error_message,
@@ -266,9 +274,11 @@ pub struct ActivityStats {
 /// `200 OK` with `ActivityStats` JSON.
 pub async fn activity_stats(
     State(state): State<Arc<AppState>>,
-    Extension(_claims): Extension<TokenClaims>,
+    Extension(claims): Extension<TokenClaims>,
     Query(q): Query<StatsQuery>,
 ) -> Result<Json<ActivityStats>, ApiError> {
+    crate::routes::admin::require_admin(&claims)?;
+
     let since = q.since.unwrap_or_else(|| Utc::now() - chrono::Duration::days(7));
 
     let (total_calls, error_count, confirmed_count): (i64, i64, i64) = sqlx::query_as(

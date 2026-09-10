@@ -168,12 +168,12 @@ pub async fn process_turn(
     };
 
     if input.images.is_empty() {
-        messages.push(aust_llm_providers::LlmMessage::user(user_turn_text));
+        messages.push(aust_llm_providers::LlmMessage::user(user_turn_text.clone()));
     } else {
         // Vision turn: attach the photos / rasterized PDF pages to the user message.
         info!(chat_id = input.chat_id, image_count = input.images.len(), "Turn carries images");
         messages.push(aust_llm_providers::LlmMessage::user_with_images(
-            user_turn_text,
+            user_turn_text.clone(),
             input.images.clone(),
         ));
     }
@@ -300,10 +300,25 @@ pub async fn process_turn(
                                 .await?;
                             match retry_resp {
                                 ChatResponse::ToolCalls(retry_calls) => {
-                                    if let Some(rc) = retry_calls.into_iter().find(|c| c.name == call.name) {
-                                        rc.arguments
-                                    } else {
-                                        continue;
+                                    match retry_calls.into_iter().find(|c| c.name == call.name) {
+                                        // The retry was never re-validated, so a model
+                                        // that got it wrong twice ran its second bad
+                                        // payload straight against a real write tool.
+                                        Some(rc) => match ToolRegistry::validate_args(tool, &rc.arguments) {
+                                            Ok(_) => rc.arguments,
+                                            Err(e) => {
+                                                warn!(
+                                                    tool = call.name,
+                                                    err = %e,
+                                                    "Retried tool call failed validation too — not executing"
+                                                );
+                                                messages.push(aust_llm_providers::LlmMessage::user(
+                                                    format!("[Validierungsfehler] {e}. Der Aufruf wurde nicht ausgeführt."),
+                                                ));
+                                                continue;
+                                            }
+                                        },
+                                        None => continue,
                                     }
                                 }
                                 ChatResponse::Text(t) => {
@@ -389,10 +404,24 @@ pub async fn process_turn(
                             .await
                             .unwrap_or_else(|e| warn!("Audit write failed: {e}"));
 
+                            // A tool that ran but could not do the job reports it in-band
+                            // as {"ok": false, "message": ...} — no email on file, the
+                            // reminder already closed, SMTP refused the address. Treating
+                            // that as backing let "Erinnerung gesetzt" through for a
+                            // reminder that was never created. It ran; it did not act.
+                            let acted = result["ok"].as_bool() != Some(false);
+
                             // Every ID returned by a real tool call is now citable,
                             // and the tool itself now backs claims about its entity.
                             grounded_ids.extend(extract_uuid_shapes(&result.to_string()));
-                            tools_ran_this_turn.insert(call.name.clone());
+                            if acted {
+                                tools_ran_this_turn.insert(call.name.clone());
+                            } else {
+                                warn!(
+                                    tool = call.name,
+                                    "Tool declined in-band; not counting it as backing a claim"
+                                );
+                            }
 
                             // Feed the tool result back into the conversation.
                             messages.push(aust_llm_providers::LlmMessage::user(format!(
@@ -438,10 +467,14 @@ pub async fn process_turn(
     }
 
     // Step 7: Persist the turn.
+    // Persist what the model was actually shown, quote included. Storing the bare text
+    // meant the referent was gone by the next turn: Alex replies to a customer's message
+    // with "erinnere sie an den Termin", Josie handles it, and then "ja, mach das" has
+    // no idea who "sie" is. That is the wrong-customer reminder, one turn later.
     session::append_turn(
         pool,
         &mut session,
-        Turn::user(input.text),
+        Turn::user(user_turn_text),
         llm.as_ref(),
     )
     .await

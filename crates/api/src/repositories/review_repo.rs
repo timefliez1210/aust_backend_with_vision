@@ -22,6 +22,24 @@ pub(crate) struct ReviewReminderRow {
 // ---------------------------------------------------------------------------
 // Write
 // ---------------------------------------------------------------------------
+/// The current state of this inquiry's review request, if one was ever recorded.
+///
+/// **Caller**: `billing_reminder_service::decide_review_request`
+/// **Why**: Sending is not idempotent — asking Josie twice mailed the customer two
+/// review requests, because the send path checked nothing before dispatching.
+pub(crate) async fn fetch_status(
+    db: &PgPool,
+    inquiry_id: Uuid,
+) -> Result<Option<String>, ApiError> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT status FROM review_requests WHERE inquiry_id = $1")
+            .bind(inquiry_id)
+            .fetch_optional(db)
+            .await
+            .map_err(ApiError::Database)?;
+    Ok(row.map(|(s,)| s))
+}
+
 
 /// Creates or replaces the review request for an inquiry.
 ///

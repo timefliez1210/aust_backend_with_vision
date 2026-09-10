@@ -340,13 +340,84 @@ pub(crate) fn parse_uuid(args: &Value, key: &str, tool: &str) -> Result<Uuid> {
 
 /// Helper: parse a required date (YYYY-MM-DD) argument from a JSON object.
 pub(crate) fn parse_date(args: &Value, key: &str, tool: &str) -> Result<chrono::NaiveDate> {
-    args[key]
-        .as_str()
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| AssistantError::ArgValidation {
-            tool: tool.to_string(),
-            message: format!("{key} must be a date in YYYY-MM-DD format"),
+    parse_date_str(args[key].as_str()).ok_or_else(|| AssistantError::ArgValidation {
+        tool: tool.to_string(),
+        message: format!("{key} must be a date, YYYY-MM-DD or DD.MM.YYYY"),
+    })
+}
+
+/// Accept both the ISO form and the German one.
+///
+/// The whole conversation is in German, so a model asked to move a Termin to the 16th
+/// will happily emit `"16.07.2026"`. `str::parse` rejects that, and every optional-date
+/// site turned the rejection into `None` — the patch left the date untouched and Josie
+/// still reported "Termin verschoben".
+pub(crate) fn parse_date_str(s: Option<&str>) -> Option<chrono::NaiveDate> {
+    let s = s?.trim();
+    if let Ok(d) = s.parse::<chrono::NaiveDate>() {
+        return Some(d);
+    }
+    // `%Y` happily reads a bare "26" as the year 26, so a two-digit year would book the
+    // job two millennia ago instead of failing where Alex can see it. Insist on four.
+    let year_is_four_digits = s
+        .rsplit('.')
+        .next()
+        .is_some_and(|y| y.len() == 4 && y.chars().all(|c| c.is_ascii_digit()));
+    if !year_is_four_digits {
+        return None;
+    }
+    chrono::NaiveDate::parse_from_str(s, "%d.%m.%Y").ok()
+}
+
+/// An optional date argument that fails loudly when it is present but unreadable.
+///
+/// `None` means the caller left the field out. A value that cannot be parsed is an
+/// error, never a silent `None` — that distinction is what stopped a mistyped date from
+/// being reported as a successful reschedule.
+pub(crate) fn parse_date_opt(args: &Value, key: &str, tool: &str) -> Result<Option<chrono::NaiveDate>> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => parse_date_str(v.as_str())
+            .map(Some)
+            .ok_or_else(|| AssistantError::ArgValidation {
+                tool: tool.to_string(),
+                message: format!("{key} must be a date, YYYY-MM-DD or DD.MM.YYYY"),
+            }),
+    }
+}
+
+/// A list of UUIDs that fails loudly on a bad entry.
+///
+/// The crew lists were parsed with `filter_map(…ok())`, so a malformed employee id was
+/// dropped without a word: "plane das mit Kevin und Marco" scheduled the job with one
+/// of them, or none, and reported success either way.
+pub(crate) fn parse_uuid_list(
+    args: &Value,
+    key: &str,
+    tool: &str,
+) -> Result<Option<Vec<uuid::Uuid>>> {
+    let arr = match args.get(key) {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Array(a)) => a,
+        Some(_) => {
+            return Err(AssistantError::ArgValidation {
+                tool: tool.to_string(),
+                message: format!("{key} must be an array of employee ids"),
+            })
+        }
+    };
+
+    arr.iter()
+        .map(|v| {
+            v.as_str()
+                .and_then(|s| s.trim().parse::<uuid::Uuid>().ok())
+                .ok_or_else(|| AssistantError::ArgValidation {
+                    tool: tool.to_string(),
+                    message: format!("{key} contains an entry that is not an employee id: {v}"),
+                })
         })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
 }
 
 /// Helper: parse an optional time-of-day string. Accepts `HH:MM` and `HH:MM:SS`.
@@ -533,5 +604,62 @@ mod tests {
         let tool = registry.get("get_inquiry", Role::Owner).unwrap();
         let args = json!({"inquiry_id": "00000000-0000-0000-0000-000000000001"});
         assert!(ToolRegistry::validate_args(tool, &args).is_ok());
+    }
+
+    /// The conversation is German, so the model emits German dates. Rejecting them
+    /// silently left the patch untouched while Josie reported "Termin verschoben".
+    #[test]
+    fn dates_parse_in_both_the_iso_and_the_german_form() {
+        use chrono::NaiveDate;
+        let expected = NaiveDate::from_ymd_opt(2026, 7, 16).unwrap();
+        for form in ["2026-07-16", "16.07.2026", " 16.07.2026 "] {
+            assert_eq!(parse_date_str(Some(form)), Some(expected), "form {form:?}");
+        }
+        // A two-digit year is refused rather than guessed: chrono reads "16.07.26" as
+        // the year 26, and a job silently booked two millennia ago is worse than an
+        // error Alex can see.
+        assert_eq!(parse_date_str(Some("16.07.26")), None);
+        assert_eq!(parse_date_str(Some("nächsten Freitag")), None);
+        assert_eq!(parse_date_str(None), None);
+    }
+
+    /// Absent means "leave it alone"; present-but-unreadable is an error. Collapsing the
+    /// two is what turned a mistyped date into a silent no-op reported as success.
+    #[test]
+    fn an_unreadable_optional_date_is_an_error_not_a_none() {
+        let absent = serde_json::json!({});
+        assert!(matches!(parse_date_opt(&absent, "new_date", "t"), Ok(None)));
+
+        let null = serde_json::json!({ "new_date": null });
+        assert!(matches!(parse_date_opt(&null, "new_date", "t"), Ok(None)));
+
+        let good = serde_json::json!({ "new_date": "16.07.2026" });
+        assert!(matches!(parse_date_opt(&good, "new_date", "t"), Ok(Some(_))));
+
+        let bad = serde_json::json!({ "new_date": "irgendwann" });
+        assert!(parse_date_opt(&bad, "new_date", "t").is_err());
+    }
+
+    /// A crew list used to drop malformed ids without a word, so a job was scheduled
+    /// with fewer people than asked for and reported as done.
+    #[test]
+    fn a_bad_crew_entry_fails_instead_of_vanishing() {
+        let a = uuid::Uuid::now_v7();
+        let b = uuid::Uuid::now_v7();
+
+        let good = serde_json::json!({ "crew": [a.to_string(), b.to_string()] });
+        assert_eq!(parse_uuid_list(&good, "crew", "t").unwrap(), Some(vec![a, b]));
+
+        let absent = serde_json::json!({});
+        assert_eq!(parse_uuid_list(&absent, "crew", "t").unwrap(), None);
+
+        let empty = serde_json::json!({ "crew": [] });
+        assert_eq!(parse_uuid_list(&empty, "crew", "t").unwrap(), Some(vec![]));
+
+        let bad = serde_json::json!({ "crew": [a.to_string(), "Kevin"] });
+        assert!(parse_uuid_list(&bad, "crew", "t").is_err(), "a name is not an id");
+
+        let not_a_list = serde_json::json!({ "crew": a.to_string() });
+        assert!(parse_uuid_list(&not_a_list, "crew", "t").is_err());
     }
 }
