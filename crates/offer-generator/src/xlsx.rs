@@ -86,14 +86,15 @@ pub struct OfferData {
     pub stop_floor_info: String,
     /// Estimated move volume in cubic metres (used in the "Umzugspauschale" label at A29).
     pub volume_m3: f64,
-    /// Number of workers — written to cell J50 so the labor formula `G38 = E38*F38*J50` works.
+    /// Number of workers — written to cell J58 so each labor row's formula
+    /// `G = IF(E="", 0, F*E*J58)` works.
     pub persons: u32,
     /// Estimated job duration in hours (used in the labor line item's quantity column E).
     pub estimated_hours: f64,
     /// Hourly rate per worker in euros (used in the labor line item's unit-price column F).
     pub rate_per_person_hour: f64,
-    /// Line items written sequentially into rows 31-42 of the template.
-    /// Maximum 12 items (slots 31-42). Extra items are silently truncated.
+    /// Line items written sequentially into rows 31-50 of the template.
+    /// Maximum 20 items (slots 31-50). Extra items are silently truncated.
     pub line_items: Vec<OfferLineItem>,
     /// Optional detected/parsed inventory items added to the second sheet.
     /// If empty, no second sheet is created.
@@ -104,7 +105,7 @@ pub struct OfferData {
     pub headline_override: Option<String>,
 }
 
-/// A single line item written into one row of the XLSX offer template (rows 31-42).
+/// A single line item written into one row of the XLSX offer template (rows 31-50).
 ///
 /// **Caller**: `crates/api/src/routes/offers.rs` (`build_line_items` function)
 /// **Why**: The offer template has a fixed set of rows for services. Each
@@ -122,8 +123,8 @@ pub struct OfferLineItem {
     /// Unit price in euros written to column F, e.g. `100.0` for €100/zone.
     pub unit_price: f64,
     /// When `true`, column F is styled as an hourly rate (€/Stunde) and the
-    /// G-column formula multiplies by `J50` (number of workers):
-    /// `G = E × F × J50`.
+    /// G-column formula multiplies by `J58` (number of workers):
+    /// `G = E × F × J58`.
     #[serde(default)]
     pub is_labor: bool,
     /// Optional remark written to column C (Bemerkung), e.g. a note about the service.
@@ -405,7 +406,7 @@ type CellModResult = (Vec<(String, CellValue)>, Vec<u32>, Vec<u32>, Vec<(u32, f6
 /// All domain knowledge about which cell holds which offer field lives here, not in
 /// the XML manipulation functions.
 ///
-/// The function hides ALL template line-item rows (31-42) first, then writes items
+/// The function hides ALL template line-item rows (31-50) first, then writes items
 /// sequentially starting at row 31, un-hiding only the rows actually used. This
 /// ensures unused rows (and their preset values) never appear in the PDF.
 ///
@@ -559,7 +560,7 @@ fn build_cell_modifications(data: &OfferData) -> CellModResult {
 
     // --- Line items: dynamic row assignment with alternating styles ---
     //
-    // Template column layout for rows 31-42:
+    // Template column layout for rows 31-50:
     //   A-B (merged): Beschreibung (main description)
     //   C:            Bemerkung (remark)
     //   D:            (mostly empty)
@@ -755,7 +756,7 @@ fn apply_modifications(
 ///
 /// # Parameters
 /// - `xml` — the current `sheet1.xml` content
-/// - `cell_ref` — Excel address string, e.g. `"A8"`, `"G44"`, `"J50"`
+/// - `cell_ref` — Excel address string, e.g. `"A8"`, `"G52"`, `"J58"`
 /// - `value` — the `CellValue` variant determining type and content of the new cell
 ///
 /// # Returns
@@ -905,7 +906,7 @@ fn build_cell_xml(cell_ref: &str, style: Option<&str>, value: &CellValue) -> Str
 ///
 /// **Why**: Not every cell in the template has an explicit `<c>` element — Excel
 /// omits cells that are empty. When the generator needs to write to such a cell
-/// (e.g. J50 for the persons count), it must inject a new element into the
+/// (e.g. J58 for the persons count), it must inject a new element into the
 /// correct `<row>` block.
 ///
 /// Falls back to inserting a new `<row>` containing the cell just before
@@ -913,7 +914,7 @@ fn build_cell_xml(cell_ref: &str, style: Option<&str>, value: &CellValue) -> Str
 ///
 /// # Parameters
 /// - `xml` — current `sheet1.xml` content
-/// - `cell_ref` — Excel address of the new cell, e.g. `"J50"`
+/// - `cell_ref` — Excel address of the new cell, e.g. `"J58"`
 /// - `value` — the value to write into the new cell
 ///
 /// # Returns
@@ -969,7 +970,7 @@ fn insert_cell(xml: &str, cell_ref: &str, value: &CellValue) -> String {
 
 /// Set `hidden="true"` on the `<row>` element for the given row number.
 ///
-/// **Why**: Unused line-item rows in the template (31-42) are hidden so they
+/// **Why**: Unused line-item rows in the template (31-50) are hidden so they
 /// don't appear in the PDF. The function handles two sub-cases: the row already
 /// has `hidden="false"` (replace it), or has no `hidden` attribute at all (insert it).
 ///
@@ -1212,7 +1213,7 @@ fn modify_workbook(xml: &str, add_items_sheet: bool) -> String {
 /// **Why**: Without this flag, LibreOffice trusts the stale cached `<v>` values
 /// in formula cells. Even after `strip_formula_cached_values` removes those caches,
 /// `fullCalcOnLoad` is needed as a belt-and-suspenders measure to guarantee that
-/// the SUM in G44 and all line-item totals are recalculated before PDF rendering.
+/// the SUM in G52 and all line-item totals are recalculated before PDF rendering.
 ///
 /// # Parameters
 /// - `xml` — raw `workbook.xml` content
@@ -1238,7 +1239,7 @@ fn force_recalc(xml: &str) -> String {
 ///
 /// **Why**: The template was saved with a print area that includes two ranges:
 /// `Tabelle1!$A$1:$H$120,Tabelle1!$I$1:$P$43`. Columns I-P hold internal
-/// calculation helper values (e.g. J50 for worker count) that must not appear
+/// calculation helper values (e.g. J58 for worker count) that must not appear
 /// in the customer-facing PDF. Replacing the defined name removes them from
 /// the print area before LibreOffice converts the file.
 ///

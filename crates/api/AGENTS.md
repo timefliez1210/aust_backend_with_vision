@@ -1,6 +1,6 @@
 # crates/api — REST API, Repos, Services
 
-The main backend crate. Axum HTTP server with JWT middleware, 19 route files, 18 repository modules, 10 service modules.
+The main backend crate. Axum HTTP server with JWT middleware, 22 route files, 21 repository modules, 18 service modules (16 files + `assistant_bridge/` and `bridge/`).
 
 ## File Map
 
@@ -22,10 +22,14 @@ The main backend crate. Axum HTTP server with JWT middleware, 19 route files, 18
 | `auth.rs` | JWT login/refresh | 17KB |
 | `estimates.rs` | Volume estimation CRUD + image serving | 36KB |
 | `distance.rs` | ORS distance calculation endpoint | 2KB |
-| `flash_contact.rs` | Flash contact form submission | 2KB |
+| `flash_contact.rs` | Public `POST /flash-contact` callback form, own rate limiter | 3KB |
 | `health.rs` | Health/readiness checks | 1KB |
 | `shared.rs` | Shared route utilities | 2KB |
 | `offers.rs` | Minimal offer route stub | 0.4KB |
+| `agent_activity.rs` | Admin view of the assistant's `agent_actions` audit log, `/admin/agent-activity` | 25KB |
+| `inquiry_appointments.rs` | CRUD for lightweight non-crew appointments (e.g. Besichtigung) on an inquiry, `/inquiries/{id}/appointments` | 16KB |
+| `storage.rs` | Storage-rental ("Lagerung") admin routes, `/admin/storage` — contracts + auto-generated monthly invoices, brutto-in/netto-stored at the boundary | 12KB |
+| `vehicles.rs` | Vehicle fleet CRUD + reminders (TÜV, Ölwechsel, ...), `/admin/vehicles` | 7KB |
 
 ### Repositories (`src/repositories/`)
 
@@ -44,9 +48,14 @@ The main backend crate. Axum HTTP server with JWT middleware, 19 route files, 18
 | `email_repo.rs` | `email_threads`, `email_messages` | |
 | `auth_repo.rs` | `users` (login/role lookups) | |
 | `feedback_repo.rs` | `feedback_reports` | Admin customer feedback |
-| `invoice_reminder_repo.rs` | `invoice_reminders` | |
-| `review_repo.rs` | `reviews` | |
+| `invoice_reminder_repo.rs` | `invoice_reminders` | Dashboard-driven dunning flow |
+| `review_repo.rs` | `review_requests` | Google-review follow-up emails |
 | `settings_repo.rs` | `settings` (invoices, reminders, review config) | |
+| `calendar_item_repo.rs` | `calendar_items`, `calendar_item_employees` | Non-inquiry work blocks; mirrors `inquiry_employees` shape |
+| `customer_address_repo.rs` | `customer_addresses` | Per-customer address book; rows are self-contained copies, not FKs into `addresses` |
+| `inquiry_appointment_repo.rs` | `inquiry_appointments` | Lightweight, possibly non-consecutive appointments (e.g. Besichtigung); NOT crew/hours tracked |
+| `storage_repo.rs` | `storage_contracts`, storage invoices | Deliberately isolated from `invoice_repo`/`inquiry_repo` |
+| `vehicle_repo.rs` | `vehicles`, `vehicle_reminders` | |
 
 ### Services (`src/services/`)
 
@@ -58,9 +67,18 @@ The main backend crate. Axum HTTP server with JWT middleware, 19 route files, 18
 | `offer_pipeline.rs` | Auto-offer trigger: check readiness → calculate distance → generate offer |
 | `email_dispatch.rs` | SMTP email sending on offer approval |
 | `email.rs` | Email formatting helpers |
-| `otp_service.rs` | OTP generation + verification |
+| `otp_service.rs` | Shared OTP request/verify logic, used by both customer and employee auth flows |
 | `vision.rs` | Vision service client (photo, depth, video) |
-| `flash_contact_service.rs` | Flash contact form processing |
+| `flash_contact_service.rs` | Flash-contact reminder cron (`run_reminder_check`) — sends the delayed Telegram ping via the flash-contact bot token |
+| `invoice_number.rs` | Invoice number format `YYYY-N` — parse, format, ordering |
+| `kva_export.rs` | XLSX export for the KVA-Buch; mirrors `register_export`'s workbook plumbing |
+| `kva_followup_service.rs` | Nachfassen cron for Kostenvoranschläge — 60s tick spawned in `src/main.rs`, pings Telegram |
+| `register_export.rs` | Rechnungsausgangsbuch → XLSX, handed to the Steuerberater |
+| `billing_reminder_service.rs` | Zahlungserinnerung/Mahnung dunning + review-request logic; driven by both admin routes and the assistant service bridge |
+| `storage_billing_service.rs` | Generates one invoice per active storage contract per calendar month |
+| `vehicle_reminder_service.rs` | Vehicle reminder cron — 60s tick spawned in `src/main.rs`, pings Telegram |
+| `assistant_bridge/` | Glue between the `aust-assistant` driver and the Telegram bot / offer pipeline (`notifier_impl`, `telegram_input`/`telegram_output`, `confirm_dispatcher`, `media`) |
+| `bridge/` | One `*ServiceImpl` per `aust_core::services::traits` trait, delegating to these repos/services; grouped into `ServiceBundle` at startup for the assistant's `ToolCtx` |
 
 ## Critical Patterns
 
@@ -101,10 +119,22 @@ All pricing constants are in `CompanyConfig`:
 
 **AR submissions are volume-first.** The mobile app's capture screen makes the item name optional, so `item_manifest` entries may carry an empty (or missing) `label`. `device_volume_items()` keeps those items — only an implausible `device_volume_m3` (outside 0.005–12 m³) drops the whole submission back to server-side vision. Unnamed items are then named by `fill_missing_labels()` via `VlmEstimator::label_objects` (one representative frame per item, batches of 8), falling back to `aust_volume_estimator::FALLBACK_LABEL` when the VLM backend is unconfigured or unreachable. A missing name must never cost a measured volume.
 
+### Middleware (`src/middleware/`)
+
+| File | Purpose |
+|------|---------|
+| `auth.rs` | Admin JWT verification, populates `TokenClaims` extension |
+| `customer_auth.rs` | Customer session-token check (DB-backed, not JWT) — see `crates/api/AGENTS.md` customer app notes |
+| `employee_auth.rs` | Employee session-token check for the worker-facing endpoints |
+| `rate_limit.rs` | `RateLimiter` + `apply_rate_limit`; instantiate one per endpoint group that needs its own bucket (e.g. `flash_contact.rs` uses its own instance, separate from the auth-route limiter) |
+| `request_id.rs` | Assigns/propagates a request ID, wraps the handler span |
+| `security_headers.rs` | Injects standard security headers on every response |
+
 ## Test Infrastructure
 
 - `src/test_helpers.rs` — DB pool factory, JWT generator, insert factories (customer, address, inquiry, employee, estimation)
-- `tests/integration_tests.rs` — 20 DB-level integration tests requiring `DATABASE_URL`
+- `tests/integration_tests.rs` — 25 DB-level integration tests requiring `DATABASE_URL`
+- `tests/e2e_submissions.rs` — 19 tests exercising the submission handlers end-to-end
 - Unit tests in `#[cfg(test)] mod tests` blocks within source files (repos, routes, services)
 
 ## When Adding a New Endpoint

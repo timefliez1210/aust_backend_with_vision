@@ -15,11 +15,13 @@ src/main.rs
     │       ├── crates/storage           ← S3/local file storage abstraction
     │       ├── crates/distance-calculator ← ORS geocoding + routing
     │       ├── crates/offer-generator   ← pricing engine, XLSX gen, PDF via LibreOffice
-    │       └── crates/volume-estimator  ← LLM vision + ML service client
+    │       ├── crates/volume-estimator  ← LLM vision + ML service client
+    │       └── crates/assistant         ← "Josie": Telegram assistant, tool registry, LLM driver
     │
     └── crates/email-agent  ← IMAP poller, email parser, Telegram approval loop
             ├── crates/core
-            └── crates/llm-providers
+            ├── crates/llm-providers
+            └── crates/assistant  ← EmailResponder drafts replies through Josie's LLM (OllamaAssistantLlm)
 ```
 
 There is **no `crates/calendar`** — calendar logic lives in `aust-api`
@@ -28,7 +30,15 @@ There is **no `crates/calendar`** — calendar logic lives in `aust-api`
 
 `crates/core` is the only crate with zero internal dependencies. Every other crate depends on it.
 The `aust-flash-contact` crate (callback-form capture) and the `flash-contact-bot` binary sit
-alongside these and also depend only on `crates/core`.
+alongside these and also depend only on `crates/core`; `flash-contact-bot` ships as its own
+container (`aust_flash_contact_bot`) with its own Telegram bot token so it never contends with
+the email-agent's `/getUpdates` polling.
+
+`crates/assistant` implements the Telegram assistant persona "Josie" (see `crates/assistant/AGENTS.md`
+and `SOUL.md`). It runs **in-process inside the `aust_backend` binary**, not as a separate
+service — `src/main.rs` builds an `OllamaAssistantLlm`, a `ToolRegistry`, and a `Soul` at
+startup and wires them into `AppState`. Because it shares the process, a panic anywhere in the
+assistant's tool-call path aborts the whole backend (see [DEBUGGING.md](DEBUGGING.md)).
 
 ---
 
@@ -161,10 +171,16 @@ These are **independent** — they do NOT share data:
 
 | System | Stored in | Source | Purpose |
 |--------|-----------|--------|---------|
-| Offer hours | `offers` table (`result_data`) | `PricingEngine::calculate()` formula | Customer pricing, PDF content |
+| Offer hours | `offers` table (`hours_estimated`, `persons`) | `PricingEngine::calculate()` formula | Customer pricing, PDF content |
 | Payroll hours | `inquiry_employees` table (`planned_hours`, `actual_hours`) | Manual input in admin UI | Accounting / payroll tracking |
 
-The offer PricingEngine formula: `hours = ceil(volume_m3 / (persons × 2.0))`
+The offer PricingEngine formula (`crates/offer-generator/src/pricing.rs`):
+```text
+persons_base  = max(2, ceil(volume_m3 / 5.0))
+extra_workers = max(0, highest_floor_without_elevator - 1)
+total_persons = persons_base + extra_workers
+hours         = max(1.0, volume_m3 / (total_persons × 0.625))
+```
 
 The assign-employee modal defaults `planned_hours` to `0` — the admin fills it in.
 
@@ -183,18 +199,26 @@ Sheet "Tabelle1":
   A26-A28  Origin address (street, city, floor)
   F26-F28  Destination address (street, city, floor)
   A29      "Umzugspauschale X.X m³"
-  J50      Number of persons (referenced by G38 formula)
+  J58      Number of persons, written only when a labor line item exists
+           (referenced by that row's own IF(...) formula, not a fixed row)
 
-  Line items (rows 31-42, generator hides ALL then reveals active):
+  Line items (rows 31-50, 20 slots — extended from the original 12 (31-42);
+  generator hides ALL then reveals active):
     First:  Fahrkostenpauschale (always, flat ORS round-trip amount)
     Then:   Demontage (if disassembly), Montage (if assembly)
             Halteverbotszone (1-2 count)
             Umzugsmaterial (if packing)
             Manual overrides (Möbellift, Kartons, etc.)
-    Labor:  N Umzugshelfer (is_labor=true, G38 = E38 × F38 × J50)
+    Labor:  N Umzugshelfer (is_labor=true, per-row formula
+            `IF(E{row}="",0,F{row}*E{row}*J58)`)
     Last:   Nürnbergerversicherung (qty=1, price=0, decorative)
 
-  G44      Netto total (SUM G31:G42)
+  G52      Netto total (SUM G31:G50) — was G44/SUM(G31:G42) before the row
+           extension; rows 43+ shifted down by 8 to add the extra 8 slots
+```
+
+More than 20 line items truncates in the PDF (`warn!`-logged, not rejected). See
+`crates/offer-generator/AGENTS.md` for the full cell map and rate back-calculation.
 
 Sheet "Erfasste Gegenstände" (added only when items list is non-empty):
   Item name, volume m³, dimensions, confidence
@@ -208,6 +232,7 @@ Sheet "Erfasste Gegenstände" (added only when items list is non-empty):
 |---------|-------|-----------|-------|
 | OpenRouteService | distance-calculator | `AUST__MAPS__API_KEY` | Geocode + routing. 40 req/min free. Must send `Accept: application/geo+json;charset=UTF-8` for directions or get 406. |
 | Claude / OpenAI / Ollama | llm-providers | `AUST__LLM__*` | German language → use Claude as primary |
+| Ollama Cloud (two-tier) | assistant | `AUST__LLM__OLLAMA__*` | Model names hardcoded in `crates/assistant/src/llm.rs`, not config-driven — `ModelTier::Main` = `kimi-k2.6` (conversational + tool-calling), cheap tier = `deepseek-v4-flash`. Separate from the generic `AUST__LLM__DEFAULT_PROVIDER` selection above; also drafts email auto-replies (`EmailResponder`) |
 | S3 / MinIO | storage | `AUST__STORAGE__*` | PDF + image storage |
 | IMAP / SMTP | email-agent | `AUST__EMAIL__*` | lettre + async-imap |
 | Telegram Bot API | email-agent | `AUST__TELEGRAM__*` | Long-polling `/getUpdates`. Only one instance must poll or conflicts occur. |

@@ -52,9 +52,12 @@ See [DEPLOYMENT.md](DEPLOYMENT.md#backups) and [scripts/backup.sh](scripts/backu
 | Offer generator | `crates/offer-generator/` | Pricing engine, XLSX template → PDF |
 | Distance calculator | `crates/distance-calculator/` | ORS route calculation |
 | Email agent | `crates/email-agent/` | IMAP polling, ParsedInquiry, Telegram approval |
+| Telegram assistant | `crates/assistant/` | "Josie" — in-Telegram chief-of-staff agent, tool-calling over the API via `services/assistant_bridge` |
 | LLM providers | `crates/llm-providers/` | Claude/OpenAI/Ollama trait + mocks |
 | Object storage | `crates/storage/` | S3/MinIO upload-download-delete trait |
-| Volume estimator | `crates/volume-estimator/` | Vision service client |
+| Volume estimator | `crates/volume-estimator/` | Vision service client (photo/video ML pipeline + VLM fallback) |
+| Flash contact | `crates/flash-contact/` | Public quick-callback form → DB, immediate Telegram ping |
+| Flash contact bot | `crates/flash-contact-bot/` | Standalone Telegram bot binary handling flash-contact callbacks |
 | Admin frontend | `frontend/` | SvelteKit dashboard (git submodule) |
 | Python vision | `services/vision/` | FastAPI + GroundingDINO + SAM2 + MASt3R on Modal GPU |
 
@@ -62,7 +65,7 @@ See [DEPLOYMENT.md](DEPLOYMENT.md#backups) and [scripts/backup.sh](scripts/backu
 
 **Scale**: Single-tenant, <1000 req/day. No horizontal scaling needed.
 
-**DB**: PostgreSQL 16, 40+ migrations in `migrations/`. **Additive only** — never destructive without explicit agreement.
+**DB**: PostgreSQL 16, 115+ migrations in `migrations/`. **Additive only** — never destructive without explicit agreement.
 
 ## Architecture in 30 seconds
 
@@ -98,6 +101,7 @@ When working on a specific area, read the corresponding AGENTS.md for focused co
 - **[crates/offer-generator/AGENTS.md](crates/offer-generator/AGENTS.md)** — Pricing engine, XLSX template, line items
 - **[crates/distance-calculator/AGENTS.md](crates/distance-calculator/AGENTS.md)** — ORS geocoding + routing
 - **[crates/email-agent/AGENTS.md](crates/email-agent/AGENTS.md)** — IMAP polling, parsing, Telegram bot
+- **[crates/assistant/AGENTS.md](crates/assistant/AGENTS.md)** — Josie: soul loader, memory, tool registry, driver loop
 - **[crates/llm-providers/AGENTS.md](crates/llm-providers/AGENTS.md)** — Claude/OpenAI/Ollama trait abstraction
 - **[crates/storage/AGENTS.md](crates/storage/AGENTS.md)** — S3/MinIO upload-download-delete trait
 - **[crates/volume-estimator/AGENTS.md](crates/volume-estimator/AGENTS.md)** — Vision service client, estimation methods
@@ -105,6 +109,9 @@ When working on a specific area, read the corresponding AGENTS.md for focused co
 - **[frontend/src/routes/admin/AGENTS.md](frontend/src/routes/admin/AGENTS.md)** — Admin SPA pages, components, auth, multi-day scheduling
 - **[services/vision/AGENTS.md](services/vision/AGENTS.md)** — Python ML pipeline, Modal deployment, inference endpoints
 - **[app/AGENTS.md](app/AGENTS.md)** — Mobile customer photo app (SvelteKit + Capacitor)
+- **[crates/flash-contact/AGENTS.md](crates/flash-contact/AGENTS.md)** — Quick-callback domain library (reminder times, Telegram formatting)
+- **[crates/flash-contact-bot/AGENTS.md](crates/flash-contact-bot/AGENTS.md)** — Standalone bot binary for the reminder callbacks
+- **[tests/e2e/AGENTS.md](tests/e2e/AGENTS.md)** — Playwright end-to-end suite (`scripts/staging.sh`)
 
 ## Critical Constraints
 
@@ -137,9 +144,10 @@ Informational only — `can_transition_to()` returns `true` for all transitions 
 
 ## Testing
 
-- **Unit tests**: `cargo test --lib --workspace` (242 tests, zero DB dependency)
-- **Integration tests**: `DATABASE_URL=... cargo test -p aust-api --test integration_tests` (20 tests, needs Postgres)
+- **Unit tests**: `cargo test --lib --workspace` — zero DB dependency, runs across every crate (`aust-api` and `aust-assistant` carry the bulk of them)
+- **Integration tests**: `DATABASE_URL=... cargo test -p aust-api --tests` — needs Postgres, spins up a throwaway DB per test via `#[sqlx::test(migrations = "../../migrations")]`; lives in `crates/api/tests/integration_tests.rs` (bug-regression tests) and `crates/api/tests/e2e_submissions.rs` (submission-handler coverage)
 - **Test helpers**: `crates/api/src/test_helpers.rs` — DB pool, factories for customer/address/inquiry/employee
+- **E2E**: Playwright suite in `tests/e2e/` against the staging stack — see `tests/e2e/AGENTS.md`
 
 ## ⚠️ Connected Changes — Touch One, Check These
 
@@ -149,13 +157,13 @@ When you modify something in column A, verify or update everything in column B. 
 |---|---|---|
 | `InquiryStatus` enum or state machine | `can_transition_to()`, integration tests, admin frontend status labels | Status is enforced in 3 places (model, API handler, frontend) |
 | `CompanyConfig` pricing fields | `PricingEngine::with_rate()`, `ServicePrices::from_pricing()`, offer XLSX template, unit tests | Price constants flow through 4 layers |
-| `Services` struct (flags like `packing`, `assembly`) | `build_line_items()`, `format_services_display()`, XLSX rows 31–42, foto-angebot form | Adding a service flag touches submission, offer, and PDF |
-| `PricingInput` / `PricingResult` | `build_offer_with_overrides()`, `ServicePrices`, XLSX `persons` cell (J50), Telegram edit flow | Pricing inputs flow into offer generation and Telegram editing |
+| `Services` struct (flags like `packing`, `assembly`) | `build_line_items()`, `format_services_display()`, XLSX rows 31–50, foto-angebot form | Adding a service flag touches submission, offer, and PDF |
+| `PricingInput` / `PricingResult` | `build_offer_with_overrides()`, `ServicePrices`, XLSX `persons` cell (J58), Telegram edit flow | Pricing inputs flow into offer generation and Telegram editing |
 | `inquiry_employees` / `calendar_item_employees` schema | `calendar_repo` schedule queries, `employee_repo` hours/schedule queries, admin employee panel, `inquiry_builder` snapshot | One row per (entity, employee, job_date) — all reads go through this single flat table |
-| `offers` table or unique constraint | `offer_pipeline.rs` (race guard), `offer_builder.rs` (insert_returning catch), `offer_repo.rs` | Unique partial index prevents duplicates, insert path must handle constraint violation |
+| `offers` table or unique constraint | `offer_pipeline.rs` (race guard), `offer_builder.rs` (insert_returning catch), `offer_repo.rs`, every "active offer" query | Unique partial index prevents duplicates; a superseded KVA is replaced in place (`status = 'superseded'`) — every query for the *active* offer must filter it out or it resurfaces as a duplicate (regressed once, fixed) |
 | DB migration | `test_helpers.rs` (factory functions), integration tests, `deploy-prod.sh` (manual migrate) | Migrations are one-way; test factories must match new columns |
 | Frontend `api.svelte.ts` | All admin pages that call the API | Adding/removing endpoints requires updating both API routes and fetch functions |
-| `EstimationMethod` enum | `volume.rs`, `submissions.rs` (4 handlers), `offer_builder.rs` (parse_detected_items), vision service | New estimation methods need handler + parsing + DB CHECK constraint update |
+| `EstimationMethod` enum | `volume.rs`, `submissions.rs` (4 handlers), `offer_builder.rs` (parse_detected_items), vision service | New estimation methods need handler + parsing; `volume_estimations.method` is a plain VARCHAR with no CHECK constraint, so nothing rejects a typo |
 | `build_line_items()` / service prices | XLSX template rows, foto-angebot form, `ServicePrices.from_pricing()`, unit tests | Line item order and max (12) must match template slots |
 | `Scheduled_date` / date fields | Calendar queries, offer PDF date, XLSX cell B17, Telegram summary | Date changes propagate to calendar, offer, PDF, Telegram |
 | `address_repo` or address fields | `merge_address_parts()` in all 5 submission handlers, offer PDF address block, XLSX cells A8-A11 | Address format changes must match both submission parsing and PDF rendering |

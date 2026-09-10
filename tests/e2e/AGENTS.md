@@ -36,10 +36,11 @@ and `FRONTEND_URL=http://localhost:4173` exported, after `npm ci` in this dir.
 ## Admin seeding (required for admin login)
 
 The admin specs log in as `admin@integration-test.invalid` /
-`integration-test-password-1234` via `POST /auth/login`. That user is **not**
-auto-seeded by the backend. It is upserted (argon2) into staging Postgres by the
-**vitest integration global setup**: `frontend/tests/integration/globalSetup.ts`,
-run via `npm run test:integration` (from `frontend/`). Because the staging
+`integration-test-password-1234` (`frontend/tests/integration/config.ts`) via
+`POST /api/v1/auth/login`. That user is **not** auto-seeded by the backend.
+It is upserted (argon2) into staging Postgres by the **vitest integration
+global setup**: `frontend/tests/integration/globalSetup.ts`, run via
+`npm run test:integration` (from `frontend/`). Because the staging
 Postgres volume is persistent, one run seeds it for all later Playwright runs.
 
 If admin login 401s on a fresh DB, run the integration suite once (or re-run its
@@ -90,6 +91,8 @@ STAGING_URL=http://localhost:8099 FRONTEND_URL=http://localhost:4173 \
 | `worker-job-hours.spec.ts`, `worker-pending-hours.spec.ts` | mobile | worker logs hours; loose keypad input; admin read-back |
 | `worker-termin.spec.ts` | mobile | calendar-Termin job cards are tappable + show addresses |
 | `admin-payroll-hours.spec.ts` | chromium | Stundenkonto: multi-day deactivate + paid-time adjust, live hour-account math, persistence, **destructive "Stundenkonto säubern"** cleanup, edit-gate |
+| `admin-payroll-cleanup-scope.spec.ts` | chromium | "Stundenkonto säubern" only touches the target worker/day: multi-day and single-day scoping, colleague rows left intact |
+| `admin-break-decimal-hours.spec.ts` | chromium | decimal-hours break entry (`0.25`, `0.33`, German-comma `0,75`) round-trips to minutes; recalculated hour sheet |
 
 ## Known environment caveat: Node 24 + Playwright loader
 

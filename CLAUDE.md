@@ -14,9 +14,12 @@ Moving company automation: inquiry → estimation → offer → scheduling → i
 - [crates/offer-generator/AGENTS.md](crates/offer-generator/AGENTS.md) — Pricing engine, XLSX template
 - [crates/distance-calculator/AGENTS.md](crates/distance-calculator/AGENTS.md) — ORS routing
 - [crates/email-agent/AGENTS.md](crates/email-agent/AGENTS.md) — IMAP + Telegram approval
+- [crates/assistant/AGENTS.md](crates/assistant/AGENTS.md) — Josie, the in-Telegram tool-calling agent
 - [crates/llm-providers/AGENTS.md](crates/llm-providers/AGENTS.md) — LLM abstraction
 - [crates/storage/AGENTS.md](crates/storage/AGENTS.md) — S3 file storage
 - [crates/volume-estimator/AGENTS.md](crates/volume-estimator/AGENTS.md) — Vision client
+- [crates/flash-contact/AGENTS.md](crates/flash-contact/AGENTS.md) — Quick-callback form + reminders
+- [crates/flash-contact-bot/AGENTS.md](crates/flash-contact-bot/AGENTS.md) — Its standalone Telegram bot
 - [frontend/AGENTS.md](frontend/AGENTS.md) — SvelteKit admin dashboard
 - [services/vision/AGENTS.md](services/vision/AGENTS.md) — Python ML pipeline
 - [tests/e2e/AGENTS.md](tests/e2e/AGENTS.md) — Playwright end-to-end suite (`scripts/staging.sh`)

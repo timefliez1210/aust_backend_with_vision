@@ -60,9 +60,9 @@ ssh root@<vps> 'docker compose -f /opt/aust/docker-compose.yml restart backend' 
 
 **Symptom**: Offer PDF has incorrect netto totals, or line items that should be zero are contributing to the sum.
 
-**Root cause**: The XLSX template has preset non-zero values in the E (quantity) and F (unit price) columns of rows 31-42. If the generator writes new items without first clearing these presets, the old values persist and sum into G44.
+**Root cause**: The XLSX template has preset non-zero values in the E (quantity) and F (unit price) columns of the line-item rows (31-50, 20 slots since the template's row-31-42 range was extended). If the generator writes new items without first clearing these presets, the old values persist and sum into the totals formula (`G52`, previously `G44` before the extension).
 
-**Fix**: The generator must set all rows 31-42 columns E and F to 0 before writing any line item. Verify in `crates/offer-generator/src/xlsx.rs` that the clear loop runs before the write loop.
+**Fix**: The generator must set all line-item rows' columns E and F to 0 before writing any line item. Verify in `crates/offer-generator/src/xlsx.rs` that the clear loop (currently `for row in 31..=50`) runs before the write loop.
 
 ---
 
@@ -166,3 +166,59 @@ Search for fragile effective-date COALESCEs before shipping:
 ```bash
 grep -rn "COALESCE.*scheduled_date" crates/
 ```
+
+---
+
+## 12. A Panic Anywhere in the Assistant Aborts the Whole Backend
+
+**Symptom**: The entire backend goes down — not just Telegram/Josie features, but
+HTTP routes, the email poller, everything — and comes back up, then dies again a
+few seconds later in a tight crash loop.
+
+**Root cause**: `crates/assistant` ("Josie") is not a separate service. It runs
+**inside** the `aust_backend` process (`src/main.rs` wires it straight into
+`AppState`), so an unhandled panic anywhere in its tool-call or LLM-response path
+aborts the same process serving the API and the email agent. A single malformed
+input is enough: a non-UTF-8-boundary slice on a German customer email (containing
+umlauts) once did this — the panic aborted the process, the container restarted,
+the poison message was re-read from IMAP, and it crashed again immediately.
+
+**Fix pattern**: Never slice `&str` by raw byte index in code that touches
+LLM-derived or user-derived text; use a char-boundary-safe helper. See
+`crate::text::truncate_on_char_boundary` in `crates/email-agent/src/text.rs` for the
+pattern (used at every truncation site in `processor.rs`, `responder.rs`, `telegram.rs`).
+When a crash loop is suspected, check the backend logs for a panic message before
+assuming it's an infra problem — restarting the container just re-triggers it if the
+poison input is still unread in the mailbox.
+
+**Files**: `crates/email-agent/src/text.rs`, `crates/assistant/` (tool-call path).
+
+---
+
+## 13. KVA Terms Page Looks Fine Locally, Wraps in Production
+
+**Symptom**: `templates/offer_template.xlsx` renders correctly when opened in
+LibreOffice/Excel on your own machine, but the generated customer PDF has a
+signature line wrapped onto its own line of bare underscores on the terms page.
+
+**Root cause**: The signature lines are text boxes sized in Calibri metrics. The
+production image resolves `Calibri` to the metric-compatible `Carlito` font
+(`fonts-crosextra-carlito`, installed by `docker/Dockerfile.backend`) — but your host
+machine likely has neither installed, so `fc-match` silently substitutes something
+else with different character widths, and the layout you see locally does not
+predict what LibreOffice will render inside the container. `check_template_fonts()`
+(`crates/offer-generator/src/fonts.rs`) checks this at backend startup and logs an
+error if `Calibri` doesn't resolve to a Calibri-compatible face.
+
+**Fix**: Never eyeball a template edit on the host. Run:
+```bash
+docker build -f docker/Dockerfile.backend -t aust_backend:latest .
+bash scripts/check-templates.sh
+```
+This renders the template **inside** the production image (correct fonts, correct
+LibreOffice version) and asserts both signature lines fit on one line each. This has
+already caught two regressions (2026-08-27: font substitution; a later edit where a
+line was ~40pt too wide for its box) that looked fine in the XML and on a host preview.
+
+**Files**: `scripts/check-templates.sh`, `scripts/check-templates.py`,
+`crates/offer-generator/src/fonts.rs`.

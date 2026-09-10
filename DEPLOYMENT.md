@@ -19,7 +19,9 @@ VPS (Hostinger 187.124.161.90)
   │  /opt/aust/migrations/         (uploaded by deploy-prod.sh)
   │  /opt/aust/backups/            (daily postgres + minio dumps)
   │
-  ├─ container: aust_postgres            (postgres:16-alpine, 127.0.0.1:5432)
+  ├─ container: aust_postgres            (pgvector/pgvector:pg16, 127.0.0.1:5432 — must be
+  │                                        the pgvector image, not plain postgres:16-alpine,
+  │                                        because the assistant subsystem uses vector columns)
   ├─ container: aust_minio               (minio/minio, 127.0.0.1:9000/9001)
   ├─ container: aust_backend             (Dockerfile.backend, 127.0.0.1:8080)
   └─ container: aust_flash_contact_bot   (Dockerfile.flash-contact-bot)
@@ -46,7 +48,7 @@ Frontend (SvelteKit)
 
 | Container                  | Image                   | Host port(s)         | Purpose                      |
 |----------------------------|-------------------------|----------------------|------------------------------|
-| `aust_staging_postgres`    | postgres:16-alpine      | `5435→5432`          | Isolated staging DB          |
+| `aust_staging_postgres`    | pgvector/pgvector:pg16  | `5435→5432`          | Isolated staging DB          |
 | `aust_staging_minio`       | minio/minio             | `9010→9000`, `9011→9001` | Object storage            |
 | `aust_staging_minio_setup` | minio/mc                | —                    | Creates bucket, then exits   |
 | `aust_staging_mailpit`     | axllent/mailpit         | `1025→1025`, `8025→8025` | Fake SMTP + web UI       |
@@ -148,6 +150,16 @@ bash scripts/pull-backups.sh
 
 Rsyncs `/opt/aust/backups/` on the VPS to `~/aust-backups/` on the dev machine.
 Requires SSH access to `root@187.124.161.90` (ProtonVPN may be needed).
+
+`scripts/setup-local-backup-cron.sh` installs a user-level cron entry (04:00 daily) on the
+dev machine that runs `pull-backups.sh` and prunes local copies older than 60 days —
+run it once so the pull doesn't depend on someone remembering.
+
+`scripts/backup-db.sh` / `scripts/backup-minio.sh` are older, unrelated standalone
+scripts that dump the **local dev** `aust_postgres`/`aust_minio` containers into
+`backups/db|minio/` in the repo. They are not part of the VPS backup pipeline above
+and are not invoked by `deploy-prod.sh` or `setup-backups.sh` — don't confuse them
+with `backup.sh` (the one that runs on the VPS).
 
 ### Restore into staging containers
 

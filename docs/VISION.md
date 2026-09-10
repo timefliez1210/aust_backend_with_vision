@@ -1,207 +1,209 @@
-# Vision Pipeline & Mobile App — Technical Reference
+# Vision Pipeline — Technical Reference
 
-How the system estimates moving volume from images, video, and on-device depth capture.
+How the system estimates moving volume from photos, video, and on-device
+capture. See `services/vision/AGENTS.md` for the file-by-file map of the
+Python service and the exact Modal wiring.
+
+**Which backend actually runs is chosen per-submission, in priority order**
+(`crates/api/src/routes/submissions.rs::process_ar_submission_background`,
+`crates/core/src/config.rs::VisionServiceConfig`):
+
+1. **On-device (LiDAR)** — if every item in the client's manifest carries a
+   plausible `device_volume_m3`, the app already computed volumes on-device
+   and the backend short-circuits: no server-side vision call at all.
+   Recorded as `estimation_method = "ar_device"`.
+2. **VLM** (`vision_service.backend = "vlm"`) — one representative frame per
+   item goes through a catalogue-grounded vision model via Ollama
+   (`VlmEstimator` in `crates/volume-estimator/src/vlm.rs`). No Modal call.
+   Recorded as `"ar"` (AR submissions) or the equivalent photo/video method.
+3. **Modal** (`vision_service.backend = "modal"`, the default enum value) —
+   the legacy Python GPU pipeline described below, via async submit + poll.
+
+The code default (`default_vision_backend()` in `crates/core/src/config.rs`)
+is `"modal"`, but `.env.example` sets `AUST__VISION_SERVICE__BACKEND=vlm` —
+confirm the actual value of that env var on the deployment you're targeting
+before assuming which pipeline is live. The Modal pipeline below remains
+reachable and is the fallback when `backend != "vlm"`.
 
 ---
 
-## 1. Photo Pipeline
+## Part A — Modal GPU Pipeline (`services/vision/`)
 
-**Entry points**
-- Customer photo webapp: `POST /api/v1/submit/photo` (multipart, no auth)
-- Admin dashboard: `POST /api/v1/inquiries/{id}/estimate/depth`
+**There is no local GPU.** This pipeline is only meaningful running against
+the deployed Modal apps. `modal deploy services/vision/modal_app.py` deploys
+three independent apps (`serve`, `serve_video`, `serve_ar`), each a no-GPU
+HTTP layer plus a GPU worker class (`gpu="L4"`) — see `services/vision/AGENTS.md`
+for the exact endpoints, timeouts, and container settings.
 
-**Goal**: Identify all furniture in a set of room photos and sum their volumes.
+**⚠️ The live Modal deployment predates the CLIP/Qwen cross-image dedup and
+the moveable-item filter that exist in `services/vision/app/vision/` today
+(`clip_dedup.py`, `vlm_dedup.py`, `is_moveable` on `DetectedItem`). Redeploy
+before trusting any evaluation run against it.**
 
-### Processing steps
+### 1. Photo pipeline
+
+**Entry point (production)**: Modal `serve` app, `POST /estimate/submit` +
+`GET /estimate/status/{job_id}` (async). A synchronous `POST /estimate/images`
+also exists in the local FastAPI app (`app/api/endpoints/estimate.py`) for
+dev/testing only.
 
 ```
 Photos
   → EXIF extraction          (FocalLengthIn35mmFilm → pixel focal length)
-  → Grounding DINO           (open-vocabulary object detection)
+  → Grounding DINO           (open-vocabulary object detection, multi-prompt)
   → SAM 2.1 Hiera Large      (per-instance segmentation mask)
   → Depth Anything V2        (metric monocular depth map)
-  → RE lookup                (primary: match against 73-item catalog)
+  → RE lookup                (primary: match against 74-item catalog)
   → Geometric OBB            (fallback: Open3D oriented bounding box)
-  → Scale calibration        (EXIF intrinsics + depth map → real-world dims)
-  → Within-image dedup       (remove duplicate detections in same photo)
+  → Within-image dedup       (merge overlapping detections, same photo)
+  → CLIP cross-image dedup   (cluster visually-similar crops across photos)
+  → Qwen2-VL dedup           (VLM pass over the CLIP-reduced item set)
   → Packing multipliers      (only for geometric OBB items; RE volumes already include handling space)
   → DetectedItem[]
 ```
 
 ### RE (Raumeinheit) catalog
 
-73 standardised furniture volumes from the Alltransport 24 Umzugsgutliste.
-`1 RE = 0.1 m³`.
+74 standardised furniture entries (`app/models/schemas.py::RE_CATALOG`), from
+the Alltransport 24 Umzugsgutliste. `1 RE = 0.1 m³`. Mirrored in
+`crates/volume-estimator/src/re_catalogue.txt` for the Rust-side VLM prompt —
+kept in sync by hand, no shared source of truth.
 
 | Type | Logic |
 |------|-------|
 | Fixed | Detect item → lookup RE value directly. Chair = 2 RE = 0.2 m³ |
 | Size-variant | Detect → measure key dimension → pick RE bracket. Table ≤1.0 m = 5 RE, >1.2 m = 8 RE |
-| Per-unit | Detect → measure width → count units. Sofa: width 2.1 m ÷ 0.65 m/seat ≈ 3 seats × 4 RE |
+| Per-unit | Detect → measure width/length → count units. Sofa: width 2.1 m ÷ 0.65 m/seat ≈ 3 seats × 4 RE |
 
-For items not in the catalog, Depth Anything V2 + EXIF intrinsics are used to estimate dimensions geometrically (OBB on the segmented depth region).
+Items not in the catalog fall back to Depth Anything V2 + EXIF intrinsics for
+geometric OBB estimation.
+
+### Cross-image dedup — the known bottleneck
+
+The same physical object photographed from multiple angles was, before the
+CLIP/Qwen stages existed, counted once per photo — roughly **doubling** the
+estimated volume. Crop-based CLIP + Qwen (comparing item thumbnails) narrows
+this but doesn't fully solve it; a full-image VLM shown the whole photo set
+at once (see Part B) came in at roughly **half** the crop-pipeline's count
+in evaluation, closer to the human gold standard.
 
 ### Infrastructure
 
-Deployed on Modal serverless GPU (L4, 24 GB VRAM).
-Function `serve`: `max_inputs=4`, `max_containers=1`, 60 s idle shutdown, 1800 s timeout.
-Typical latency: **~5 s per job**.
+Modal `PhotoPipeline` (`gpu="L4"`), `scaledown_window=120`, `max_containers=1`,
+`timeout=1800`. Fronted by the no-GPU `serve` function
+(`scaledown_window=60`, `max_containers=2`, `timeout=60`).
 
 ### Fallback
 
-If the ML service is unavailable or disabled, the API falls back to LLM vision (Claude/OpenAI). The LLM receives base64 images and returns a structured item list. Less accurate (no actual measurement), but fast and cheap.
+If the ML service is unavailable or disabled, submission handling falls back
+further down the priority order above (VLM, or LLM vision as a last resort
+depending on config).
 
 ---
 
 ## 2. Video Pipeline
 
-**Entry point**: Admin dashboard → `POST /api/v1/inquiries/{id}/estimate/video` (multipart `.mp4 / .mov / .webm / .mkv`, max 500 MB).
+**Entry point**: Modal `serve_video` app, `POST /estimate/video/submit` +
+`GET /estimate/video/status/{job_id}` (async). A synchronous
+`POST /estimate/video` also exists locally (`app/api/endpoints/video.py`,
+multipart, `≤500MB`, `video/*` content types) for dev/testing.
 
-**Goal**: True metric 3D reconstruction of a room from a walkthrough video — more accurate than monocular depth because multiple viewpoints are used.
-
-### Processing steps
+**Goal**: True metric 3D reconstruction of a room from a walkthrough video —
+more accurate than monocular depth because multiple viewpoints are used.
 
 ```
 Video
-  → Keyframe extraction      (OpenCV: scene-change detection + blur rejection, 10–20 frames)
+  → Keyframe extraction      (scene-change detection + blur rejection)
   → MASt3R                   (multi-view stereo 3D reconstruction → metric point cloud + camera poses)
   → Grounding DINO           (object detection on keyframes)
-  → SAM 2 video predictor    (temporal mask propagation across all frames → no dedup needed)
+  → SAM 2 video predictor    (temporal mask propagation across all frames → no cross-image dedup needed)
   → Mask → point cloud proj  (project SAM masks onto MASt3R point cloud per object)
   → OBB fitting              (Open3D oriented bounding box per object)
   → RE lookup                (same catalog as photo pipeline)
-  → Scale correction         (RE catalog anchors + ceiling height validation)
   → DetectedItem[]
 ```
 
 ### Why MASt3R instead of monocular depth
 
-Monocular depth (Depth Anything V2) estimates depth from a single image. Scale is approximate and depends on EXIF intrinsics being correct. Accuracy degrades on unusual focal lengths or unknown camera models.
-
-MASt3R solves multi-view stereo: given N keyframes, it jointly estimates a metric 3D point cloud and the camera pose for every frame. The geometry is consistent across the whole room, not just within a single image. Scale is anchored by RE catalog detections and ceiling height measurement.
-
-### Scale anchoring
-
-Two mechanisms prevent scale drift:
-
-1. **RE catalog anchors**: High-confidence items with known RE values constrain the point cloud scale at solve time.
-2. **Ceiling height validation**: Floor plane detection + distance to ceiling checks whether the MASt3R scale is physically plausible (typical room: 2.3–2.8 m).
-
-If MASt3R produces fewer than 1000 points or the scale fails validation, the pipeline **falls back to per-keyframe Depth Anything V2** (same as photo pipeline).
+Monocular depth (Depth Anything V2) estimates depth from a single image;
+scale is approximate and depends on EXIF intrinsics being correct, and
+degrades on unusual focal lengths or unknown camera models. MASt3R jointly
+estimates a metric 3D point cloud and camera pose across all keyframes, so
+geometry is consistent across the whole room rather than frame-by-frame.
 
 ### GPU memory management
 
-MASt3R (~1.5 GB weights, ~12–15 GB peak) and the detection/segmentation models (~3 GB combined) cannot fit in VRAM simultaneously. They are loaded and unloaded in phases:
+MASt3R and the detection/segmentation models (DINO + SAM 2 + Depth Anything)
+do not fit in VRAM simultaneously on an L4 (24 GB), so `model_loader.py`
+loads MASt3R on demand and swaps it out for the detection stack before
+running detection/segmentation — see `services/vision/app/vision/model_loader.py`.
 
-| Phase | Models on GPU | Peak VRAM |
-|-------|--------------|-----------|
-| Startup / idle | DINO + SAM 2 + DA | ~3 GB |
-| Phase 1: reconstruction | MASt3R only | ~12–15 GB |
-| Phase 2: detection/segmentation | DINO + SAM 2 | ~5 GB |
-| Phase 3: OBB fitting | CPU only (Open3D) | ~0 GB |
-
-Function `serve_video`: `max_inputs=1`, `max_containers=1`, 120 s idle shutdown, 1800 s timeout.
-Typical latency: **2–10 min per job** depending on video length.
+Modal `VideoPipeline` (`gpu="L4"`), `scaledown_window=120`, `max_containers=1`,
+`timeout=900`. Fronted by the no-GPU `serve_video` function
+(`scaledown_window=60`, `max_containers=2`, `timeout=60`).
 
 ---
 
-## 3. Mobile App — On-Device 3D Reconstruction
+## Part B — Rust-side VLM Backend (production default)
 
-**Repo**: `alex_aust_app/` (SvelteKit + Capacitor)
-**Plugin**: `plugins/capacitor-depth-capture/` (TypeScript + Swift/ARKit + Java/ARCore)
+`crates/volume-estimator/src/vlm.rs` (`VlmEstimator`) sends photos/frames to
+an Ollama-hosted vision-language model along with the RE catalogue
+(`re_catalogue.txt`, embedded via `include_str!`), and asks it to deduplicate,
+classify, and volume-estimate in a single pass — no Modal call, no separate
+detection/segmentation/depth stages.
 
-### Concept
+- Selected via `vision_service.backend = "vlm"` in config
+  (`crates/core/src/config.rs`).
+- Model tag: `vision_service.vlm_model`; connects through
+  `llm.ollama.base_url`/`api_key`.
+- Thinking models are slow — a wall-clock timeout
+  (`vision_service.vlm_timeout_secs`) exists because e.g. a large reasoning
+  model can take minutes on a full photo set.
+- This is the architecture validated by the eval scripts in
+  `services/vision/vlm_ollama_eval.py` / `vlm_cloud_eval.py` (standalone
+  experiments, not production code, run against a separate Modal app
+  `aust-vlm-eval` or Ollama Cloud) — full-image VLM input beat the crop-based
+  CLIP/Qwen pipeline on cross-image dedup accuracy, which is why this became
+  the default backend.
 
-The phone captures a sequence of RGBD frames while the user slowly walks through the room. Each frame includes:
+## Part C — On-Device (LiDAR)
 
-- **RGB image** — JPEG, for object detection
-- **Depth map** — 16-bit PNG, mm precision (LiDAR on iPhone Pro; estimated depth on others)
-- **Camera intrinsics** — fx, fy, cx, cy in pixels
-- **Camera pose** — 4×4 transform matrix from the AR session (device-to-world)
+**App repo**: `app/` (in-repo git submodule; SvelteKit + Capacitor).
 
-The pose is the key piece. ARKit (`frame.camera.transform`) and ARCore (`camera.getPose()`) provide a calibrated, metric, visual-inertial odometry pose for every frame — for free. This gives the exact position and orientation of the camera in world space at each capture.
+iPhones with LiDAR compute per-item volumes on-device (depth back-projection
++ oriented bounding box) during AR capture. If every manifest item the app
+submits carries a plausible `device_volume_m3`, the backend takes those
+values directly — `estimation_method = "ar_device"` — and does not call any
+vision service.
 
-### Why camera poses matter
-
-Without poses you have isolated depth frames — each one in its own coordinate system, impossible to merge. With poses you can project every depth frame into a shared world coordinate system and accumulate a single metric point cloud of the whole room. This is the same principle as MASt3R for video, except:
-
-| | MASt3R (video pipeline) | Mobile AR |
-|---|---|---|
-| Poses | Estimated from image pairs | Given by ARKit/ARCore VIO (free, metric) |
-| Depth | Estimated by stereo matching | LiDAR / ARCore depth API (direct measurement) |
-| Scale | Estimated, needs anchoring | Metric from hardware |
-| Latency | 2–10 min server-side | ~seconds (mostly upload + server fusion) |
-
-The mobile approach is fundamentally simpler and more accurate because both depth and pose come directly from the hardware.
-
-### Data flow
-
-```
-User scans room with phone
-  → AR session running (ARWorldTrackingConfiguration / ARCore session)
-  → captureFrame() called N times (e.g. every 0.5 s, ~20–40 frames total)
-      returns: { imageBase64, depthMapBase64, width, height, intrinsics, transform }
-  → frames buffered in app
-  → user confirms scan
-  → POST /api/v1/submit/mobile (multipart)
-      fields per frame: image, depth_map, intrinsics (JSON), transform (JSON, 4×4 flat)
-  → backend: project each depth map into world space using its pose
-  → merge into single point cloud
-  → run DINO detection on RGB frames
-  → SAM 2 segment + project onto point cloud
-  → OBB fitting → RE lookup → volume sum
-  → inquiry + estimation record created
-  → offer auto-generated
-```
-
-### Platform depth sources
-
-| Platform | Depth source | Notes |
-|----------|-------------|-------|
-| iOS (LiDAR) | `frame.sceneDepth.depthMap` | iPhone 12 Pro+, iPad Pro. Accurate to ~1% at 5 m. |
-| iOS (no LiDAR) | `frame.smoothedSceneDepth.depthMap` | ARKit photogrammetry estimate. Less accurate, but usable. |
-| Android (ARCore) | `Frame.acquireDepthImage16Bits()` | Available on ARCore Depth API devices. |
-| Web fallback | None | Falls back to photo pipeline (no depth, no pose). |
-
-### Current implementation status
-
-The plugin currently captures: **RGB + depth map + intrinsics**.
-**Camera pose (`frame.camera.transform`) is NOT yet included.**
-
-To complete the implementation, add to each layer:
-
-1. **`definitions.ts`** — add `transform: number[]` (16 floats, row-major 4×4) to `CapturedFrame`
-2. **Swift (iOS)** — `frame.camera.transform` is `simd_float4x4`; flatten columns to a 16-element float array and include in `call.resolve()`
-3. **Android** — `camera.getPose().toMatrix(float[], 0)` returns a 16-element float array
-4. **Backend `submit/mobile` handler** — parse `transform` per frame, project depth maps to world space, merge point cloud, run volume estimation
-
-### Auth
-
-Customer magic-link OTP → session token. Tables: `customer_otps`, `customer_sessions`.
-Routes: `POST /api/v1/customer/auth/request` → `POST /api/v1/customer/auth/verify` → session token → protected `/api/v1/customer/*`.
+Auth: customer magic-link OTP → session token. Tables: `customer_otps`,
+`customer_sessions`. Routes: `POST /api/v1/customer/auth/*` (public),
+`/api/v1/customer/*` (protected). Middleware:
+`crates/api/src/middleware/customer_auth.rs` (DB-backed session token, not JWT).
 
 ---
 
-## 4. Output Format
+## Output Format
 
-All three pipelines produce the same `DetectedItem` structure stored in `volume_estimations.result_data` (raw JSON array):
+All estimation paths converge on the same `DetectedItem` shape, stored in
+`volume_estimations.result_data`. Fields (from
+`services/vision/app/models/schemas.py::DetectedItem`):
 
 ```json
-[
-  {
-    "name": "sofa",
-    "volume_m3": 1.2,
-    "dimensions": { "length_m": 2.2, "width_m": 0.9, "height_m": 0.85 },
-    "confidence": 0.92,
-    "seen_in_images": [0, 1, 3],
-    "category": "furniture",
-    "german_name": "Sofa, Couch, Liege je Sitz",
-    "re_value": 12.0,
-    "units": 3,
-    "volume_source": "re",
-    "crop_s3_key": "estimates/{inquiry_id}/{estimation_id}/crops/sofa_0.jpg"
-  }
-]
+{
+  "name": "sofa",
+  "volume_m3": 1.2,
+  "dimensions": { "length_m": 2.2, "width_m": 0.9, "height_m": 0.85 },
+  "confidence": 0.92,
+  "seen_in_images": [0, 1, 3],
+  "category": "furniture",
+  "german_name": "Sofa, Couch, Liege je Sitz",
+  "re_value": 12.0,
+  "units": 3,
+  "volume_source": "re",
+  "is_moveable": true
+}
 ```
 
-`total_volume_m3` on the inquiry is set from `SUM(item.volume_m3 × item.units)` and flows directly into the pricing engine for offer generation.
+`total_volume_m3` on the inquiry is `SUM(item.volume_m3 × item.units)` and
+flows directly into the pricing engine for offer generation.

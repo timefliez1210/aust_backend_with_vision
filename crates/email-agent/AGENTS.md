@@ -23,9 +23,23 @@ IMAP poll → parse email → extract JSON attachment or plain text
 | `src/responder.rs` | LLM-powered response generation/revising |
 | `src/telegram.rs` | Telegram Bot integration (inline keyboards, calendar commands) |
 
+## Char-Boundary Safety
+
+Every place this crate slices a `String` for a preview/log/Telegram message goes
+through `text::truncate_on_char_boundary(s, max_bytes)` (13 call sites across
+`processor.rs`, `responder.rs`, `telegram.rs`, `text.rs`), which snaps the cut down
+to the nearest UTF-8 char boundary. A plain `&s[..n]` panics whenever `n` lands
+inside a multi-byte character — common in German text (ü, ä, ö, ß) — and because
+this crate runs inside the main process, that panic previously aborted the whole
+backend and crash-looped it on the same unread mail. Never slice a String here
+without it.
+
 ## JSON Form Attachment Parsing
 
-The kostenloses-angebot web form sends JSON attached to the email. Key field mappings:
+Two web forms feed this path — `kostenloses-angebot` (hyphenated field names) and
+`manuell-angebot` (snake_case). `ParsedInquiry`'s serde fields accept both via
+`alias` (e.g. `etage-auszug` / `etage_auszug`, `halteverbot-auszug` / `halteverbot_auszug`).
+Key field mappings (hyphenated form shown; see `parser.rs` for the aliases):
 
 | JSON Field | MovingInquiry Field |
 |-----------|-------------------|

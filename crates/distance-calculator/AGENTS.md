@@ -42,7 +42,9 @@ Called from `offer_builder.rs::build_fahrt_item()` (Fahrkostenpauschale) and `su
 
 ## Pricing
 
-€1.00/km (`PRICE_PER_KM_CENTS = 100`), total km ceiled before multiplying. Configured as constant in `route.rs`.
+`RouteCalculator::calculate` also returns a `price_cents` field: `ceil(total_distance_km) × PRICE_PER_KM_CENTS`, with `PRICE_PER_KM_CENTS = 100` (€1.00/km) hardcoded as a constant in `route.rs`. This field is only used by the standalone `GET` distance route (`routes/distance.rs`).
+
+**The KVA's actual Fahrkostenpauschale ignores this field.** `offer_builder.rs::build_fahrt_item()` takes only `RouteResult.total_distance_km` from this crate and multiplies it by the config-driven `CompanyConfig::fahrt_rate_per_km` (default `1.0`, same €1/km, but it can be changed via settings without touching this crate). If you change the pricing customers actually pay, that rate lives in core config / `settings_repo.rs`, not here.
 
 ## Testing
 

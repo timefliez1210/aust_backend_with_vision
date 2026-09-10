@@ -1,6 +1,6 @@
 # AUST Backend
 
-A modular Rust backend that automates the quote-to-offer pipeline for a moving company operating in the Austrian/German market. It ingests customer inquiries from email and direct API calls, estimates moving volume via LLM vision or a 3D ML pipeline, generates priced PDF offers, and sends them to an admin for approval via Telegram before delivering them to the customer by email.
+A modular Rust backend that automates the quote-to-offer pipeline for a moving company operating in the Austrian/German market. It ingests customer inquiries from email, a photo/mobile app, and direct API calls, estimates moving volume via LLM vision, on-device LiDAR, or a 3D ML pipeline, generates priced PDF offers (KVA), and sends them to an admin for approval via Telegram before delivering them to the customer by email. The same Telegram bot also hosts "Josie", a tool-calling assistant that can look up inquiries, draft offers, and answer scheduling/invoicing questions on the admin's behalf (`crates/assistant`).
 
 ## Architecture
 
@@ -156,7 +156,8 @@ All variables follow the pattern `AUST__SECTION__KEY` (double underscore as sepa
 | `aust-core` | Domain models, configuration structs, shared error types — used by every other crate |
 | `aust-api` | Axum HTTP server, all route handlers, request/response types, orchestrator event loop |
 | `aust-email-agent` | IMAP polling, email parsing, JSON attachment extraction, Telegram approval bot |
-| `aust-volume-estimator` | LLM vision analysis + client for the external 3D ML vision service |
+| `aust-assistant` | "Josie" — in-Telegram tool-calling agent (soul/memory/tool registry/driver loop), wired into the email-agent's Telegram poller |
+| `aust-volume-estimator` | LLM vision analysis, VLM (vision-language model) fallback, and client for the external 3D ML vision service |
 | `aust-distance-calculator` | Geocoding and multi-stop driving distance via OpenRouteService |
 | `aust-offer-generator` | Pricing engine, XLSX template rendering, LibreOffice PDF conversion |
 | `aust-llm-providers` | Pluggable LLM abstraction (Claude, OpenAI, Ollama) behind a common trait |
@@ -186,10 +187,13 @@ Migration files are in `migrations/`. Key tables:
 | `invoices` | Issued invoices and payment tracking |
 | `employees` | Field staff — profile, auth, documents, clock times |
 | `inquiry_employees` / `calendar_item_employees` | Employee assignments (one row per employee per `job_date`) |
-| `calendar_items` | Non-inquiry calendar work items |
+| `calendar_items` | Non-inquiry calendar work items, incl. paid Zusatztermine (appointments) |
+| `customer_addresses` | Per-customer known-address catalogue, harvested from past inquiries |
 | `flash_contacts` | Quick callback requests from the public flash-contact form |
 | `users` | Admin users (email + password hash + role) |
-| `email_threads` / `email_messages` | Full email conversation history |
+| `email_threads` / `email_messages` | Full email conversation history — read/handled state, RFC threading, attachments |
+| `storage_contracts` | Einlagerung (storage) contracts and their recurring billing |
+| `agent_memory` / `agent_episodes` / `agent_actions` / `pending_actions` | Josie's durable + episodic memory, audit log, and confirmation queue |
 
 ## API Reference
 
@@ -197,16 +201,23 @@ See [docs/API.md](docs/API.md) for the full API reference with request/response 
 
 ### Endpoint summary
 
-| Group | Base path |
-|---|---|
-| Health | `/health`, `/ready` |
-| Auth | `/api/v1/auth/` |
-| Inquiries | `/api/v1/inquiries/` |
-| Volume Estimation | `/api/v1/estimates/` |
-| Offers | `/api/v1/offers/` |
-| Calendar | `/api/v1/calendar/` |
-| Distance | `/api/v1/distance/` |
-| Admin | `/api/v1/admin/` |
+| Group | Base path | Notes |
+|---|---|---|
+| Health | `/health`, `/ready` | `/ready` checks the DB connection |
+| Public submission | `/api/v1/submit/` | photo/mobile/AR/video/manual inquiry intake, no auth |
+| Public misc | `/api/v1/estimates/images/`, `/api/v1/media/`, `/api/v1/distance/calculate`, `/api/v1/flash-contact` | no auth, no rate limit except flash-contact (10/min/IP) |
+| Auth | `/api/v1/auth/` | login/OTP public, rate-limited 10/min/IP; token refresh etc. under admin JWT |
+| Inquiries | `/api/v1/inquiries/` | admin JWT; also carries invoices and appointments (`/inquiries/{id}/invoices`, `/inquiries/{id}/appointments`) |
+| Volume Estimation | `/api/v1/estimates/` | admin JWT for vision/inventory/depth-sensor/video runs |
+| Calendar | `/api/v1/calendar/`, `/api/v1/admin/calendar-items/` | admin JWT |
+| Vehicles | `/api/v1/admin/vehicles/` | admin JWT |
+| Storage (S3 objects) | `/api/v1/admin/storage/` | admin JWT |
+| Admin | `/api/v1/admin/` | dashboard, customers, emails, employees, feedback, Rechnungsausgangsbuch, KVA-Buch, settings — admin JWT |
+| Agent activity | `/api/v1/admin/agent-activity/` | Josie's action/confirmation log — admin JWT |
+| Customer portal | `/api/v1/customer/` | OTP magic-link auth, then DB-backed session token |
+| Employee portal | `/api/v1/employee/` | own auth scheme, clock-in/out + hours |
+
+There is no standalone `/api/v1/offers/` route group — offer generation and editing live under `/api/v1/inquiries/{id}/...`.
 
 ## Deployment
 
@@ -243,13 +254,17 @@ VPS cron once with `bash scripts/setup-backups.sh`.
 ### Run tests
 
 ```bash
-# Run tests for a specific crate (skips broken example binaries)
+# Run tests for a specific crate
 cargo test -p aust-api --lib
 cargo test -p aust-core --lib
 cargo test -p aust-offer-generator --lib
 
-# Run all library tests
+# Run all library tests (all targets, incl. examples, also compile: `cargo build --all-targets`)
 cargo test --lib --workspace
+
+# DB-backed integration tests (needs Postgres)
+DATABASE_URL=postgres://aust:aust_dev_password@localhost:5432/aust_backend_test \
+  cargo test -p aust-api --tests
 ```
 
 ### Useful development commands

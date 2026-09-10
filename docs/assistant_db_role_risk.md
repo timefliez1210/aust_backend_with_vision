@@ -1,5 +1,13 @@
 # Assistant DB Privilege Boundary — Accepted Risk (M4, 2026-05-29)
 
+**Status as of 2026-09-10: still unfixed.** No code path issues `SET ROLE
+aust_assistant` (verified — `grep -rn "SET ROLE" crates/` finds nothing), and no
+migration after `20260609000027` restores the role's grants. Everything below still
+holds; only the migration inventory in "Path to an enforced boundary" step 3 has
+grown (`crates/assistant` and its DB-backed tables — `agent_sessions`,
+`agent_memory`, `pending_actions`, etc. — did not exist when this was first written
+but are covered by the same single-pool boundary).
+
 Migration `20260609000008_aust_assistant_db_role.sql` originally created a
 least-privilege `aust_assistant` role, and `20260609000027_drop_aust_assistant_role.sql`
 later revokes all of its grants. The role survives but has no privileges.
