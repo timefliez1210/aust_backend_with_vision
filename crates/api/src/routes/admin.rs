@@ -83,6 +83,15 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/employees/{id}/hours/cleanup", post(cleanup_hours_adjustments))
         .route("/employees/{id}/hours/export", get(employee_hours_export))
         .route(
+            "/employees/{id}/documents",
+            post(upload_employee_extra_document),
+        )
+        // Two path segments, so this never collides with the fixed-slot route below.
+        .route(
+            "/employees/{id}/documents/extra/{doc_id}",
+            get(download_employee_extra_document).delete(delete_employee_extra_document),
+        )
+        .route(
             "/employees/{id}/documents/{doc_type}",
             post(upload_employee_document)
                 .get(download_employee_document)
@@ -1138,9 +1147,30 @@ async fn fetch_employee_json(
         "active": row.active,
         "arbeitsvertrag_key": row.arbeitsvertrag_key,
         "mitarbeiterfragebogen_key": row.mitarbeiterfragebogen_key,
+        // The free-form documents ride along with the employee so the card can
+        // render every slot, fixed and labelled alike, from one response.
+        "documents": extra_documents_json(pool, id).await?,
         "created_at": row.created_at,
         "updated_at": row.updated_at,
     }))
+}
+
+/// Serialise an employee's free-form documents for the admin payload.
+async fn extra_documents_json(
+    pool: &sqlx::PgPool,
+    employee_id: Uuid,
+) -> Result<serde_json::Value, ApiError> {
+    let docs = employee_repo::list_extra_documents(pool, employee_id).await?;
+    Ok(serde_json::json!(docs
+        .into_iter()
+        .map(|d| serde_json::json!({
+            "id": d.id,
+            "label": d.label,
+            "filename": d.filename,
+            "size_bytes": d.size_bytes,
+            "created_at": d.created_at,
+        }))
+        .collect::<Vec<_>>()))
 }
 
 // --- Employee Documents ---
@@ -1319,6 +1349,237 @@ async fn delete_employee_document(
     employee_repo::clear_document_key(&state.db, id, col).await?;
 
     tracing::info!("Employee {id}: deleted {doc_type}");
+    let employee = fetch_employee_json(&state.db, id).await?;
+    Ok(Json(employee))
+}
+
+// --- Employee Documents: free-form, labelled by the office ---
+
+/// Largest free-form employee document we accept, in bytes.
+///
+/// A personnel file holds scans and PDFs, not video. 20 MB is generous for that
+/// and still keeps one bad upload from filling a request buffer.
+const MAX_EMPLOYEE_DOCUMENT_BYTES: usize = 20 * 1024 * 1024;
+
+/// Trim and length-check a document label typed by the admin.
+///
+/// **Caller**: `upload_employee_extra_document`
+/// **Why**: The label is the only thing that identifies the document in the UI, so a
+/// blank one is rejected rather than stored as an unnamed row.
+fn normalize_document_label(raw: &str) -> Option<String> {
+    let label = raw.trim();
+    if label.is_empty() || label.chars().count() > 100 {
+        return None;
+    }
+    Some(label.to_string())
+}
+
+/// Reduce an uploaded filename to a safe lowercase extension.
+///
+/// **Caller**: `upload_employee_extra_document`
+/// **Why**: The extension becomes part of the S3 key, so anything with a slash, a dot
+/// or an unexpected length is dropped in favour of `bin`.
+fn safe_extension(filename: &str) -> String {
+    // `rsplit` on a name with no dot yields the whole name, which would turn
+    // "vertrag" into the extension "vertrag" — so require a real dot first.
+    let ext = filename
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    if !ext.is_empty()
+        && ext.len() <= 8
+        && ext.chars().all(|c| c.is_ascii_alphanumeric())
+    {
+        ext
+    } else {
+        "bin".to_string()
+    }
+}
+
+/// Strip a filename down to what is safe inside a `Content-Disposition` header.
+///
+/// **Caller**: `download_employee_extra_document`
+/// **Why**: A quote or a newline in the stored filename would break the header, so
+/// only plain characters survive.
+fn safe_download_filename(filename: &str) -> String {
+    let cleaned: String = filename
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ' ') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let cleaned = cleaned.trim().to_string();
+    if cleaned.is_empty() {
+        "dokument".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// `POST /api/v1/admin/employees/{id}/documents` — Upload a labelled employee document.
+///
+/// **Caller**: Admin employee detail page document card ("Weiteres Dokument").
+/// **Why**: The personnel file collects documents the schema never anticipated —
+/// Führungszeugnis, Fahrerlaubnis, Bescheinigungen. Alex types the label and uploads
+/// the file instead of waiting for a migration per document type.
+///
+/// Expects `multipart/form-data` with a `"label"` text part and a `"file"` part.
+///
+/// # Returns
+/// `200 OK` with updated employee JSON, including the new document in `documents`.
+async fn upload_employee_extra_document(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<TokenClaims>,
+    Path(id): Path<Uuid>,
+    mut multipart: Multipart,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // Employee documents are sensitive PII — admin-only, same as the fixed slots.
+    require_admin(&claims)?;
+
+    if !employee_repo::exists(&state.db, id).await? {
+        return Err(ApiError::NotFound("Mitarbeiter nicht gefunden".into()));
+    }
+
+    let mut label: Option<String> = None;
+    let mut file_bytes: Option<Bytes> = None;
+    let mut filename = String::from("dokument");
+    let mut content_type_str = String::from("application/octet-stream");
+
+    // The label may arrive before or after the file, so every part is read.
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| ApiError::BadRequest(format!("Fehler beim Lesen der Datei: {e}")))?
+    {
+        match field.name() {
+            Some("label") => {
+                let text = field.text().await.map_err(|e| {
+                    ApiError::BadRequest(format!("Fehler beim Lesen der Bezeichnung: {e}"))
+                })?;
+                label = Some(text);
+            }
+            Some("file") => {
+                if let Some(fname) = field.file_name()
+                    && !fname.trim().is_empty()
+                {
+                    filename = fname.to_string();
+                }
+                if let Some(ct) = field.content_type() {
+                    content_type_str = ct.to_string();
+                }
+                file_bytes = Some(field.bytes().await.map_err(|e| {
+                    ApiError::BadRequest(format!("Fehler beim Lesen der Dateidaten: {e}"))
+                })?);
+            }
+            _ => {}
+        }
+    }
+
+    let label = label
+        .as_deref()
+        .and_then(normalize_document_label)
+        .ok_or_else(|| ApiError::BadRequest("Bezeichnung fehlt oder ist zu lang".into()))?;
+    let data = file_bytes.ok_or_else(|| ApiError::BadRequest("Kein Dateifeld gefunden".into()))?;
+
+    if data.is_empty() {
+        return Err(ApiError::BadRequest("Die Datei ist leer".into()));
+    }
+    if data.len() > MAX_EMPLOYEE_DOCUMENT_BYTES {
+        return Err(ApiError::BadRequest("Die Datei ist zu groß (max. 20 MB)".into()));
+    }
+
+    let doc_id = Uuid::now_v7();
+    let size_bytes = data.len() as i64;
+    // The document id is in the key, so re-uploading under the same label never
+    // overwrites the file that is already there.
+    let key = format!("employees/{id}/documents/{doc_id}.{}", safe_extension(&filename));
+
+    state
+        .storage
+        .upload(&key, data, &content_type_str)
+        .await
+        .map_err(|e| {
+            tracing::error!("S3 upload error for employee document: {e}");
+            ApiError::Internal("Datei-Upload fehlgeschlagen".into())
+        })?;
+
+    employee_repo::insert_extra_document(
+        &state.db,
+        id,
+        doc_id,
+        &label,
+        &key,
+        &filename,
+        &content_type_str,
+        size_bytes,
+    )
+    .await?;
+
+    tracing::info!("Employee {id}: uploaded document '{label}' → {key}");
+    let employee = fetch_employee_json(&state.db, id).await?;
+    Ok(Json(employee))
+}
+
+/// `GET /api/v1/admin/employees/{id}/documents/extra/{doc_id}` — Download a labelled document.
+///
+/// **Caller**: Admin employee detail page document card download button.
+/// **Why**: Proxies the S3 object through the API so the admin JWT gates access.
+async fn download_employee_extra_document(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<TokenClaims>,
+    Path((id, doc_id)): Path<(Uuid, Uuid)>,
+) -> Result<Response, ApiError> {
+    require_admin(&claims)?;
+
+    let doc = employee_repo::fetch_extra_document(&state.db, id, doc_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Dokument nicht vorhanden".into()))?;
+
+    let data = state.storage.download(&doc.s3_key).await.map_err(|e| {
+        tracing::error!("S3 download error for employee document: {e}");
+        ApiError::NotFound("Dokument nicht abrufbar".into())
+    })?;
+
+    let filename = safe_download_filename(&doc.filename);
+
+    Ok(Response::builder()
+        .header(header::CONTENT_TYPE, doc_content_type(&doc.s3_key))
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{filename}\""),
+        )
+        .body(axum::body::Body::from(data))
+        .unwrap())
+}
+
+/// `DELETE /api/v1/admin/employees/{id}/documents/extra/{doc_id}` — Remove a labelled document.
+///
+/// **Caller**: Admin employee detail page document card delete button.
+/// **Why**: Deletes the object from S3 and drops the row so the card stops listing it.
+async fn delete_employee_extra_document(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<TokenClaims>,
+    Path((id, doc_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&claims)?;
+
+    let doc = employee_repo::fetch_extra_document(&state.db, id, doc_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Dokument nicht vorhanden".into()))?;
+
+    // Best-effort S3 delete — a missing object must not block clearing the row,
+    // otherwise the card keeps a dead entry no one can remove.
+    if let Err(e) = state.storage.delete(&doc.s3_key).await {
+        tracing::warn!("S3 delete for employee document {} failed (ignoring): {e}", doc.s3_key);
+    }
+
+    employee_repo::delete_extra_document(&state.db, id, doc_id).await?;
+
+    tracing::info!("Employee {id}: deleted document '{}'", doc.label);
     let employee = fetch_employee_json(&state.db, id).await?;
     Ok(Json(employee))
 }
@@ -2826,6 +3087,34 @@ async fn update_number_settings(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_blank_label_is_not_a_document_name() {
+        assert_eq!(normalize_document_label("  Führungszeugnis  "), Some("Führungszeugnis".into()));
+        assert_eq!(normalize_document_label("   "), None);
+        assert_eq!(normalize_document_label(""), None);
+        assert_eq!(normalize_document_label(&"a".repeat(101)), None);
+        assert_eq!(normalize_document_label(&"a".repeat(100)).map(|l| l.len()), Some(100));
+    }
+
+    #[test]
+    fn an_extension_can_never_escape_the_key() {
+        assert_eq!(safe_extension("vertrag.PDF"), "pdf");
+        assert_eq!(safe_extension("scan.jpeg"), "jpeg");
+        // No extension, a path separator, or something absurdly long all fall back.
+        assert_eq!(safe_extension("vertrag"), "bin");
+        assert_eq!(safe_extension("a.pd/f"), "bin");
+        assert_eq!(safe_extension("a.verylongextension"), "bin");
+        assert_eq!(safe_extension("a."), "bin");
+    }
+
+    #[test]
+    fn a_download_filename_cannot_break_the_header() {
+        assert_eq!(safe_download_filename("Führungszeugnis.pdf"), "F_hrungszeugnis.pdf");
+        assert_eq!(safe_download_filename("evil\"; rm -rf /.pdf"), "evil__ rm -rf _.pdf");
+        assert_eq!(safe_download_filename("   "), "dokument");
+        assert_eq!(safe_download_filename(""), "dokument");
+    }
 
     #[test]
     fn resolve_doc_column_valid_types() {

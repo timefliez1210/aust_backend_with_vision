@@ -2253,6 +2253,115 @@ pub(crate) async fn fetch_document_key(
     .await
 }
 
+/// One free-form employee document — a label Alex typed plus the file behind it.
+#[derive(Debug, FromRow)]
+pub(crate) struct EmployeeDocumentRow {
+    pub id: Uuid,
+    pub label: String,
+    pub s3_key: String,
+    pub filename: String,
+    pub size_bytes: i64,
+    pub created_at: DateTime<Utc>,
+}
+
+/// List an employee's free-form documents, newest first.
+///
+/// **Caller**: `admin::fetch_employee_json`, `admin::list_employee_extra_documents`
+/// **Why**: The personnel file grows by label, not by column, so these live in their
+/// own table and are read as a list rather than as named slots.
+pub(crate) async fn list_extra_documents(
+    pool: &PgPool,
+    employee_id: Uuid,
+) -> Result<Vec<EmployeeDocumentRow>, sqlx::Error> {
+    sqlx::query_as(
+        r#"
+        SELECT id, label, s3_key, filename, size_bytes, created_at
+        FROM employee_documents
+        WHERE employee_id = $1
+        ORDER BY created_at DESC
+        "#,
+    )
+    .bind(employee_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// Insert a free-form employee document.
+///
+/// **Caller**: `admin::upload_employee_extra_document`
+/// **Why**: Records the label and the S3 key together; the row is what makes the
+/// uploaded object findable again.
+// repository fn — args mirror DB columns
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn insert_extra_document(
+    pool: &PgPool,
+    employee_id: Uuid,
+    id: Uuid,
+    label: &str,
+    s3_key: &str,
+    filename: &str,
+    content_type: &str,
+    size_bytes: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        INSERT INTO employee_documents
+            (id, employee_id, label, s3_key, filename, content_type, size_bytes)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        "#,
+    )
+    .bind(id)
+    .bind(employee_id)
+    .bind(label)
+    .bind(s3_key)
+    .bind(filename)
+    .bind(content_type)
+    .bind(size_bytes)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Fetch one free-form document, scoped to its employee.
+///
+/// **Caller**: `admin::download_employee_extra_document`, `admin::delete_employee_extra_document`
+/// **Why**: The employee id in the path is part of the lookup, so a document id
+/// guessed against the wrong employee finds nothing instead of leaking a file.
+pub(crate) async fn fetch_extra_document(
+    pool: &PgPool,
+    employee_id: Uuid,
+    doc_id: Uuid,
+) -> Result<Option<EmployeeDocumentRow>, sqlx::Error> {
+    sqlx::query_as(
+        r#"
+        SELECT id, label, s3_key, filename, size_bytes, created_at
+        FROM employee_documents
+        WHERE employee_id = $1 AND id = $2
+        "#,
+    )
+    .bind(employee_id)
+    .bind(doc_id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Delete a free-form document row, scoped to its employee.
+///
+/// **Caller**: `admin::delete_employee_extra_document`
+/// **Why**: Removes the reference after the S3 object is gone.
+pub(crate) async fn delete_extra_document(
+    pool: &PgPool,
+    employee_id: Uuid,
+    doc_id: Uuid,
+) -> Result<u64, sqlx::Error> {
+    let res = sqlx::query("DELETE FROM employee_documents WHERE employee_id = $1 AND id = $2")
+        .bind(employee_id)
+        .bind(doc_id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
 /// Clear employee document key in DB.
 ///
 /// **Caller**: `admin::delete_employee_document`
@@ -2302,6 +2411,72 @@ mod tests {
     use super::*;
     use crate::test_helpers;
     use sqlx::PgPool;
+
+    /// Inserts a bare employee and returns the id.
+    async fn seed_employee(pool: &PgPool) -> Uuid {
+        let id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO employees (id, first_name, last_name, email, monthly_hours_target)
+             VALUES ($1, 'Ali', 'Yildiz', $2, 160)",
+        )
+        .bind(id)
+        .bind(format!("{id}@example.test"))
+        .execute(pool)
+        .await
+        .expect("insert employee");
+        id
+    }
+
+    /// A labelled document survives the round trip and is scoped to its employee.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_labelled_document_round_trips(pool: PgPool) {
+        let employee = seed_employee(&pool).await;
+        let other = seed_employee(&pool).await;
+        let doc_id = Uuid::now_v7();
+
+        insert_extra_document(
+            &pool, employee, doc_id, "Führungszeugnis",
+            "employees/x/documents/a.pdf", "fz.pdf", "application/pdf", 4096,
+        )
+        .await
+        .expect("insert");
+
+        let docs = list_extra_documents(&pool, employee).await.expect("list");
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].label, "Führungszeugnis");
+        assert_eq!(docs[0].filename, "fz.pdf");
+        assert_eq!(docs[0].size_bytes, 4096);
+
+        // The employee id is part of the lookup, so another employee's id must not
+        // reach this document.
+        assert!(fetch_extra_document(&pool, other, doc_id).await.expect("fetch").is_none());
+        assert!(fetch_extra_document(&pool, employee, doc_id).await.expect("fetch").is_some());
+
+        assert_eq!(delete_extra_document(&pool, other, doc_id).await.expect("delete"), 0);
+        assert_eq!(delete_extra_document(&pool, employee, doc_id).await.expect("delete"), 1);
+        assert!(list_extra_documents(&pool, employee).await.expect("list").is_empty());
+    }
+
+    /// Newest first, because the document just uploaded is the one being looked for.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn documents_list_newest_first(pool: PgPool) {
+        let employee = seed_employee(&pool).await;
+        for label in ["Erstes", "Zweites", "Drittes"] {
+            insert_extra_document(
+                &pool, employee, Uuid::now_v7(), label,
+                &format!("employees/x/{label}.pdf"), "d.pdf", "application/pdf", 1,
+            )
+            .await
+            .expect("insert");
+        }
+        let labels: Vec<String> = list_extra_documents(&pool, employee)
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|d| d.label)
+            .collect();
+        assert_eq!(labels, vec!["Drittes", "Zweites", "Erstes"]);
+    }
 
     /// Seeds a customer, a fully addressed move and one employee on it, and
     /// returns (inquiry_id, employee_id, job_date).
