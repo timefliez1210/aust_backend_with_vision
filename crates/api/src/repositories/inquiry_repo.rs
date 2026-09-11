@@ -860,10 +860,17 @@ pub(crate) async fn fetch_employee_assignments_snapshot(
                -- NOT declarative. `actual_hours` above is derived ONLY from the admin clock
                -- columns; employee self-clock is surfaced separately (employee_actual_hours)
                -- and intentionally never folded into the authoritative hours. Do not COALESCE.
+               --
+               -- Derived inline, NOT via `aust_shift_hours`: that function is declared
+               -- `(TIME, TIME)` because it exists to fix TIME - TIME going negative across
+               -- midnight. These two columns are TIMESTAMPTZ (migration 20260322000000), where
+               -- subtraction is already exact and the midnight case needs no special handling.
+               -- Passing them to the TIME overload makes Postgres reject the whole statement at
+               -- plan time, which 500'd every inquiry detail read (2026-09-11 incident).
                ie.employee_clock_in,
                ie.employee_clock_out,
                CASE WHEN ie.employee_clock_out IS NOT NULL AND ie.employee_clock_in IS NOT NULL
-                    THEN (aust_shift_hours(ie.employee_clock_in, ie.employee_clock_out))::float8
+                    THEN (EXTRACT(EPOCH FROM (ie.employee_clock_out - ie.employee_clock_in)) / 3600.0)::float8
                     ELSE NULL END AS employee_actual_hours,
                ie.notes,
                ie.job_date,
@@ -1139,6 +1146,99 @@ mod tests {
                 "{ih:02}:{im:02}-{oh:02}:{om:02} with a {brk}min break: expected {expected}, got {got}"
             );
         }
+    }
+
+    /// A worker's self-reported punch must not break the inquiry detail read.
+    ///
+    /// `employee_clock_in`/`employee_clock_out` are TIMESTAMPTZ (migration
+    /// 20260322000000), while `aust_shift_hours` is declared `(TIME, TIME)` — it
+    /// exists to fix TIME - TIME going negative across midnight, which cannot
+    /// happen between two timestamps. Commit 6d180ab routed these two columns
+    /// through that function anyway, so Postgres rejected the whole statement at
+    /// plan time with `function aust_shift_hours(timestamp with time zone,
+    /// timestamp with time zone) does not exist` and EVERY inquiry with a crew
+    /// member returned 500 (2026-09-11 incident).
+    ///
+    /// Seeding a punch is what makes this fail: with both columns NULL the CASE
+    /// arm is never planned into an error, which is why the bug survived until a
+    /// real worker clocked in from their phone.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn snapshot_survives_an_employee_self_clock_punch(pool: sqlx::PgPool) {
+        use crate::test_helpers;
+
+        let inquiry_id = test_helpers::insert_test_quote(&pool).await;
+        let emp_id = test_helpers::insert_test_employee(&pool, "Max", "Mustermann").await;
+        let job_date = chrono::NaiveDate::from_ymd_opt(2026, 9, 11).unwrap();
+        test_helpers::insert_test_inquiry_employee(&pool, inquiry_id, emp_id, job_date, 8.0).await;
+
+        // 08:00 → 16:30 UTC with a 30-minute self-reported break: 8.5 gross hours.
+        // Deliberately crossing no midnight — the timestamp case needs no wrap.
+        let clock_in = chrono::DateTime::parse_from_rfc3339("2026-09-11T08:00:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let clock_out = chrono::DateTime::parse_from_rfc3339("2026-09-11T16:30:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        sqlx::query(
+            "UPDATE inquiry_employees
+                SET employee_clock_in = $1, employee_clock_out = $2, employee_break_minutes = 30
+              WHERE inquiry_id = $3 AND employee_id = $4",
+        )
+        .bind(clock_in)
+        .bind(clock_out)
+        .bind(inquiry_id)
+        .bind(emp_id)
+        .execute(&pool)
+        .await
+        .expect("seed employee punch");
+
+        // The regression: this call returned Err before the fix, which the route
+        // handler turned into a 500.
+        let rows = super::fetch_employee_assignments_snapshot(&pool, inquiry_id)
+            .await
+            .expect("snapshot query must plan against TIMESTAMPTZ columns");
+
+        assert_eq!(rows.len(), 1, "one crew row expected");
+        let row = &rows[0];
+        assert_eq!(row.employee_clock_in, Some(clock_in));
+        assert_eq!(row.employee_clock_out, Some(clock_out));
+
+        // 8.5 gross hours from the punch. The self-reported break is NOT folded in
+        // here (the admin's break_minutes owns that); this asserts the span only.
+        let hours = row.employee_actual_hours.expect("hours derived");
+        assert!(
+            (hours - 8.5).abs() < 0.001,
+            "08:00→16:30 is 8.5 gross hours, got {hours}"
+        );
+
+        // An overnight punch (22:00 → 06:00) is 8 hours, and unlike the TIME
+        // columns it needs no midnight special-casing — the timestamps carry the date.
+        let night_in = chrono::DateTime::parse_from_rfc3339("2026-09-11T22:00:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let night_out = chrono::DateTime::parse_from_rfc3339("2026-09-12T06:00:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        sqlx::query(
+            "UPDATE inquiry_employees SET employee_clock_in = $1, employee_clock_out = $2
+              WHERE inquiry_id = $3 AND employee_id = $4",
+        )
+        .bind(night_in)
+        .bind(night_out)
+        .bind(inquiry_id)
+        .bind(emp_id)
+        .execute(&pool)
+        .await
+        .expect("seed overnight punch");
+
+        let rows = super::fetch_employee_assignments_snapshot(&pool, inquiry_id)
+            .await
+            .expect("overnight snapshot");
+        let hours = rows[0].employee_actual_hours.expect("overnight hours");
+        assert!(
+            (hours - 8.0).abs() < 0.001,
+            "22:00→06:00 across midnight is 8 hours, got {hours}"
+        );
     }
 
     /// Same guarantee for Termine (`calendar_items`), whose `start_time` is also

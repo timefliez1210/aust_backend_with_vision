@@ -985,3 +985,107 @@ async fn reschedule_moves_multiday_crew_overlapping(pool: PgPool) {
         "both crew days must shift to the new window with no unique-constraint failure, found: {remaining:?}"
     );
 }
+
+// ============================================================================
+// 2026-09-11: opening an inquiry 500'd whenever a crew member had punched in
+// ============================================================================
+/// The admin dashboard's inquiry detail page must return 200 even after a worker
+/// has self-reported their times from the portal.
+///
+/// `employee_clock_in`/`employee_clock_out` are TIMESTAMPTZ; `aust_shift_hours`
+/// only exists for `(TIME, TIME)`. Commit 6d180ab passed the timestamps through
+/// that function, so Postgres failed the whole statement at plan time
+/// (`function aust_shift_hours(timestamp with time zone, timestamp with time
+/// zone) does not exist`) and `GET /api/v1/inquiries/{id}` answered 500 for
+/// every inquiry with a crew. The punch is what triggers it — with both columns
+/// NULL the broken CASE arm is never reached, so the bug only appeared once
+/// real workers started clocking in.
+#[sqlx::test(migrations = "../../migrations")]
+async fn inquiry_detail_survives_an_employee_punch(pool: PgPool) {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let customer_id = test_helpers::insert_test_customer(&pool).await;
+    let origin_id =
+        test_helpers::insert_test_address(&pool, "Musterstr. 1", "Hildesheim", "31134", None, None)
+            .await;
+    let dest_id =
+        test_helpers::insert_test_address(&pool, "Zielstr. 5", "Hannover", "30159", None, None)
+            .await;
+    let inquiry_id = test_helpers::insert_test_inquiry_full(
+        &pool,
+        customer_id,
+        origin_id,
+        dest_id,
+        "scheduled",
+        "foto",
+        None,
+    )
+    .await;
+    let emp_id = test_helpers::insert_test_employee(&pool, "Max", "Mustermann").await;
+    let job_date = chrono::NaiveDate::from_ymd_opt(2026, 9, 11).unwrap();
+    test_helpers::insert_test_inquiry_employee(&pool, inquiry_id, emp_id, job_date, 8.0).await;
+
+    // The trigger: a worker punches in and out from their phone.
+    sqlx::query(
+        "UPDATE inquiry_employees
+            SET employee_clock_in      = '2026-09-11T08:00:00+00:00',
+                employee_clock_out     = '2026-09-11T16:30:00+00:00',
+                employee_break_minutes = 30
+          WHERE inquiry_id = $1 AND employee_id = $2",
+    )
+    .bind(inquiry_id)
+    .bind(emp_id)
+    .execute(&pool)
+    .await
+    .expect("seed employee punch");
+
+    let state = test_helpers::test_app_state_with_pool(pool.clone()).await;
+    let app = aust_api::create_router(state);
+    let token = test_helpers::generate_test_jwt();
+
+    let response = app
+        .oneshot(
+            Request::get(format!("/api/v1/inquiries/{inquiry_id}"))
+                .header("Authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "inquiry detail must not 500 once a worker has punched in"
+    );
+
+    let bytes = axum::body::to_bytes(response.into_body(), 8 * 1024 * 1024)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+    let crew = json["employees"]
+        .as_array()
+        .expect("employees array in response");
+    assert_eq!(crew.len(), 1, "exactly one crew member");
+
+    // The self-reported span must survive as 8.5 gross hours, not be dropped.
+    let hours = crew[0]["employee_actual_hours"]
+        .as_f64()
+        .expect("employee_actual_hours must be derived from the punch");
+    assert!(
+        (hours - 8.5).abs() < 0.001,
+        "08:00→16:30 is 8.5 gross hours, got {hours}"
+    );
+
+    // The admin's authoritative hours stay untouched: no admin clock_in/clock_out
+    // was set, so actual_hours must be null rather than silently borrowing the
+    // worker's self-report.
+    assert!(
+        crew[0]["actual_hours"].is_null(),
+        "admin actual_hours must not be derived from the worker's self-report, got {:?}",
+        crew[0]["actual_hours"]
+    );
+}
