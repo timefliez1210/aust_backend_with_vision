@@ -10,7 +10,7 @@ into the `aust-email-agent` Telegram poller.
 | Module | Purpose |
 |--------|---------|
 | `soul.rs` | Loads + validates SOUL.md at startup; exposes parsed sections |
-| `llm.rs` | Two-tier LLM routing (Main: `kimi-k2.6` / Cheap: `deepseek-v4-flash`), both **hardcoded** in `model_name()` — see Key Constraints |
+| `llm.rs` | Two-tier LLM routing (Main / Cheap) plus an image override, all config-driven — see Key Constraints |
 | `roles.rs` | `Role { Owner, Operator }` + satisfaction helpers |
 | `bindings.rs` | Telegram chat_id → (user_id, role) repo |
 | `session.rs` | Per-chat rolling turn history with LLM summarisation |
@@ -63,11 +63,22 @@ directly (would create a circular dependency); `DraftOffer`/`CommitOfferDraft` g
 - `driver.rs` is named `driver` not `loop` — `loop` is a reserved Rust keyword.
 - No `unwrap()` in non-test code.
 - German for all user-facing strings (tool descriptions, Telegram replies).
-- **The chat model is hardcoded, not config-driven.** `llm.rs::OllamaAssistantLlm::model_name()`
-  returns a fixed `"kimi-k2.6"`/`"deepseek-v4-flash"` per `ModelTier`. `CompanyConfig`'s sibling
-  `LlmConfig::ollama.model` field (env var `AUST__LLM__OLLAMA__MODEL`) looks like it should
-  control this — it does not; that field feeds a *different* generic Ollama provider elsewhere
-  in the codebase (e.g. vision), not Josie. Changing Josie's model means editing `model_name()`.
+- **Josie's models come from `LlmConfig::ollama`, but not from its `model` field.**
+  `assistant_model` / `assistant_cheap_model` / `assistant_vision_model` (env
+  `AUST__LLM__OLLAMA__ASSISTANT_MODEL`, `…__ASSISTANT_CHEAP_MODEL`, `…__ASSISTANT_VISION_MODEL`)
+  feed `OllamaAssistantLlm::with_models()`/`with_vision_model()` in `src/main.rs`; defaults live
+  in `llm.rs` as `DEFAULT_MAIN_MODEL` / `DEFAULT_CHEAP_MODEL` / `DEFAULT_VISION_MODEL`. The
+  sibling `LlmConfig::ollama.model` (`AUST__LLM__OLLAMA__MODEL`) looks like it should control
+  this — it does not; that field feeds a *different* generic Ollama provider elsewhere in the
+  codebase (e.g. vision), not Josie.
+- **Ollama Cloud gates models by plan.** On the free plan `kimi-k2.6`, `deepseek-v4-flash`,
+  `glm-*`, `qwen3.5:397b`, `minimax-m*`, `mistral-large-3` and `deepseek-*` all answer
+  `402 "this model is not included in your free usage"`. Free-plan usable as of 2026-09:
+  `gpt-oss:120b`, `gpt-oss:20b`, `gemma4:31b`, `nemotron-3-super`, `nemotron-3-nano:30b`.
+- **Only the vision model may see images.** `gpt-oss:*` and `nemotron-*` reject an
+  image-bearing request outright (`"this model does not support image input"`), so
+  `chat_core` routes any turn carrying `images` to `vision_model` regardless of tier.
+  `gemma4:31b` is the free multimodal option.
 - `LinfaPredictor::train` and `predict` are `unimplemented!("Phase 5")`.
 - `NoopTranscriber::transcribe` returns `Err(VoiceUnsupported)` — Phase 6 wires real ASR.
 - Tools never call `offer_builder` directly (would create circular dep); `DraftOffer`/`CommitOfferDraft` return a marker JSON via the `OfferService` trait instead.

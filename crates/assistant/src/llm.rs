@@ -1,9 +1,15 @@
 //! LLM routing layer for the assistant.
 //!
 //! Wraps `crates/llm-providers` with a two-tier model selection:
-//! - [`ModelTier::Main`] → `kimi-k2.6` (conversational + tool-calling)
-//! - [`ModelTier::Cheap`] → `deepseek-v4-flash` (background tasks: reflection, summarisation,
-//!   consolidation)
+//! - [`ModelTier::Main`] → conversational + tool-calling (default `gpt-oss:120b`)
+//! - [`ModelTier::Cheap`] → background tasks: reflection, summarisation, consolidation
+//!   (default `gemma4:31b`)
+//!
+//! Both names are configurable (`AUST__LLM__OLLAMA__ASSISTANT_MODEL` /
+//! `…__ASSISTANT_CHEAP_MODEL`) because Ollama Cloud gates models by plan: the
+//! former defaults (`kimi-k2.6`, `deepseek-v4-flash`) answer
+//! `402 "this model is not included in your free usage"`. The defaults here are
+//! free-plan models that still tool-call reliably and write clean German.
 //!
 //! The `AssistantLlm` struct holds two pre-configured provider instances. All callers
 //! go through this facade rather than directly referencing the LLM provider.
@@ -17,9 +23,9 @@ use crate::error::{AssistantError, Result};
 /// Which LLM tier to use for a given request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelTier {
-    /// Full conversational model with tool-calling support (kimi-k2.6).
+    /// Full conversational model with tool-calling support.
     Main,
-    /// Cheap background model for reflection, summarisation, consolidation (deepseek-v4-flash).
+    /// Cheap background model for reflection, summarisation, consolidation.
     Cheap,
 }
 
@@ -82,18 +88,40 @@ pub trait AssistantLlmProvider: Send + Sync {
 /// timeout, which is the failure mode behind the email auto-responder's
 /// "Network error: error sending request for url (…/api/chat)" — a long
 /// generation on Ollama Cloud whose idle connection gets killed mid-flight.
+/// Default [`ModelTier::Main`] model: free-plan usable on Ollama Cloud, reliable
+/// tool-caller and the cleanest German of the free models we benchmarked.
+pub const DEFAULT_MAIN_MODEL: &str = "gpt-oss:120b";
+
+/// Default [`ModelTier::Cheap`] model: free-plan usable, sub-second on short
+/// summarisation prompts.
+pub const DEFAULT_CHEAP_MODEL: &str = "gemma4:31b";
+
+/// Default model for turns that carry images (Telegram photos, rasterized PDF
+/// pages). The text models above are **not** multimodal — Ollama Cloud rejects
+/// an image-bearing request to them outright with
+/// `"this model does not support image input"` — so any turn with images is
+/// routed here regardless of tier.
+pub const DEFAULT_VISION_MODEL: &str = "gemma4:31b";
+
 pub struct OllamaAssistantLlm {
     /// Ollama base URL for the raw `/api/chat` and `/api/embeddings` endpoints.
     base_url: String,
     /// API key for the raw `/api/chat` (tool-calling) and `/api/embeddings` requests.
     /// Ollama Cloud requires `Authorization: Bearer <key>`; without it requests 401.
     api_key: Option<String>,
+    /// Model used for [`ModelTier::Main`].
+    main_model: String,
+    /// Model used for [`ModelTier::Cheap`].
+    cheap_model: String,
+    /// Model used whenever a turn carries images, overriding the tier model.
+    vision_model: String,
     http: reqwest::Client,
 }
 
 impl OllamaAssistantLlm {
-    /// Construct from explicit base URL. Both tiers hit the same Ollama instance
-    /// but select a different model name per [`ModelTier`].
+    /// Construct from explicit base URL, using the default free-plan models.
+    /// Both tiers hit the same Ollama instance but select a different model
+    /// name per [`ModelTier`]; use [`Self::with_models`] to override them.
     pub fn new(base_url: impl Into<String>, api_key: Option<String>) -> Self {
         let url = base_url.into();
         // Generous per-request ceiling: conversational/email generations on the
@@ -106,14 +134,57 @@ impl OllamaAssistantLlm {
         Self {
             base_url: url,
             api_key: api_key.filter(|k| !k.is_empty()),
+            main_model: DEFAULT_MAIN_MODEL.to_string(),
+            cheap_model: DEFAULT_CHEAP_MODEL.to_string(),
+            vision_model: DEFAULT_VISION_MODEL.to_string(),
             http,
         }
     }
 
-    fn model_name(&self, tier: ModelTier) -> &'static str {
+    /// Override the per-tier model names (empty strings keep the default).
+    #[must_use]
+    pub fn with_models(
+        mut self,
+        main: impl Into<String>,
+        cheap: impl Into<String>,
+    ) -> Self {
+        let main = main.into();
+        let cheap = cheap.into();
+        if !main.is_empty() {
+            self.main_model = main;
+        }
+        if !cheap.is_empty() {
+            self.cheap_model = cheap;
+        }
+        self
+    }
+
+    /// Override the model used for image-bearing turns (empty keeps the default).
+    #[must_use]
+    pub fn with_vision_model(mut self, vision: impl Into<String>) -> Self {
+        let vision = vision.into();
+        if !vision.is_empty() {
+            self.vision_model = vision;
+        }
+        self
+    }
+
+    /// Pick the model for a request: image-bearing turns must go to a
+    /// multimodal model, because the text-only tiers reject them outright with
+    /// "this model does not support image input" — which would surface as
+    /// Josie going silent on a photo.
+    fn select_model(&self, tier: ModelTier, messages: &[LlmMessage]) -> &str {
+        if messages.iter().any(|m| !m.images.is_empty()) {
+            &self.vision_model
+        } else {
+            self.model_name(tier)
+        }
+    }
+
+    fn model_name(&self, tier: ModelTier) -> &str {
         match tier {
-            ModelTier::Main => "kimi-k2.6",
-            ModelTier::Cheap => "deepseek-v4-flash",
+            ModelTier::Main => &self.main_model,
+            ModelTier::Cheap => &self.cheap_model,
         }
     }
 
@@ -175,7 +246,7 @@ impl OllamaAssistantLlm {
         messages: &[LlmMessage],
         tools: &[ToolSchema],
     ) -> Result<ChatResponse> {
-        let model = self.model_name(tier);
+        let model = self.select_model(tier, messages).to_string();
         let url = format!("{}/api/chat", self.base_url);
 
         let ollama_messages: Vec<Value> = messages
@@ -337,5 +408,63 @@ impl AssistantLlmProvider for MockAssistantLlm {
     async fn embed(&self, _text: &str) -> Result<Vec<f32>> {
         // Deterministic 768-dim unit vector for tests.
         Ok(vec![0.001_f32; 768])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn msg(content: &str, images: Vec<String>) -> LlmMessage {
+        LlmMessage {
+            role: aust_llm_providers::LlmRole::User,
+            content: content.to_string(),
+            images,
+        }
+    }
+
+    #[test]
+    fn defaults_are_free_plan_models() {
+        let llm = OllamaAssistantLlm::new("https://ollama.com", None);
+        assert_eq!(llm.model_name(ModelTier::Main), DEFAULT_MAIN_MODEL);
+        assert_eq!(llm.model_name(ModelTier::Cheap), DEFAULT_CHEAP_MODEL);
+        assert_eq!(llm.vision_model, DEFAULT_VISION_MODEL);
+    }
+
+    #[test]
+    fn with_models_overrides_both_tiers() {
+        let llm = OllamaAssistantLlm::new("https://ollama.com", None)
+            .with_models("model-a", "model-b")
+            .with_vision_model("model-c");
+        assert_eq!(llm.model_name(ModelTier::Main), "model-a");
+        assert_eq!(llm.model_name(ModelTier::Cheap), "model-b");
+        assert_eq!(llm.vision_model, "model-c");
+    }
+
+    #[test]
+    fn empty_override_keeps_the_default() {
+        let llm = OllamaAssistantLlm::new("https://ollama.com", None)
+            .with_models("", "")
+            .with_vision_model("");
+        assert_eq!(llm.model_name(ModelTier::Main), DEFAULT_MAIN_MODEL);
+        assert_eq!(llm.model_name(ModelTier::Cheap), DEFAULT_CHEAP_MODEL);
+        assert_eq!(llm.vision_model, DEFAULT_VISION_MODEL);
+    }
+
+    /// The text tiers reject image payloads outright, so a turn carrying an
+    /// image must be sent to the vision model even on the Main tier.
+    #[test]
+    fn images_select_the_vision_model() {
+        let llm = OllamaAssistantLlm::new("https://ollama.com", None)
+            .with_models("text-main", "text-cheap")
+            .with_vision_model("sees-pictures");
+
+        let with_image = [msg("Was ist das?", vec!["base64".to_string()])];
+        let text_only = [msg("Moin", vec![])];
+
+        assert_eq!(llm.select_model(ModelTier::Main, &with_image), "sees-pictures");
+        assert_eq!(llm.select_model(ModelTier::Cheap, &with_image), "sees-pictures");
+        assert_eq!(llm.select_model(ModelTier::Main, &text_only), "text-main");
+        assert_eq!(llm.select_model(ModelTier::Cheap, &text_only), "text-cheap");
     }
 }

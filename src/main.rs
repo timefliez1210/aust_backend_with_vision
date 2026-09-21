@@ -103,13 +103,39 @@ async fn main() -> Result<()> {
     // Build assistant dependencies (LLM, tool registry, soul).
     // Soul is loaded from SOUL.md; missing file is non-fatal — falls back to a stub.
     let assistant_llm: std::sync::Arc<dyn aust_assistant::AssistantLlmProvider> = {
-        let (base_url, api_key) = config
+        let (base_url, api_key, main_model, cheap_model, vision_model) = config
             .llm
             .ollama
             .as_ref()
-            .map(|o| (o.base_url.clone(), o.api_key.clone()))
-            .unwrap_or_else(|| ("http://localhost:11434".to_string(), None));
-        std::sync::Arc::new(OllamaAssistantLlm::new(base_url, api_key))
+            .map(|o| {
+                (
+                    o.base_url.clone(),
+                    o.api_key.clone(),
+                    o.assistant_model.clone(),
+                    o.assistant_cheap_model.clone(),
+                    o.assistant_vision_model.clone(),
+                )
+            })
+            .unwrap_or_else(|| {
+                (
+                    "http://localhost:11434".to_string(),
+                    None,
+                    aust_assistant::llm::DEFAULT_MAIN_MODEL.to_string(),
+                    aust_assistant::llm::DEFAULT_CHEAP_MODEL.to_string(),
+                    aust_assistant::llm::DEFAULT_VISION_MODEL.to_string(),
+                )
+            });
+        tracing::info!(
+            main_model = %main_model,
+            cheap_model = %cheap_model,
+            vision_model = %vision_model,
+            "assistant LLM models"
+        );
+        std::sync::Arc::new(
+            OllamaAssistantLlm::new(base_url, api_key)
+                .with_models(main_model, cheap_model)
+                .with_vision_model(vision_model),
+        )
     };
     // Email auto-replies are generated through Josie's LLM (same resilient
     // `/api/chat` path), not the generic provider — see EmailResponder.

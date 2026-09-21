@@ -128,6 +128,9 @@ All variables follow the pattern `AUST__SECTION__KEY` (double underscore as sepa
 | `AUST__LLM__OPENAI__MODEL` | OpenAI model ID | `gpt-4o` |
 | `AUST__LLM__OLLAMA__BASE_URL` | Ollama base URL | `http://localhost:11434` |
 | `AUST__LLM__OLLAMA__MODEL` | Ollama model name | `llama3.2-vision` |
+| `AUST__LLM__OLLAMA__ASSISTANT_MODEL` | Josie/email conversational + tool-calling model | `gpt-oss:120b` |
+| `AUST__LLM__OLLAMA__ASSISTANT_CHEAP_MODEL` | Josie background tier (reflection, summarisation) | `gemma4:31b` |
+| `AUST__LLM__OLLAMA__ASSISTANT_VISION_MODEL` | Model for assistant turns carrying images (must be multimodal) | `gemma4:31b` |
 | `AUST__MAPS__API_KEY` | OpenRouteService API key | `5b3ce3...` |
 | `AUST__EMAIL__IMAP_HOST` | IMAP server hostname | `imap.example.com` |
 | `AUST__EMAIL__IMAP_PORT` | IMAP port (SSL) | `993` |

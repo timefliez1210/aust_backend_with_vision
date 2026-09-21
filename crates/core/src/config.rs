@@ -143,6 +143,35 @@ pub struct OllamaConfig {
     pub model: String,
     /// Optional bearer token when Ollama is behind an authenticated proxy.
     pub api_key: Option<String>,
+    /// Model the Telegram assistant (Josie) and the email auto-responder use for
+    /// conversational turns and tool-calling.
+    ///
+    /// **Why configurable**: Ollama Cloud gates most models behind a paid plan —
+    /// `kimi-k2.6` and friends answer `402 "not included in your free usage"`.
+    /// The default is the strongest model that is free-plan usable and still
+    /// writes clean German (`gpt-oss:120b`).
+    #[serde(default = "default_assistant_model")]
+    pub assistant_model: String,
+    /// Model for the assistant's background work (reflection, summarisation,
+    /// memory consolidation), where latency matters more than depth.
+    #[serde(default = "default_assistant_cheap_model")]
+    pub assistant_cheap_model: String,
+    /// Model for assistant turns that carry images (Telegram photos, rasterized
+    /// PDF pages). Must be multimodal — the text tiers above are not.
+    #[serde(default = "default_assistant_vision_model")]
+    pub assistant_vision_model: String,
+}
+
+fn default_assistant_model() -> String {
+    "gpt-oss:120b".to_string()
+}
+
+fn default_assistant_cheap_model() -> String {
+    "gemma4:31b".to_string()
+}
+
+fn default_assistant_vision_model() -> String {
+    "gemma4:31b".to_string()
 }
 
 /// Geocoding / routing provider settings.
