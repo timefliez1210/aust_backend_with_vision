@@ -132,6 +132,8 @@ impl InvoiceService for InvoiceServiceImpl {
             billing_city: String::new(),
             service_street: String::new(),
             service_city: String::new(),
+            destination_street: String::new(),
+            destination_city: String::new(),
             offer_number: kva_nr.to_string(),
             salutation: customer.formal_greeting(),
             line_items,

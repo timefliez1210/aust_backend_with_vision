@@ -207,6 +207,9 @@ fn build_storage_invoice_data(
         billing_city: billing_city.clone(),
         service_street: billing_street,
         service_city: billing_city,
+        // Lagerung is billed for a place we keep the goods, not a route.
+        destination_street: String::new(),
+        destination_city: String::new(),
         offer_number: String::new(),
         salutation: customer.formal_greeting(),
         line_items: vec![line_item],

@@ -731,6 +731,23 @@ pub(crate) async fn fetch_origin_address_id(
         .map(|opt: Option<Option<Uuid>>| opt.flatten())
 }
 
+/// Fetch the destination (Entladestelle) address ID for an inquiry.
+///
+/// **Caller**: `invoices::load_invoice_context` — the second half of the Auftragsort.
+/// **Why**: A move is performed between two places, so the invoice names both ends.
+/// The intermediate `stop_address_id` is deliberately *not* read here: a
+/// Zwischenstopp is priced, not a place the job was performed for.
+pub(crate) async fn fetch_destination_address_id(
+    pool: &PgPool,
+    inquiry_id: Uuid,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    sqlx::query_scalar("SELECT destination_address_id FROM inquiries WHERE id = $1")
+        .bind(inquiry_id)
+        .fetch_optional(pool)
+        .await
+        .map(|opt: Option<Option<Uuid>>| opt.flatten())
+}
+
 /// Fetch the latest offer netto price for an inquiry.
 ///
 /// **Caller**: `invoices::get_offer_netto`

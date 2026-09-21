@@ -985,6 +985,8 @@ struct InvoiceContext {
     billing_city: String,
     service_street: String,
     service_city: String,
+    destination_street: String,
+    destination_city: String,
     moving_date: Option<chrono::NaiveDate>,
 }
 
@@ -1087,6 +1089,30 @@ async fn load_invoice_context(
         })
         .unwrap_or_default();
 
+    // Destination (Entladestelle) — the other end of the Auftragsort line.
+    // A Zwischenstopp is never loaded: only the two ends of the route are printed.
+    let destination_addr_id = invoice_repo::fetch_destination_address_id(db, inquiry_id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let destination = address_repo::fetch_optional(db, destination_addr_id).await?;
+    let destination_street = destination
+        .as_ref()
+        .map(|a| {
+            match a.house_number.as_deref() {
+                Some(hn) if !hn.is_empty() => format!("{} {}", a.street, hn),
+                _ => a.street.clone(),
+            }
+        })
+        .unwrap_or_default();
+    let destination_city = destination
+        .as_ref()
+        .map(|a| {
+            let postal = a.postal_code.as_deref().unwrap_or("");
+            let city = a.city.as_str();
+            if postal.is_empty() { city.to_string() } else { format!("{postal} {city}") }
+        })
+        .unwrap_or_default();
+
     Ok(InvoiceContext {
         offer,
         customer,
@@ -1094,6 +1120,8 @@ async fn load_invoice_context(
         billing_city,
         service_street,
         service_city,
+        destination_street,
+        destination_city,
         moving_date,
     })
 }
@@ -1140,6 +1168,8 @@ fn build_invoice_data_from_items(
         billing_city: ctx.billing_city.clone(),
         service_street: ctx.service_street.clone(),
         service_city: ctx.service_city.clone(),
+        destination_street: ctx.destination_street.clone(),
+        destination_city: ctx.destination_city.clone(),
         offer_number: ctx.offer.offer_number.clone().unwrap_or_default(),
         salutation: ctx.customer.formal_greeting(),
         line_items,

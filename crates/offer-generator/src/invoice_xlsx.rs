@@ -6,16 +6,16 @@
 //!
 //! ## Template
 //!
-//! The invoice generator uses `templates/Rechnung_Vorlage_v3.xlsx`, which is
-//! derived from the manually created Rechnung layout (see `2025- Luttert.xlsx`).
+//! The invoice generator uses `templates/Rechnung_Vorlage_v4.xlsx`, which is
+//! derived from the manually created Rechnung layout (see `01 Rechnungen.xlsx`).
 //! The layout uses columns A–E with a clean invoice design:
 //!
 //! - **Address block**: A8–A11 (customer), A12 (contact)
 //! - **Dates**:        C18/E18 labels, C19 service date, E19 invoice date
 //! - **Title**:        A22 (e.g. "Rechnung Nr. 2026-0042")
 //! - **Salutation**:   A24
-//! - **Auftragsort**:  A26
-//! - **Intro text**:   A27
+//! - **Intro text**:   A26
+//! - **Auftragsort**:  A27 (merged A27:E28) — Belade- und Entladestelle
 //! - **Table header**: Row 30 (Pos., Beschreibung, Menge, Einzelpreis, Gesamtpreis)
 //! - **Line items**:   rows 31–50 (A=pos, B=desc, C=qty, D=unit_price, E=formula D*C)
 //! - **Totals**:       Row 51 Nettosumme (E51=SUM(E31:E50)),
@@ -106,6 +106,12 @@ pub struct InvoiceData {
     /// Service location (Auftragsort) postal code + city (A27).
     /// Defaults to billing city when empty.
     pub service_city: String,
+    /// Entladestelle street + house number, printed as the second half of the
+    /// Auftragsort line (A27). Empty when the job has no destination address
+    /// (Entrümpelung, Lagerung) — the line then names the one place only.
+    pub destination_street: String,
+    /// Entladestelle postal code + city (A27, second half).
+    pub destination_city: String,
     /// Offer number used in line item descriptions, e.g. `"2026-0042"`.
     pub offer_number: String,
     /// Formal salutation line, e.g. `"Sehr geehrter Herr Müller,"`.
@@ -302,6 +308,19 @@ pub fn generate_invoice_xlsx(data: &InvoiceData) -> Result<Vec<u8>, OfferError> 
 /// - E54: Rechnungsbetrag / E51+E52
 ///
 /// Footer: already present as shared strings in the template.
+/// Join a street and a "PLZ Ort" line into one printable address.
+///
+/// Either half may be missing (a half-filled address row), so the separator is
+/// only emitted when both sides actually carry text.
+fn join_address(street: &str, city: &str) -> String {
+    match (street.trim(), city.trim()) {
+        ("", "") => String::new(),
+        (s, "") => s.to_string(),
+        ("", c) => c.to_string(),
+        (s, c) => format!("{s}, {c}"),
+    }
+}
+
 fn build_cell_modifications(
     data: &InvoiceData,
 ) -> (Vec<(String, CellValue)>, Vec<u32>, Vec<u32>) {
@@ -386,9 +405,21 @@ fn build_cell_modifications(
     } else {
         data.service_city.clone()
     };
+    // A move runs Beladestelle → [Zwischenstopp] → Entladestelle. The invoice
+    // names only the two ends: the Zwischenstopp is priced (extra kilometres and
+    // loading time), but it is not a place the job was performed *for*, and
+    // printing three addresses made the line wrap into the intro text.
+    let auftragsort = match (
+        join_address(&service_street, &service_city),
+        join_address(&data.destination_street, &data.destination_city),
+    ) {
+        (origin, destination) if destination.is_empty() || destination == origin => origin,
+        (origin, _) if origin.is_empty() => join_address(&data.destination_street, &data.destination_city),
+        (origin, destination) => format!("{origin} – {destination}"),
+    };
     mods.push((
         "A27".into(),
-        CellValue::Text(format!("Auftragsort: {service_street}, {service_city}")),
+        CellValue::Text(format!("Auftragsort: {auftragsort}")),
     ));
 
     // ── Line items (rows 31–50, columns A-D) ──────────────────────────────
@@ -665,6 +696,8 @@ mod tests {
             billing_city: "31135 Hildesheim".into(),
             service_street: String::new(),
             service_city: String::new(),
+            destination_street: String::new(),
+            destination_city: String::new(),
             offer_number: "2026-0042".into(),
             salutation: "Sehr geehrter Herr Mustermann,".into(),
             line_items: vec![
@@ -724,6 +757,8 @@ mod tests {
             billing_city: "30159 Hannover".into(),
             service_street: String::new(),
             service_city: String::new(),
+            destination_street: String::new(),
+            destination_city: String::new(),
             offer_number: "2026-0010".into(),
             salutation: "Sehr geehrte Frau Musterfrau,".into(),
             line_items: vec![InvoiceLineItem {
@@ -758,6 +793,8 @@ mod tests {
             billing_city: "12345 Altstadt".into(),
             service_street: String::new(),
             service_city: String::new(),
+            destination_street: String::new(),
+            destination_city: String::new(),
             offer_number: "2025-0099".into(),
             salutation: "Sehr geehrte Damen und Herren,".into(),
             line_items: vec![], // empty → triggers legacy path
@@ -806,6 +843,8 @@ mod tests {
             billing_city: "31162 Bad Salzdetfurth".into(),
             service_street: String::new(),
             service_city: String::new(),
+            destination_street: String::new(),
+            destination_city: String::new(),
             offer_number: "2026-0006".into(),
             salutation: "Sehr geehrter Herr Karge,".into(),
             line_items: vec![
