@@ -22,8 +22,9 @@ use crate::routes::inquiry_actions::{
     retry_estimation, trigger_estimate, trigger_estimate_upload, trigger_video_upload,
     update_assignment, update_inquiry_items,
 };
-use crate::services::inquiry_builder;
+use crate::services::{inquiry_builder, route_plan};
 use crate::{ApiError, AppState};
+use aust_distance_calculator::{RouteCalculator, RouteRequest};
 use aust_core::models::{
     InquiryListItem, InquiryResponse as InquiryResponseModel, InquiryStatus, Services, TokenClaims,
 };
@@ -52,6 +53,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/{id}/estimate/{method}", post(trigger_estimate))
         .route("/{id}/generate-offer", post(generate_inquiry_offer))
         .route("/{id}/emails", get(get_inquiry_emails))
+        .route("/{id}/route", get(get_inquiry_route))
         .route(
             "/{id}/employees",
             get(list_inquiry_employees).post(assign_employee).put(put_inquiry_employees),
@@ -762,6 +764,100 @@ async fn get_inquiry_emails(
 ) -> Result<Json<Vec<inquiry_repo::EmailThreadSummary>>, ApiError> {
     let threads = inquiry_repo::fetch_email_threads(&state.db, inquiry_id).await?;
     Ok(Json(threads))
+}
+
+
+// ---------------------------------------------------------------------------
+// Route (Umzugsroute)
+// ---------------------------------------------------------------------------
+
+/// One driven leg of the Umzugsroute, as rendered in the admin Route card.
+#[derive(Debug, Serialize)]
+struct InquiryRouteLeg {
+    /// German role label of the leg's start, e.g. `"Lager"` or `"Auszug"`.
+    from_label: String,
+    /// German role label of the leg's end.
+    to_label: String,
+    from_address: String,
+    to_address: String,
+    distance_km: f64,
+    duration_minutes: u32,
+    /// GeoJSON `[[lng, lat], ...]` polyline for this leg only; the frontend
+    /// concatenates all legs to draw the whole trip.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    geometry: Vec<[f64; 2]>,
+}
+
+/// Full round-trip route for an inquiry.
+#[derive(Debug, Serialize)]
+struct InquiryRouteResponse {
+    /// Sum over all legs — the figure the Fahrkostenpauschale is priced from.
+    total_distance_km: f64,
+    total_duration_minutes: u32,
+    legs: Vec<InquiryRouteLeg>,
+}
+
+/// `GET /api/v1/inquiries/{id}/route` — driven round trip Lager → Auszug → [Zwischenstopp] → Einzug → Lager.
+///
+/// **Caller**: Admin inquiry detail page (Route card: map polyline + per-leg km list).
+/// **Why**: the page used to post `[origin, destination]` to `/distance/calculate` itself,
+/// which left out the depot and the Zwischenstopp — so the map showed a shorter trip than
+/// the KVA charged and the total kilometres were nowhere on screen (report bce7d392). The
+/// waypoints now come from `route_plan`, the same helper the Fahrkostenpauschale uses, and
+/// the depot stays server-side config.
+///
+/// # Errors
+/// - 400 — inquiry has no Auszug or no Einzug address yet
+/// - 500 — ORS unreachable or an address could not be geocoded
+async fn get_inquiry_route(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<InquiryRouteResponse>, ApiError> {
+    let inquiry = inquiry_repo::fetch_by_id(&state.db, id).await?;
+
+    let origin = address_repo::fetch_optional(&state.db, inquiry.origin_address_id).await?;
+    let destination = address_repo::fetch_optional(&state.db, inquiry.destination_address_id).await?;
+    let stop = address_repo::fetch_optional(&state.db, inquiry.stop_address_id).await?;
+
+    let waypoints = route_plan::build_waypoints(
+        &state.config.company.depot_address,
+        origin.as_ref(),
+        destination.as_ref(),
+        stop.as_ref(),
+    )
+    .ok_or_else(|| {
+        ApiError::BadRequest("Route benötigt eine Auszugs- und eine Einzugsadresse".into())
+    })?;
+
+    let labels: Vec<String> = waypoints.iter().map(|w| w.label.clone()).collect();
+    let addresses: Vec<String> = waypoints.iter().map(|w| w.address.clone()).collect();
+
+    let calculator = RouteCalculator::new(state.config.maps.api_key.clone());
+    let result = calculator
+        .calculate(&RouteRequest { addresses })
+        .await
+        .map_err(|e| ApiError::Internal(format!("Routenberechnung fehlgeschlagen: {e}")))?;
+
+    let legs = result
+        .legs
+        .into_iter()
+        .enumerate()
+        .map(|(i, leg)| InquiryRouteLeg {
+            from_label: labels[i].clone(),
+            to_label: labels[i + 1].clone(),
+            from_address: leg.from_address,
+            to_address: leg.to_address,
+            distance_km: leg.distance_km,
+            duration_minutes: leg.duration_minutes,
+            geometry: leg.geometry,
+        })
+        .collect();
+
+    Ok(Json(InquiryRouteResponse {
+        total_distance_km: result.total_distance_km,
+        total_duration_minutes: result.total_duration_minutes,
+        legs,
+    }))
 }
 
 /// `GET /api/v1/inquiries/{id}/employees/{emp_id}/travel-expenses` — Generate travel expense XLSX.

@@ -815,6 +815,53 @@ curl http://localhost:8080/api/v1/inquiries/019500000000000000000000/emails \
 
 ---
 
+### GET /api/v1/inquiries/{id}/route
+
+Driven round trip for this inquiry: **Lager → Auszug → [Zwischenstopp] → Einzug → Lager**.
+
+The waypoints are built server-side by `services::route_plan`, the same helper
+`offer_builder::build_fahrt_item` uses to price the Fahrkostenpauschale — the depot address
+is backend config (`company.depot_address`), so the map cannot drift from the KVA. Note this
+differs from the inquiry's `distance_km` field, which is the one-way customer distance.
+
+Each call costs one ORS geocode per waypoint plus one directions request per leg (free tier:
+40 req/min), so call it once per page load rather than on every edit.
+
+**Auth**: Bearer JWT
+
+**Response** `200 OK`
+```typescript
+{
+  total_distance_km: number;
+  total_duration_minutes: number;
+  legs: {
+    from_label: "Lager" | "Auszug" | "Zwischenstopp" | "Einzug";
+    to_label:   "Lager" | "Auszug" | "Zwischenstopp" | "Einzug";
+    from_address: string;
+    to_address: string;
+    distance_km: number;
+    duration_minutes: number;
+    geometry?: [number, number][];  // [lng, lat] pairs, omitted when empty
+  }[];
+}
+```
+
+**Status codes**
+| Code | Meaning |
+|---|---|
+| 200 | OK |
+| 400 | Inquiry has no Auszug and/or no Einzug address |
+| 404 | Inquiry not found |
+| 500 | ORS unreachable or an address could not be geocoded |
+
+**Example**
+```bash
+curl http://localhost:8080/api/v1/inquiries/019500000000000000000000/route \
+  -H "Authorization: Bearer <token>"
+```
+
+---
+
 ### GET /api/v1/inquiries/{id}/employees/{emp_id}/travel-expenses
 
 Generate the travel-expenses (Reisekosten) document for one employee's assignment on this inquiry.

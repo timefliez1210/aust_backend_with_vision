@@ -4,6 +4,7 @@ use uuid::Uuid;
 use crate::ApiError;
 use crate::repositories::{AddressRow, CustomerRow};
 use crate::repositories::{address_repo, customer_repo, offer_repo, settings_repo};
+use crate::services::route_plan;
 use crate::types::resolve_billing_address_id;
 use crate::types::InquiryRow;
 use aust_core::config::Config;
@@ -993,20 +994,10 @@ async fn build_fahrt_item(
 ) -> OfferLineItem {
     let depot = config.company.depot_address.clone();
 
-    let format_addr = |a: &AddressRow| -> String {
-        match &a.postal_code {
-            Some(plz) => format!("{}, {} {}", a.street, plz, a.city),
-            None => format!("{}, {}", a.street, a.city),
-        }
-    };
-
-    let flat_total = if let (Some(orig), Some(dest)) = (origin, destination) {
-        let mut route_addrs = vec![depot.clone(), format_addr(orig)];
-        if let Some(s) = stop {
-            route_addrs.push(format_addr(s));
-        }
-        route_addrs.push(format_addr(dest));
-        route_addrs.push(depot.clone());
+    // Waypoints come from route_plan so the admin map (GET /inquiries/{id}/route) and this
+    // price are always the same trip — they used to be built independently and disagreed.
+    let flat_total = if let Some(waypoints) = route_plan::build_waypoints(&depot, origin, destination, stop) {
+        let route_addrs: Vec<String> = waypoints.into_iter().map(|w| w.address).collect();
 
         let calculator = RouteCalculator::new(config.maps.api_key.clone());
         match calculator.calculate(&RouteRequest { addresses: route_addrs }).await {

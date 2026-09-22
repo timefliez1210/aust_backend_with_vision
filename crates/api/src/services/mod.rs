@@ -7,6 +7,7 @@ pub(crate) mod offer_builder;
 pub(crate) mod offer_pipeline;
 pub(crate) mod otp_service;
 pub(crate) mod register_export;
+pub(crate) mod route_plan;
 pub mod storage_billing_service;
 pub(crate) mod telegram_service;
 pub(crate) mod vision;
