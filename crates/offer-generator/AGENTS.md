@@ -21,11 +21,14 @@ date_adjustment = saturday_surcharge_cents if Saturday, else 0
 
 ### Service Line Items (built in `offer_builder.rs`, not here)
 
-Service line-item prices come from `ServicePrices` (also `CompanyConfig`-driven):
-- Demontage/Montage: `assembly_price` (default €25)
-- Halteverbotszone: `parking_ban_price` per zone (default €100)
-- Umzugsmaterial: `packing_price` (default €30)
-- 3,5t Transporter m. Koffer: `transporter_price` (default €60)
+Service line-item prices come from `ServicePrices::from_positions()`, fed by the
+Positionen catalogue in `settings_repo.rs` (editable in Einstellungen → Positionen;
+see `formulas.md` for the full table):
+- Demontage: `demontage` (default €25) — priced separately from Montage
+- Montage: `montage` (default €25)
+- Halteverbotszone: `halteverbotszone` per zone (default €100)
+- Umzugsmaterial: `umzugsmaterial` (default €30)
+- 3,5t Transporter m. Koffer: `transporter_3_5t` (default €60)
 - Fahrkostenpauschale: ORS route `depot → origin → [stop] → destination → depot` (via `distance-calculator`) × `fahrt_rate_per_km` (default €1.00/km) — see `crates/distance-calculator/AGENTS.md` for why this ignores that crate's own `price_cents` field
 
 ## XLSX Generator (`src/xlsx.rs`)

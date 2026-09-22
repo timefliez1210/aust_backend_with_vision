@@ -2095,6 +2095,26 @@ Silence a thread's unanswered-mail reminder without marking it as handled.
 
 ---
 
+### GET /api/v1/admin/nav-badges
+
+Counts for the admin sidebar badges, polled once a minute by the navigation.
+
+**Auth**: Bearer JWT
+
+**Response** `200 OK`
+```json
+{ "flash_contacts": 1, "unread_emails": 3, "new_inquiries": 2, "kva_followups": 5 }
+```
+
+| Field | Meaning |
+|-------|---------|
+| `flash_contacts` | Rückrufe neither handled nor dismissed — the "Offen" list on `/admin/flash-contacts` |
+| `unread_emails` | Unread inbound messages, same number `GET /emails/unread` reports as `unread_messages` |
+| `new_inquiries` | Inquiries still at `pending`; deliberately narrower than the dashboard's "offene Anfragen" so the badge can reach zero |
+| `kva_followups` | KVAs past the follow-up threshold, unmuted, move date still ahead — the KVA-Buch Nachfassliste |
+
+---
+
 ### GET /api/v1/admin/emails/unread
 
 Badge counts for the mailbox nav.
@@ -2896,10 +2916,14 @@ Download one calendar year of the KVA register as XLSX.
     packing_price: number;
     transporter_price: number;
   };
+  // The fixed KVA positions and their effective unit prices.
+  positions: { key: string; label: string; remark: string; unit_price_cents: number }[];
   next_invoice_number: number;
   next_offer_number: number;
 }
 ```
+
+`pricing.assembly_price`, `parking_ban_price`, `packing_price` and `transporter_price` are legacy fallbacks: they still feed a position whose own price has never been saved, but the offer generator reads `positions`. Edit prices through `PUT /settings/positions`.
 
 ---
 
@@ -2910,6 +2934,32 @@ Persist the standard pricing values (see shape above).
 **Auth**: Bearer JWT (admin)
 
 **Response** `200 OK` — `{ "ok": true }`
+
+---
+
+### PUT /api/v1/admin/settings/positions
+
+Set the unit price of one or more fixed KVA positions. Only the positions in the body are touched.
+
+**Auth**: Bearer JWT (admin)
+
+**Request body**: `{ positions: [{ key: string; unit_price_cents: number }] }`
+
+**Response** `200 OK` — `{ "ok": true }`
+
+**Status codes**: `400` on an unknown `key` or a negative price — nothing is written if any entry is rejected.
+
+---
+
+### GET /api/v1/admin/positions
+
+The same catalogue as `GET /settings`, without the admin gate — the Positionen panel on an inquiry needs it, and a Bürokraft writes KVAs too.
+
+**Auth**: Bearer JWT (any admin-panel role)
+
+**Response** `200 OK` — `{ positions: [{ key, label, remark, unit_price_cents }] }`
+
+Price resolution per position: saved `position_price.<key>` → legacy scalar setting (`assembly_price`, `parking_ban_price`, `packing_price`, `transporter_price`) → code default in `POSITION_CATALOG`.
 
 ---
 

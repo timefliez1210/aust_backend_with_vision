@@ -92,7 +92,7 @@ All configurable via `config/*.toml` with `serde(default)`:
 | `depot_address` | String | "Borsigstr 6 31135 Hildesheim" | ORS route start/end |
 | `fahrt_rate_per_km` | f64 | 1.0 | Per-km travel charge (€) |
 | `rate_per_person_hour_cents` | i64 | 3000 | Labor rate (€30/hr) |
-| `assembly_price` | f64 | 25.0 | De/Montage per unit (€) |
+| `assembly_price` | f64 | 25.0 | De/Montage per unit (€) — fallback only; the live price is the Positionen catalogue in `settings_repo.rs` |
 | `parking_ban_price` | f64 | 100.0 | Halteverbotszone per zone (€) |
 | `packing_price` | f64 | 30.0 | Umzugsmaterial (€) |
 | `transporter_price` | f64 | 60.0 | 3,5t Transporter m. Koffer (€) |

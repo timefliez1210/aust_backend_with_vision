@@ -19,6 +19,34 @@ pub(crate) async fn count_open_inquiries(pool: &PgPool) -> Result<i64, sqlx::Err
     Ok(count)
 }
 
+/// Count inquiries that nobody has touched yet — the Anfragen badge.
+///
+/// **Caller**: `admin::nav_badges`
+/// **Why**: deliberately narrower than `count_open_inquiries`, which also counts
+/// `info_requested`/`estimated`. A badge that never returns to zero stops being
+/// read, so only fresh, unprocessed inquiries are counted.
+pub(crate) async fn count_new_inquiries(pool: &PgPool) -> Result<i64, sqlx::Error> {
+    let (count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM inquiries WHERE status = 'pending'")
+            .fetch_one(pool)
+            .await?;
+    Ok(count)
+}
+
+/// Count callback requests still waiting for a call — the Rückrufe badge.
+///
+/// **Caller**: `admin::nav_badges`
+/// **Why**: mirrors the "Offen" section of the Rückrufe page exactly: neither
+/// handled nor dismissed.
+pub(crate) async fn count_open_flash_contacts(pool: &PgPool) -> Result<i64, sqlx::Error> {
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM flash_contacts WHERE handled_at IS NULL AND dismissed_at IS NULL",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(count)
+}
+
 /// Count pending (draft) offers.
 pub(crate) async fn count_pending_offers(pool: &PgPool) -> Result<i64, sqlx::Error> {
     let (count,): (i64,) =

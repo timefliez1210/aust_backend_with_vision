@@ -38,15 +38,36 @@ implemented. If that's still wanted, it needs to be built, not just documented.
 |---|---|---|
 | Labor, per person-hour | `rate_per_person_hour_cents` | 3000 (€30.00) |
 | Saturday surcharge | `saturday_surcharge_cents` | 5000 (€50.00) |
-| Demontage/Montage | `assembly_price` | €25.00 |
-| Halteverbotszone (per zone) | `parking_ban_price` | €100.00 |
-| Umzugsmaterial | `packing_price` | €30.00 |
-| 3,5t Transporter m. Koffer | `transporter_price` | €60.00 |
 | Fahrkostenpauschale, per km | `fahrt_rate_per_km` | €1.00 |
 
-All seven are DB-overridable via the settings endpoints (`PricingSettings` in
+These three are DB-overridable via `PUT /settings/pricing` (`PricingSettings` in
 `settings_repo.rs`), falling back to `CompanyConfig`'s hardcoded defaults above when
 no DB row exists.
+
+### Position prices (`POSITION_CATALOG`, `settings_repo.rs`, DB-backed)
+
+Every fixed KVA position has its own price, edited in Einstellungen → Positionen
+(`PUT /settings/positions`, stored as `position_price.<key>` in cents):
+
+| Position | Key | Default |
+|---|---|---|
+| Demontage | `demontage` | €25.00 |
+| Montage | `montage` | €25.00 |
+| Einpackservice | `einpackservice` | €0.00 |
+| Halteverbotszone (per zone) | `halteverbotszone` | €100.00 |
+| Umzugsmaterial | `umzugsmaterial` | €30.00 |
+| Verkauf Seidenpapier | `verkauf_seidenpapier` | €5.00 |
+| Verkauf U-Karton | `verkauf_u_karton` | €2.10 |
+| Verkauf B-Karton | `verkauf_b_karton` | €2.20 |
+| Fernsehkarton | `fernsehkarton` | €0.00 |
+| Verleih Kleiderboxen | `verleih_kleiderboxen` | €10.00 |
+| 3,5t Transporter m. Koffer | `transporter_3_5t` | €60.00 |
+| Möbellift | `moebellift` | €0.00 |
+| Transferfahrzeug | `transferfahrzeug` | €0.00 |
+
+Resolution order: saved `position_price.<key>` → the pre-catalogue scalar setting
+(`assembly_price`, `parking_ban_price`, `packing_price`, `transporter_price`) →
+the default above.
 
 ## Fahrkostenpauschale (`offer_builder.rs::build_fahrt_item`)
 

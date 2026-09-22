@@ -53,6 +53,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/emails/{id}/reply", post(admin_emails::reply_to_thread))
         .route("/emails/{id}/inquiry", patch(admin_emails::link_thread_to_inquiry))
         .route("/emails/unread", get(admin_emails::email_unread_counts))
+        .route("/nav-badges", get(nav_badges))
         .route("/emails/{id}/mute", patch(admin_emails::set_thread_muted))
         .route(
             "/emails/messages/{id}/handled",
@@ -122,6 +123,8 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/flash-contacts/{id}/handle", post(handle_flash_contact))
         .route("/settings", get(get_settings))
         .route("/settings/pricing", put(update_pricing_settings))
+        .route("/settings/positions", put(update_position_prices))
+        .route("/positions", get(list_position_prices))
         .route("/settings/numbers", put(update_number_settings))
 }
 
@@ -2518,6 +2521,70 @@ fn lage_of(inquiry_status: Option<&str>) -> &'static str {
     }
 }
 
+/// Whether one KVA row is overdue for a follow-up call.
+///
+/// **Caller**: `kva_buch` (the Nachfassliste flag) and `nav_badges` (the count).
+/// **Why**: the badge has to agree with the list it links to; a second copy of
+/// this condition would drift the moment either side changes.
+fn kva_needs_followup(
+    r: &offer_repo::KvaBuchRow,
+    today: NaiveDate,
+    threshold_days: i64,
+) -> bool {
+    let kva_date = r
+        .created_at
+        .with_timezone(&chrono_tz::Europe::Berlin)
+        .date_naive();
+    lage_of(r.inquiry_status.as_deref()) == "offen"
+        && (today - kva_date).num_days() > threshold_days
+        && !r.followup_muted
+        && matches!(r.scheduled_date, Some(d) if d > today)
+}
+
+/// Counts for the sidebar badges.
+///
+/// **Caller**: Admin shell navigation, polled once a minute.
+/// **Why**: a Rückruf could sit unanswered for hours because nothing outside the
+/// Rückrufe page said one had come in (feedback report dc7515c2). One endpoint
+/// rather than one per badge keeps that poll to a single round-trip.
+#[derive(Debug, Serialize)]
+struct NavBadges {
+    /// Callback requests neither handled nor dismissed.
+    flash_contacts: i64,
+    /// Unread inbound mail — same number the mailbox badge showed before.
+    unread_emails: i64,
+    /// Inquiries still at `pending`, i.e. nobody has looked at them.
+    new_inquiries: i64,
+    /// KVAs past the follow-up threshold and still worth chasing.
+    kva_followups: i64,
+}
+
+async fn nav_badges(
+    State(state): State<Arc<AppState>>,
+    Extension(_claims): Extension<TokenClaims>,
+) -> Result<Json<NavBadges>, ApiError> {
+    let flash_contacts = admin_repo::count_open_flash_contacts(&state.db).await?;
+    let (unread_emails, _, _) = admin_repo::email_unread_counts(&state.db).await?;
+    let new_inquiries = admin_repo::count_new_inquiries(&state.db).await?;
+
+    let threshold_days = settings_repo::get_kva_followup_days(&state.db).await?;
+    let today = Utc::now()
+        .with_timezone(&chrono_tz::Europe::Berlin)
+        .date_naive();
+    let kva_followups = offer_repo::list_for_kva_buch(&state.db)
+        .await?
+        .iter()
+        .filter(|r| kva_needs_followup(r, today, threshold_days))
+        .count() as i64;
+
+    Ok(Json(NavBadges {
+        flash_contacts,
+        unread_emails,
+        new_inquiries,
+        kva_followups,
+    }))
+}
+
 /// `GET /api/v1/admin/kva-buch` — Register of all Kostenvoranschläge.
 ///
 /// **Caller**: Admin KVA-Buch page.
@@ -2542,6 +2609,7 @@ async fn kva_buch(
             let netto = r.price_cents;
             let brutto = (netto as f64 * 1.19).round() as i64;
 
+            let needs_followup = kva_needs_followup(&r, today, threshold_days);
             let lage = lage_of(r.inquiry_status.as_deref());
             let is_open = lage == "offen";
             // The KVA date is its creation day: `offers.sent_at` is populated on
@@ -2569,10 +2637,7 @@ async fn kva_buch(
                 pdf_s3_key: r.pdf_storage_key,
                 lage: lage.to_string(),
                 age_days,
-                needs_followup: is_open
-                    && overdue
-                    && !r.followup_muted
-                    && matches!(r.scheduled_date, Some(d) if d > today),
+                needs_followup,
                 followup_date_missing: is_open && overdue && r.scheduled_date.is_none(),
                 move_date_passed: is_open
                     && matches!(r.scheduled_date, Some(d) if d <= today),
@@ -3022,6 +3087,11 @@ async fn handle_flash_contact(
 #[derive(Debug, Serialize)]
 struct SettingsResponse {
     pricing: PricingSettings,
+    /// The fixed KVA positions with their effective unit prices.
+    ///
+    /// Read by the settings page (to edit them) and by the Positionen panel on
+    /// an inquiry (to pre-fill a new line item) — feedback report ce764f7b.
+    positions: Vec<settings_repo::PositionPrice>,
     next_invoice_number: i64,
     next_offer_number: i64,
 }
@@ -3034,9 +3104,11 @@ async fn get_settings(
 ) -> Result<Json<SettingsResponse>, ApiError> {
     require_admin(&claims)?;
     let pricing = settings_repo::get_pricing(&state.db, &state.config).await?;
+    let positions = settings_repo::get_positions(&state.db, &state.config).await?;
     let numbers = settings_repo::get_next_numbers(&state.db).await?;
     Ok(Json(SettingsResponse {
         pricing,
+        positions,
         next_invoice_number: numbers.next_invoice_number,
         next_offer_number: numbers.next_offer_number,
     }))
@@ -3051,6 +3123,56 @@ async fn update_pricing_settings(
     require_admin(&claims)?;
     settings_repo::upsert_pricing(&state.db, &body).await?;
     tracing::info!(admin = %claims.sub, "Admin updated pricing settings");
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// `GET /api/v1/admin/positions` — the fixed KVA positions with their prices.
+///
+/// **Caller**: the Positionen panel on an inquiry.
+/// **Why**: separate from `GET /settings`, which is admin-only. A Bürokraft
+/// writes KVAs too and must see the same prices Alex configured, not the code
+/// defaults a 403 would fall back to.
+async fn list_position_prices(
+    State(state): State<Arc<AppState>>,
+    Extension(_claims): Extension<TokenClaims>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let positions = settings_repo::get_positions(&state.db, &state.config).await?;
+    Ok(Json(serde_json::json!({ "positions": positions })))
+}
+
+/// One price change from the Positionen card.
+#[derive(Debug, Deserialize)]
+struct PositionPriceInput {
+    key: String,
+    unit_price_cents: i64,
+}
+
+/// Body for `PUT /settings/positions`.
+#[derive(Debug, Deserialize)]
+struct PositionPricesRequest {
+    positions: Vec<PositionPriceInput>,
+}
+
+/// `PUT /api/v1/admin/settings/positions` — set the unit price of one or more
+/// fixed KVA positions.
+///
+/// **Caller**: the Positionen card in the admin settings page.
+/// **Why**: these prices used to be hardcoded in the frontend, so changing
+/// e.g. the Kleiderboxen rate meant a redeploy (feedback report ce764f7b).
+/// Only the positions in the body are touched; the rest keep their value.
+async fn update_position_prices(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<TokenClaims>,
+    Json(body): Json<PositionPricesRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&claims)?;
+    let prices: Vec<(String, i64)> = body
+        .positions
+        .into_iter()
+        .map(|p| (p.key, p.unit_price_cents))
+        .collect();
+    settings_repo::upsert_positions(&state.db, &prices).await?;
+    tracing::info!(admin = %claims.sub, count = prices.len(), "Admin updated position prices");
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -3087,6 +3209,129 @@ async fn update_number_settings(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The KVA badge must count exactly what the Nachfassliste shows: open,
+    /// past the threshold, not muted, and the move still ahead.
+    #[test]
+    fn only_a_live_overdue_kva_needs_a_follow_up() {
+        use chrono::TimeZone;
+
+        let today = NaiveDate::from_ymd_opt(2026, 9, 22).unwrap();
+        let base = offer_repo::KvaBuchRow {
+            id: Uuid::nil(),
+            inquiry_id: Uuid::nil(),
+            offer_number: None,
+            price_cents: 100_000,
+            status: "draft".into(),
+            pdf_storage_key: None,
+            valid_until: None,
+            sent_at: None,
+            // 20 days old, well past the 7-day threshold used below.
+            created_at: Utc.with_ymd_and_hms(2026, 9, 2, 10, 0, 0).unwrap(),
+            customer_name: Some("Testkunde".into()),
+            scheduled_date: Some(NaiveDate::from_ymd_opt(2026, 10, 15).unwrap()),
+            invoice_number: None,
+            inquiry_status: Some("offer_sent".into()),
+            followup_last_pinged_on: None,
+            followup_muted: false,
+        };
+        assert!(kva_needs_followup(&base, today, 7));
+
+        // Decided one way or the other — nothing left to chase.
+        let won = offer_repo::KvaBuchRow { inquiry_status: Some("accepted".into()), ..base_clone(&base) };
+        assert!(!kva_needs_followup(&won, today, 7));
+
+        // Still inside the threshold.
+        assert!(!kva_needs_followup(&base, today, 30));
+
+        // Muted by hand.
+        let muted = offer_repo::KvaBuchRow { followup_muted: true, ..base_clone(&base) };
+        assert!(!kva_needs_followup(&muted, today, 7));
+
+        // Move date gone or missing: liveness is unprovable, so no nag.
+        let past = offer_repo::KvaBuchRow {
+            scheduled_date: Some(NaiveDate::from_ymd_opt(2026, 9, 1).unwrap()),
+            ..base_clone(&base)
+        };
+        assert!(!kva_needs_followup(&past, today, 7));
+        let undated = offer_repo::KvaBuchRow { scheduled_date: None, ..base_clone(&base) };
+        assert!(!kva_needs_followup(&undated, today, 7));
+    }
+
+    /// `KvaBuchRow` is a DB projection and deliberately not `Clone`; the test
+    /// above only needs a fresh copy to vary one field at a time.
+    fn base_clone(r: &offer_repo::KvaBuchRow) -> offer_repo::KvaBuchRow {
+        offer_repo::KvaBuchRow {
+            id: r.id,
+            inquiry_id: r.inquiry_id,
+            offer_number: r.offer_number.clone(),
+            price_cents: r.price_cents,
+            status: r.status.clone(),
+            pdf_storage_key: r.pdf_storage_key.clone(),
+            valid_until: r.valid_until,
+            sent_at: r.sent_at,
+            created_at: r.created_at,
+            customer_name: r.customer_name.clone(),
+            scheduled_date: r.scheduled_date,
+            invoice_number: r.invoice_number.clone(),
+            inquiry_status: r.inquiry_status.clone(),
+            followup_last_pinged_on: r.followup_last_pinged_on,
+            followup_muted: r.followup_muted,
+        }
+    }
+
+    /// A new Rückruf raises the sidebar badge, and marking it handled lowers it
+    /// again — the whole point of report dc7515c2.
+    ///
+    /// Asserts deltas, not absolutes: the test DB is shared, so other rows may
+    /// be present.
+    #[tokio::test]
+    async fn a_new_callback_request_raises_the_badge_and_handling_it_clears_it() {
+        use crate::test_helpers::{generate_test_jwt, test_app_state};
+        use axum::body::Body;
+        use hyper::Request;
+        use tower::ServiceExt;
+
+        let state = test_app_state().await;
+        let pool = state.db.clone();
+        let token = generate_test_jwt();
+
+        // One AppState per call: `create_router` consumes it, and the pool it
+        // holds is cheap to rebuild from the same test DB.
+        async fn badge_count(token: &str) -> i64 {
+            let app = crate::create_router(crate::test_helpers::test_app_state().await);
+            let resp = app
+                .oneshot(
+                    Request::get("/api/v1/admin/nav-badges")
+                        .header("Authorization", format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            json["flash_contacts"].as_i64().unwrap()
+        }
+
+        let before = badge_count(&token).await;
+
+        let contact = aust_flash_contact::insert(
+            &pool,
+            &aust_flash_contact::CreateFlashContact {
+                name: "Badge Testkunde".into(),
+                phone: "+49 5121 000000".into(),
+                time_preference: aust_flash_contact::TimePreference::Gleich,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(badge_count(&token).await, before + 1);
+
+        aust_flash_contact::mark_handled(&pool, contact.id).await.unwrap();
+        assert_eq!(badge_count(&token).await, before);
+    }
 
     #[test]
     fn a_blank_label_is_not_a_document_name() {

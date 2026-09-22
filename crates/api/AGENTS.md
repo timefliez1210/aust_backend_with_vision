@@ -106,15 +106,19 @@ The old `inquiry_days`, `inquiry_day_employees`, `calendar_item_days`, `calendar
 `offers_inquiry_active_unique` partial unique index prevents duplicate active offers. `offer_builder.rs::insert_returning()` catches constraint violations and falls back to updating the existing offer.
 
 ### Configurable Pricing (M2)
-All pricing constants are in `CompanyConfig`:
+Labor and travel constants are in `CompanyConfig`, DB-overridable via `PUT /settings/pricing`:
 - `rate_per_person_hour_cents` (default 3000 = €30/hr)
-- `assembly_price` (default 25.0 = €25)
-- `parking_ban_price` (default 100.0 = €100)
-- `packing_price` (default 30.0 = €30)
 - `saturday_surcharge_cents` (default 5000 = €50)
 - `fahrt_rate_per_km` (default 1.0)
 
-`PricingEngine::with_rate(rate, surcharge)` and `ServicePrices::from_pricing()` replaces `PricingEngine::new()` in non-test code.
+`PricingEngine::with_rate(rate, surcharge)` replaces `PricingEngine::new()` in non-test code.
+
+Per-position prices live in `POSITION_CATALOG` (`settings_repo.rs`), stored as
+`position_price.<key>` and edited in Einstellungen → Positionen (`PUT /settings/positions`).
+`ServicePrices::from_positions()` feeds them to `build_line_items`, and the admin
+Positionen panel pre-fills from `GET /positions`. The old scalars
+(`assembly_price`, `parking_ban_price`, `packing_price`, `transporter_price`) survive
+only as the fallback for a position whose own price was never saved.
 
 ### Submission Handlers
 5 handlers in `submissions.rs`: photo, mobile (via `handle_submission`), AR, video, manual. All create billing addresses from parsed fields via `merge_address_parts()`. Manual mode has volume fast-path (skip vision pipeline).

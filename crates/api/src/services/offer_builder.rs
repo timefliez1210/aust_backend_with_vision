@@ -4,7 +4,6 @@ use uuid::Uuid;
 use crate::ApiError;
 use crate::repositories::{AddressRow, CustomerRow};
 use crate::repositories::{address_repo, customer_repo, offer_repo, settings_repo};
-use crate::repositories::settings_repo::PricingSettings;
 use crate::types::resolve_billing_address_id;
 use crate::types::InquiryRow;
 use aust_core::config::Config;
@@ -190,6 +189,7 @@ pub(crate) async fn run_offer_computation(
     };
 
     let pricing = settings_repo::get_pricing(db, config).await?;
+    let positions = settings_repo::get_positions(db, config).await?;
     let pricing_engine = PricingEngine::with_rate(pricing.rate_per_person_hour_cents, pricing.saturday_surcharge_cents);
     let mut pricing_result = pricing_engine.calculate(&pricing_input);
 
@@ -277,7 +277,7 @@ pub(crate) async fn run_offer_computation(
         }
         result
     } else {
-        let service_prices = ServicePrices::from_pricing(&pricing);
+        let service_prices = ServicePrices::from_positions(&positions);
         let auto = build_line_items(&inquiry_services, &service_prices);
         let mut services_items: Vec<OfferLineItem> = Vec::new();
         let mut insurance: Option<OfferLineItem> = None;
@@ -1028,11 +1028,15 @@ async fn build_fahrt_item(
     }
 }
 
-/// Configurable service line-item prices, loaded from `CompanyConfig`.
+/// Configurable service line-item prices, resolved from the Positionen catalogue.
 ///
 /// **Caller**: `build_line_items` — determines unit prices for assembly, parking ban, and packing.
 /// **Why**: Avoids hardcoded pricing constants that require a redeploy to change.
+/// Demontage and Montage are separate fields even though they shared one
+/// `assembly_price` setting for a long time: the catalogue prices them
+/// individually, and a generated KVA has to honour that (report ce764f7b).
 pub(crate) struct ServicePrices {
+    pub disassembly_unit_price: f64,
     pub assembly_unit_price: f64,
     pub parking_ban_unit_price: f64,
     pub packing_unit_price: f64,
@@ -1040,13 +1044,21 @@ pub(crate) struct ServicePrices {
 }
 
 impl ServicePrices {
-    /// Build from the effective (DB-backed, config-fallback) pricing settings.
-    pub fn from_pricing(p: &PricingSettings) -> Self {
+    /// Build from the effective (catalogue → legacy setting → code default) prices.
+    pub fn from_positions(positions: &[settings_repo::PositionPrice]) -> Self {
+        let eur = |key: &str, fallback: f64| {
+            positions
+                .iter()
+                .find(|p| p.key == key)
+                .map(|p| p.unit_price_cents as f64 / 100.0)
+                .unwrap_or(fallback)
+        };
         Self {
-            assembly_unit_price: p.assembly_price,
-            parking_ban_unit_price: p.parking_ban_price,
-            packing_unit_price: p.packing_price,
-            transporter_unit_price: p.transporter_price,
+            disassembly_unit_price: eur("demontage", 25.0),
+            assembly_unit_price: eur("montage", 25.0),
+            parking_ban_unit_price: eur("halteverbotszone", 100.0),
+            packing_unit_price: eur("umzugsmaterial", 30.0),
+            transporter_unit_price: eur("transporter_3_5t", 60.0),
         }
     }
 
@@ -1054,6 +1066,7 @@ impl ServicePrices {
     #[allow(dead_code)]
     pub fn defaults() -> Self {
         Self {
+            disassembly_unit_price: 25.0,
             assembly_unit_price: 25.0,
             parking_ban_unit_price: 100.0,
             packing_unit_price: 30.0,
@@ -1092,7 +1105,7 @@ pub(crate) fn build_line_items(services: &Services, prices: &ServicePrices) -> V
         items.push(OfferLineItem {
             description: "Demontage".to_string(),
             quantity: 1.0,
-            unit_price: prices.assembly_unit_price,
+            unit_price: prices.disassembly_unit_price,
             ..Default::default()
         });
     }
@@ -2110,9 +2123,49 @@ mod tests {
 
     // --- M2: Configurable pricing tests ---
 
+    /// The generated KVA must use the prices from the Positionen catalogue, not
+    /// the old shared `assembly_price` — report ce764f7b.
+    #[test]
+    fn service_prices_come_from_the_position_catalogue() {
+        let pos = |key: &str, cents: i64| settings_repo::PositionPrice {
+            key: key.into(),
+            label: key.into(),
+            remark: String::new(),
+            unit_price_cents: cents,
+        };
+        let prices = ServicePrices::from_positions(&[
+            pos("demontage", 4500),
+            pos("montage", 5000),
+            pos("halteverbotszone", 12_000),
+            pos("umzugsmaterial", 3_500),
+            pos("transporter_3_5t", 7_000),
+        ]);
+        assert_eq!(prices.disassembly_unit_price, 45.0);
+        assert_eq!(prices.assembly_unit_price, 50.0);
+        assert_eq!(prices.parking_ban_unit_price, 120.0);
+        assert_eq!(prices.packing_unit_price, 35.0);
+        assert_eq!(prices.transporter_unit_price, 70.0);
+
+        let items = build_line_items(
+            &Services { disassembly: true, assembly: true, ..Default::default() },
+            &prices,
+        );
+        let price_of = |d: &str| items.iter().find(|i| i.description == d).unwrap().unit_price;
+        assert_eq!(price_of("Demontage"), 45.0);
+        assert_eq!(price_of("Montage"), 50.0);
+
+        // A catalogue missing an entry falls back to the code default rather
+        // than pricing the position at zero.
+        let empty = ServicePrices::from_positions(&[]);
+        assert_eq!(empty.assembly_unit_price, 25.0);
+        assert_eq!(empty.parking_ban_unit_price, 100.0);
+    }
+
     #[test]
     fn configurable_service_prices_affect_line_items() {
         let custom_prices = ServicePrices {
+            // Demontage and Montage are priced separately by the catalogue.
+            disassembly_unit_price: 45.0,
             assembly_unit_price: 50.0,
             parking_ban_unit_price: 150.0,
             packing_unit_price: 40.0,
@@ -2128,10 +2181,10 @@ mod tests {
         let items = build_line_items(&services, &custom_prices);
 
         let demontage = items.iter().find(|i| i.description == "Demontage").expect("should have demontage");
-        assert_eq!(demontage.unit_price, 50.0, "custom assembly price should apply to Demontage");
+        assert_eq!(demontage.unit_price, 45.0, "the Demontage price should apply to Demontage");
 
         let montage = items.iter().find(|i| i.description == "Montage").expect("should have montage");
-        assert_eq!(montage.unit_price, 50.0, "custom assembly price should apply to Montage");
+        assert_eq!(montage.unit_price, 50.0, "the Montage price should apply to Montage");
 
         let hv = items.iter().find(|i| i.description == "Halteverbotszone").expect("should have halteverbot");
         assert_eq!(hv.unit_price, 150.0, "custom parking ban price should apply");
