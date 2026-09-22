@@ -391,17 +391,25 @@ pub(crate) async fn fetch_pdf_key(
 /// Mark an invoice as paid.
 ///
 /// **Caller**: `invoices::update_invoice`
-/// **Why**: Sets paid_at timestamp and status.
+/// **Why**: Sets paid_at timestamp and status. Also backfills `sent_at` when it is
+/// still unset — Alex frequently downloads a draft PDF and hands or emails it to the
+/// customer himself instead of using the in-app "Senden" button, so a paid invoice
+/// reaching this function has, in reality, already been issued even though the
+/// system never recorded it. Without this the row would keep showing as an
+/// unissued "Entwurf" and its total would be left out of the register's revenue.
 pub(crate) async fn mark_paid(
     pool: &PgPool,
     inv_id: Uuid,
     now: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE invoices SET status = 'paid', paid_at = $1 WHERE id = $2")
-        .bind(now)
-        .bind(inv_id)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "UPDATE invoices SET status = 'paid', paid_at = $1, sent_at = COALESCE(sent_at, $1) \
+         WHERE id = $2",
+    )
+    .bind(now)
+    .bind(inv_id)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
