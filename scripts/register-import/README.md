@@ -40,9 +40,21 @@ without ever writing to the database straight from the spreadsheet.
    ones coloured yellow or red. The dropdown constrains him to four answers, so
    nothing comes back that the importer cannot parse.
 
-4. **Dry-run the import against a restored backup**, never against production.
+4. **Dry-run the import against a restored backup**, never against production:
 
-5. **Run it for real** inside a transaction, right after a fresh backup.
+   ```bash
+   python3 import_register.py --book "Rechnungsausgangsbuch 2024.xlsx" --review Abgleich_2026.xlsx \
+     --psql "docker exec -i aust_staging_postgres psql -U aust_staging -d aust_import_test" \
+     --out import_2026.sql --apply
+   ```
+
+   It plans against the database it is pointed at, prints every action, and writes one
+   SQL file. The file pins every row it touches by fingerprint and asserts every number
+   it inserts is free, so it aborts (writing nothing) if the data moved since planning.
+   A second run refuses: the drafts it renumbers no longer exist.
+
+5. **Run it for real** right after a fresh backup, with migration `20260927120000`
+   deployed: same command, `--psql` pointed at prod. Read the SQL before `--apply`.
 
 ## Warum kein CSV
 

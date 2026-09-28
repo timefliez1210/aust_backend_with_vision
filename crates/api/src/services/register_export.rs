@@ -26,6 +26,9 @@ pub(crate) struct ExportRow {
     pub invoice_number: String,
     /// Leistungszeitraum, pre-rendered: `"24.02.2026"` or `"12.-13.01.2026"`.
     pub service_period: String,
+    /// First day of the Leistungszeitraum — the month the summary sheet books the row
+    /// into. `None` for rows without a job date; those fall back to `sent_at`.
+    pub service_date: Option<NaiveDate>,
     pub customer: String,
     pub netto_cents: Option<i64>,
     pub mwst_cents: Option<i64>,
@@ -388,16 +391,18 @@ const MONTH_NAMES: [&str; 12] = [
 /// Twelve rows, always — a month with no invoices is a zero row, not a missing one,
 /// so the reader can see that February was quiet rather than wonder where it went.
 ///
-/// Rows are bucketed by Rechnungsdatum (`sent_at`), because the Umsatzsteuer follows
-/// the invoice date under Soll-Versteuerung. A row whose Rechnungsdatum falls outside
-/// `year` — or which has none at all — is collected in a trailing "ohne Monat" row
-/// rather than silently dropped: the sheet's total must reconcile with the register's.
+/// Rows are bucketed by Leistungsdatum (`service_date`) — Alex credits revenue to the
+/// month the job was done, which is also when the Umsatzsteuer arises under
+/// Soll-Versteuerung (§ 13 Abs. 1 Nr. 1a UStG). Rows without a job date fall back to
+/// the Rechnungsdatum. A row whose date falls outside `year` — or which has none at
+/// all — is collected in a trailing "ohne Monat" row rather than silently dropped:
+/// the sheet's total must reconcile with the register's.
 fn summary_sheet_xml(year: i32, rows: &[ExportRow]) -> String {
     let mut buckets = [(0i64, 0i64, 0i64, 0i64, 0i64); 12]; // count, netto, mwst, brutto, offen
     let mut unassigned = (0i64, 0i64, 0i64, 0i64, 0i64);
 
     for r in rows {
-        let slot = match r.sent_at {
+        let slot = match r.service_date.or(r.sent_at) {
             Some(d) if d.year() == year => Some((d.month() - 1) as usize),
             _ => None,
         };
@@ -430,7 +435,7 @@ fn summary_sheet_xml(year: i32, rows: &[ExportRow]) -> String {
         cell_xml(
             0,
             2,
-            &Cell::Text("Umsatz nach Rechnungsdatum — Grundlage der Umsatzsteuer-Voranmeldung".to_string()),
+            &Cell::Text("Umsatz nach Leistungsdatum — Grundlage der Umsatzsteuer-Voranmeldung".to_string()),
             style::PLAIN
         ),
     ));
@@ -594,6 +599,7 @@ mod tests {
             ExportRow {
                 invoice_number: "2026-01".into(),
                 service_period: "12.-13.01.2026".into(),
+                service_date: Some(d(2026, 1, 12)),
                 customer: "Luttert Ordnungs u. Regal Systeme & Co".into(),
                 netto_cents: Some(148_800),
                 mwst_cents: Some(28_272),
@@ -610,6 +616,7 @@ mod tests {
             ExportRow {
                 invoice_number: "2026-02".into(),
                 service_period: "27.07.2026".into(),
+                service_date: Some(d(2026, 7, 27)),
                 customer: "Gabriele Kampe".into(),
                 netto_cents: Some(107_000),
                 mwst_cents: Some(20_330),
@@ -673,15 +680,36 @@ mod tests {
         for name in MONTH_NAMES {
             assert!(xml.contains(name), "month {name} missing from the summary");
         }
-        // Row 1 is January-dated (20.01.), row 2 August-dated (03.08.).
+        // Row 1 is a January job (12.01.), row 2 a July job invoiced in August.
         assert!(xml.contains("<v>1488</v>"), "January netto");
-        assert!(xml.contains("<v>1070</v>"), "August netto");
+        assert!(xml.contains("<v>1070</v>"), "July netto");
         // The year total must equal the register's own sum, or the two sheets disagree.
         assert!(xml.contains("<v>2558</v>"), "netto total 1488.00 + 1070.00");
         assert!(xml.contains("Summe 2026"));
     }
 
-    /// A row whose Rechnungsdatum falls outside the year — or which has none — must be
+    /// A job done in March but booked as bezahlt in May (which backfills `sent_at` with
+    /// the payment date) belongs to March.
+    #[test]
+    fn summary_sheet_buckets_by_leistungsdatum_not_rechnungsdatum() {
+        let rows = vec![ExportRow {
+            invoice_number: "2026-05".into(),
+            service_date: Some(d(2026, 3, 14)),
+            netto_cents: Some(33_300),
+            sent_at: Some(d(2026, 5, 20)),
+            paid_at: Some(d(2026, 5, 20)),
+            ..Default::default()
+        }];
+        let xml = summary_sheet_xml(2026, &rows);
+        let march = xml.split("März").nth(1).expect("März row");
+        let march_row = &march[..march.find("</row>").expect("row end")];
+        assert!(march_row.contains("<v>333</v>"), "netto must land in März: {march_row}");
+        let may = xml.split(">Mai<").nth(1).expect("Mai row");
+        let may_row = &may[..may.find("</row>").expect("row end")];
+        assert!(!may_row.contains("<v>333</v>"), "must not land in Mai: {may_row}");
+    }
+
+    /// A row whose Leistungsdatum falls outside the year — or which has none — must be
     /// collected, not dropped, or the summary stops reconciling with the register.
     #[test]
     fn summary_sheet_collects_rows_with_no_month_of_this_year() {
@@ -691,8 +719,9 @@ mod tests {
             customer: "Praxis Günter Engelhardt".into(),
             netto_cents: Some(12_000),
             brutto_cents: Some(14_280),
-            // Issued in the previous December, but numbered into the 2026 book.
-            sent_at: Some(d(2025, 12, 23)),
+            // Done in the previous December, but numbered into the 2026 book.
+            service_date: Some(d(2025, 12, 23)),
+            sent_at: Some(d(2026, 1, 5)),
             ..Default::default()
         });
         let xml = summary_sheet_xml(2026, &rows);

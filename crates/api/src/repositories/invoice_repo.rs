@@ -812,8 +812,12 @@ pub(crate) async fn list_for_rechnungsausgangsbuch(
             inv.is_legacy,
             off.price_cents AS offer_netto_cents,
             c.name AS customer_name,
-            i.scheduled_date,
-            i.end_date
+            -- An imported row carries its Leistungszeitraum itself; a generated one
+            -- takes it from the job. The pair is chosen together so a row never mixes
+            -- its own start with the inquiry's end.
+            COALESCE(inv.service_start, i.scheduled_date) AS scheduled_date,
+            CASE WHEN inv.service_start IS NOT NULL THEN inv.service_end
+                 ELSE i.end_date END AS end_date
          FROM invoices inv
          LEFT JOIN inquiries i ON i.id = inv.inquiry_id
          -- An imported row names its customer directly; a generated one reaches it

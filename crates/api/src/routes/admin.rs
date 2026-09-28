@@ -2948,6 +2948,7 @@ async fn export_rechnungsausgangsbuch(
         .map(|it| register_export::ExportRow {
             invoice_number: it.invoice_number.clone(),
             service_period: register_export::format_service_period(it.scheduled_date, it.end_date),
+            service_date: it.scheduled_date,
             customer: it.customer_name.clone().unwrap_or_default(),
             netto_cents: it.netto_cents,
             mwst_cents: it.mwst_cents,
