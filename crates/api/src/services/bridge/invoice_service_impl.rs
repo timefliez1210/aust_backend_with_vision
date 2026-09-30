@@ -120,6 +120,7 @@ impl InvoiceService for InvoiceServiceImpl {
         };
 
         let invoice_data = aust_offer_generator::InvoiceData {
+            cash_paid_on: None,
             invoice_number: invoice_num.clone(),
             invoice_type: InvoiceType::Full,
             invoice_date: today,

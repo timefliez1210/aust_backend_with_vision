@@ -195,6 +195,7 @@ fn build_storage_invoice_data(
     };
 
     InvoiceData {
+        cash_paid_on: None,
         invoice_number: invoice_number.to_string(),
         invoice_type: InvoiceType::Full,
         invoice_date: Utc::now().with_timezone(&chrono_tz::Europe::Berlin).date_naive(),

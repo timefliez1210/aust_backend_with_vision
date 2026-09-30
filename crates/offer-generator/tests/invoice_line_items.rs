@@ -52,6 +52,7 @@ fn base_line_items() -> Vec<InvoiceLineItem> {
 
 fn make_invoice_data(line_items: Vec<InvoiceLineItem>, invoice_type: InvoiceType) -> InvoiceData {
     InvoiceData {
+        cash_paid_on: None,
         invoice_number: "2026-0131".into(),
         invoice_type,
         invoice_date: NaiveDate::from_ymd_opt(2026, 4, 14).unwrap(),
@@ -263,6 +264,7 @@ fn test_legacy_path_base_netto_plus_extras() {
     // still works and produces valid XLSX output
     #[allow(deprecated)]
     let data = InvoiceData {
+        cash_paid_on: None,
         invoice_number: "2026-0200".into(),
         invoice_type: InvoiceType::Full,
         invoice_date: NaiveDate::from_ymd_opt(2026, 4, 14).unwrap(),

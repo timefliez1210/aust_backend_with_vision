@@ -120,6 +120,10 @@ pub struct InvoiceData {
     /// Each item has pos, description, quantity, unit_price (EUR, may be negative for credits),
     /// and optional remark. Maximum 20 items (rows 31–50).
     pub line_items: Vec<InvoiceLineItem>,
+    /// Day the customer paid in cash (Barzahlung). `Some` turns the invoice into its
+    /// own receipt: the footer's bank block and the "Bitte überweisen" line are
+    /// replaced by "Diese Rechnung wurde am … in bar beglichen." `None` → normal invoice.
+    pub cash_paid_on: Option<NaiveDate>,
 
     // ── Legacy fields (kept for backward compatibility during migration) ──
 
@@ -249,6 +253,11 @@ pub fn generate_invoice_xlsx(data: &InvoiceData) -> Result<Vec<u8>, OfferError> 
 
     // Remove hyperlinks section — email as plain text
     modified_sheet1 = strip_hyperlinks(&modified_sheet1);
+
+    // Barzahlung: the bank details in the page footer become the receipt line
+    if let Some(paid_on) = data.cash_paid_on {
+        modified_sheet1 = replace_footer_bank_block(&modified_sheet1, paid_on);
+    }
 
     // Read workbook.xml and force recalculation on load + fix print area
     let workbook_xml = read_zip_entry(&mut template_zip, "xl/workbook.xml")?;
@@ -507,6 +516,19 @@ fn build_cell_modifications(
     // All labels and formulas are pre-baked in the template. strip_formula_cached_values
     // will handle clearing stale caches so LibreOffice recalculates.
 
+    // ── Payment instruction (A57, merged A57:E58) ─────────────────────────
+    // A cash invoice is already settled — asking for a transfer would contradict
+    // the receipt line in the footer.
+    if let Some(paid_on) = data.cash_paid_on {
+        mods.push((
+            "A57".into(),
+            CellValue::Text(format!(
+                "Der Rechnungsbetrag wurde am {} in bar beglichen. Diese Rechnung gilt zugleich als Quittung.",
+                paid_on.format("%d.%m.%Y")
+            )),
+        ));
+    }
+
     // ── Footer (rows 44–49) ────────────────────────────────────────────────
     // A44 = payment instruction text (shared string, keep as-is)
     // A47 = "Mit freundlichen Grüßen" (shared string, keep as-is)
@@ -597,6 +619,34 @@ fn modify_invoice_workbook(xml: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Page footer
+// ---------------------------------------------------------------------------
+
+/// Replace the centre section of the page footer (Sparkasse / IBAN / BIC) with
+/// the bold cash-receipt line.
+///
+/// The footer is `&L…&C<bank>&R…` inside `<oddFooter>`; only the `&C` … `&R`
+/// span is rewritten, so address and tax numbers stay. `&B` toggles bold.
+fn replace_footer_bank_block(xml: &str, paid_on: NaiveDate) -> String {
+    let Some(footer_start) = xml.find("<oddFooter>") else {
+        return xml.to_string();
+    };
+    let Some(c_rel) = xml[footer_start..].find("&amp;C") else {
+        return xml.to_string();
+    };
+    let c_start = footer_start + c_rel;
+    let Some(r_rel) = xml[c_start..].find("&amp;R") else {
+        return xml.to_string();
+    };
+    let r_start = c_start + r_rel;
+    let receipt = format!(
+        "&amp;C&amp;8&amp;BDiese Rechnung wurde am\n{} in bar beglichen.&amp;B ",
+        paid_on.format("%d.%m.%Y")
+    );
+    format!("{}{}{}", &xml[..c_start], receipt, &xml[r_start..])
+}
+
+// ---------------------------------------------------------------------------
 // Drawing shape stripping
 // ---------------------------------------------------------------------------
 
@@ -684,6 +734,7 @@ mod tests {
     fn sample_data() -> InvoiceData {
         #[allow(deprecated)]
         InvoiceData {
+            cash_paid_on: None,
             invoice_number: "2026-0001".into(),
             invoice_type: InvoiceType::Full,
             invoice_date: NaiveDate::from_ymd_opt(2026, 4, 19).unwrap(),
@@ -745,6 +796,7 @@ mod tests {
     fn test_partial_first_invoice() {
         #[allow(deprecated)]
         let data = InvoiceData {
+            cash_paid_on: None,
             invoice_number: "2026-0002".into(),
             invoice_type: InvoiceType::PartialFirst { percent: 30 },
             invoice_date: NaiveDate::from_ymd_opt(2026, 4, 19).unwrap(),
@@ -781,6 +833,7 @@ mod tests {
     fn test_legacy_line_items_fallback() {
         #[allow(deprecated)]
         let data = InvoiceData {
+            cash_paid_on: None,
             invoice_number: "2026-0003".into(),
             invoice_type: InvoiceType::Full,
             invoice_date: NaiveDate::from_ymd_opt(2026, 4, 19).unwrap(),
@@ -828,9 +881,33 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    fn sheet1_of(xlsx: &[u8]) -> String {
+        let mut zip = ZipArchive::new(Cursor::new(xlsx)).unwrap();
+        String::from_utf8(read_zip_entry(&mut zip, "xl/worksheets/sheet1.xml").unwrap()).unwrap()
+    }
+
+    #[test]
+    fn cash_invoice_replaces_bank_block_with_receipt_line() {
+        let mut data = sample_data();
+        data.cash_paid_on = NaiveDate::from_ymd_opt(2026, 9, 30);
+        let sheet = sheet1_of(&generate_invoice_xlsx(&data).unwrap());
+        assert!(!sheet.contains("IBAN"), "bank details must be gone on a cash invoice");
+        assert!(sheet.contains("&amp;BDiese Rechnung wurde am\n30.09.2026 in bar beglichen.&amp;B"));
+        assert!(sheet.contains("USt-IdNr."), "left/right footer sections stay");
+        assert!(sheet.contains("Der Rechnungsbetrag wurde am 30.09.2026 in bar beglichen."));
+    }
+
+    #[test]
+    fn transfer_invoice_keeps_bank_block() {
+        let sheet = sheet1_of(&generate_invoice_xlsx(&sample_data()).unwrap());
+        assert!(sheet.contains("IBAN: DE67259501300057453749"));
+        assert!(!sheet.contains("in bar beglichen"));
+    }
+
     #[allow(deprecated)]
     fn realistic_data() -> InvoiceData {
         InvoiceData {
+            cash_paid_on: None,
             invoice_number: "2026-TEST".into(),
             invoice_type: InvoiceType::Full,
             invoice_date: NaiveDate::from_ymd_opt(2026, 4, 25).unwrap(),

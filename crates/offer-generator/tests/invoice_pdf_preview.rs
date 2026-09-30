@@ -79,6 +79,7 @@ fn schilling_offer_line_items() -> Vec<InvoiceLineItem> {
 
 fn schilling_data(line_items: Vec<InvoiceLineItem>, invoice_type: InvoiceType) -> InvoiceData {
     InvoiceData {
+        cash_paid_on: None,
         invoice_number: "2026-1107".into(),
         invoice_type,
         invoice_date: NaiveDate::from_ymd_opt(2026, 4, 14).unwrap(),
@@ -222,6 +223,7 @@ async fn preview_6_stache_gutschrift_kaputt_tv() {
     }];
 
     let data = InvoiceData {
+        cash_paid_on: None,
         invoice_number: "2026-0059".into(),
         invoice_type: InvoiceType::Full,
         invoice_date: NaiveDate::from_ymd_opt(2026, 6, 30).unwrap(),
@@ -277,6 +279,7 @@ async fn preview_5_business_customer_invoice() {
     ];
 
     let data = InvoiceData {
+        cash_paid_on: None,
         invoice_number: "2026-1075".into(),
         invoice_type: InvoiceType::Full,
         invoice_date: NaiveDate::from_ymd_opt(2026, 4, 14).unwrap(),

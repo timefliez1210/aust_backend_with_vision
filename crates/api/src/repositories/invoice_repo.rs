@@ -34,6 +34,8 @@ pub(crate) struct InvoiceRow {
     /// Hand-edited line items (array of `ManualLineItem`), present only for
     /// manual invoices. NULL for offer-derived invoices.
     pub line_items_json: Option<serde_json::Value>,
+    /// Day the customer paid in cash — the PDF then doubles as a Quittung.
+    pub cash_paid_on: Option<chrono::NaiveDate>,
 }
 
 /// Flat projection for Rechnungsausgangsbuch — one row per invoice with
@@ -106,7 +108,7 @@ pub(crate) async fn list_by_inquiry(
         "SELECT id, inquiry_id, invoice_number, invoice_type, partial_group_id,
                 partial_percent, status, extra_services, pdf_s3_key, sent_at, paid_at, created_at,
                 deposit_percent, deposit_invoice_id,
-                base_netto_cents, is_manual, line_items_json
+                base_netto_cents, is_manual, line_items_json, cash_paid_on
          FROM invoices WHERE inquiry_id = $1 ORDER BY created_at",
     )
     .bind(inquiry_id)
@@ -340,7 +342,7 @@ pub(crate) async fn fetch_by_id(
         "SELECT id, inquiry_id, invoice_number, invoice_type, partial_group_id,
                 partial_percent, status, extra_services, pdf_s3_key, sent_at, paid_at, created_at,
                 deposit_percent, deposit_invoice_id,
-                base_netto_cents, is_manual, line_items_json
+                base_netto_cents, is_manual, line_items_json, cash_paid_on
          FROM invoices WHERE id = $1",
     )
     .bind(inv_id)
@@ -361,7 +363,7 @@ pub(crate) async fn fetch_by_id_and_inquiry(
         "SELECT id, inquiry_id, invoice_number, invoice_type, partial_group_id,
                 partial_percent, status, extra_services, pdf_s3_key, sent_at, paid_at, created_at,
                 deposit_percent, deposit_invoice_id,
-                base_netto_cents, is_manual, line_items_json
+                base_netto_cents, is_manual, line_items_json, cash_paid_on
          FROM invoices WHERE id = $1 AND inquiry_id = $2",
     )
     .bind(inv_id)
@@ -607,6 +609,32 @@ pub(crate) async fn update_line_items(
         .bind(inv_id)
         .execute(pool)
         .await?;
+    Ok(())
+}
+
+/// Set or clear the Barzahlung date on an invoice.
+///
+/// **Caller**: `invoices::update_invoice` (cash-payment toggle).
+/// **Why**: A cash invoice prints "in bar beglichen" instead of the bank details.
+/// Setting it also records `BAR` as the register's Zahlungsart; clearing it drops
+/// that value again only if it is still the one this toggle wrote.
+pub(crate) async fn update_cash_paid_on(
+    pool: &PgPool,
+    inv_id: Uuid,
+    cash_paid_on: Option<chrono::NaiveDate>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE invoices SET cash_paid_on = $1,
+                payment_method = CASE
+                    WHEN $1::date IS NOT NULL THEN 'BAR'
+                    WHEN payment_method = 'BAR' THEN NULL
+                    ELSE payment_method END
+         WHERE id = $2",
+    )
+    .bind(cash_paid_on)
+    .bind(inv_id)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 

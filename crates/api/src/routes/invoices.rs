@@ -96,6 +96,11 @@ pub struct UpdateInvoiceRequest {
     /// Set to `false` (with no `line_items`) to leave manual mode and revert to the
     /// offer-derived invoice. Ignored otherwise.
     pub is_manual: Option<bool>,
+    /// Barzahlung toggle. `true` (with `cash_paid_on`) prints the invoice as paid in
+    /// cash and books it as paid; `false` switches back to the bank details.
+    pub cash_paid: Option<bool>,
+    /// Day the cash was received. Required when `cash_paid` is `true`.
+    pub cash_paid_on: Option<chrono::NaiveDate>,
 }
 
 /// Maximum hand-edited line items per invoice — matches the 20 line-item rows in
@@ -149,6 +154,8 @@ pub struct InvoiceResponse {
     pub pdf_s3_key: Option<String>,
     pub sent_at: Option<chrono::DateTime<Utc>>,
     pub paid_at: Option<chrono::DateTime<Utc>>,
+    /// Day the invoice was paid in cash; NULL → paid (or to be paid) by transfer.
+    pub cash_paid_on: Option<chrono::NaiveDate>,
     pub created_at: chrono::DateTime<Utc>,
 }
 
@@ -777,13 +784,14 @@ async fn update_invoice(
             }
         };
 
-        let data = build_invoice_data_from_items(
+        let mut data = build_invoice_data_from_items(
             &invoice_context,
             inv_type,
             &row.invoice_number,
             today,
             regen_items,
         );
+        data.cash_paid_on = row.cash_paid_on;
 
         let xlsx = generate_invoice_xlsx(&data)
             .map_err(|e| ApiError::Internal(format!("Invoice XLSX error: {e}")))?;
@@ -833,6 +841,36 @@ async fn update_invoice(
         invoice_repo::update_line_items(&state.db, inv_id, None, false).await?;
         let reverted_row = fetch_invoice_row(&state.db, inv_id).await?;
         regenerate_invoice_pdf(&state, &reverted_row).await?;
+    }
+
+    // Barzahlung toggle: the invoice becomes its own Quittung. Paid in cash means
+    // paid — booked through the same path as the register's "Bezahlt" button, so
+    // dunning closes and the inquiry settles. Switching it off only restores the
+    // bank details; the payment itself stays booked (undo that in the register).
+    if let Some(cash_paid) = req.cash_paid {
+        let cash_paid_on = if cash_paid {
+            Some(req.cash_paid_on.ok_or_else(|| {
+                ApiError::BadRequest("Bitte das Datum der Barzahlung angeben".into())
+            })?)
+        } else {
+            None
+        };
+        invoice_repo::update_cash_paid_on(&state.db, inv_id, cash_paid_on).await?;
+
+        if let Some(day) = cash_paid_on {
+            let current = fetch_invoice_row(&state.db, inv_id).await?;
+            if current.paid_at.is_none() {
+                let paid_at = day
+                    .and_hms_opt(12, 0, 0)
+                    .map(|dt| chrono::DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc))
+                    .ok_or_else(|| ApiError::BadRequest("Ungültiges Zahlungsdatum".into()))?;
+                crate::services::billing_reminder_service::mark_invoice_paid(&state.db, inv_id, paid_at)
+                    .await?;
+            }
+        }
+
+        let cash_row = fetch_invoice_row(&state.db, inv_id).await?;
+        regenerate_invoice_pdf(&state, &cash_row).await?;
     }
 
     let updated_row = fetch_invoice_row(&state.db, inv_id).await?;
@@ -1156,6 +1194,7 @@ fn build_invoice_data_from_items(
     let customer_name = invoice_display_name(ctx);
 
     InvoiceData {
+        cash_paid_on: None,
         invoice_number: invoice_number.to_string(),
         invoice_type,
         invoice_date,
@@ -1485,13 +1524,14 @@ async fn regenerate_invoice_pdf(
     // the offer, which would clobber Alex's hand edits. This is the guard that makes
     // the manual mode durable across self-heal and number-overwrite regenerations.
     if row.is_manual {
-        let data = build_invoice_data_from_items(
+        let mut data = build_invoice_data_from_items(
             &ctx,
             InvoiceType::Full,
             &row.invoice_number,
             today,
             manual_line_items(row),
         );
+        data.cash_paid_on = row.cash_paid_on;
         let xlsx = generate_invoice_xlsx(&data)
             .map_err(|e| ApiError::Internal(format!("Invoice XLSX error: {e}")))?;
         let pdf = generate_pdf_bytes(&xlsx).await;
@@ -1582,7 +1622,8 @@ async fn regenerate_invoice_pdf(
         }
     };
 
-    let data = build_invoice_data_from_items(&ctx, inv_type, &row.invoice_number, today, items);
+    let mut data = build_invoice_data_from_items(&ctx, inv_type, &row.invoice_number, today, items);
+    data.cash_paid_on = row.cash_paid_on;
     let xlsx = generate_invoice_xlsx(&data)
         .map_err(|e| ApiError::Internal(format!("Invoice XLSX error: {e}")))?;
     let pdf = generate_pdf_bytes(&xlsx).await;
@@ -1802,6 +1843,7 @@ fn build_invoice_response(row: InvoiceRow, offer_netto_cents: i64) -> InvoiceRes
         pdf_s3_key: row.pdf_s3_key,
         sent_at: row.sent_at,
         paid_at: row.paid_at,
+        cash_paid_on: row.cash_paid_on,
         created_at: row.created_at,
     }
 }
@@ -1833,6 +1875,7 @@ mod tests {
             base_netto_cents: Some(999_999),
             is_manual: true,
             line_items_json: Some(line_items_json),
+            cash_paid_on: None,
         }
     }
 

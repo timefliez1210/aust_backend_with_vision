@@ -14,6 +14,7 @@ use chrono::NaiveDate;
 fn data() -> InvoiceData {
     #[allow(deprecated)]
     InvoiceData {
+        cash_paid_on: None,
         invoice_number: "2026-0131".into(),
         invoice_type: InvoiceType::Full,
         invoice_date: NaiveDate::from_ymd_opt(2026, 4, 14).unwrap(),
