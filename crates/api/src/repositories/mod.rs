@@ -4,6 +4,7 @@
 //! Repository functions take `&PgPool` (or a transaction) as first argument
 //! and return domain row types.
 
+pub(crate) mod accounting_repo;
 pub(crate) mod address_repo;
 pub(crate) mod admin_repo;
 pub(crate) mod auth_repo;
@@ -20,6 +21,7 @@ pub(crate) mod inquiry_appointment_repo;
 pub(crate) mod inquiry_repo;
 pub(crate) mod invoice_repo;
 pub(crate) mod offer_repo;
+pub(crate) mod overview_repo;
 pub(crate) mod review_repo;
 pub(crate) mod settings_repo;
 pub(crate) mod storage_repo;

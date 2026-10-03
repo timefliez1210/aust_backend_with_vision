@@ -115,6 +115,10 @@ struct ListInquiriesQuery {
     status: Option<String>,
     search: Option<String>,
     has_offer: Option<bool>,
+    /// `created_at` (default) | `customer_name` | `volume_m3`
+    sort: Option<String>,
+    /// `asc` | `desc` (default)
+    dir: Option<String>,
     limit: Option<i64>,
     offset: Option<i64>,
 }
@@ -417,6 +421,8 @@ async fn list_inquiries(
         query.status.as_deref(),
         query.search.as_deref(),
         query.has_offer,
+        inquiry_repo::ListSort::parse(query.sort.as_deref()),
+        query.dir.as_deref() == Some("asc"),
         limit,
         offset,
     )

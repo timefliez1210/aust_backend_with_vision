@@ -30,6 +30,7 @@ The main backend crate. Axum HTTP server with JWT middleware, 22 route files, 21
 | `inquiry_appointments.rs` | CRUD for lightweight non-crew appointments (e.g. Besichtigung) on an inquiry, `/inquiries/{id}/appointments` |
 | `storage.rs` | Storage-rental ("Lagerung") admin routes, `/admin/storage` — contracts + auto-generated monthly invoices, brutto-in/netto-stored at the boundary |
 | `vehicles.rs` | Vehicle fleet CRUD + reminders (TÜV, Ölwechsel, ...), `/admin/vehicles` |
+| `profit.rs` | Gewinn tab, `/admin/profit` (admin only) — expenses + receipts, Daueraufträge, monthly hours transfer, margin views; brutto-in at the boundary |
 
 ### Repositories (`src/repositories/`)
 
@@ -56,6 +57,7 @@ The main backend crate. Axum HTTP server with JWT middleware, 22 route files, 21
 | `inquiry_appointment_repo.rs` | `inquiry_appointments` | Lightweight, possibly non-consecutive appointments (e.g. Besichtigung); NOT crew/hours tracked |
 | `storage_repo.rs` | `storage_contracts`, storage invoices | Deliberately isolated from `invoice_repo`/`inquiry_repo` |
 | `vehicle_repo.rs` | `vehicles`, `vehicle_reminders` | |
+| `accounting_repo.rs` | `expense_categories`, `expenses`, `recurring_expenses`, `labor_months`, `accounting_audit_log` | Every write logs to the audit table in the same tx; `crew_days` mirrors the three `employee_repo::fetch_admin_*_hours` filters — change them together |
 
 ### Services (`src/services/`)
 
@@ -77,6 +79,7 @@ The main backend crate. Axum HTTP server with JWT middleware, 22 route files, 21
 | `billing_reminder_service.rs` | Zahlungserinnerung/Mahnung dunning + review-request logic; driven by both admin routes and the assistant service bridge |
 | `storage_billing_service.rs` | Generates one invoice per active storage contract per calendar month |
 | `vehicle_reminder_service.rs` | Vehicle reminder cron — 60s tick spawned in `src/main.rs`, pings Telegram |
+| `profit_service.rs` | Gewinn math: real hourly rate (booked wages ÷ transferred hours), month labor mix, per-job margin, KVA preview, hours-transfer snapshot, Stundensatz-Kalkulation (`compute_hourly_rate`: w + v + F ÷ H). Revenue comes from `admin::issued_revenue` (the register's own rows) |
 | `assistant_bridge/` | Glue between the `aust-assistant` driver and the Telegram bot / offer pipeline (`notifier_impl`, `telegram_input`/`telegram_output`, `confirm_dispatcher`, `media`) |
 | `bridge/` | One `*ServiceImpl` per `aust_core::services::traits` trait, delegating to these repos/services; grouped into `ServiceBundle` at startup for the assistant's `ToolCtx` |
 
@@ -161,4 +164,6 @@ Specific to this crate:
 | Inquiry status handling | `can_transition_to()` in core, the PATCH validation in `inquiries.rs`, `inquiry_repo.rs` status queries, `INQUIRY_STATUS_LABELS` in the frontend |
 | `inquiry_employees` columns | the `calendar_item_employees` mirror, `calendar_repo` schedule queries, `employee_repo` hours queries, the admin employee panel |
 | The `offers` unique constraint | the race guard in `offer_pipeline.rs`, the insert catch in `offer_builder.rs`, `offer_repo.rs::fetch_active_id` |
+| Paid-hours logic (`admin::paid_hours_for`, `hours_adjustments`) or the hours-tab day filters | `profit_service::paid_days` and `accounting_repo::crew_days` — the Gewinn tab must pay the same hours the hours tab shows |
+| Rechnungsausgangsbuch row/amount logic | `admin::issued_revenue` — the Gewinn tab's revenue |
 | Address handling | `merge_address_parts()` in all 5 submission handlers, the offer PDF address block, XLSX cells A8-A11, the frontend address editor |

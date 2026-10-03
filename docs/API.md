@@ -3179,6 +3179,39 @@ Approve and send a generated storage invoice — same funnel as the Telegram inl
 
 ---
 
+## Gewinn (Profit / Cost Accounting)
+
+Alex's personal controlling, mounted at `/api/v1/admin/profit`. **Admin role only** (Bürokraft gets `403`). Not tax bookkeeping, but GoBD-ready: corrections default to a Storno row, hard deletes are allowed, and every write lands in `accounting_audit_log`.
+
+Money: requests take `brutto_cents` + `vat_rate` (0, 7 or 19); the server stores netto/USt/brutto. Category kind `wages` forces 0 %. Months are `YYYY-MM`.
+
+**Labor cost** = paid hours × rate. The rate starts at the default (setting `labor_default_rate_cents`, €18.50) and becomes each employee's real rate = booked wages ÷ transferred hours over the last 6 months that have both. Wages booked without `employee_id` (e.g. SV-Beiträge) are spread over that month's crew by hours. Per-response `rate_source`: `belegt` (own data), `betrieb` (company average), `standard` (default).
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/overview?year=2026` | 12 months: revenue (netto, by Leistungsmonat, same rows as the Rechnungsausgangsbuch), labor (`labor_source`: `gebucht` / `uebernommen` / `vorlaeufig` / `keine`), fixed/variable costs (unconfirmed recurring drafts included, future months projected from active templates), result; break-even from the last 3 complete months; cost per vehicle; open draft count |
+| GET | `/jobs?month=2026-09` | Per-job margin for jobs starting in the month (status accepted…paid): revenue (`rechnung` or the KVA's netto as `angebot`), crew hours × rate (transferred months use frozen hours, future days use planned hours), directly booked costs |
+| GET | `/inquiries/{id}` | KVA margin preview (persons × hours × company rate) + actual margin once crew hours exist; also returns `rates` (the inquiry editor's labor-profit indicator reads `rates.company_rate_cents`) and `hourly` (break-even / target €/h — the KVA editor warns below them) |
+| GET | `/employees` | Last 6 months per employee: hours (snapshot or live), wage share, monthly €/h, real rate, warnings |
+| GET | `/labor/{month}` | Hours-transfer preview: paid hours per employee as the hours tab computes them (incl. `hours_adjustments`), unconfirmed days, rate, cost, diff vs. existing snapshot |
+| POST | `/labor/{month}/transfer` | Freeze that preview into `labor_months` (replaces an earlier snapshot; a re-transfer keeps the originally applied rate). Future months → `422` |
+| GET | `/hourly-rate` | Stundensatz-Kalkulation (`null` until a complete month with sold crew hours exists). `rate(H) = w + v + F ÷ H`: w = all wage cost ÷ hours sold to customers (moves + Zusatztermine; Termine like Lager are paid but not sold), v = variable costs of categories with `in_hourly_rate` ÷ sold hours, F = fixed costs of those categories per month (drafts included), H = sold hours/month (average, or the planned value). Returns break-even, target rate (+ `target_profit_cents`), current KVA rate (Einstellungen → Preise, netto), hours needed at the current rate, monthly result, full-capacity comparison (crew × h/day × days), a volume table and a per-category breakdown. Sample = complete months from the first one with sold hours, within `window_months`; `inaccurate` + `warnings` while < 12 months or wages are only estimated |
+| GET/POST | `/categories` | List / add expense categories (`kind`: fixed, variable, wages; `in_hourly_rate`) |
+| PATCH | `/categories/{id}` | `{ "recharge_positions": ["Fahrkostenpauschale"] }` — the KVA/invoice positions customers pay this cost through (matched by name, case/whitespace-insensitive). Empty = Eigene Kosten. `in_hourly_rate` follows (= no positions): recharged costs stay out of the Stundensatz |
+| GET | `/positions` | Position names for the picker: Fahrkostenpauschale, the KVA catalogue, and every non-labor name used on KVAs/manual invoices in the last 12 months |
+| GET | `/recharge?year=` | Weiterberechnete Kosten: per recharged category, per month, revenue through its positions vs. its booked cost (drafts incl.); `verdict` gewinn / durchlauf (±2 %, min 5 €) / verlust / unklar (one side zero). Revenue per position: manual invoice → its lines; KVA-based → the KVA's non-labor lines × invoice share (full 1, Anzahlung p, Schlussrechnung 1−p) + extras. Legacy (Excel-imported) invoices have no positions — counted in `legacy_invoices` |
+| GET | `/expenses?from=&to=&category_id=&vehicle_id=&inquiry_id=&employee_id=&status=` | List bookings (also generates due recurring drafts up to the current month) |
+| POST | `/expenses` | Book: `category_id`, `receipt_date`, `brutto_cents`, `vat_rate`, optional `paid_on`, `period_month`, `supplier`, `receipt_number`, `description`, `vehicle_id`, `inquiry_id`, `employee_id` |
+| PATCH | `/expenses/{id}` | Same body; `409` on a Storno row or a reversed booking |
+| POST | `/expenses/{id}/storno` | Create the negated twin (`storno_of`); once per booking; not for drafts |
+| POST | `/expenses/{id}/confirm` | Draft → booked |
+| DELETE | `/expenses/{id}` | Hard delete (also deletes its Storno row; logged with a snapshot) |
+| GET/POST | `/expenses/{id}/receipt` | Download / upload (multipart `file`, image or PDF, ≤ 15 MB; SHA-256 stored) |
+| GET/POST | `/recurring` | Daueraufträge: `category_id`, `label`, `brutto_cents`, `vat_rate`, `interval_months` (1/3/6/12), `day_of_month` (1–28), `start_month`, optional `end_month`, `vehicle_id`, `active`, `notes` |
+| PATCH/DELETE | `/recurring/{id}` | Edit (unconfirmed drafts follow) / delete (drafts deleted, booked entries kept) |
+| GET/PUT | `/settings` | `{ "default_rate_cents": 1850, "hourly": { "target_profit_cents": 0, "window_months": 12, "planned_hours_per_month": null, "capacity_crew": null, "capacity_hours_per_day": 8, "capacity_days_per_month": 21 } }` — `hourly` optional on PUT; `capacity_crew: null` = active employees |
+| GET | `/audit?entity_id=` | Last 200 audit entries |
+
 ## Vehicles
 
 Fleet management — vehicles and their maintenance reminders (TÜV, Ölwechsel, …), mounted at `/api/v1/admin/vehicles`. A background job pings Telegram as a reminder's due date approaches.

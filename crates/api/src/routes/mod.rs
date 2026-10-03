@@ -16,6 +16,8 @@ pub mod inquiry_actions;
 pub mod inquiry_appointments;
 pub mod invoices;
 pub mod offers;
+pub(crate) mod overview;
+pub mod profit;
 pub(crate) mod shared;
 pub mod storage;
 pub mod submissions;

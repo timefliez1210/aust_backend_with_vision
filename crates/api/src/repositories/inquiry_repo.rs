@@ -912,15 +912,47 @@ pub(crate) struct ListItemDbRow {
     pub created_at: DateTime<Utc>,
 }
 
+/// Column the admin list can be sorted by. Anything else falls back to the date.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ListSort {
+    #[default]
+    CreatedAt,
+    CustomerName,
+    Volume,
+}
+
+impl ListSort {
+    /// Parse the `sort` query value; unknown keys are the default, never an error.
+    pub(crate) fn parse(key: Option<&str>) -> Self {
+        match key {
+            Some("customer_name") => Self::CustomerName,
+            Some("volume_m3") => Self::Volume,
+            _ => Self::CreatedAt,
+        }
+    }
+
+    fn as_sql_key(self) -> &'static str {
+        match self {
+            Self::CreatedAt => "created_at",
+            Self::CustomerName => "customer_name",
+            Self::Volume => "volume_m3",
+        }
+    }
+}
+
 /// Fetch a paginated list of inquiries with filters.
 ///
 /// **Caller**: `inquiry_builder::build_inquiry_list`
-/// **Why**: Canonical paginated list query.
+/// **Why**: Canonical paginated list query. `search` matches customer name, email
+/// and the origin/destination city; `sort` + `ascending` pick the order (ties: newest first).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn list_items(
     pool: &PgPool,
     status: Option<&str>,
     search_pattern: Option<&str>,
     has_offer: Option<bool>,
+    sort: ListSort,
+    ascending: bool,
     limit: i64,
     offset: i64,
 ) -> Result<Vec<ListItemDbRow>, sqlx::Error> {
@@ -953,14 +985,22 @@ pub(crate) async fn list_items(
         LEFT JOIN addresses oa ON i.origin_address_id = oa.id
         LEFT JOIN addresses da ON i.destination_address_id = da.id
         WHERE ($1::text IS NULL OR i.status = $1)
-          AND ($2::text IS NULL OR c.name ILIKE $2 OR c.email ILIKE $2)
+          AND ($2::text IS NULL OR c.name ILIKE $2 OR c.email ILIKE $2
+               OR oa.city ILIKE $2 OR da.city ILIKE $2)
           AND ($3::bool IS NULL OR
                (CASE WHEN $3 THEN EXISTS (
                    SELECT 1 FROM offers WHERE inquiry_id = i.id AND status NOT IN ('rejected', 'cancelled', 'superseded')
                ) ELSE NOT EXISTS (
                    SELECT 1 FROM offers WHERE inquiry_id = i.id AND status NOT IN ('rejected', 'cancelled', 'superseded')
                ) END))
-        ORDER BY i.created_at DESC
+        -- Static SQL with a whitelisted key ($6) — no string-built ORDER BY.
+        ORDER BY
+            CASE WHEN $6 = 'customer_name' AND $7 THEN LOWER(c.name) END ASC NULLS LAST,
+            CASE WHEN $6 = 'customer_name' AND NOT $7 THEN LOWER(c.name) END DESC NULLS LAST,
+            CASE WHEN $6 = 'volume_m3' AND $7 THEN i.estimated_volume_m3 END ASC NULLS LAST,
+            CASE WHEN $6 = 'volume_m3' AND NOT $7 THEN i.estimated_volume_m3 END DESC NULLS LAST,
+            CASE WHEN $6 = 'created_at' AND $7 THEN i.created_at END ASC,
+            i.created_at DESC
         LIMIT $4 OFFSET $5
         "#,
     )
@@ -969,6 +1009,8 @@ pub(crate) async fn list_items(
     .bind(has_offer)
     .bind(limit)
     .bind(offset)
+    .bind(sort.as_sql_key())
+    .bind(ascending)
     .fetch_all(pool)
     .await
 }
@@ -988,8 +1030,11 @@ pub(crate) async fn count_items(
         SELECT COUNT(*)
         FROM inquiries i
         LEFT JOIN customers c ON i.customer_id = c.id
+        LEFT JOIN addresses oa ON i.origin_address_id = oa.id
+        LEFT JOIN addresses da ON i.destination_address_id = da.id
         WHERE ($1::text IS NULL OR i.status = $1)
-          AND ($2::text IS NULL OR c.name ILIKE $2 OR c.email ILIKE $2)
+          AND ($2::text IS NULL OR c.name ILIKE $2 OR c.email ILIKE $2
+               OR oa.city ILIKE $2 OR da.city ILIKE $2)
           AND ($3::bool IS NULL OR
                (CASE WHEN $3 THEN EXISTS (
                    SELECT 1 FROM offers WHERE inquiry_id = i.id AND status NOT IN ('rejected', 'cancelled', 'superseded')
@@ -1082,6 +1127,51 @@ pub(crate) async fn count_active_days_and_employees(
 
 #[cfg(test)]
 mod tests {
+    /// The admin list sorts by the whitelisted column in both directions, keeps
+    /// rows without a volume at the end either way, and finds inquiries by city.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_list_sorts_by_volume_and_name_and_searches_cities(pool: sqlx::PgPool) {
+        use super::{count_items, list_items, ListSort};
+        use crate::test_helpers::insert_test_quote_with_status;
+
+        let mut ids = Vec::new();
+        for (name, volume) in [("Bauer", Some(30.0)), ("Adler", None), ("Zander", Some(10.0))] {
+            let id = insert_test_quote_with_status(&pool, "pending").await;
+            sqlx::query("UPDATE inquiries SET estimated_volume_m3 = $2 WHERE id = $1")
+                .bind(id)
+                .bind(volume)
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE customers SET name = $2 WHERE id = (SELECT customer_id FROM inquiries WHERE id = $1)")
+                .bind(id)
+                .bind(name)
+                .execute(&pool)
+                .await
+                .unwrap();
+            ids.push(id);
+        }
+        let names = |rows: Vec<super::ListItemDbRow>| {
+            rows.into_iter().map(|r| r.customer_name.unwrap()).collect::<Vec<_>>()
+        };
+
+        let asc = list_items(&pool, None, None, None, ListSort::Volume, true, 10, 0).await.unwrap();
+        assert_eq!(names(asc), ["Zander", "Bauer", "Adler"]);
+        let desc = list_items(&pool, None, None, None, ListSort::Volume, false, 10, 0).await.unwrap();
+        assert_eq!(names(desc), ["Bauer", "Zander", "Adler"]);
+
+        let by_name = list_items(&pool, None, None, None, ListSort::CustomerName, true, 10, 0).await.unwrap();
+        assert_eq!(names(by_name), ["Adler", "Bauer", "Zander"]);
+
+        // Every test inquiry moves Hildesheim → Hannover.
+        let hits = list_items(&pool, None, Some("%hannover%"), None, ListSort::default(), false, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 3);
+        assert_eq!(count_items(&pool, None, Some("%hannover%"), None).await.unwrap(), 3);
+        assert_eq!(ListSort::parse(Some("'; DROP TABLE inquiries; --")), ListSort::CreatedAt);
+    }
+
     /// The standard Auftragszeit is 08:00–16:30, and it is the *column DEFAULT*
     /// that decides it — `start_time`/`end_time` are NOT NULL, so an INSERT that
     /// omits them writes the default and the `COALESCE(..., '08:00')` fallbacks
