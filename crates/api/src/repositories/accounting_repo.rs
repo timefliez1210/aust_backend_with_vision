@@ -5,7 +5,9 @@
 //! read-only bulk reads over the crew-hours tables for the labor-cost projection.
 //!
 //! This is Alex's personal controlling, not tax bookkeeping. It is kept GoBD-ready:
-//! every write goes through [`log`] and a correction defaults to a Storno row.
+//! every write goes through [`log`] and a correction defaults to a Storno row —
+//! including the bulk ones: generated Dauerauftrag drafts (actor `dauerauftrag`) and
+//! the drafts a template edit/delete re-syncs or removes get one entry per row.
 
 use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use serde::Serialize;
@@ -336,8 +338,10 @@ pub(crate) async fn insert_category(
     name: &str,
     kind: &str,
     default_vat_rate: i16,
+    actor: &str,
 ) -> Result<CategoryRow, ApiError> {
-    sqlx::query_as(
+    let mut tx = pool.begin().await?;
+    let row: CategoryRow = sqlx::query_as(
         "INSERT INTO expense_categories (name, kind, default_vat_rate, sort_order)
          VALUES ($1, $2, $3, (SELECT COALESCE(MAX(sort_order), 0) + 10 FROM expense_categories))
          RETURNING id, name, kind, default_vat_rate, skr03_account, sort_order, active, in_hourly_rate, recharge_positions",
@@ -345,14 +349,17 @@ pub(crate) async fn insert_category(
     .bind(name)
     .bind(kind)
     .bind(default_vat_rate)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| match &e {
         sqlx::Error::Database(db) if db.is_unique_violation() => {
             ApiError::Conflict("Kategorie existiert bereits".into())
         }
         _ => e.into(),
-    })
+    })?;
+    log(&mut tx, "category", Some(row.id), "create", actor, None, to_json(&row)).await?;
+    tx.commit().await?;
+    Ok(row)
 }
 
 /// Set the positions a category is recharged through. No positions = Eigene Kosten
@@ -540,6 +547,45 @@ async fn fetch_expense_tx(
 
 fn to_json<T: Serialize>(v: &T) -> Option<serde_json::Value> {
     serde_json::to_value(v).ok()
+}
+
+async fn fetch_expenses_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    ids: &[Uuid],
+) -> Result<Vec<ExpenseRow>, ApiError> {
+    let sql = format!("{EXPENSE_SELECT} WHERE e.id = ANY($1) ORDER BY e.period_month");
+    Ok(sqlx::query_as(&sql).bind(ids).fetch_all(&mut **tx).await?)
+}
+
+/// Equal apart from the `updated_at` stamp — a resync that changed nothing is not logged.
+fn same_content(a: &ExpenseRow, b: &ExpenseRow) -> bool {
+    let strip = |r: &ExpenseRow| {
+        let mut v = to_json(r).unwrap_or_default();
+        if let Some(o) = v.as_object_mut() {
+            o.remove("updated_at");
+        }
+        v
+    };
+    strip(a) == strip(b)
+}
+
+/// Delete expense rows and log each one with its full content.
+///
+/// **Why**: the cascades of a Dauerauftrag edit/delete touch several drafts in one
+/// go; each still needs its own `delete` entry, written before the row is gone.
+async fn delete_expenses_logged(
+    tx: &mut Transaction<'_, Postgres>,
+    ids: &[Uuid],
+    actor: &str,
+) -> Result<(), ApiError> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    for row in fetch_expenses_tx(tx, ids).await? {
+        log(tx, "expense", Some(row.id), "delete", actor, to_json(&row), None).await?;
+    }
+    sqlx::query("DELETE FROM expenses WHERE id = ANY($1)").bind(ids).execute(&mut **tx).await?;
+    Ok(())
 }
 
 pub(crate) async fn insert_expense(
@@ -868,9 +914,9 @@ pub(crate) async fn update_recurring(
     // Drafts for months the template no longer charges (start moved later, end moved
     // earlier, interval changed) go; booked entries are history and stay. Months that
     // became due are filled by the next `generate_recurring_drafts`.
-    sqlx::query(
-        "DELETE FROM expenses e USING recurring_expenses r
-         WHERE r.id = $1 AND e.recurring_id = r.id AND e.status = 'draft'
+    let doomed: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT e.id FROM expenses e JOIN recurring_expenses r ON r.id = e.recurring_id
+         WHERE r.id = $1 AND e.status = 'draft'
            AND (e.period_month < r.start_month
                 OR (r.end_month IS NOT NULL AND e.period_month > r.end_month)
                 OR ((EXTRACT(YEAR FROM e.period_month) * 12 + EXTRACT(MONTH FROM e.period_month))
@@ -878,9 +924,16 @@ pub(crate) async fn update_recurring(
                    % r.interval_months <> 0)",
     )
     .bind(id)
-    .execute(&mut *tx)
+    .fetch_all(&mut *tx)
     .await?;
+    delete_expenses_logged(&mut tx, &doomed, actor).await?;
     // Unconfirmed drafts follow the template; booked entries are history and stay.
+    let draft_ids: Vec<Uuid> =
+        sqlx::query_scalar("SELECT id FROM expenses WHERE recurring_id = $1 AND status = 'draft'")
+            .bind(id)
+            .fetch_all(&mut *tx)
+            .await?;
+    let drafts_before = fetch_expenses_tx(&mut tx, &draft_ids).await?;
     sqlx::query(
         "UPDATE expenses e SET category_id = r.category_id, supplier = r.supplier,
                 description = r.label, netto_cents = r.netto_cents, vat_rate = r.vat_rate,
@@ -894,6 +947,11 @@ pub(crate) async fn update_recurring(
     .bind(id)
     .execute(&mut *tx)
     .await?;
+    for (old, new) in drafts_before.iter().zip(fetch_expenses_tx(&mut tx, &draft_ids).await?) {
+        if !same_content(old, &new) {
+            log(&mut tx, "expense", Some(new.id), "update", actor, to_json(old), to_json(&new)).await?;
+        }
+    }
     let after = fetch_recurring_tx(&mut tx, id).await?.ok_or_else(|| ApiError::Internal("Dauerauftrag verschwunden".into()))?;
     log(&mut tx, "recurring_expense", Some(id), "update", actor, to_json(&before), to_json(&after)).await?;
     tx.commit().await?;
@@ -907,10 +965,12 @@ pub(crate) async fn delete_recurring(pool: &PgPool, id: Uuid, actor: &str) -> Re
     let before = fetch_recurring_tx(&mut tx, id)
         .await?
         .ok_or_else(|| ApiError::NotFound("Dauerauftrag nicht gefunden".into()))?;
-    sqlx::query("DELETE FROM expenses WHERE recurring_id = $1 AND status = 'draft'")
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
+    let drafts: Vec<Uuid> =
+        sqlx::query_scalar("SELECT id FROM expenses WHERE recurring_id = $1 AND status = 'draft'")
+            .bind(id)
+            .fetch_all(&mut *tx)
+            .await?;
+    delete_expenses_logged(&mut tx, &drafts, actor).await?;
     sqlx::query("DELETE FROM recurring_expenses WHERE id = $1")
         .bind(id)
         .execute(&mut *tx)
@@ -933,7 +993,8 @@ pub(crate) async fn generate_recurring_drafts(
     pool: &PgPool,
     up_to_month: NaiveDate,
 ) -> Result<u64, ApiError> {
-    let res = sqlx::query(
+    let mut tx = pool.begin().await?;
+    let ids: Vec<Uuid> = sqlx::query_scalar(
         r#"
         INSERT INTO expenses (category_id, status, receipt_date, period_month, supplier,
                               description, netto_cents, vat_rate, vat_cents, brutto_cents,
@@ -953,12 +1014,17 @@ pub(crate) async fn generate_recurring_drafts(
               SELECT 1 FROM recurring_expense_skips k
               WHERE k.recurring_id = r.id AND k.period_month = m.month::date)
         ON CONFLICT (recurring_id, period_month) WHERE recurring_id IS NOT NULL DO NOTHING
+        RETURNING id
         "#,
     )
     .bind(up_to_month)
-    .execute(pool)
+    .fetch_all(&mut *tx)
     .await?;
-    Ok(res.rows_affected())
+    for row in fetch_expenses_tx(&mut tx, &ids).await? {
+        log(&mut tx, "expense", Some(row.id), "create", "dauerauftrag", None, to_json(&row)).await?;
+    }
+    tx.commit().await?;
+    Ok(ids.len() as u64)
 }
 
 // ── Aggregations ────────────────────────────────────────────────────────────

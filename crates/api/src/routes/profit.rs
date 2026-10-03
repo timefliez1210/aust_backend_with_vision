@@ -205,7 +205,7 @@ async fn create_category(
         return Err(ApiError::Validation("Ungültige Kostenart".into()));
     }
     validate_vat(body.default_vat_rate)?;
-    let row = accounting_repo::insert_category(&state.db, name, &body.kind, body.default_vat_rate).await?;
+    let row = accounting_repo::insert_category(&state.db, name, &body.kind, body.default_vat_rate, &actor(&claims)).await?;
     Ok((StatusCode::CREATED, Json(row)))
 }
 

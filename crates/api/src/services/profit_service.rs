@@ -2009,6 +2009,58 @@ mod db_tests {
         assert_eq!(costs.iter().map(|c| c.netto_cents).sum::<i64>(), 0);
     }
 
+    /// GoBD-readiness: the bulk paths (generated drafts, the drafts a template edit or
+    /// delete touches, a new category) each leave one audit entry per row.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn bulk_writes_are_audited_row_by_row(pool: PgPool) {
+        let cat = accounting_repo::insert_category(&pool, "Lagerhalle", "fixed", 19, "alex").await.unwrap();
+        assert_eq!(audit_actions(&pool, cat.id).await, vec!["create"]);
+
+        let mut input = RecurringInput {
+            category_id: cat.id,
+            label: "Halle".into(),
+            supplier: None,
+            netto_cents: 100_000,
+            vat_rate: 19,
+            vat_cents: 19_000,
+            brutto_cents: 119_000,
+            interval_months: 1,
+            day_of_month: 1,
+            start_month: d(2025, 1, 1),
+            end_month: None,
+            vehicle_id: None,
+            active: true,
+            notes: None,
+        };
+        let r = accounting_repo::insert_recurring(&pool, &input, "alex").await.unwrap();
+        assert_eq!(accounting_repo::generate_recurring_drafts(&pool, d(2025, 3, 1)).await.unwrap(), 3);
+        let ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM expenses WHERE recurring_id = $1 ORDER BY period_month")
+            .bind(r.id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        let actor: String = sqlx::query_scalar("SELECT actor FROM accounting_audit_log WHERE entity_id = $1")
+            .bind(ids[0])
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(actor, "dauerauftrag");
+
+        // Price change + start moved to February: January's draft goes, the others follow.
+        input.netto_cents = 120_000;
+        input.start_month = d(2025, 2, 1);
+        accounting_repo::update_recurring(&pool, r.id, &input, "alex").await.unwrap();
+        assert_eq!(audit_actions(&pool, ids[0]).await, vec!["create", "delete"]);
+        assert_eq!(audit_actions(&pool, ids[1]).await, vec!["create", "update"]);
+
+        // Saving again without a change logs nothing more for the drafts.
+        accounting_repo::update_recurring(&pool, r.id, &input, "alex").await.unwrap();
+        assert_eq!(audit_actions(&pool, ids[1]).await, vec!["create", "update"]);
+
+        accounting_repo::delete_recurring(&pool, r.id, "alex").await.unwrap();
+        assert_eq!(audit_actions(&pool, ids[2]).await, vec!["create", "update", "delete"]);
+    }
+
     /// Moving a Dauerauftrag's day re-dates its open drafts; booked months keep theirs.
     #[sqlx::test(migrations = "../../migrations")]
     async fn changing_day_of_month_redates_open_drafts(pool: PgPool) {
