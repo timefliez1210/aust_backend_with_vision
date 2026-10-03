@@ -1603,10 +1603,47 @@ pub(crate) async fn transfer_preview(pool: &PgPool, month: NaiveDate) -> Result<
     Ok(transfer_data(pool, month).await?.preview)
 }
 
+/// Freeze a month's hours into `labor_months`.
+///
+/// **Why the lock**: the snapshot is computed from reads (live hours, the rate a
+/// month was first costed at) and then written. Two transfers of the same month
+/// running side by side (two admins, two tabs) could each write a different
+/// snapshot, and the older one could win. A transaction-scoped advisory lock per
+/// month makes them run one after the other; it is released on commit, rollback
+/// or when the request is dropped. With tenants, the key must include the tenant.
+///
+/// The response is built from this one read plus the rows just written, so it is
+/// exactly what a reload would show without computing the month twice.
 pub(crate) async fn transfer(pool: &PgPool, month: NaiveDate, actor: &str) -> Result<TransferPreview, ApiError> {
+    let mut lock = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("labor_transfer:{month}"))
+        .execute(&mut *lock)
+        .await?;
     let data = transfer_data(pool, month).await?;
-    accounting_repo::replace_labor_month(pool, month, &data.inputs, actor).await?;
-    transfer_preview(pool, month).await
+    let written = accounting_repo::replace_labor_month(pool, month, &data.inputs, actor).await?;
+    lock.commit().await?;
+    Ok(settled_preview(data.preview, &written))
+}
+
+/// The preview as it reads once `written` is the month's snapshot: every line is
+/// "transferred and unchanged"; lines without a stored row (nothing worked, old
+/// row deleted) drop out, as they would on a fresh read.
+fn settled_preview(mut p: TransferPreview, written: &[LaborMonthRow]) -> TransferPreview {
+    p.lines.retain_mut(|l| match written.iter().find(|w| w.employee_id == l.employee_id) {
+        Some(w) => {
+            l.transferred_hours = Some(w.paid_hours);
+            l.transferred_cost_cents = Some(w.cost_cents);
+            l.changed = false;
+            true
+        }
+        None => false,
+    });
+    p.total_hours = round2(p.lines.iter().map(|l| l.paid_hours).sum());
+    p.total_cost_cents = p.lines.iter().map(|l| l.cost_cents).sum();
+    p.transferred_at = written.iter().map(|w| w.transferred_at).max();
+    p.has_changes = false;
+    p
 }
 
 #[cfg(test)]
@@ -2226,6 +2263,28 @@ mod db_tests {
         .unwrap();
     }
 
+    /// A second transfer of the same month waits until the first one is done.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn transfers_of_one_month_run_one_after_the_other(pool: PgPool) {
+        let month = add_months(month_start(today_berlin()), -2);
+        let mut holder = pool.begin().await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("labor_transfer:{month}"))
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+
+        let p = pool.clone();
+        let waiting = tokio::spawn(async move { transfer(&p, month, "alex").await });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!waiting.is_finished(), "transfer ran while the month was locked");
+
+        holder.commit().await.unwrap();
+        assert!(waiting.await.unwrap().is_ok());
+        // Another month is never blocked.
+        transfer(&pool, add_months(month, -1), "alex").await.unwrap();
+    }
+
     /// The core promise: cost starts at €18.50 × hours and becomes the real rate once
     /// Alex transfers the month's hours and books the wages.
     #[sqlx::test(migrations = "../../migrations")]
@@ -2254,6 +2313,11 @@ mod db_tests {
         let done = transfer(&pool, march, "alex").await.unwrap();
         assert!(!done.has_changes);
         assert!(done.transferred_at.is_some());
+        // Built without a second read, the answer must still equal a reload.
+        assert_eq!(
+            serde_json::to_value(&done).unwrap(),
+            serde_json::to_value(transfer_preview(&pool, march).await.unwrap()).unwrap()
+        );
 
         // Later edits in the hours tab don't move the frozen month…
         sqlx::query("UPDATE inquiry_employees SET actual_hours = 10 WHERE employee_id = $1")

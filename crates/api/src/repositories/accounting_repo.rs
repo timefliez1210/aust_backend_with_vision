@@ -1134,8 +1134,9 @@ pub(crate) async fn replace_labor_month(
     month: NaiveDate,
     rows: &[LaborMonthInput],
     actor: &str,
-) -> Result<(), ApiError> {
+) -> Result<Vec<LaborMonthRow>, ApiError> {
     let mut tx = pool.begin().await?;
+    let mut written = Vec::with_capacity(rows.len());
     let existing: Vec<LaborMonthRow> = sqlx::query_as(
         "SELECT id, employee_id, month, paid_hours::float8 AS paid_hours,
                 worked_hours::float8 AS worked_hours, rate_cents, cost_cents,
@@ -1187,9 +1188,10 @@ pub(crate) async fn replace_labor_month(
             to_json(&new),
         )
         .await?;
+        written.push(new);
     }
     tx.commit().await?;
-    Ok(())
+    Ok(written)
 }
 
 /// Every crew assignment-day in a range, for all employees, from the three crew
