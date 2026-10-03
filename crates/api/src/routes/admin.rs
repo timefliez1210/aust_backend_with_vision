@@ -2294,18 +2294,7 @@ pub(crate) struct RevenueEntry {
 /// **Why**: Built from the register's own rows so the Gewinn tab and the register
 /// can never disagree about what was billed.
 pub(crate) async fn issued_revenue(db: &sqlx::PgPool) -> Result<Vec<RevenueEntry>, ApiError> {
-    Ok(load_register_items(db)
-        .await?
-        .into_iter()
-        .filter(|r| !register_is_draft(r) && !matches!(r.status.as_str(), "void" | "written_off"))
-        .filter_map(|r| {
-            r.netto_cents.map(|netto| RevenueEntry {
-                inquiry_id: r.inquiry_id,
-                service_date: r.scheduled_date,
-                netto_cents: netto,
-            })
-        })
-        .collect())
+    Ok(issued_register(db).await?.revenue)
 }
 
 /// One issued invoice with money still outstanding.
@@ -2317,29 +2306,41 @@ pub(crate) struct Receivable {
     pub open_cents: i64,
 }
 
-/// What customers still owe, exactly as the Rechnungsausgangsbuch shows it in its
-/// "offen" column: issued rows only, voided / written-off left out, Gutschriften
-/// (negative) ignored.
-///
-/// **Caller**: `routes::overview`
-/// **Why**: the overview links straight to the register, so it must not compute a
-/// second, slightly different "open" number.
-pub(crate) async fn open_receivables(db: &sqlx::PgPool) -> Result<Vec<Receivable>, ApiError> {
-    Ok(load_register_items(db)
-        .await?
-        .into_iter()
-        .filter(|r| !register_is_draft(r) && !matches!(r.status.as_str(), "void" | "written_off"))
-        .filter_map(|r| match r.offene_zahlungen_cents {
-            Some(open) if open > 0 => Some(Receivable {
+/// The register's issued rows (no reserved numbers, voided / written-off left out),
+/// read once and split into what was billed and what is still owed.
+pub(crate) struct IssuedRegister {
+    pub revenue: Vec<RevenueEntry>,
+    /// Exactly the register's "offen" column; Gutschriften (negative) ignored.
+    pub receivables: Vec<Receivable>,
+}
+
+/// **Caller**: `issued_revenue`, `routes::overview`
+/// **Why**: the overview needs both halves; loading the register once keeps the
+/// dashboard to a single register query and both figures from the same snapshot.
+pub(crate) async fn issued_register(db: &sqlx::PgPool) -> Result<IssuedRegister, ApiError> {
+    let mut out = IssuedRegister { revenue: Vec::new(), receivables: Vec::new() };
+    for r in load_register_items(db).await? {
+        if register_is_draft(&r) || matches!(r.status.as_str(), "void" | "written_off") {
+            continue;
+        }
+        if let Some(netto) = r.netto_cents {
+            out.revenue.push(RevenueEntry {
+                inquiry_id: r.inquiry_id,
+                service_date: r.scheduled_date,
+                netto_cents: netto,
+            });
+        }
+        if let Some(open) = r.offene_zahlungen_cents.filter(|o| *o > 0) {
+            out.receivables.push(Receivable {
                 invoice_number: r.invoice_number,
                 inquiry_id: r.inquiry_id,
                 customer_name: r.customer_name,
                 due_date: r.due_date,
                 open_cents: open,
-            }),
-            _ => None,
-        })
-        .collect())
+            });
+        }
+    }
+    Ok(out)
 }
 
 /// One KVA as the KVA-Buch judges it.

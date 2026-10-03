@@ -705,6 +705,12 @@ pub(crate) async fn delete_expense(pool: &PgPool, id: Uuid, actor: &str) -> Resu
     let row = fetch_expense_tx(&mut tx, id)
         .await?
         .ok_or_else(|| ApiError::NotFound("Buchung nicht gefunden".into()))?;
+    // Deleting only the reversal would silently bring the original cost back.
+    if row.storno_of.is_some() {
+        return Err(ApiError::Conflict(
+            "Eine Stornobuchung kann nicht einzeln gelöscht werden. Lösche die Originalbuchung, die Storno wird mitgelöscht.".into(),
+        ));
+    }
     let mut keys = Vec::new();
     if let Some(sid) = row.storno_id {
         if let Some(s) = fetch_expense_tx(&mut tx, sid).await? {
@@ -879,6 +885,8 @@ pub(crate) async fn update_recurring(
         "UPDATE expenses e SET category_id = r.category_id, supplier = r.supplier,
                 description = r.label, netto_cents = r.netto_cents, vat_rate = r.vat_rate,
                 vat_cents = r.vat_cents, brutto_cents = r.brutto_cents, vehicle_id = r.vehicle_id,
+                -- same date rule as generate_recurring_drafts
+                receipt_date = (e.period_month + (LEAST(r.day_of_month, 28) - 1) * INTERVAL '1 day')::date,
                 updated_at = NOW()
          FROM recurring_expenses r
          WHERE r.id = $1 AND e.recurring_id = r.id AND e.status = 'draft'",

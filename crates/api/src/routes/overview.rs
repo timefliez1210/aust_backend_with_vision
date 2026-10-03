@@ -19,8 +19,8 @@ use uuid::Uuid;
 
 use aust_core::models::TokenClaims;
 
-use super::admin::{issued_revenue, kva_states, open_receivables, WON_INQUIRY_STATUSES};
-use crate::repositories::{admin_repo, calendar_repo, overview_repo};
+use super::admin::{issued_register, kva_states, WON_INQUIRY_STATUSES};
+use crate::repositories::{accounting_repo, admin_repo, calendar_repo, overview_repo};
 use crate::services::{billing_reminder_service, profit_service};
 use crate::{ApiError, AppState};
 
@@ -262,8 +262,9 @@ async fn overview(
     let first_month = current_month - Months::new(11);
     let months: Vec<NaiveDate> = (0..12).map(|i| first_month + Months::new(i)).collect();
 
+    let register = issued_register(db).await?;
     let mut revenue_by_month: HashMap<NaiveDate, i64> = HashMap::new();
-    for e in issued_revenue(db).await? {
+    for e in &register.revenue {
         if let Some(d) = e.service_date {
             *revenue_by_month.entry(profit_service::month_start(d)).or_default() += e.netto_cents;
         }
@@ -275,8 +276,11 @@ async fn overview(
         if current_month.year() != first_month.year() {
             years.push(current_month.year());
         }
+        // Same Dauerauftrag drafts the Gewinn tab books (idempotent insert), once per
+        // request, so "Ergebnis" here matches the Gewinn tab for the current month.
+        accounting_repo::generate_recurring_drafts(db, current_month).await?;
         for y in years {
-            for m in profit_service::overview(db, y).await?.months {
+            for m in profit_service::overview_from(db, y, &register.revenue).await?.months {
                 result_by_month.insert(m.month, m.result_cents);
             }
         }
@@ -353,7 +357,7 @@ async fn overview(
     // ── Receivables (register) ───────────────────────────────────────────────
     let mut receivables = Receivables::default();
     let mut overdue: Vec<OverdueInvoice> = Vec::new();
-    for r in open_receivables(db).await? {
+    for r in register.receivables {
         receivables.open_cents += r.open_cents;
         let days = r.due_date.map(|d| (today - d).num_days()).unwrap_or(0);
         match days {
@@ -505,7 +509,9 @@ mod tests {
         assert!(jobs_for(&json, wish).is_empty());
         assert!(is_unstaffed(&json, won));
 
-        let employee = insert_test_employee(&pool, "Max", "Mustermann").await;
+        // Unique surname: the test DB is shared and employees.email is unique.
+        let surname = format!("M{}", uuid::Uuid::now_v7().simple());
+        let employee = insert_test_employee(&pool, "Max", &surname).await;
         insert_test_inquiry_employee(&pool, won, employee, today, 8.0).await;
 
         let json = fetch_overview().await;

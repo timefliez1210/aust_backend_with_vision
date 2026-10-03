@@ -912,10 +912,6 @@ pub(crate) struct ListItemDbRow {
     pub created_at: DateTime<Utc>,
 }
 
-/// Fetch a paginated list of inquiries with filters.
-///
-/// **Caller**: `inquiry_builder::build_inquiry_list`
-/// **Why**: Canonical paginated list query.
 /// Column the admin list can be sorted by. Anything else falls back to the date.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum ListSort {
@@ -944,6 +940,11 @@ impl ListSort {
     }
 }
 
+/// Fetch a paginated list of inquiries with filters.
+///
+/// **Caller**: `inquiry_builder::build_inquiry_list`
+/// **Why**: Canonical paginated list query. `search` matches customer name, email
+/// and the origin/destination city; `sort` + `ascending` pick the order (ties: newest first).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn list_items(
     pool: &PgPool,

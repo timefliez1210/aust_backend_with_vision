@@ -24,7 +24,7 @@ use crate::repositories::accounting_repo::{
     self, BulkAdjustmentRow, CrewDayRow, LaborMonthInput, LaborMonthRow, WagesRow,
 };
 use crate::repositories::employee_repo::HoursAdjustmentRow;
-use crate::routes::admin::{issued_revenue, paid_hours_for};
+use crate::routes::admin::{issued_revenue, paid_hours_for, RevenueEntry};
 use crate::ApiError;
 
 /// How many qualifying months feed the real hourly rate.
@@ -411,15 +411,24 @@ fn rates_summary(r: &Rates) -> RatesSummary {
 }
 
 pub(crate) async fn overview(pool: &PgPool, year: i32) -> Result<Overview, ApiError> {
+    accounting_repo::generate_recurring_drafts(pool, month_start(today_berlin())).await?;
+    let revenue = issued_revenue(pool).await?;
+    overview_from(pool, year, &revenue).await
+}
+
+/// The year's month rows from an already-loaded register, without generating drafts.
+///
+/// **Caller**: `overview`, `routes::overview` (Heute, which spans two years and
+/// already holds the register)
+/// **Why**: the dashboard must not reload the register or re-run draft generation
+/// once per year it shows.
+pub(crate) async fn overview_from(pool: &PgPool, year: i32, revenue: &[RevenueEntry]) -> Result<Overview, ApiError> {
     let today = today_berlin();
     let current = month_start(today);
     let first = NaiveDate::from_ymd_opt(year, 1, 1).ok_or_else(|| ApiError::BadRequest("Ungültiges Jahr".into()))?;
     let last = NaiveDate::from_ymd_opt(year, 12, 1).expect("valid");
 
-    accounting_repo::generate_recurring_drafts(pool, current).await?;
-
     let rates = load_rates(pool).await?;
-    let revenue = issued_revenue(pool).await?;
     let costs = accounting_repo::cost_by_kind(pool, first, last).await?;
     let wages = accounting_repo::wages_by_month(pool, first, last).await?;
     let labor = accounting_repo::list_labor_months(pool, first, last).await?;
@@ -1985,6 +1994,56 @@ mod db_tests {
         // The log outlives the rows.
         assert_eq!(audit_actions(&pool, e.id).await, vec!["create", "storno", "delete"]);
         assert_eq!(audit_actions(&pool, s.id).await, vec!["delete"]);
+    }
+
+    /// Deleting only the negative twin would bring the reversed cost back unnoticed.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn storno_row_cannot_be_deleted_on_its_own(pool: PgPool) {
+        let fuel = category(&pool, "Kraftstoff").await;
+        let m = d(2025, 3, 1);
+        let e = accounting_repo::insert_expense(&pool, &expense(fuel, m, 11_900, 19), "alex").await.unwrap();
+        let s = accounting_repo::storno_expense(&pool, e.id, "alex").await.unwrap();
+
+        assert!(matches!(accounting_repo::delete_expense(&pool, s.id, "alex").await, Err(ApiError::Conflict(_))));
+        let costs = accounting_repo::cost_by_kind(&pool, m, m).await.unwrap();
+        assert_eq!(costs.iter().map(|c| c.netto_cents).sum::<i64>(), 0);
+    }
+
+    /// Moving a Dauerauftrag's day re-dates its open drafts; booked months keep theirs.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn changing_day_of_month_redates_open_drafts(pool: PgPool) {
+        let rent = category(&pool, "Miete").await;
+        let mut input = RecurringInput {
+            category_id: rent,
+            label: "Miete".into(),
+            supplier: None,
+            netto_cents: 100_000,
+            vat_rate: 19,
+            vat_cents: 19_000,
+            brutto_cents: 119_000,
+            interval_months: 1,
+            day_of_month: 1,
+            start_month: d(2025, 1, 1),
+            end_month: None,
+            vehicle_id: None,
+            active: true,
+            notes: None,
+        };
+        let r = accounting_repo::insert_recurring(&pool, &input, "alex").await.unwrap();
+        accounting_repo::generate_recurring_drafts(&pool, d(2025, 2, 1)).await.unwrap();
+        let all = |pool: PgPool| async move {
+            accounting_repo::list_expenses(&pool, &accounting_repo::ExpenseFilter::default()).await.unwrap()
+        };
+        let jan = all(pool.clone()).await.into_iter().find(|e| e.period_month == d(2025, 1, 1)).unwrap();
+        accounting_repo::confirm_expense(&pool, jan.id, "alex").await.unwrap();
+
+        input.day_of_month = 28;
+        accounting_repo::update_recurring(&pool, r.id, &input, "alex").await.unwrap();
+
+        let rows = all(pool.clone()).await;
+        let date_of = |m: NaiveDate| rows.iter().find(|e| e.period_month == m).unwrap().receipt_date;
+        assert_eq!(date_of(d(2025, 1, 1)), d(2025, 1, 1), "booked month keeps its date");
+        assert_eq!(date_of(d(2025, 2, 1)), d(2025, 2, 28), "open draft follows the template");
     }
 
     #[sqlx::test(migrations = "../../migrations")]
