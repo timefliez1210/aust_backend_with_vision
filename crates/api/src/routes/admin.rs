@@ -32,6 +32,7 @@ use super::invoices::{compute_invoice_amounts, InvoiceAmountInput};
 /// into a single router mounted at `/api/v1/admin`.
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
+        .merge(super::overview::router())
         .route("/dashboard", get(dashboard))
         .route("/customers", get(admin_customers::list_customers).post(admin_customers::create_customer))
         .route("/customers/{id}", get(admin_customers::get_customer).patch(admin_customers::update_customer))
@@ -863,7 +864,7 @@ fn build_adjustment_map(
 /// - `deactivated` → 0
 /// - `paid_clock_in` & `paid_clock_out` set → derived (minus paid break, clamped ≥0)
 /// - else → the recorded worked hours (no override)
-fn paid_hours_for(
+pub(crate) fn paid_hours_for(
     worked: Option<f64>,
     adj: Option<&employee_repo::HoursAdjustmentRow>,
 ) -> Option<f64> {
@@ -2276,7 +2277,107 @@ async fn rechnungsausgangsbuch(
     State(state): State<Arc<AppState>>,
     Extension(_claims): Extension<TokenClaims>,
 ) -> Result<Json<Vec<RechnungsausgangItem>>, ApiError> {
-    let rows = invoice_repo::list_for_rechnungsausgangsbuch(&state.db).await?;
+    Ok(Json(load_register_items(&state.db).await?))
+}
+
+/// One issued invoice's netto, dated by its Leistungsmonat — the Gewinn tab's revenue.
+pub(crate) struct RevenueEntry {
+    pub inquiry_id: Option<Uuid>,
+    pub service_date: Option<NaiveDate>,
+    pub netto_cents: i64,
+}
+
+/// Revenue exactly as the Rechnungsausgangsbuch counts it: issued rows only
+/// (no reserved numbers), voided and written-off invoices left out.
+///
+/// **Caller**: `services::profit_service`
+/// **Why**: Built from the register's own rows so the Gewinn tab and the register
+/// can never disagree about what was billed.
+pub(crate) async fn issued_revenue(db: &sqlx::PgPool) -> Result<Vec<RevenueEntry>, ApiError> {
+    Ok(load_register_items(db)
+        .await?
+        .into_iter()
+        .filter(|r| !register_is_draft(r) && !matches!(r.status.as_str(), "void" | "written_off"))
+        .filter_map(|r| {
+            r.netto_cents.map(|netto| RevenueEntry {
+                inquiry_id: r.inquiry_id,
+                service_date: r.scheduled_date,
+                netto_cents: netto,
+            })
+        })
+        .collect())
+}
+
+/// One issued invoice with money still outstanding.
+pub(crate) struct Receivable {
+    pub invoice_number: String,
+    pub inquiry_id: Option<Uuid>,
+    pub customer_name: Option<String>,
+    pub due_date: Option<NaiveDate>,
+    pub open_cents: i64,
+}
+
+/// What customers still owe, exactly as the Rechnungsausgangsbuch shows it in its
+/// "offen" column: issued rows only, voided / written-off left out, Gutschriften
+/// (negative) ignored.
+///
+/// **Caller**: `routes::overview`
+/// **Why**: the overview links straight to the register, so it must not compute a
+/// second, slightly different "open" number.
+pub(crate) async fn open_receivables(db: &sqlx::PgPool) -> Result<Vec<Receivable>, ApiError> {
+    Ok(load_register_items(db)
+        .await?
+        .into_iter()
+        .filter(|r| !register_is_draft(r) && !matches!(r.status.as_str(), "void" | "written_off"))
+        .filter_map(|r| match r.offene_zahlungen_cents {
+            Some(open) if open > 0 => Some(Receivable {
+                invoice_number: r.invoice_number,
+                inquiry_id: r.inquiry_id,
+                customer_name: r.customer_name,
+                due_date: r.due_date,
+                open_cents: open,
+            }),
+            _ => None,
+        })
+        .collect())
+}
+
+/// One KVA as the KVA-Buch judges it.
+pub(crate) struct KvaState {
+    /// `gewonnen` | `verloren` | `offen` | `unbekannt`
+    pub lage: &'static str,
+    pub netto_cents: i64,
+    pub kva_date: NaiveDate,
+    pub move_date_passed: bool,
+    pub needs_followup: bool,
+}
+
+/// Every KVA with its win/loss state and follow-up flag.
+///
+/// **Caller**: `routes::overview`
+/// **Why**: the acceptance rate and the open pipeline on the overview must equal the
+/// KVA-Buch's own figures, so they are derived through the same `lage_of` /
+/// `kva_needs_followup` the register uses.
+pub(crate) async fn kva_states(db: &sqlx::PgPool, today: NaiveDate) -> Result<Vec<KvaState>, ApiError> {
+    let threshold_days = settings_repo::get_kva_followup_days(db).await?;
+    Ok(offer_repo::list_for_kva_buch(db)
+        .await?
+        .iter()
+        .map(|r| {
+            let lage = lage_of(r.inquiry_status.as_deref());
+            KvaState {
+                lage,
+                netto_cents: r.price_cents,
+                kva_date: r.created_at.with_timezone(&chrono_tz::Europe::Berlin).date_naive(),
+                move_date_passed: lage == "offen" && matches!(r.scheduled_date, Some(d) if d <= today),
+                needs_followup: kva_needs_followup(r, today, threshold_days),
+            }
+        })
+        .collect())
+}
+
+async fn load_register_items(db: &sqlx::PgPool) -> Result<Vec<RechnungsausgangItem>, ApiError> {
+    let rows = invoice_repo::list_for_rechnungsausgangsbuch(db).await?;
 
     let mut items: Vec<RechnungsausgangItem> = rows
         .into_iter()
@@ -2355,7 +2456,7 @@ async fn rechnungsausgangsbuch(
 
     // Storage invoices share the invoice-number sequence and belong in the same
     // legal register. Merge them in and re-sort so the ledger stays sequential.
-    let storage_rows = storage_repo::list_for_register(&state.db).await?;
+    let storage_rows = storage_repo::list_for_register(db).await?;
     for r in storage_rows {
         // A rejected storage invoice already holds a number from the shared sequence,
         // so it stays in the register to account for that number — but it is not owed
@@ -2402,7 +2503,7 @@ async fn rechnungsausgangsbuch(
         invoice_number::sort_key(&a.invoice_number).cmp(&invoice_number::sort_key(&b.invoice_number))
     });
 
-    Ok(Json(items))
+    Ok(items)
 }
 
 /// Is this register row a reserved number rather than an issued invoice?
@@ -2499,7 +2600,7 @@ struct KvaBuchItem {
 }
 
 /// Inquiry statuses that count as a won job.
-const WON_INQUIRY_STATUSES: &[&str] = &[
+pub(crate) const WON_INQUIRY_STATUSES: &[&str] = &[
     "accepted", "scheduled", "completed", "invoiced", "paid",
 ];
 

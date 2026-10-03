@@ -40,6 +40,7 @@ ammonia = { workspace = true }
 reqwest = { workspace = true }
 rand = { workspace = true }
 hex = { workspace = true }
+sha2 = "0.10"
 async-trait = { workspace = true }
 
 [dev-dependencies]

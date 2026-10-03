@@ -360,6 +360,8 @@ pub async fn build_inquiry_list(
     status: Option<&str>,
     search: Option<&str>,
     has_offer: Option<bool>,
+    sort: inquiry_repo::ListSort,
+    ascending: bool,
     limit: i64,
     offset: i64,
 ) -> Result<(Vec<InquiryListItem>, i64), ApiError> {
@@ -371,6 +373,8 @@ pub async fn build_inquiry_list(
         status,
         search_pattern.as_deref(),
         has_offer,
+        sort,
+        ascending,
         limit,
         offset,
     )

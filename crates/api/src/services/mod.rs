@@ -5,6 +5,7 @@ pub(crate) mod inquiry_builder;
 pub(crate) mod invoice_number;
 pub(crate) mod offer_builder;
 pub(crate) mod offer_pipeline;
+pub(crate) mod profit_service;
 pub(crate) mod otp_service;
 pub(crate) mod register_export;
 pub(crate) mod route_plan;
