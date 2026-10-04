@@ -63,9 +63,9 @@ pub async fn require_employee_auth(
 
     let now = Utc::now();
 
-    let row: Option<(Uuid, String)> = sqlx::query_as(
+    let row: Option<(Uuid, String, aust_core::tenant::TenantId)> = sqlx::query_as(
         r#"
-        SELECT es.employee_id, e.email
+        SELECT es.employee_id, e.email, es.tenant_id
         FROM employee_sessions es
         JOIN employees e ON es.employee_id = e.id
         WHERE es.token = $1 AND es.expires_at > $2
@@ -80,7 +80,7 @@ pub async fn require_employee_auth(
         unauthorized("Authentifizierung fehlgeschlagen")
     })?;
 
-    let (employee_id, email) =
+    let (employee_id, email, tenant) =
         row.ok_or_else(|| unauthorized("Ungültiges oder abgelaufenes Token"))?;
 
     let token = token.to_string();
@@ -90,5 +90,5 @@ pub async fn require_employee_auth(
         token,
     });
 
-    Ok(next.run(request).await)
+    Ok(aust_core::tenant::scope(tenant, next.run(request)).await)
 }

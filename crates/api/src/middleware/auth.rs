@@ -66,6 +66,7 @@ pub async fn require_auth(
         ));
     }
 
+    let tenant = token_data.claims.tenant();
     request.extensions_mut().insert(token_data.claims);
-    Ok(next.run(request).await)
+    Ok(aust_core::tenant::scope(tenant, next.run(request)).await)
 }

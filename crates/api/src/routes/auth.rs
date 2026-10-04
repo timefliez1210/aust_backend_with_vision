@@ -14,6 +14,7 @@ use serde::Serialize;
 use validator::Validate;
 
 use aust_core::models::{AuthToken, CreateUser, LoginRequest, TokenClaims, TokenType, UserRole};
+use aust_core::tenant::TenantId;
 
 use crate::repositories::auth_repo;
 use crate::{ApiError, AppState};
@@ -53,6 +54,7 @@ pub fn protected_router() -> Router<Arc<AppState>> {
 /// - `user_id` — UUID placed in the `sub` claim
 /// - `email` — stored in the token claims for display purposes
 /// - `role` — `UserRole` enum stored in the claims for middleware authorisation
+/// - `tenant` — the user's company, stored as the `tid` claim
 /// - `jwt_secret` — HMAC-SHA256 signing secret from config
 /// - `expiry_hours` — access token lifetime in hours
 ///
@@ -66,6 +68,7 @@ fn create_tokens(
     user_id: Uuid,
     email: &str,
     role: UserRole,
+    tenant: TenantId,
     jwt_secret: &str,
     expiry_hours: u64,
 ) -> Result<AuthToken, ApiError> {
@@ -78,6 +81,7 @@ fn create_tokens(
         iat: now,
         exp: now + (expiry_hours as usize * 3600),
         typ: TokenType::Access,
+        tid: Some(tenant),
     };
 
     let access_token = encode(
@@ -95,6 +99,7 @@ fn create_tokens(
         iat: now,
         exp: now + (7 * 24 * 3600),
         typ: TokenType::Refresh,
+        tid: Some(tenant),
     };
 
     let refresh_token = encode(
@@ -158,6 +163,7 @@ async fn login(
         user.id,
         &user.email,
         role,
+        user.tenant_id,
         &state.config.auth.jwt_secret,
         state.config.auth.jwt_expiry_hours,
     )?;
@@ -212,6 +218,7 @@ async fn refresh_token(
         user.id,
         &user.email,
         UserRole::from_db_str(&user.role),
+        user.tenant_id,
         secret,
         state.config.auth.jwt_expiry_hours,
     )?;

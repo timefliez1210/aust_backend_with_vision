@@ -129,6 +129,17 @@ pub struct TokenClaims {
     /// until they expire.
     #[serde(default)]
     pub typ: TokenType,
+    /// The user's company (`tenants.id`). Tokens issued before multi-tenancy have
+    /// none and count as Aust — see [`TokenClaims::tenant`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tid: Option<crate::tenant::TenantId>,
+}
+
+impl TokenClaims {
+    /// The tenant this token acts for.
+    pub fn tenant(&self) -> crate::tenant::TenantId {
+        self.tid.unwrap_or(crate::tenant::AUST)
+    }
 }
 
 /// What a signed token may be used for.

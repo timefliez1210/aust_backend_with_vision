@@ -15,6 +15,7 @@ validator = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 sqlx = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"

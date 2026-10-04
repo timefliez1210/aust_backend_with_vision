@@ -330,8 +330,8 @@ pub async fn sweep_domain_events(pool: &PgPool, now: DateTime<Utc>) -> Result<u6
 
     let result = sqlx::query(
         r#"
-        INSERT INTO domain_events_archive (id, kind, aggregate, payload, created_at, consumed_by)
-        SELECT id, kind, aggregate, payload, created_at, consumed_by
+        INSERT INTO domain_events_archive (id, kind, aggregate, payload, created_at, consumed_by, tenant_id)
+        SELECT id, kind, aggregate, payload, created_at, consumed_by, tenant_id
         FROM domain_events
         WHERE consumed_by ? 'assistant'
           AND created_at < $1

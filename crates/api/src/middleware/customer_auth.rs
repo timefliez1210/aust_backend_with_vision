@@ -58,9 +58,9 @@ pub async fn require_customer_auth(
 
     let now = Utc::now();
 
-    let row: Option<(Uuid, String)> = sqlx::query_as(
+    let row: Option<(Uuid, String, aust_core::tenant::TenantId)> = sqlx::query_as(
         r#"
-        SELECT cs.customer_id, c.email
+        SELECT cs.customer_id, c.email, cs.tenant_id
         FROM customer_sessions cs
         JOIN customers c ON cs.customer_id = c.id
         WHERE cs.token = $1 AND cs.expires_at > $2
@@ -75,7 +75,7 @@ pub async fn require_customer_auth(
         unauthorized("Authentifizierung fehlgeschlagen")
     })?;
 
-    let (customer_id, email) =
+    let (customer_id, email, tenant) =
         row.ok_or_else(|| unauthorized("Ungültiges oder abgelaufenes Token"))?;
 
     let token = token.to_string();
@@ -85,5 +85,5 @@ pub async fn require_customer_auth(
         token,
     });
 
-    Ok(next.run(request).await)
+    Ok(aust_core::tenant::scope(tenant, next.run(request)).await)
 }

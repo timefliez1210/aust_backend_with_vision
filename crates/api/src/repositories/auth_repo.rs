@@ -12,6 +12,7 @@ pub(crate) struct UserRow {
     pub email: String,
     pub password_hash: String,
     pub role: String,
+    pub tenant_id: aust_core::tenant::TenantId,
 }
 
 /// Password reset OTP row.
@@ -29,7 +30,7 @@ pub(crate) async fn fetch_user_by_email(
     pool: &PgPool,
     email: &str,
 ) -> Result<Option<UserRow>, sqlx::Error> {
-    sqlx::query_as("SELECT id, email, password_hash, role FROM users WHERE email = $1")
+    sqlx::query_as("SELECT id, email, password_hash, role, tenant_id FROM users WHERE email = $1")
         .bind(email)
         .fetch_optional(pool)
         .await
@@ -44,7 +45,7 @@ pub(crate) async fn fetch_user_by_email_lower(
     email_lower: &str,
 ) -> Result<Option<UserRow>, sqlx::Error> {
     sqlx::query_as(
-        "SELECT id, email, password_hash, role FROM users WHERE LOWER(email) = $1",
+        "SELECT id, email, password_hash, role, tenant_id FROM users WHERE LOWER(email) = $1",
     )
     .bind(email_lower)
     .fetch_optional(pool)
@@ -105,7 +106,7 @@ pub(crate) async fn fetch_user_by_id(
     user_id: Uuid,
 ) -> Result<Option<UserRow>, sqlx::Error> {
     sqlx::query_as(
-        "SELECT id, email, password_hash, role FROM users WHERE id = $1",
+        "SELECT id, email, password_hash, role, tenant_id FROM users WHERE id = $1",
     )
     .bind(user_id)
     .fetch_optional(pool)

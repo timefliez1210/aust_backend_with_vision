@@ -1610,13 +1610,14 @@ pub(crate) async fn transfer_preview(pool: &PgPool, month: NaiveDate) -> Result<
 /// running side by side (two admins, two tabs) could each write a different
 /// snapshot, and the older one could win. A transaction-scoped advisory lock per
 /// month makes them run one after the other; it is released on commit, rollback
-/// or when the request is dropped. With tenants, the key must include the tenant.
+/// or when the request is dropped. The key includes the tenant, so companies never wait
+/// on each other.
 ///
 /// The response is built from this one read plus the rows just written, so it is
 /// exactly what a reload would show without computing the month twice.
 pub(crate) async fn transfer(pool: &PgPool, month: NaiveDate, actor: &str) -> Result<TransferPreview, ApiError> {
     let mut lock = pool.begin().await?;
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended(current_tenant_id()::text || ':' || $1, 0))")
         .bind(format!("labor_transfer:{month}"))
         .execute(&mut *lock)
         .await?;
@@ -2268,7 +2269,7 @@ mod db_tests {
     async fn transfers_of_one_month_run_one_after_the_other(pool: PgPool) {
         let month = add_months(month_start(today_berlin()), -2);
         let mut holder = pool.begin().await.unwrap();
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended(current_tenant_id()::text || ':' || $1, 0))")
             .bind(format!("labor_transfer:{month}"))
             .execute(&mut *holder)
             .await

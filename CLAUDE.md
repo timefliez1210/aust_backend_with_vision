@@ -4,9 +4,10 @@
 
 Moving company automation: inquiry → estimation → offer → scheduling → invoicing.
 
-**Tech**: Rust/Axum, PostgreSQL 16, S3, LLM, Telegram bot. Single-tenant, <1000 req/day.
+**Tech**: Rust/Axum, PostgreSQL 16, S3, LLM, Telegram bot. Becoming multi-tenant (Aust = tenant #1, see [docs/MULTI_TENANT.md](docs/MULTI_TENANT.md)), <1000 req/day.
 
 **Key constraints**: DB migrations additive-only. German for all user-facing strings. Money in cents. UUIDs v7.
+Every table has `tenant_id`; inside a request use `aust_core::tenant::spawn`, not `tokio::spawn`.
 
 **Subsystem deep-dives**:
 - [crates/api/AGENTS.md](crates/api/AGENTS.md) — Routes, repos, services, tests
