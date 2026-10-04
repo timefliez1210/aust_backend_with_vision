@@ -329,16 +329,14 @@ impl Default for ServerConfig {
     }
 }
 
-/// Company-specific pricing and logistics constants.
+/// Default prices, used for any key a tenant has not set in `settings`.
 ///
-/// **Caller**: `offer-generator` pricing engine uses `depot_address` as the
-/// route start/end point and `fahrt_rate_per_km` to calculate the Anfahrt
-/// (travel surcharge) line item. `rate_per_person_hour_cents` controls the
-/// base labor rate. Service line-item prices are also configurable here.
+/// **Caller**: `settings_repo::get_pricing` (per-key fallback). The depot is per
+/// company and lives in `tenants.depot_address`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CompanyConfig {
-    /// Full street address of the company depot, used as the origin when
-    /// calculating the outbound travel distance for the Anfahrt line item.
+    /// No longer read — the depot is `tenants.depot_address`. Kept so existing
+    /// config files still parse.
     pub depot_address: String,
     /// Euro amount charged per kilometre for the Anfahrt/Abfahrt line item.
     /// For example, `1.5` means €1.50/km.

@@ -11,7 +11,8 @@ ALTER TABLE tenants
     ADD COLUMN owner_name  TEXT NOT NULL DEFAULT '',  -- supervisor on timesheets
     ADD COLUMN phone       TEXT NOT NULL DEFAULT '',  -- as printed in customer mails
     ADD COLUMN city        TEXT NOT NULL DEFAULT '',  -- "ein Umzugsunternehmen in …"
-    ADD COLUMN review_url  TEXT NOT NULL DEFAULT '';  -- Google review link
+    ADD COLUMN review_url  TEXT NOT NULL DEFAULT '',  -- Google review link
+    ADD COLUMN depot_address TEXT NOT NULL DEFAULT ''; -- start and end of every route (Fahrkostenpauschale, map)
 
 UPDATE tenants SET
     short_name = 'Aust Umzüge',
@@ -19,5 +20,6 @@ UPDATE tenants SET
     owner_name = 'Alex Aust',
     phone      = '05121 – 7558379',
     city       = 'Hildesheim',
-    review_url = 'https://www.google.com/search?q=Aust+Umz%C3%BCge+%26+Haushaltsaufl%C3%B6sungen+Reviews'
+    review_url = 'https://www.google.com/search?q=Aust+Umz%C3%BCge+%26+Haushaltsaufl%C3%B6sungen+Reviews',
+    depot_address = 'Borsigstr 6 31135 Hildesheim'
 WHERE id = '0190aa57-0000-7000-8000-000000000001';

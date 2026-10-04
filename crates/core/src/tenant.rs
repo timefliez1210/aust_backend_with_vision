@@ -44,12 +44,14 @@ pub struct TenantProfile {
     pub city: String,
     /// Link for review requests.
     pub review_url: String,
+    /// Depot: start and end of every route (Fahrkostenpauschale, admin map).
+    pub depot_address: String,
 }
 
 /// The profile of the tenant this pool connection works for (`current_tenant_id()`).
 pub async fn profile(pool: &sqlx::PgPool) -> Result<TenantProfile, sqlx::Error> {
     sqlx::query_as(
-        "SELECT id, name, short_name, brand_name, owner_name, phone, city, review_url \
+        "SELECT id, name, short_name, brand_name, owner_name, phone, city, review_url, depot_address \
          FROM tenants WHERE id = current_tenant_id()",
     )
     .fetch_one(pool)

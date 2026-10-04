@@ -520,5 +520,6 @@ pub fn aust_profile() -> aust_core::tenant::TenantProfile {
         phone: "05121 – 7558379".into(),
         city: "Hildesheim".into(),
         review_url: "https://www.google.com/search?q=Aust+Umz%C3%BCge+%26+Haushaltsaufl%C3%B6sungen+Reviews".into(),
+        depot_address: "Borsigstr 6 31135 Hildesheim".into(),
     }
 }

@@ -451,6 +451,7 @@ mod tests {
             phone: "05121 – 7558379".into(),
             city: "Hildesheim".into(),
             review_url: String::new(),
+            depot_address: String::new(),
         }
     }
 
