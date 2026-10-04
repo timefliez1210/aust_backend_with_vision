@@ -7,7 +7,7 @@
 //! B2  Mitarbeiterdetails          E4  Arbeitsstunden gesamt
 //! B3  {Name}                      E5  {total hours}
 //! B5  Vorgesetztendetails         E6  Reguläre Arbeitsstunden
-//! B6  Alex Aust                   E7  {regular hours}
+//! B6  {supervisor}                E7  {regular hours}
 //! B8  Zeitraum…                   E8  Überstunden
 //! B9  Monat: | C9: {MM.YYYY}      E9  {overtime}
 //!
@@ -53,6 +53,8 @@ pub struct TimesheetData {
     pub target_hours: f64,
     /// All assignment entries for the month (unsorted; sorted internally).
     pub entries: Vec<TimesheetEntry>,
+    /// Supervisor printed under "Vorgesetztendetails" (the company owner).
+    pub supervisor: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -207,7 +209,7 @@ fn build_sheet_xml(
         6,
         &format!(
             "{}{}",
-            str_cell("B6", "Alex Aust", false),
+            str_cell("B6", &data.supervisor, false),
             str_cell("E6", "Reguläre Arbeitsstunden", false)
         ),
     ));

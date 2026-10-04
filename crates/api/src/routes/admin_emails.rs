@@ -289,9 +289,12 @@ pub(super) async fn send_draft_email(
         ApiError::BadRequest("Kein Empfänger hinterlegt — bitte Adresse ergänzen.".into())
     })?;
 
-    let subject = draft
-        .subject
-        .unwrap_or_else(|| "Ihr Umzugsangebot — AUST Umzüge".into());
+    let subject = match draft.subject {
+        Some(s) => s,
+        None => crate::services::email::offer_mail_subject(
+            &crate::repositories::tenant_repo::profile(&state.db).await?,
+        ),
+    };
     let body = draft.body_text.unwrap_or_default();
 
     let mut attachments: Vec<OutboundAttachment> = Vec::new();

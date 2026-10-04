@@ -175,8 +175,10 @@ async fn main() -> Result<()> {
         soul,
     );
 
-    // Start email processor as background task
+    // Start email processor as background task. One mailbox, one company: the
+    // processor writes in the name of the tenant the mailbox belongs to (Aust).
     let poll_interval = config.email.poll_interval_secs;
+    let mailbox_profile = aust_core::tenant::profile(&db_for_email).await?;
     tokio::spawn(async move {
         let mut processor = EmailProcessor::new(
             email_config,
@@ -187,6 +189,7 @@ async fn main() -> Result<()> {
             cal_default_capacity,
             cal_alternatives_count,
             cal_search_window_days,
+            mailbox_profile,
         );
         processor.set_offer_channel(offer_tx);
         processor.run(poll_interval).await;

@@ -1065,6 +1065,7 @@ async fn employee_hours_export(
         month_label,
         target_hours: target,
         entries,
+        supervisor: crate::repositories::tenant_repo::profile(&state.db).await?.owner_name,
     })
     .map_err(|e| ApiError::Internal(format!("Timesheet XLSX generation failed: {e}")))?;
 
@@ -3037,6 +3038,7 @@ async fn export_rechnungsausgangsbuch(
     require_admin(&claims)?;
 
     let year = q.year.unwrap_or_else(|| Utc::now().date_naive().year());
+    let company = crate::repositories::tenant_repo::profile(&state.db).await?.name;
     let Json(items) = rechnungsausgangsbuch(State(state), Extension(claims)).await?;
 
     let rows: Vec<register_export::ExportRow> = items
@@ -3066,7 +3068,7 @@ async fn export_rechnungsausgangsbuch(
         })
         .collect();
 
-    let bytes = register_export::build_xlsx(year, &rows)?;
+    let bytes = register_export::build_xlsx(&company, year, &rows)?;
     let filename = format!("Rechnungsausgangsbuch_{year}.xlsx");
 
     Response::builder()

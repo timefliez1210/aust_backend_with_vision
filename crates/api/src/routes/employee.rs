@@ -104,8 +104,8 @@ impl OtpBackend for EmployeeOtpBackend {
         employee_repo::mark_otp_used(pool, otp_id).await
     }
 
-    fn otp_email_subject(&self) -> &str {
-        "Ihr Zugangscode — Aust Umzüge Mitarbeiterportal"
+    fn otp_email_subject(&self, p: &aust_core::tenant::TenantProfile) -> String {
+        format!("Ihr Zugangscode — {} Mitarbeiterportal", p.short_name)
     }
 
     fn request_success_message(&self) -> &str {
@@ -1295,6 +1295,15 @@ async fn logout_everywhere(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Golden: same subject as before the company name moved into the tenant profile.
+    #[test]
+    fn aust_otp_subject_is_unchanged() {
+        assert_eq!(
+            EmployeeOtpBackend.otp_email_subject(&crate::test_helpers::aust_profile()),
+            "Ihr Zugangscode — Aust Umzüge Mitarbeiterportal"
+        );
+    }
     use chrono::TimeZone;
 
     // 2026-06-15 is in CEST (UTC+2): a UTC h:m renders as (h+2):m in Berlin.

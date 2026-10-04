@@ -32,6 +32,8 @@ rolled back alone.
 
 ### Rules for new code
 
+- Customer-facing text never names the company literally: take it from
+  `TenantProfile` (`tenant_repo::profile`). Add a golden test when you touch one.
 - `tokio::spawn` drops the tenant. Use `aust_core::tenant::spawn` inside a request.
 - A background job that serves every tenant loops over `tenants` and runs each
   pass inside `tenant::scope`.
@@ -45,9 +47,10 @@ rolled back alone.
 | # | Step | Visible to Aust | Status |
 |---|------|-----------------|--------|
 | 1 | `tenants` table, `tenant_id` everywhere, tenant context (task-local → pool → `app.tenant_id`), `tid` claim | no | done |
-| 2 | Company profile in data: names, addresses, bank, footers, mail texts, prices, depot — out of code/TOML into `tenants`; golden tests prove identical output | no | open |
+| 2 | Company profile in data: names, phone, review link, owner — out of code into `tenants` (`TenantProfile`, loaded per request); golden tests pin Aust's mails, prompts and exports word for word | no | done |
+| 2b | Prices and depot (`[company]` in TOML) per tenant | no | open |
 | 3 | Row-level security: app connects as a non-superuser role, `FORCE ROW LEVEL SECURITY` + policy on every table; login and session lookups through `SECURITY DEFINER` functions; two-tenant leak test over every endpoint | no | open |
-| 4 | Per-tenant integrations: IMAP/SMTP mailbox, Telegram bot + bindings, Josie memory, invoice counters, S3 prefix `tenants/{id}/`, XLSX templates, background jobs per tenant | no | open |
+| 4 | Per-tenant integrations: IMAP/SMTP mailbox (one `EmailProcessor` per tenant — it already takes its `TenantProfile`), Telegram bot + bindings, Josie memory + `SOUL.md` + the signature of the `draft_reply` tool, invoice counters, S3 prefix `tenants/{id}/`, XLSX/PDF templates (letterhead, bank footer, logo are baked into `templates/*.xlsx`), background jobs per tenant | no | open |
 | 5 | Per-company uniqueness: `customers.email`, `employees.email`, `invoices.invoice_number`, `storage_invoices.invoice_number`, `expense_categories.name`, `calendar_capacity_overrides.override_date`, `settings.key`, `invoice_number_counters.year` become unique per tenant | no | open — drops the old indexes, needs an exception to "migrations additive-only" |
 | 6 | Onboarding: create a tenant + first admin; console reads name/accent from the API (`lib/tenant.ts`); console on its own host, `aust-umzuege.de` stays the marketing site | no | open |
 

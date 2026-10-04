@@ -229,9 +229,41 @@ pub async fn send_email(
     Ok(())
 }
 
+/// Subject of the offer mail and its thread.
+pub(crate) fn offer_mail_subject(p: &aust_core::tenant::TenantProfile) -> String {
+    format!("Ihr Umzugsangebot — {}", p.brand_name)
+}
+
+/// The cover letter drafted when an offer is approved; Alex edits and sends it.
+pub(crate) fn offer_mail_draft_body(p: &aust_core::tenant::TenantProfile) -> String {
+    format!(
+        "Sehr geehrte/r [Name],\n\n\
+         anbei erhalten Sie Ihr persönliches Umzugsangebot.\n\n\
+         Bei Rückfragen stehen wir Ihnen gerne unter {phone} zur Verfügung.\n\n\
+         Mit freundlichen Grüßen,\n\
+         Ihr {brand} Team",
+        phone = p.phone,
+        brand = p.brand_name,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Golden: Aust's offer mail texts are word for word what they were before the
+    /// brand and phone moved into the tenant profile.
+    #[test]
+    fn aust_offer_mail_texts_are_unchanged() {
+        let p = crate::test_helpers::aust_profile();
+        assert_eq!(offer_mail_subject(&p), "Ihr Umzugsangebot — AUST Umzüge");
+        assert_eq!(
+            offer_mail_draft_body(&p),
+            "Sehr geehrte/r [Name],\n\nanbei erhalten Sie Ihr persönliches Umzugsangebot.\n\n\
+             Bei Rückfragen stehen wir Ihnen gerne unter 05121 – 7558379 zur Verfügung.\n\n\
+             Mit freundlichen Grüßen,\nIhr AUST Umzüge Team"
+        );
+    }
 
     #[test]
     fn build_plain_email_message() {

@@ -24,6 +24,38 @@ pub struct TenantId(pub Uuid);
 /// Must match the id seeded in `migrations/20261004120000_tenants.sql`.
 pub const AUST: TenantId = TenantId(Uuid::from_u128(0x0190aa57_0000_7000_8000_000000000001));
 
+/// A company's own words: names, phone, review link. Loaded from `tenants` for the
+/// running tenant ([`profile`]) and handed to
+/// whatever writes a mail, subject or document.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
+pub struct TenantProfile {
+    pub id: TenantId,
+    /// Full company name — invoices, reminders, the register export.
+    pub name: String,
+    /// Short name — OTP mails and short signatures.
+    pub short_name: String,
+    /// Brand as written in offer mails and auto-replies.
+    pub brand_name: String,
+    /// Owner / supervisor, printed on timesheets.
+    pub owner_name: String,
+    /// Phone number exactly as printed in customer mails.
+    pub phone: String,
+    /// Home town, for "ein Umzugsunternehmen in …".
+    pub city: String,
+    /// Link for review requests.
+    pub review_url: String,
+}
+
+/// The profile of the tenant this pool connection works for (`current_tenant_id()`).
+pub async fn profile(pool: &sqlx::PgPool) -> Result<TenantProfile, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT id, name, short_name, brand_name, owner_name, phone, city, review_url \
+         FROM tenants WHERE id = current_tenant_id()",
+    )
+    .fetch_one(pool)
+    .await
+}
+
 tokio::task_local! {
     static CURRENT: TenantId;
 }

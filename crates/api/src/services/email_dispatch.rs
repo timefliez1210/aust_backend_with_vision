@@ -170,13 +170,20 @@ pub(crate) async fn find_or_create_offer_thread(
         return None;
     };
 
+    let profile = match crate::repositories::tenant_repo::profile(&state.db).await {
+        Ok(p) => p,
+        Err(e) => {
+            error!("Cannot create email thread: tenant profile not loaded: {e}");
+            return None;
+        }
+    };
     let thread_id = Uuid::now_v7();
     match email_repo::create_thread(
         &state.db,
         thread_id,
         customer.id,
         inquiry_id,
-        "Ihr Umzugsangebot — AUST Umzüge",
+        &crate::services::email::offer_mail_subject(&profile),
     )
     .await
     {

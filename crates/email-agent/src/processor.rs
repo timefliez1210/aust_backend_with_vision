@@ -80,6 +80,7 @@ impl EmailProcessor {
         default_capacity: i32,
         alternatives_count: usize,
         search_window_days: i64,
+        profile: aust_core::tenant::TenantProfile,
     ) -> Self {
         let from_address = email_config.from_address.clone();
         let imap = ImapClient::new(email_config.clone());
@@ -96,7 +97,7 @@ impl EmailProcessor {
             smtp,
             telegram: Arc::new(Mutex::new(telegram)),
             parser: EmailParser::new(),
-            responder: EmailResponder::new(llm),
+            responder: EmailResponder::new(llm, profile),
             default_capacity,
             alternatives_count,
             search_window_days,
