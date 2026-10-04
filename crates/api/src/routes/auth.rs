@@ -210,7 +210,8 @@ async fn refresh_token(
     // Re-read the account rather than trusting the token's own claims. Re-signing
     // `claims.role` meant a demoted or revoked administrator could refresh admin rights
     // indefinitely — the only thing that ever expired was the token, never the privilege.
-    let user = auth_repo::fetch_user_by_id(&state.db, claims.sub)
+    // A public route: the token's own tenant decides where to look.
+    let user = aust_core::tenant::scope(claims.tenant(), auth_repo::fetch_user_by_id(&state.db, claims.sub))
         .await?
         .ok_or_else(|| ApiError::Unauthorized("Benutzer nicht gefunden".into()))?;
 

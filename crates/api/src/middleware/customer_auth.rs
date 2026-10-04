@@ -58,6 +58,13 @@ pub async fn require_customer_auth(
 
     let now = Utc::now();
 
+    // The token is all we have: look it up across tenants, then run the request
+    // inside the tenant the session belongs to.
+    let mut session_lookup = aust_core::tenant::bypass(&state.db).await.map_err(|e| {
+        tracing::error!("Session lookup transaction failed: {e}");
+        unauthorized("Authentifizierung fehlgeschlagen")
+    })?;
+
     let row: Option<(Uuid, String, aust_core::tenant::TenantId)> = sqlx::query_as(
         r#"
         SELECT cs.customer_id, c.email, cs.tenant_id
@@ -68,7 +75,7 @@ pub async fn require_customer_auth(
     )
     .bind(token)
     .bind(now)
-    .fetch_optional(&state.db)
+    .fetch_optional(&mut *session_lookup)
     .await
     .map_err(|e| {
         tracing::error!("Customer session lookup failed: {e}");

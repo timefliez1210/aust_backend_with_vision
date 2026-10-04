@@ -154,6 +154,9 @@ async fn set_session_tenant(conn: &mut sqlx::PgConnection) -> Result<(), sqlx::E
 
 
 #[cfg(test)]
+mod rls_tests;
+
+#[cfg(test)]
 mod tenant_pool_tests {
     use aust_core::tenant::{self, TenantId, AUST};
 

@@ -85,6 +85,22 @@ where
     }
 }
 
+/// A transaction that sees every tenant's rows (row-level security bypass).
+///
+/// Only for lookups that must run before the tenant is known — login by email,
+/// session tokens — and for jobs that deliberately span tenants. Read what you
+/// need, then continue inside [`scope`] of the tenant you found. The bypass ends
+/// with the transaction.
+pub async fn bypass(
+    pool: &sqlx::PgPool,
+) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT set_config('app.tenant_bypass', 'on', true)")
+        .execute(&mut *tx)
+        .await?;
+    Ok(tx)
+}
+
 /// Value for the `app.tenant_id` session setting: the tenant's id, or `""` outside
 /// a scope (which `current_tenant_id()` treats as unset).
 pub fn session_value() -> String {

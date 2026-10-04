@@ -49,16 +49,37 @@ rolled back alone.
 | 1 | `tenants` table, `tenant_id` everywhere, tenant context (task-local → pool → `app.tenant_id`), `tid` claim | no | done |
 | 2 | Company profile in data: names, phone, review link, owner — out of code into `tenants` (`TenantProfile`, loaded per request); golden tests pin Aust's mails, prompts and exports word for word | no | done |
 | 2b | Depot per tenant (`tenants.depot_address`). Prices already live per key in `settings`, with `[company]` in TOML as the default — they become per company with steps 3 and 5 | no | done |
-| 3 | Row-level security: app connects as a non-superuser role, `FORCE ROW LEVEL SECURITY` + policy on every table; login and session lookups through `SECURITY DEFINER` functions; two-tenant leak test over every endpoint | no | open |
+| 3 | Row-level security: `FORCE ROW LEVEL SECURITY` + policy `tenant_isolation` on every tenant table; login and session lookups through `tenant::bypass`; the whole test suite passes as a non-superuser role | no | code done — enforced on prod only after the role switch below |
 | 4 | Per-tenant integrations: IMAP/SMTP mailbox (one `EmailProcessor` per tenant — it already takes its `TenantProfile`), Telegram bot + bindings, Josie memory + `SOUL.md` + the signature of the `draft_reply` tool, invoice counters, S3 prefix `tenants/{id}/`, XLSX/PDF templates (letterhead, bank footer, logo are baked into `templates/*.xlsx`), background jobs per tenant | no | open |
 | 5 | Per-company uniqueness: `customers.email`, `employees.email`, `invoices.invoice_number`, `storage_invoices.invoice_number`, `expense_categories.name`, `calendar_capacity_overrides.override_date`, `settings.key`, `invoice_number_counters.year` become unique per tenant | no | open — drops the old indexes, needs an exception to "migrations additive-only" |
 | 6 | Onboarding: create a tenant + first admin; console reads name/accent from the API (`lib/tenant.ts`); console on its own host, `aust-umzuege.de` stays the marketing site | no | open |
 
-### Known gaps until step 3
+## Prod: switch to a non-superuser role (enforces step 3)
 
-- The app's database role (`aust`) is a superuser. Superusers bypass row-level
-  security even with `FORCE`, so step 3 needs a new non-superuser role that owns
-  the tables (one-time ops change on the VPS).
-- Login (`users` by email) and session lookups run before the tenant is known;
-  under RLS they need `SECURITY DEFINER` functions or an exemption.
+Superusers skip row-level security, and prod connects as the superuser `aust`.
+Until this runs, the policies exist but change nothing.
+
+1. Backup (`/opt/aust/backup.sh`).
+2. `docker exec -i aust_postgres psql -U aust -d aust_backend -v app_password="'<new password>'" < scripts/db-app-role.sql`
+   — creates `aust_app` (no superuser, no BYPASSRLS) and hands it every table,
+   sequence, function and type in `public`. The output must list no table "not
+   owned by aust_app".
+3. In `/opt/aust/.env`, point the backend's database URL at
+   `aust_app:<password>`; restart the backend. Migrations keep running at
+   startup — `aust_app` owns the schema.
+4. Rollback: point the URL back at `aust`.
+
+`backup.sh` keeps dumping as `aust` (superuser dumps see every row).
+
+Tested: `scripts/db-app-role.sql` on a superuser-owned copy of the schema; the
+full workspace suite against a database owned by a non-superuser role.
+
+## Known gaps
+
+- Pre-login flows other than admin login and session tokens — OTP request and
+  verify, password reset — still run unscoped, i.e. as Aust. Fine while Aust is
+  the only tenant; they need the tenant from the host name (step 6) before the
+  Aust fallback in `current_tenant_id()` is removed.
+- Background jobs (mailbox, reminders, billing tick, recurring drafts) run
+  unscoped, i.e. as Aust, until step 4 loops them per tenant.
 - 46 `tokio::spawn` sites in request and job code still use the plain spawn.

@@ -25,14 +25,16 @@ pub(crate) struct ResetRow {
 /// Fetch a user by email (exact match).
 ///
 /// **Caller**: `login` handler
-/// **Why**: Verifies credentials during login.
+/// **Why**: Verifies credentials during login. Runs before the tenant is known, so
+/// it looks across tenants (`tenant::bypass`); the row says which tenant it is.
 pub(crate) async fn fetch_user_by_email(
     pool: &PgPool,
     email: &str,
 ) -> Result<Option<UserRow>, sqlx::Error> {
+    let mut tx = aust_core::tenant::bypass(pool).await?;
     sqlx::query_as("SELECT id, email, password_hash, role, tenant_id FROM users WHERE email = $1")
         .bind(email)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await
 }
 
