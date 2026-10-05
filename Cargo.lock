@@ -469,6 +469,7 @@ dependencies = [
  "aust-storage",
  "bytes",
  "chrono",
+ "image",
  "proptest",
  "regex",
  "serde",

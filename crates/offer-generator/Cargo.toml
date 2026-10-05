@@ -22,6 +22,7 @@ zip = { workspace = true }
 regex = "1"
 tempfile = { workspace = true }
 bytes = { workspace = true }
+image = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"

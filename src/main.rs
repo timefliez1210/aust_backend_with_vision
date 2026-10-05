@@ -148,6 +148,9 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Every other company's letterhead, from which its templates are derived.
+    aust_api::services::letterhead::register_all(&db).await?;
+
     // Every other company's own document templates (Aust's are compiled in).
     {
         let mut tx = tenant::bypass(&db).await?;

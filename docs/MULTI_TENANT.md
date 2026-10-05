@@ -98,9 +98,12 @@ company is created there or with `tenant-create`.
    `AUST__TENANTS__<SLUG>__EMAIL__…`). Without them the company simply has no
    mailbox / bot. Flash-contact sidecar: one more container with
    `AUST__TENANT_ID=<id>` and its own bot token.
-5. Templates: `PUT /api/v1/admin/tenant/templates/{offer|invoice|travel_expense|clearing_page_2}`
-   with the file as body. Until then, generating that document fails (never
-   Aust's letterhead).
+5. Documents work immediately: the company's KVA, invoice and travel-expense
+   templates are Aust's layout with its letterhead (name, address, contact, bank,
+   tax numbers), logo and accent colour swapped in (`offer-generator/src/letterhead.rs`;
+   a test checks no trace of Aust survives). Optional: upload its own template via
+   `PUT /api/v1/admin/tenant/templates/{offer|invoice|travel_expense|clearing_page_2}`
+   — an upload wins. A clearing KVA keeps the derived page 2 unless one is uploaded.
 6. Restart the backend (tenants, domains and slugs are read at startup).
 
 ## Known gaps

@@ -113,8 +113,12 @@ const TERMS_PAGE_MARKER: &str = "Bei etwaigem Mehraufwand";
 ///   terms page (checked via [`TERMS_PAGE_MARKER`]) — substituting blindly would
 ///   corrupt a customer-facing document, so this fails loudly instead
 pub async fn substitute_clearing_page_2(pdf_bytes: &[u8]) -> Result<Vec<u8>, OfferError> {
-    let clearing_page_2 =
-        crate::templates::for_current(crate::templates::TemplateKind::ClearingPage2, CLEARING_PAGE_2)?;
+    // A company without its own clearing page keeps the offer's own page 2.
+    let Ok(clearing_page_2) =
+        crate::templates::for_current(crate::templates::TemplateKind::ClearingPage2, CLEARING_PAGE_2)
+    else {
+        return Ok(pdf_bytes.to_vec());
+    };
     let tmp_dir = tempfile::tempdir()
         .map_err(|e| OfferError::Pdf(format!("Failed to create temp dir: {e}")))?;
     let dir = tmp_dir.path();
