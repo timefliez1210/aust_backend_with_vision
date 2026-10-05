@@ -74,13 +74,24 @@ Until this runs, the policies exist but change nothing.
 
 Tested: `scripts/db-app-role.sql` on a superuser-owned copy of the schema; the
 full workspace suite against a database owned by a non-superuser role.
+`scripts/dev-up.sh` runs the same script and connects as `aust_app`, so local
+click-throughs see the separation exactly as prod will.
 
 ## Onboarding a company
 
+**Platform superusers** see the console tab "Firmen" (`/admin/platform`): every
+company with a few counts, and a form that creates a company plus its first admin
+and shows that admin's one-time password once. The flag `users.is_superuser` is
+set only from the server — `aust_backend superuser <email> on|off` — never through
+the API; the platform routes re-check it in the database on every call (the
+token's `su` claim only shows the tab). The steps below are the same, whether the
+company is created there or with `tenant-create`.
+
 1. Prod must enforce row-level security first (role switch above) — the backend
    refuses to start with two tenants otherwise.
-2. `docker exec aust_backend aust_backend tenant-create <slug> "<Name>" <admin-email>`
-   — prints the admin's one-time password.
+2. In the console tab "Firmen" (superusers), or
+   `docker exec aust_backend aust_backend tenant-create <slug> "<Name>" <admin-email>`
+   — either shows the admin's one-time password.
 3. Set `tenants.domains` (its website / console hosts) and the profile
    (`PUT /api/v1/admin/tenant` as that admin: names, phone, depot, accent, persona).
 4. Mailbox and bot: `[tenants.<slug>]` with `email` and `telegram` sections (env

@@ -13,6 +13,10 @@
 
 DO $$
 BEGIN
+    -- Migrations grant to the assistant's group role; a fresh cluster may lack it.
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'aust_assistant') THEN
+        CREATE ROLE aust_assistant NOLOGIN;
+    END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'aust_app') THEN
         CREATE ROLE aust_app LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE;
     END IF;

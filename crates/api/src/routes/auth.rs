@@ -55,6 +55,7 @@ pub fn protected_router() -> Router<Arc<AppState>> {
 /// - `email` — stored in the token claims for display purposes
 /// - `role` — `UserRole` enum stored in the claims for middleware authorisation
 /// - `tenant` — the user's company, stored as the `tid` claim
+/// - `superuser` — platform superuser, stored as the `su` claim (UI hint only)
 /// - `jwt_secret` — HMAC-SHA256 signing secret from config
 /// - `expiry_hours` — access token lifetime in hours
 ///
@@ -69,6 +70,7 @@ fn create_tokens(
     email: &str,
     role: UserRole,
     tenant: TenantId,
+    superuser: bool,
     jwt_secret: &str,
     expiry_hours: u64,
 ) -> Result<AuthToken, ApiError> {
@@ -82,6 +84,7 @@ fn create_tokens(
         exp: now + (expiry_hours as usize * 3600),
         typ: TokenType::Access,
         tid: Some(tenant),
+        su: superuser,
     };
 
     let access_token = encode(
@@ -100,6 +103,7 @@ fn create_tokens(
         exp: now + (7 * 24 * 3600),
         typ: TokenType::Refresh,
         tid: Some(tenant),
+        su: superuser,
     };
 
     let refresh_token = encode(
@@ -164,6 +168,7 @@ async fn login(
         &user.email,
         role,
         user.tenant_id,
+        user.is_superuser,
         &state.config.auth.jwt_secret,
         state.config.auth.jwt_expiry_hours,
     )?;
@@ -220,6 +225,7 @@ async fn refresh_token(
         &user.email,
         UserRole::from_db_str(&user.role),
         user.tenant_id,
+        user.is_superuser,
         secret,
         state.config.auth.jwt_expiry_hours,
     )?;

@@ -147,6 +147,7 @@ pub fn generate_test_jwt() -> String {
         iat: Utc::now().timestamp() as usize,
         typ: aust_core::models::TokenType::Access,
         tid: None,
+        su: false,
     };
 
     encode(

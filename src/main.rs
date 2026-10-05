@@ -85,6 +85,31 @@ async fn main() -> Result<()> {
     // `aust_backend tenant-create <slug> <name> <admin-email>`: onboard a company,
     // print its first admin's one-time password, exit. Restart the server after.
     let args: Vec<String> = std::env::args().collect();
+
+    // `aust_backend superuser <email> on|off`: the only way to grant or revoke
+    // platform superuser rights (the "Firmen" tab). Takes effect on next login.
+    if args.get(1).map(String::as_str) == Some("superuser") {
+        let email = args.get(2).cloned().unwrap_or_default();
+        let on = match args.get(3).map(String::as_str) {
+            Some("on") => true,
+            Some("off") => false,
+            _ => anyhow::bail!("Aufruf: aust_backend superuser <email> on|off"),
+        };
+        let mut tx = tenant::bypass(&db).await?;
+        let changed = sqlx::query("UPDATE users SET is_superuser = $2 WHERE lower(email) = lower($1)")
+            .bind(&email)
+            .bind(on)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        tx.commit().await?;
+        if changed == 0 {
+            anyhow::bail!("Kein Benutzer mit E-Mail {email}");
+        }
+        println!("{email}: Plattform-Superuser {}", if on { "an" } else { "aus" });
+        println!("Wirkt nach dem nächsten Login (der Reiter „Firmen“ erscheint dann).");
+        return Ok(());
+    }
     if args.get(1).map(String::as_str) == Some("tenant-create") {
         let [slug, name, admin_email] = [2, 3, 4].map(|i| args.get(i).cloned().unwrap_or_default());
         let t = aust_api::services::onboarding::create_tenant(&db, &slug, &name, &admin_email)

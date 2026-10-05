@@ -114,7 +114,14 @@ done
 # ---------------------------------------------------------------------------
 # Keep in sync with docker/docker-compose.staging.yml → staging-backend.environment.
 export RUN_MODE=development
-export AUST__DATABASE__URL="postgres://aust_staging:aust_staging_password@localhost:5435/aust_staging"
+# The backend connects as `aust_app` — not a superuser — so row-level security is
+# enforced like on prod after the role switch (docs/MULTI_TENANT.md). Without it a
+# second company would see Aust's rows. Idempotent; re-run after every restore.
+step "Handing the schema to aust_app (row-level security on)"
+docker exec -i aust_staging_postgres psql -U aust_staging -d aust_staging -q \
+    -v app_password="'aust_app_dev_password'" < "${PROJECT_DIR}/scripts/db-app-role.sql" >/dev/null
+ok "aust_app owns the schema"
+export AUST__DATABASE__URL="postgres://aust_app:aust_app_dev_password@localhost:5435/aust_staging"
 
 export AUST__STORAGE__PROVIDER=s3
 export AUST__STORAGE__ENDPOINT="http://localhost:9010"

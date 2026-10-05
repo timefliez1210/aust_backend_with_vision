@@ -133,6 +133,10 @@ pub struct TokenClaims {
     /// none and count as Aust — see [`TokenClaims::tenant`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tid: Option<crate::tenant::TenantId>,
+    /// Platform superuser (`users.is_superuser`) — only tells the console to show
+    /// the "Firmen" tab. The platform routes re-check the database on every call.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub su: bool,
 }
 
 impl TokenClaims {

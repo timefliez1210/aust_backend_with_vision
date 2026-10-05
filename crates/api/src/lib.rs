@@ -63,6 +63,7 @@ pub fn create_router(state: AppState) -> Router {
         .nest("/admin/storage", routes::storage::router())
         .nest("/admin/profit", routes::profit::router())
         .nest("/admin/tenant", routes::tenant::admin_router())
+        .nest("/platform", routes::platform::router())
         .nest("/auth", routes::auth::protected_router())
         .route_layer(axum::middleware::from_fn_with_state(
             shared_state.clone(),
