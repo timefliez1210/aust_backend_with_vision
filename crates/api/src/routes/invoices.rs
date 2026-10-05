@@ -403,7 +403,7 @@ async fn create_invoice(
             });
             let agg1 = format!("invoice:{first_id}");
             let agg2 = format!("invoice:{final_id}");
-            tokio::spawn(async move {
+            aust_core::tenant::spawn(async move {
                 if let Err(e) = emitter.emit("invoice.issued", &agg1, p1).await {
                     tracing::warn!("Failed to emit invoice.issued (partial_first): {e}");
                 }
@@ -471,7 +471,7 @@ async fn create_invoice(
                 "brutto_cents": offer_brutto,
             });
             let aggregate = format!("invoice:{inv_id}");
-            tokio::spawn(async move {
+            aust_core::tenant::spawn(async move {
                 if let Err(e) = emitter.emit("invoice.issued", &aggregate, payload).await {
                     tracing::warn!("Failed to emit invoice.issued event: {e}");
                 }
@@ -981,7 +981,7 @@ async fn send_invoice(
 
     let filename = format!("Rechnung_{invoice_num}.pdf");
     let email = crate::services::email::build_email_with_attachment(
-        &state.config.email.username,
+        &state.config.email().username,
         &profile.name,
         &customer_email,
         &subject,
@@ -993,11 +993,11 @@ async fn send_invoice(
     .map_err(|e| ApiError::Internal(format!("Failed to build invoice email: {e}")))?;
 
     crate::services::email::send_email(
-        &state.config.email.smtp_host,
-        state.config.email.smtp_port,
-        &state.config.email.smtp_tls,
-        &state.config.email.username,
-        &state.config.email.password,
+        &state.config.email().smtp_host,
+        state.config.email().smtp_port,
+        &state.config.email().smtp_tls,
+        &state.config.email().username,
+        &state.config.email().password,
         email,
     )
     .await

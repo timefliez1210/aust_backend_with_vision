@@ -2035,7 +2035,7 @@ async fn invoice_reminder_action(
     match body.action.as_str() {
         "send" => {
             let (level, _label) =
-                billing_reminder_service::send_dunning(&state.db, &state.config.email, id).await?;
+                billing_reminder_service::send_dunning(&state.db, &state.config.email(), id).await?;
             Ok(Json(serde_json::json!({ "status": "sent", "level": level })))
         }
         "later" => {
@@ -2181,7 +2181,7 @@ async fn create_review_request(
 
     let outcome = billing_reminder_service::decide_review_request(
         &state.db,
-        &state.config.email,
+        &state.config.email(),
         id,
         &body.action,
         body.remind_after_days,

@@ -342,7 +342,7 @@ impl InvoiceService for InvoiceServiceImpl {
 
     async fn send_dunning(&self, reminder_id: Uuid) -> Result<(i32, String), ServiceError> {
         let (level, label) =
-            billing_reminder_service::send_dunning(&self.pool, &self.config.email, reminder_id)
+            billing_reminder_service::send_dunning(&self.pool, &self.config.email(), reminder_id)
                 .await
                 .map_err(super::map_api)?;
         Ok((level, label.to_string()))

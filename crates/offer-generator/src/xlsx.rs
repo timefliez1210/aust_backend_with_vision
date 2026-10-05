@@ -250,7 +250,8 @@ pub const MAX_LINE_ITEMS: usize = 20;
 /// - `OfferError::Template` if any internal XML file is not valid UTF-8
 /// - `OfferError::Template` if ZIP reassembly fails
 pub fn generate_offer_xlsx(data: &OfferData) -> Result<Vec<u8>, OfferError> {
-    let mut template_zip = ZipArchive::new(Cursor::new(TEMPLATE_BYTES))
+    let template = crate::templates::for_current(crate::templates::TemplateKind::Offer, TEMPLATE_BYTES)?;
+    let mut template_zip = ZipArchive::new(Cursor::new(&*template))
         .map_err(|e| OfferError::Template(format!("Failed to read template ZIP: {e}")))?;
 
     // Build modifications

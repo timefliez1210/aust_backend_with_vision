@@ -114,8 +114,9 @@ impl Tool for DraftReply {
         // Fetch original for context (best-effort); the LLM call is left for the
         // chat layer — here we just synthesize a placeholder draft.
         let original = ctx.services.emails.get_email(email_id).await.ok();
+        let company = aust_core::tenant::profile(&ctx.db).await?.short_name;
         let draft = format!(
-            "Sehr geehrte Damen und Herren,\n\n[Entwurf basierend auf Anweisung: \"{instruction}\"]\n\nMit freundlichen Grüßen\nAust Umzüge"
+            "Sehr geehrte Damen und Herren,\n\n[Entwurf basierend auf Anweisung: \"{instruction}\"]\n\nMit freundlichen Grüßen\n{company}"
         );
         Ok(json!({
             "draft": draft,
@@ -273,17 +274,21 @@ mod tests {
         assert_eq!(r["count"], json!(0));
     }
 
-    #[tokio::test]
-    async fn draft_reply_returns_draft() {
+    /// The draft is signed in the company's name — for Aust exactly as before.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn draft_reply_returns_draft(pool: sqlx::PgPool) {
         let services = testing::mock_bundle(uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let ctx = ToolCtx { db: pool, ..ctx(services) };
         let r = DraftReply
             .execute(
-                &ctx(services),
+                &ctx,
                 &json!({ "email_id": uuid::Uuid::new_v4(), "instruction_de": "Bestätige Termin" }),
             )
             .await
             .unwrap();
-        assert!(r["draft"].as_str().unwrap().contains("Anweisung"));
+        let draft = r["draft"].as_str().unwrap();
+        assert!(draft.contains("Anweisung"));
+        assert!(draft.ends_with("\n\nMit freundlichen Grüßen\nAust Umzüge"));
     }
 
     #[tokio::test]

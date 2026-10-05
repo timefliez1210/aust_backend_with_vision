@@ -33,7 +33,7 @@ pub async fn send_offer_email(
 ) -> Result<(), String> {
     use crate::services::email::{build_email_with_attachment, send_email};
 
-    let email_config = &state.config.email;
+    let email_config = &state.config.email();
 
     let body_text = "Sehr geehrte Damen und Herren,\n\n\
         anbei erhalten Sie unser Angebot für Ihren Umzug.\n\n\
@@ -99,7 +99,7 @@ pub async fn send_offer_email_custom(
 ) -> Result<(), String> {
     use crate::services::email::{build_email_with_attachment, send_email};
 
-    let email_config = &state.config.email;
+    let email_config = &state.config.email();
 
     let message = build_email_with_attachment(
         &email_config.from_address,

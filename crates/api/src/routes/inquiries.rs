@@ -623,7 +623,7 @@ async fn update_inquiry(
             "new_status": new_status,
         });
         let aggregate = format!("inquiry:{id}");
-        tokio::spawn(async move {
+        aust_core::tenant::spawn(async move {
             if let Err(e) = emitter.emit("status.changed", &aggregate, payload).await {
                 tracing::warn!("Failed to emit status.changed event: {e}");
             }

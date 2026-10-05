@@ -280,7 +280,7 @@ pub async fn approve_and_send(
     let filename = format!("Rechnung_{num}.pdf");
 
     let message = crate::services::email::build_email_with_attachment(
-        &config.email.username,
+        &config.email().username,
         &profile.name,
         &email,
         &subject,
@@ -292,11 +292,11 @@ pub async fn approve_and_send(
     .map_err(|e| ApiError::Internal(format!("E-Mail konnte nicht erstellt werden: {e}")))?;
 
     crate::services::email::send_email(
-        &config.email.smtp_host,
-        config.email.smtp_port,
-        &config.email.smtp_tls,
-        &config.email.username,
-        &config.email.password,
+        &config.email().smtp_host,
+        config.email().smtp_port,
+        &config.email().smtp_tls,
+        &config.email().username,
+        &config.email().password,
         message,
     )
     .await
@@ -350,10 +350,10 @@ async fn notify_approval(
     let url = format!(
         "{}/bot{}/sendMessage",
         crate::services::telegram_service::telegram_api_base(),
-        config.telegram.bot_token,
+        config.telegram().bot_token,
     );
     let payload = serde_json::json!({
-        "chat_id": config.telegram.admin_chat_id,
+        "chat_id": config.telegram().admin_chat_id,
         "text": text,
         "parse_mode": "Markdown",
         "reply_markup": keyboard,

@@ -9,6 +9,10 @@
 //! Uses a dedicated bot token (`AUST__TELEGRAM__FLASH_CONTACT_BOT_TOKEN`),
 //! separate from the main email-agent bot, so the two pollers don't fight
 //! over `getUpdates` (Telegram allows only one long-poller per token).
+//!
+//! One sidecar per company: `AUST__TENANT_ID` names the tenant whose flash
+//! contacts this bot handles (every connection works for it). Unset = Aust, which
+//! is how the existing deployment runs.
 
 mod bot;
 
@@ -36,7 +40,27 @@ async fn main() -> Result<()> {
         .parse()
         .expect("AUST__TELEGRAM__ADMIN_CHAT_ID must be an integer");
 
-    let db = sqlx::PgPool::connect(&db_url).await?;
+    // Every connection works for this sidecar's tenant (`app.tenant_id`, read by
+    // `current_tenant_id()` and row-level security). Unset = Aust.
+    let tenant_id = std::env::var("AUST__TENANT_ID").unwrap_or_default();
+    if !tenant_id.is_empty() {
+        tenant_id
+            .parse::<uuid::Uuid>()
+            .expect("AUST__TENANT_ID must be a UUID");
+    }
+    let db = sqlx::postgres::PgPoolOptions::new()
+        .after_connect(move |conn, _meta| {
+            let tenant_id = tenant_id.clone();
+            Box::pin(async move {
+                sqlx::query("SELECT set_config('app.tenant_id', $1, false)")
+                    .bind(tenant_id)
+                    .execute(conn)
+                    .await
+                    .map(|_| ())
+            })
+        })
+        .connect(&db_url)
+        .await?;
 
     info!("Flash-contact bot starting — polling Telegram");
 

@@ -149,7 +149,7 @@ async fn request_otp(
     let resp = otp_service::handle_request_otp(
         &EmployeeOtpBackend,
         &state.db,
-        &state.config.email,
+        &state.config.email(),
         &body.email,
     )
     .await?;
@@ -726,7 +726,7 @@ async fn notify_hours_logged(
     let name = format!("{} {}", ctx.first_name, ctx.last_name);
     let label = ctx.job_label.unwrap_or_else(|| "—".into());
     let text = format_hours_log_message(&name, &label, is_job, clock_in, clock_out, break_minutes);
-    crate::services::telegram_service::send_admin_message(&state.config.telegram, &text).await;
+    crate::services::telegram_service::send_admin_message(&state.config.telegram(), &text).await;
 }
 
 /// Build the German "worker logged hours" message for the office.
@@ -1435,7 +1435,7 @@ mod tests {
         let c2 = counter.clone();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
+        aust_core::tenant::spawn(async move {
             if let Ok((mut s, _)) = listener.accept().await {
                 c2.fetch_add(1, Ordering::SeqCst);
                 let _ = s

@@ -96,7 +96,11 @@ impl EmailProcessor {
             imap,
             smtp,
             telegram: Arc::new(Mutex::new(telegram)),
-            parser: EmailParser::new(),
+            parser: if profile.id == aust_core::tenant::AUST {
+                EmailParser::new()
+            } else {
+                EmailParser::for_domain(from_address.rsplit('@').next().unwrap_or_default())
+            },
             responder: EmailResponder::new(llm, profile),
             default_capacity,
             alternatives_count,

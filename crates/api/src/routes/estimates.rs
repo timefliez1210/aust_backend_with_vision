@@ -193,7 +193,7 @@ async fn vision_estimate(
     // Auto-generate offer in background
     let state_clone = state.clone();
     let qid = request.inquiry_id;
-    tokio::spawn(async move { try_auto_generate_offer(state_clone, qid).await });
+    aust_core::tenant::spawn(async move { try_auto_generate_offer(state_clone, qid).await });
 
     Ok(Json(VolumeEstimation::from(est)))
 }
@@ -306,7 +306,7 @@ async fn depth_sensor_estimate(
 
     // Auto-generate offer in background
     let state_clone = state.clone();
-    tokio::spawn(async move { try_auto_generate_offer(state_clone, inquiry_id).await });
+    aust_core::tenant::spawn(async move { try_auto_generate_offer(state_clone, inquiry_id).await });
 
     Ok(Json(VolumeEstimation::from(est)))
 }
@@ -453,7 +453,7 @@ async fn video_estimate(
 
         // Spawn background task for the long-running Modal call
         let state_bg = state.clone();
-        tokio::spawn(async move {
+        aust_core::tenant::spawn(async move {
             process_video_background(state_bg, id, inquiry_id, video_bytes, video_mime, max_keyframes, detection_threshold).await;
         });
 
@@ -696,7 +696,7 @@ async fn inventory_estimate(
     // Auto-generate offer in background
     let state_clone = state.clone();
     let qid = request.inquiry_id;
-    tokio::spawn(async move { try_auto_generate_offer(state_clone, qid).await });
+    aust_core::tenant::spawn(async move { try_auto_generate_offer(state_clone, qid).await });
 
     Ok(Json(VolumeEstimation::from(est)))
 }

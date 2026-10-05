@@ -113,7 +113,7 @@ pub async fn try_auto_generate_offer(state: Arc<AppState>, inquiry_id: Uuid) {
                 });
                 let _ = customer_id; // suppress unused warning
                 let aggregate = format!("offer:{offer_id}");
-                tokio::spawn(async move {
+                aust_core::tenant::spawn(async move {
                     if let Err(e) = emitter.emit("offer.drafted", &aggregate, payload).await {
                         tracing::warn!("Failed to emit offer.drafted event: {e}");
                     }
@@ -144,13 +144,13 @@ pub async fn try_auto_generate_offer(state: Arc<AppState>, inquiry_id: Uuid) {
             if agent_owns {
                 info!("Skipping legacy Telegram approval post — agent_owns_approval=true. Event consumer will handle it.");
             } else {
-                send_offer_to_telegram(&state.config.telegram, &generated).await;
+                send_offer_to_telegram(&state.config.telegram(), &generated).await;
             }
         }
         Err(e) => {
             error!("Auto-offer generation failed for inquiry {inquiry_id}: {e}");
             notify_telegram_error(
-                &state.config.telegram,
+                &state.config.telegram(),
                 &format!("Angebotserstellung fehlgeschlagen für Anfrage {inquiry_id}: {e}"),
             )
             .await;

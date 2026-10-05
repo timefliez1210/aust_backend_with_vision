@@ -421,14 +421,14 @@ async fn reset_password_request(
             "Ihr Passwort-Reset-Code lautet:\n\n  {otp_str}\n\nDer Code ist 15 Minuten gültig.\n\nFalls Sie kein Passwort-Reset angefordert haben, können Sie diese E-Mail ignorieren."
         );
         let _ = crate::services::email::send_email(
-            &state.config.email.smtp_host,
-            state.config.email.smtp_port,
-            &state.config.email.smtp_tls,
-            &state.config.email.username,
-            &state.config.email.password,
+            &state.config.email().smtp_host,
+            state.config.email().smtp_port,
+            &state.config.email().smtp_tls,
+            &state.config.email().username,
+            &state.config.email().password,
             crate::services::email::build_plain_email(
-                &state.config.email.from_address,
-                &state.config.email.from_name,
+                &state.config.email().from_address,
+                &state.config.email().from_name,
                 &user.email,
                 "Passwort-Reset Code – AUST Admin",
                 &body_text,

@@ -210,7 +210,7 @@ impl ReviewService for ReviewServiceImpl {
     ) -> Result<String, ServiceError> {
         let outcome = billing_reminder_service::decide_review_request(
             &self.pool,
-            &self.config.email,
+            &self.config.email(),
             inquiry_id,
             action,
             remind_after_days,

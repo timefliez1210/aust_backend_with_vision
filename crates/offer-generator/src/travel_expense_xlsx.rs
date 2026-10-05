@@ -58,7 +58,8 @@ fn time_to_excel_fraction(time: chrono::NaiveTime) -> f64 {
 /// Uses the first worksheet of the template (sheet1.xml). The other worksheets
 /// are stripped so the output contains a single clean form.
 pub fn generate_travel_expense_xlsx(data: &TravelExpenseData) -> Result<Vec<u8>, OfferError> {
-    let mut template_zip = ZipArchive::new(Cursor::new(TEMPLATE_BYTES))
+    let template = crate::templates::for_current(crate::templates::TemplateKind::TravelExpense, TEMPLATE_BYTES)?;
+    let mut template_zip = ZipArchive::new(Cursor::new(&*template))
         .map_err(|e| OfferError::Template(format!("Failed to read travel-expense template ZIP: {e}")))?;
 
     // Read the first sheet

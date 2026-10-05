@@ -362,7 +362,7 @@ pub(crate) async fn handle_offer_approval(
         Uuid::now_v7(),
         thread_id,
         "outbound",
-        &state.config.email.from_address,
+        &state.config.email().from_address,
         &customer_email,
         &subject,
         &body,
@@ -813,7 +813,7 @@ pub(crate) async fn handle_offer_edit(
                 generated.offer.price_cents as f64 / 100.0
             );
 
-            send_offer_to_telegram(&state.config.telegram, &generated).await;
+            send_offer_to_telegram(&state.config.telegram(), &generated).await;
         }
         Err(e) => {
             error!("Failed to regenerate offer: {e}");

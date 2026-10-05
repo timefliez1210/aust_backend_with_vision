@@ -4,6 +4,7 @@ mod fonts;
 mod invoice_xlsx;
 mod pdf_convert;
 mod pricing;
+pub mod templates;
 mod timesheet_xlsx;
 mod travel_expense_xlsx;
 mod xlsx;

@@ -378,7 +378,7 @@ pub(crate) async fn generate_inquiry_offer(
     // Generate personalised email draft in the background (non-blocking)
     {
         let state = Arc::clone(&state);
-        tokio::spawn(async move {
+        aust_core::tenant::spawn(async move {
             generate_offer_email_draft(&state, inquiry_id).await;
         });
     }
@@ -446,7 +446,7 @@ pub(crate) async fn generate_offer_email_draft(state: &AppState, inquiry_id: Uui
         Uuid::now_v7(),
         thread_id,
         "outbound",
-        &state.config.email.from_address,
+        &state.config.email().from_address,
         &email,
         "Ihr Umzugsangebot",
         &body,
@@ -544,7 +544,7 @@ pub(crate) async fn trigger_estimate_upload(
 
     // Spawn background processing (same pipeline as public submission)
     let state_bg = Arc::clone(&state);
-    tokio::spawn(async move {
+    aust_core::tenant::spawn(async move {
         if let Err(e) = process_submission_background(
             Arc::clone(&state_bg),
             inquiry_id,
@@ -650,7 +650,7 @@ pub(crate) async fn trigger_video_upload(
     tracing::info!(inquiry_id = %inquiry_id, %s3_key, "Video uploaded to S3 before spawn");
 
     let state_bg = Arc::clone(&state);
-    tokio::spawn(async move {
+    aust_core::tenant::spawn(async move {
         if let Err(e) =
             process_video_background(state_bg.clone(), inquiry_id, estimation_id, video_bytes, mime_type, s3_key).await
         {
@@ -966,7 +966,7 @@ pub(crate) async fn retry_estimation(
         let dep_addr = departure_address;
         let arr_addr = arrival_address;
         let s3_keys_bg = s3_keys;
-        tokio::spawn(async move {
+        aust_core::tenant::spawn(async move {
             if let Err(e) = process_submission_background(
                 Arc::clone(&state_bg),
                 inquiry_id,
@@ -1019,7 +1019,7 @@ pub(crate) async fn retry_estimation(
         );
 
         let state_bg = Arc::clone(&state);
-        tokio::spawn(async move {
+        aust_core::tenant::spawn(async move {
             if let Err(e) = process_video_background(
                 Arc::clone(&state_bg),
                 inquiry_id,

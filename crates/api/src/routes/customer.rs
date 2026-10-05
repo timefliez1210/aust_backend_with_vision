@@ -109,7 +109,7 @@ async fn request_otp(
     let resp = otp_service::handle_request_otp(
         &CustomerOtpBackend,
         &state.db,
-        &state.config.email,
+        &state.config.email(),
         &body.email,
     )
     .await?;
@@ -471,7 +471,7 @@ async fn accept_inquiry(
 
     // Notify admin via Telegram
     notify_admin_telegram(
-        &state.config.telegram,
+        &state.config.telegram(),
         &format!("✅ Kunde hat Angebot angenommen: {customer_name}"),
     )
     .await;
@@ -528,7 +528,7 @@ async fn reject_inquiry(
 
     // Notify admin via Telegram
     notify_admin_telegram(
-        &state.config.telegram,
+        &state.config.telegram(),
         &format!("❌ Kunde hat Angebot abgelehnt: {customer_name}"),
     )
     .await;

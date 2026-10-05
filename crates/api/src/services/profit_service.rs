@@ -2276,7 +2276,7 @@ mod db_tests {
             .unwrap();
 
         let p = pool.clone();
-        let waiting = tokio::spawn(async move { transfer(&p, month, "alex").await });
+        let waiting = aust_core::tenant::spawn(async move { transfer(&p, month, "alex").await });
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert!(!waiting.is_finished(), "transfer ran while the month was locked");
 

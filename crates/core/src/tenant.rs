@@ -62,6 +62,33 @@ tokio::task_local! {
     static CURRENT: TenantId;
 }
 
+static SLUGS: std::sync::OnceLock<std::collections::HashMap<TenantId, String>> =
+    std::sync::OnceLock::new();
+
+/// Remember every tenant's slug (`tenants.slug`), so config lookups keyed by slug
+/// (`[tenants.<slug>]`) can follow the running tenant. Called once at startup.
+pub fn register_slugs(slugs: std::collections::HashMap<TenantId, String>) {
+    let _ = SLUGS.set(slugs);
+}
+
+/// The running tenant's slug, or `None` for Aust and outside any scope (both use
+/// the top-level config). An unknown tenant yields `""`, which matches no section.
+pub fn current_slug() -> Option<&'static str> {
+    let t = current()?;
+    if t == AUST {
+        return None;
+    }
+    Some(SLUGS.get().and_then(|m| m.get(&t)).map(String::as_str).unwrap_or(""))
+}
+
+/// Every tenant's id and slug, read across tenants (startup, per-tenant jobs).
+pub async fn all(pool: &sqlx::PgPool) -> Result<Vec<(TenantId, String)>, sqlx::Error> {
+    let mut tx = bypass(pool).await?;
+    sqlx::query_as("SELECT id, slug FROM tenants ORDER BY created_at, id")
+        .fetch_all(&mut *tx)
+        .await
+}
+
 /// The tenant of the running task, if it runs inside [`scope`].
 pub fn current() -> Option<TenantId> {
     CURRENT.try_with(|t| *t).ok()
