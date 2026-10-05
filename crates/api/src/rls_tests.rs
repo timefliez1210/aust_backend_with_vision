@@ -172,3 +172,27 @@ async fn bypass_is_scoped_to_its_transaction(pool: PgPool) {
     let (after,): (bool,) = sqlx::query_as("SELECT tenant_bypass()").fetch_one(&pool).await.unwrap();
     assert!(!after);
 }
+
+/// KVA numbers: Aust keeps drawing from `offer_number_seq`; another company
+/// counts on its own from 1001 and never takes one of Aust's numbers.
+#[sqlx::test(migrations = "../../migrations")]
+async fn each_company_numbers_its_own_kvas(pool: PgPool) {
+    use crate::repositories::offer_repo::next_offer_number;
+    let day = chrono::NaiveDate::from_ymd_opt(2026, 10, 5).unwrap();
+    let other = Uuid::now_v7();
+    sqlx::query("INSERT INTO tenants (id, slug, name) VALUES ($1, 'zweite', 'Zweite Umzüge')")
+        .bind(other)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let aust_1 = tenant::scope(AUST, next_offer_number(&pool, day)).await.unwrap();
+    let other_1 = tenant::scope(tenant::TenantId(other), next_offer_number(&pool, day)).await.unwrap();
+    let other_2 = tenant::scope(tenant::TenantId(other), next_offer_number(&pool, day)).await.unwrap();
+    let aust_2 = tenant::scope(AUST, next_offer_number(&pool, day)).await.unwrap();
+
+    assert_eq!(other_1, "2026-1001");
+    assert_eq!(other_2, "2026-1002");
+    let n = |s: &str| s.split('-').nth(1).unwrap().parse::<i64>().unwrap();
+    assert_eq!(n(&aust_2), n(&aust_1) + 1, "Aust's sequence must not jump");
+}

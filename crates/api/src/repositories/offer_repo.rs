@@ -174,18 +174,57 @@ pub(crate) async fn fetch_price(
     Ok(row.map(|(p,)| p))
 }
 
-/// Get next offer number from the sequence.
+/// Get the next offer number of the running tenant.
 ///
 /// **Caller**: `build_offer_with_overrides`
-/// **Why**: New offers need a sequential offer number.
+/// **Why**: New offers need a sequential offer number. Aust draws from
+/// `offer_number_seq` as always, so its numbering never jumps; every other company
+/// counts in its own `offer_number_counters` row.
 pub(crate) async fn next_offer_number(
     pool: &PgPool,
     today: chrono::NaiveDate,
 ) -> Result<String, sqlx::Error> {
-    let (seq_val,): (i64,) = sqlx::query_as("SELECT nextval('offer_number_seq')")
+    let (seq_val,): (i64,) = if uses_aust_sequence() {
+        sqlx::query_as("SELECT nextval('offer_number_seq')")
+            .fetch_one(pool)
+            .await?
+    } else {
+        // Starts at 1001 like `offer_number_seq` did.
+        sqlx::query_as(
+            "INSERT INTO offer_number_counters (last_value) VALUES (1001)
+             ON CONFLICT (tenant_id) DO UPDATE SET last_value = offer_number_counters.last_value + 1
+             RETURNING last_value",
+        )
         .fetch_one(pool)
-        .await?;
+        .await?
+    };
     Ok(format!("{}-{:04}", today.format("%Y"), seq_val))
+}
+
+/// Whether the running tenant's KVA numbers come from `offer_number_seq` (Aust,
+/// and code outside any tenant scope) rather than `offer_number_counters`.
+pub(crate) fn uses_aust_sequence() -> bool {
+    aust_core::tenant::current().is_none_or(|t| t == aust_core::tenant::AUST)
+}
+
+/// The next KVA number a non-Aust tenant will get, without taking it.
+pub(crate) async fn peek_next_counter(pool: &PgPool) -> Result<i64, sqlx::Error> {
+    let row: Option<(i64,)> = sqlx::query_as("SELECT last_value FROM offer_number_counters WHERE tenant_id = current_tenant_id()")
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map_or(1001, |(v,)| v + 1))
+}
+
+/// Make `n` the next KVA number of a non-Aust tenant.
+pub(crate) async fn set_next_counter(pool: &PgPool, n: i64) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO offer_number_counters (last_value) VALUES ($1 - 1)
+         ON CONFLICT (tenant_id) DO UPDATE SET last_value = EXCLUDED.last_value",
+    )
+    .bind(n)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// Mark an offer as rejected.

@@ -535,7 +535,7 @@ async fn update_invoice_number(
         .await
         .map_err(|e| {
             if let sqlx::Error::Database(ref db_err) = e
-                && db_err.constraint() == Some("invoices_invoice_number_key") {
+                && db_err.constraint() == Some("invoices_tenant_invoice_number_key") {
                     return ApiError::BadRequest(format!(
                         "Rechnungsnummer {new_number} wird bereits verwendet"
                     ));

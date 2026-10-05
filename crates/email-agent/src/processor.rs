@@ -170,7 +170,7 @@ impl EmailProcessor {
                 r#"
                 INSERT INTO customers (id, email, name, salutation, first_name, last_name, phone, created_at, updated_at)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
-                ON CONFLICT (email) DO UPDATE SET
+                ON CONFLICT (tenant_id, email) WHERE merged_into IS NULL DO UPDATE SET
                     name       = COALESCE(EXCLUDED.name,       customers.name),
                     salutation = COALESCE(EXCLUDED.salutation, customers.salutation),
                     first_name = COALESCE(EXCLUDED.first_name, customers.first_name),
@@ -191,7 +191,7 @@ impl EmailProcessor {
             .map_err(|e| warn!("Failed to upsert customer for email tracking: {e}"));
 
             match sqlx::query_as::<_, (Uuid,)>(
-                "SELECT id FROM customers WHERE email = $1",
+                "SELECT id FROM customers WHERE email = $1 AND merged_into IS NULL",
             )
             .bind(customer_email)
             .fetch_optional(&self.db)

@@ -3731,7 +3731,7 @@ mod tests {
     /// (`test_app_state`, not `#[sqlx::test]`) and pick their year from the wall
     /// clock — `2040 + timestamp % 50`. That bucket repeats, so a second run inside
     /// the same window collided with its own leftovers on
-    /// `invoices_invoice_number_key` and the test failed for reasons that had
+    /// `invoices_tenant_invoice_number_key` and the test failed for reasons that had
     /// nothing to do with the code under test. Clearing the year first makes the
     /// tests idempotent without giving up the isolated-year trick.
     #[cfg(test)]

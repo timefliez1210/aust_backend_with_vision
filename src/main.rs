@@ -89,6 +89,24 @@ async fn main() -> Result<()> {
     let tenant_ids: Arc<Vec<TenantId>> = Arc::new(tenants.iter().map(|(id, _)| *id).collect());
     tracing::info!(count = tenants.len(), "Tenants loaded");
 
+    // A second company may only be served when Postgres enforces row-level
+    // security, i.e. the app's role is neither superuser nor BYPASSRLS
+    // (scripts/db-app-role.sql). Otherwise every unfiltered query would mix them.
+    if tenants.len() > 1 {
+        let (bypasses,): (bool,) = sqlx::query_as(
+            "SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname = current_user",
+        )
+        .fetch_one(&db)
+        .await?;
+        if bypasses {
+            anyhow::bail!(
+                "{} tenants, but the database role bypasses row-level security — \
+                 run scripts/db-app-role.sql and connect as aust_app (docs/MULTI_TENANT.md)",
+                tenants.len()
+            );
+        }
+    }
+
     // Every other company's own document templates (Aust's are compiled in).
     {
         let mut tx = tenant::bypass(&db).await?;

@@ -394,10 +394,10 @@ pub(super) async fn update_customer(
     )
     .await
     .map_err(|e| {
-        // A duplicate email hits the customers_email_key UNIQUE constraint. Surface a
+        // A duplicate email hits the customers_tenant_email_key UNIQUE index. Surface a
         // clear German message instead of a raw 500 ("email nicht speicherbar").
         if let sqlx::Error::Database(ref db_err) = e
-            && db_err.constraint() == Some("customers_email_key") {
+            && db_err.constraint() == Some("customers_tenant_email_key") {
                 return ApiError::Validation(
                     "Diese E-Mail-Adresse wird bereits von einem anderen Kunden verwendet".into(),
                 );
@@ -468,7 +468,7 @@ pub(super) async fn create_customer(
     .await
     .map_err(|e| {
         if let sqlx::Error::Database(ref db_err) = e
-            && db_err.constraint() == Some("customers_email_key") {
+            && db_err.constraint() == Some("customers_tenant_email_key") {
                 return ApiError::Validation("E-Mail-Adresse existiert bereits".into());
             }
         ApiError::Database(e)
