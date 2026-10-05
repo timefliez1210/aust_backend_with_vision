@@ -244,7 +244,7 @@ async fn refresh_token(
 ///
 /// # Errors
 /// - `500` if Argon2 hashing fails (should not occur in normal operation)
-fn hash_password(password: &str) -> Result<String, ApiError> {
+pub(crate) fn hash_password(password: &str) -> Result<String, ApiError> {
     let salt = SaltString::generate(&mut OsRng);
     let hash = Argon2::default()
         .hash_password(password.as_bytes(), &salt)

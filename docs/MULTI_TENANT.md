@@ -27,8 +27,9 @@ rolled back alone.
     is logged out);
   - workers and customers: their session row (`employee_sessions` /
     `customer_sessions`);
-  - public endpoints (forms, flash contact, app submissions): not resolved yet —
-    Aust. Later by host name or API key.
+  - public endpoints (forms, flash contact, OTP login, password reset): the
+    `Origin`/`Referer` host, looked up in `tenants.domains`
+    (`middleware::scope_by_origin`); an unlisted host stays Aust.
 
 ### Rules for new code
 
@@ -51,8 +52,8 @@ rolled back alone.
 | 2b | Depot per tenant (`tenants.depot_address`). Prices already live per key in `settings`, with `[company]` in TOML as the default — they become per company with steps 3 and 5 | no | done |
 | 3 | Row-level security: `FORCE ROW LEVEL SECURITY` + policy `tenant_isolation` on every tenant table; login and session lookups through `tenant::bypass`; the whole test suite passes as a non-superuser role | no | code done — enforced on prod only after the role switch below |
 | 4 | Per-tenant integrations: mailbox + Telegram from `[tenants.<slug>]` (`Config::email()` / `telegram()` follow the running tenant; a tenant without its own gets a disabled one, never Aust's); one `EmailProcessor` + offer handler + event consumer per tenant; every periodic job runs once per tenant in its scope; `tenant::spawn` everywhere; document templates per tenant (`tenant_templates`, Aust keeps the compiled-in ones, others get an error without their own); Josie's persona per tenant (`tenants.soul_md`, neutral persona otherwise); flash-contact sidecar per tenant (`AUST__TENANT_ID`) | no | done |
-| 5 | Per-company uniqueness: `customers.email`, `employees.email`, `invoices.invoice_number`, `storage_invoices.invoice_number`, `expense_categories.name`, `calendar_capacity_overrides.override_date`, `settings.key`, `invoice_number_counters.year` become unique per tenant | no | open — drops the old indexes, needs an exception to "migrations additive-only" |
-| 6 | Onboarding: create a tenant + first admin; console reads name/accent from the API (`lib/tenant.ts`); console on its own host, `aust-umzuege.de` stays the marketing site | no | open |
+| 5 | Per-company uniqueness (exception to additive-only, approved 2026-10-05): `customers.email` (among unmerged rows), `invoices`/`storage_invoices.invoice_number`, `expense_categories.name`, `calendar_capacity_overrides.override_date`, `settings` and `invoice_number_counters` keys are unique per tenant; KVA numbers: Aust keeps `offer_number_seq`, others count in `offer_number_counters`. The migration merges prod's two exact duplicate customers into the older row like the app's merge does. `employees.email` and `users.email` stay globally unique — they identify the tenant at login | no | done |
+| 6 | Public requests by domain (`tenants.domains`, `Origin`/`Referer` → scope; CORS allows those hosts); console branding from `GET /api/v1/tenant` (`lib/tenant.svelte.ts`, Aust defaults, no flash); company profile + templates via `/api/v1/admin/tenant`; `aust_backend tenant-create <slug> <name> <admin-email>` | no | done — hosting the console on its own domain is a deploy decision |
 
 ## Prod: switch to a non-superuser role (enforces step 3)
 
@@ -74,12 +75,30 @@ Until this runs, the policies exist but change nothing.
 Tested: `scripts/db-app-role.sql` on a superuser-owned copy of the schema; the
 full workspace suite against a database owned by a non-superuser role.
 
+## Onboarding a company
+
+1. Prod must enforce row-level security first (role switch above) — the backend
+   refuses to start with two tenants otherwise.
+2. `docker exec aust_backend aust_backend tenant-create <slug> "<Name>" <admin-email>`
+   — prints the admin's one-time password.
+3. Set `tenants.domains` (its website / console hosts) and the profile
+   (`PUT /api/v1/admin/tenant` as that admin: names, phone, depot, accent, persona).
+4. Mailbox and bot: `[tenants.<slug>]` with `email` and `telegram` sections (env
+   `AUST__TENANTS__<SLUG>__EMAIL__…`). Without them the company simply has no
+   mailbox / bot. Flash-contact sidecar: one more container with
+   `AUST__TENANT_ID=<id>` and its own bot token.
+5. Templates: `PUT /api/v1/admin/tenant/templates/{offer|invoice|travel_expense|clearing_page_2}`
+   with the file as body. Until then, generating that document fails (never
+   Aust's letterhead).
+6. Restart the backend (tenants, domains and slugs are read at startup).
+
 ## Known gaps
 
-- Pre-login flows other than admin login and session tokens — OTP request and
-  verify, password reset — still run unscoped, i.e. as Aust. Fine while Aust is
-  the only tenant; they need the tenant from the host name (step 6) before the
-  Aust fallback in `current_tenant_id()` is removed.
+- Unscoped code (no token, no listed `Origin`) still counts as Aust:
+  `current_tenant_id()` falls back to Aust. That keeps every existing caller
+  working; a request from an unlisted host lands with Aust, as today.
+- The customer app (`capacitor://localhost`) is Aust's app; another company's
+  app would need its own build with a tenant header.
 - Storage keys have no tenant prefix. Objects are only reached through their
   row (which RLS guards), and keys carry row UUIDs, so tenants cannot collide;
   a per-tenant prefix would only help bulk export/deletion.

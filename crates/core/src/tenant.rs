@@ -81,6 +81,37 @@ pub fn current_slug() -> Option<&'static str> {
     Some(SLUGS.get().and_then(|m| m.get(&t)).map(String::as_str).unwrap_or(""))
 }
 
+static DOMAINS: std::sync::OnceLock<std::collections::HashMap<String, TenantId>> =
+    std::sync::OnceLock::new();
+
+/// Remember which host belongs to which tenant (`tenants.domains`). Called once at
+/// startup; hosts are compared lowercase and without port.
+pub fn register_domains(domains: std::collections::HashMap<String, TenantId>) {
+    let _ = DOMAINS.set(domains.into_iter().map(|(d, t)| (d.to_lowercase(), t)).collect());
+}
+
+/// The tenant a host (`www.example.de`, optionally with `:port`) belongs to.
+pub fn by_host(host: &str) -> Option<TenantId> {
+    let host = host.rsplit_once(':').map_or(host, |(h, port)| {
+        if port.chars().all(|c| c.is_ascii_digit()) { h } else { host }
+    });
+    DOMAINS.get()?.get(&host.to_lowercase()).copied()
+}
+
+/// The tenant an `Origin` or `Referer` value (`https://host[:port][/…]`) belongs to.
+pub fn by_origin(origin: &str) -> Option<TenantId> {
+    let rest = origin.split_once("://").map_or(origin, |(_, r)| r);
+    by_host(rest.split('/').next().unwrap_or_default())
+}
+
+/// Every tenant's domains, read across tenants (startup).
+pub async fn all_domains(pool: &sqlx::PgPool) -> Result<Vec<(String, TenantId)>, sqlx::Error> {
+    let mut tx = bypass(pool).await?;
+    sqlx::query_as("SELECT unnest(domains), id FROM tenants")
+        .fetch_all(&mut *tx)
+        .await
+}
+
 /// Every tenant's id and slug, read across tenants (startup, per-tenant jobs).
 pub async fn all(pool: &sqlx::PgPool) -> Result<Vec<(TenantId, String)>, sqlx::Error> {
     let mut tx = bypass(pool).await?;
@@ -150,6 +181,19 @@ mod tests {
         assert_eq!(spawned, Some(other));
         assert_eq!(current(), None);
         assert_eq!(session_value(), "");
+    }
+
+    #[test]
+    fn hosts_and_origins_resolve_to_their_tenant() {
+        let other = TenantId(Uuid::from_u128(7));
+        register_domains(
+            [("www.aust-umzuege.de".to_string(), AUST), ("Zweite.de".to_string(), other)].into(),
+        );
+        assert_eq!(by_origin("https://www.aust-umzuege.de"), Some(AUST));
+        assert_eq!(by_origin("https://zweite.de:443/kontakt?x=1"), Some(other));
+        assert_eq!(by_host("ZWEITE.DE"), Some(other));
+        assert_eq!(by_origin("https://evil.example"), None);
+        assert_eq!(by_origin("capacitor://localhost"), None);
     }
 
     #[test]

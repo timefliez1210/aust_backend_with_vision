@@ -176,7 +176,11 @@ async fn bypass_is_scoped_to_its_transaction(pool: PgPool) {
 /// KVA numbers: Aust keeps drawing from `offer_number_seq`; another company
 /// counts on its own from 1001 and never takes one of Aust's numbers.
 #[sqlx::test(migrations = "../../migrations")]
-async fn each_company_numbers_its_own_kvas(pool: PgPool) {
+async fn each_company_numbers_its_own_kvas(
+    opts: sqlx::postgres::PgPoolOptions,
+    conn: sqlx::postgres::PgConnectOptions,
+) {
+    let pool = crate::tenant_aware(opts).connect_with(conn).await.unwrap();
     use crate::repositories::offer_repo::next_offer_number;
     let day = chrono::NaiveDate::from_ymd_opt(2026, 10, 5).unwrap();
     let other = Uuid::now_v7();
@@ -195,4 +199,10 @@ async fn each_company_numbers_its_own_kvas(pool: PgPool) {
     assert_eq!(other_2, "2026-1002");
     let n = |s: &str| s.split('-').nth(1).unwrap().parse::<i64>().unwrap();
     assert_eq!(n(&aust_2), n(&aust_1) + 1, "Aust's sequence must not jump");
+
+    let owners: Vec<(Uuid,)> = sqlx::query_as("SELECT tenant_id FROM offer_number_counters")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(owners, vec![(other,)], "the counter row belongs to the other company");
 }

@@ -82,10 +82,26 @@ async fn main() -> Result<()> {
     migrator.run(&db).await?;
     tracing::info!("Migrations completed");
 
+    // `aust_backend tenant-create <slug> <name> <admin-email>`: onboard a company,
+    // print its first admin's one-time password, exit. Restart the server after.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("tenant-create") {
+        let [slug, name, admin_email] = [2, 3, 4].map(|i| args.get(i).cloned().unwrap_or_default());
+        let t = aust_api::services::onboarding::create_tenant(&db, &slug, &name, &admin_email)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        println!("Firma angelegt: {} ({slug})", t.id.0);
+        println!("Admin: {}  Einmal-Passwort: {}", t.admin_email, t.admin_password);
+        println!("Als Nächstes: tenants.domains setzen, [tenants.{slug}] (E-Mail, Telegram) konfigurieren,");
+        println!("Vorlagen hochladen, Backend neu starten. Siehe docs/MULTI_TENANT.md.");
+        return Ok(());
+    }
+
     // Every tenant (company). Mailboxes and background jobs below run once per
     // tenant, each inside that tenant's scope. A new tenant needs a restart.
     let tenants = aust_core::tenant::all(&db).await?;
     aust_core::tenant::register_slugs(tenants.iter().cloned().collect());
+    aust_core::tenant::register_domains(aust_core::tenant::all_domains(&db).await?.into_iter().collect());
     let tenant_ids: Arc<Vec<TenantId>> = Arc::new(tenants.iter().map(|(id, _)| *id).collect());
     tracing::info!(count = tenants.len(), "Tenants loaded");
 
