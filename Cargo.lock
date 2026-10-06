@@ -527,6 +527,7 @@ name = "aust_backend"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "aust-api",
  "aust-assistant",
  "aust-core",

@@ -146,14 +146,34 @@ async fn request_otp(
     State(state): State<Arc<AppState>>,
     Json(body): Json<OtpRequest>,
 ) -> Result<Json<OtpResponse>, ApiError> {
-    let resp = otp_service::handle_request_otp(
-        &EmployeeOtpBackend,
-        &state.db,
-        &state.config.email(),
-        &body.email,
-    )
+    let tenant = employee_tenant(&state.db, &body.email).await?;
+    let resp = in_tenant(tenant, async {
+        otp_service::handle_request_otp(&EmployeeOtpBackend, &state.db, state.config.email(), &body.email)
+            .await
+    })
     .await?;
     Ok(Json(resp))
+}
+
+/// The company a worker belongs to, by email (unique system-wide) — looked up
+/// across companies, because before login the company is unknown. `None` for an
+/// unknown address; the flow then answers exactly as before (no enumeration).
+async fn employee_tenant(pool: &sqlx::PgPool, email: &str) -> Result<Option<aust_core::tenant::TenantId>, ApiError> {
+    let mut tx = aust_core::tenant::bypass(pool).await?;
+    let row: Option<(aust_core::tenant::TenantId,)> =
+        sqlx::query_as("SELECT tenant_id FROM employees WHERE lower(email) = lower($1)")
+            .bind(email.trim())
+            .fetch_optional(&mut *tx)
+            .await?;
+    Ok(row.map(|(t,)| t))
+}
+
+/// Run `f` in `tenant`'s scope when known, else as is.
+async fn in_tenant<F: std::future::Future>(tenant: Option<aust_core::tenant::TenantId>, f: F) -> F::Output {
+    match tenant {
+        Some(t) => aust_core::tenant::scope(t, f).await,
+        None => f.await,
+    }
 }
 
 /// `POST /employee/auth/verify` — validate OTP, create 30-day session, return token.
@@ -168,6 +188,12 @@ async fn verify_otp(
     State(state): State<Arc<AppState>>,
     Json(body): Json<VerifyRequest>,
 ) -> Result<Json<VerifyResponse>, ApiError> {
+    // Code, session and profile all live in the worker's own company.
+    let tenant = employee_tenant(&state.db, &body.email).await?;
+    in_tenant(tenant, verify_otp_in_tenant(&state, &body)).await
+}
+
+async fn verify_otp_in_tenant(state: &AppState, body: &VerifyRequest) -> Result<Json<VerifyResponse>, ApiError> {
     let email = body.email.trim().to_lowercase();
 
     // Shared OTP validation + token generation

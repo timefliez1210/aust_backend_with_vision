@@ -206,3 +206,85 @@ async fn each_company_numbers_its_own_kvas(
         .unwrap();
     assert_eq!(owners, vec![(other,)], "the counter row belongs to the other company");
 }
+
+/// Every single-column link between two tenant tables onto the parent's `id` has
+/// a twin on (tenant_id, column), so a link cannot cross companies — foreign-key
+/// checks ignore row-level security. A new table without the twin fails here.
+#[sqlx::test(migrations = "../../migrations")]
+async fn every_link_between_tenant_tables_stays_in_one_company(pool: PgPool) {
+    let missing: Vec<(String,)> = sqlx::query_as(
+        "SELECT c.conrelid::regclass::text || '.' || ca.attname
+         FROM pg_constraint c
+         JOIN pg_attribute ca ON ca.attrelid = c.conrelid  AND ca.attnum = c.conkey[1]
+         JOIN pg_attribute pa ON pa.attrelid = c.confrelid AND pa.attnum = c.confkey[1]
+         WHERE c.contype = 'f' AND c.connamespace = 'public'::regnamespace
+           AND array_length(c.conkey, 1) = 1 AND pa.attname = 'id' AND ca.attname <> 'tenant_id'
+           AND EXISTS (SELECT 1 FROM pg_attribute t WHERE t.attrelid = c.conrelid AND t.attname = 'tenant_id')
+           AND EXISTS (SELECT 1 FROM pg_attribute t WHERE t.attrelid = c.confrelid AND t.attname = 'tenant_id')
+           AND NOT EXISTS (
+               SELECT 1 FROM pg_constraint t
+               JOIN pg_attribute t1 ON t1.attrelid = t.conrelid AND t1.attnum = t.conkey[1]
+               JOIN pg_attribute t2 ON t2.attrelid = t.conrelid AND t2.attnum = t.conkey[2]
+               WHERE t.contype = 'f' AND t.conrelid = c.conrelid AND t.confrelid = c.confrelid
+                 AND t1.attname = 'tenant_id' AND t2.attname = ca.attname)
+         ORDER BY 1",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(missing.is_empty(), "links without a same-company twin: {missing:?}");
+}
+
+/// Another company's inquiry cannot point at an Aust customer — even when the
+/// writer could get past row-level security (bypass, superuser).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_link_to_another_companys_row_is_refused(pool: PgPool) {
+    let other = Uuid::now_v7();
+    sqlx::query("INSERT INTO tenants (id, slug, name) VALUES ($1, 'zweite', 'Zweite')")
+        .bind(other)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let aust_customer = customer(&pool, AUST.0, "Aust-Kunde").await;
+    let crossed = sqlx::query(
+        "INSERT INTO inquiries (id, tenant_id, customer_id, status) VALUES ($1, $2, $3, 'pending')",
+    )
+    .bind(Uuid::now_v7())
+    .bind(other)
+    .bind(aust_customer)
+    .execute(&pool)
+    .await;
+    let err = crossed.expect_err("a cross-company link must be refused").to_string();
+    assert!(err.contains("same_tenant"), "refused by the twin key: {err}");
+}
+
+/// Two companies keep their own daily-briefing slots and their own binding for
+/// the same Telegram chat (a private chat has one id across all bots).
+#[sqlx::test(migrations = "../../migrations")]
+async fn companies_share_slots_and_chats_without_colliding(pool: PgPool) {
+    let other = Uuid::now_v7();
+    sqlx::query("INSERT INTO tenants (id, slug, name) VALUES ($1, 'zweite', 'Zweite')")
+        .bind(other)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let day = chrono::NaiveDate::from_ymd_opt(2026, 10, 7).unwrap();
+    for t in [AUST.0, other] {
+        let claimed: Option<(chrono::NaiveDate,)> = sqlx::query_as(
+            "INSERT INTO agent_briefing_log (tenant_id, slot_date, slot, chat_id) VALUES ($1, $2, 'morning', 42)
+             ON CONFLICT (tenant_id, slot_date, slot) DO NOTHING RETURNING slot_date",
+        )
+        .bind(t)
+        .bind(day)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        assert!(claimed.is_some(), "each company claims its own morning slot");
+        sqlx::query("INSERT INTO agent_sessions (id, tenant_id, chat_id, turns) VALUES ($1, $2, 4242, '[]')")
+            .bind(Uuid::now_v7())
+            .bind(t)
+            .execute(&pool)
+            .await
+            .expect("the same chat may have a session per company");
+    }
+}

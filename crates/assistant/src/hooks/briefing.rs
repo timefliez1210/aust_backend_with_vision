@@ -359,7 +359,7 @@ pub async fn run_briefing_tick(pool: &PgPool, notifier: &dyn TelegramNotifier) -
     // holds it, `fetch_optional` yields None and we do nothing.
     let claimed: Option<(NaiveDate,)> = sqlx::query_as(
         "INSERT INTO agent_briefing_log (slot_date, slot, chat_id) VALUES ($1, $2, $3) \
-         ON CONFLICT (slot_date, slot) DO NOTHING RETURNING slot_date",
+         ON CONFLICT (tenant_id, slot_date, slot) DO NOTHING RETURNING slot_date",
     )
     .bind(today)
     .bind(*slot)

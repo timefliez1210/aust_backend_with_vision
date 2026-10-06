@@ -408,6 +408,16 @@ async fn reset_password_request(
     let user = auth_repo::fetch_user_by_email_lower(&state.db, &email).await?;
 
     if let Some(user) = user {
+        // Everything after the lookup happens in the user's own company: its
+        // mailbox, its reset rows.
+        aust_core::tenant::scope(user.tenant_id, send_reset_code(&state, &user)).await?;
+    }
+
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// Store a fresh reset code for `user` and mail it. Runs in the user's company.
+async fn send_reset_code(state: &AppState, user: &auth_repo::UserRow) -> Result<(), ApiError> {
         // Generate 6-digit OTP
         let otp: u32 = rand::rng().random_range(100_000..=999_999);
         let otp_str = format!("{otp:06}");
@@ -436,15 +446,15 @@ async fn reset_password_request(
                 &state.config.email().from_address,
                 &state.config.email().from_name,
                 &user.email,
-                "Passwort-Reset Code – AUST Admin",
+                &crate::services::email::reset_mail_subject(
+                    &crate::repositories::tenant_repo::profile(&state.db).await?,
+                ),
                 &body_text,
             )
             .map_err(|e| ApiError::Internal(e.to_string()))?,
         )
         .await;
-    }
-
-    Ok(Json(serde_json::json!({ "ok": true })))
+        Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -486,6 +496,17 @@ async fn reset_password_verify(
         .await?
         .ok_or_else(|| ApiError::Validation("Ungültiger oder abgelaufener Code".into()))?;
 
+    // The rest happens in the user's own company (its reset rows).
+    aust_core::tenant::scope(user.tenant_id, verify_reset_code(&state, &user, &body)).await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// Check `body.otp` against `user`'s latest reset code and set the new password.
+async fn verify_reset_code(
+    state: &AppState,
+    user: &auth_repo::UserRow,
+    body: &ResetVerifyBody,
+) -> Result<(), ApiError> {
     // Fetch the latest unused, unexpired token for this user
     let reset = auth_repo::fetch_valid_reset(&state.db, user.id)
         .await?
@@ -518,6 +539,5 @@ async fn reset_password_verify(
     auth_repo::update_password_tx(&mut tx, user.id, &new_hash, now).await?;
 
     tx.commit().await?;
-
-    Ok(Json(serde_json::json!({ "ok": true })))
+    Ok(())
 }

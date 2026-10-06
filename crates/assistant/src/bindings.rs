@@ -46,7 +46,7 @@ pub async fn upsert(
         r#"
         INSERT INTO telegram_chat_bindings (id, chat_id, user_id, role)
         VALUES (gen_random_uuid(), $1, $2, $3)
-        ON CONFLICT (chat_id) DO UPDATE
+        ON CONFLICT (tenant_id, chat_id) DO UPDATE
             SET user_id = EXCLUDED.user_id,
                 role    = EXCLUDED.role,
                 updated_at = NOW()

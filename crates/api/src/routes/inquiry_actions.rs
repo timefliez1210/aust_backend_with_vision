@@ -408,6 +408,13 @@ pub(crate) async fn generate_offer_email_draft(state: &AppState, inquiry_id: Uui
 
     let origin = origin_city.as_deref().unwrap_or("dem Abholort");
     let dest = dest_city.as_deref().unwrap_or("dem Zielort");
+    let team = match crate::repositories::tenant_repo::profile(&state.db).await {
+        Ok(p) => crate::services::email::offer_mail_team(&p),
+        Err(e) => {
+            tracing::error!(%inquiry_id, "Offer mail draft skipped, tenant profile not loaded: {e}");
+            return;
+        }
+    };
 
     // Ask LLM for a personalised German email body; fall back to a static template on error
     let prompt = format!(
@@ -416,7 +423,7 @@ pub(crate) async fn generate_offer_email_draft(state: &AppState, inquiry_id: Uui
          Die E-Mail soll das beigefügte Angebot kurz vorstellen, Professionalität und \
          Zuverlässigkeit betonen und zur Kontaktaufnahme einladen. \
          Nur den Textkörper, keinen Betreff. Maximal 5 Sätze. \
-         Unterschrift: 'Mit freundlichen Grüßen,\\nIhr AUST-Umzüge-Team'"
+         Unterschrift: 'Mit freundlichen Grüßen,\\n{team}'"
     );
     let body = match state.llm.complete(&[LlmMessage::user(prompt)]).await {
         Ok(b) => b,
@@ -426,7 +433,7 @@ pub(crate) async fn generate_offer_email_draft(state: &AppState, inquiry_id: Uui
                 "Sehr geehrte(r) {name},\n\n\
                  anbei erhalten Sie unser Angebot für Ihren Umzug von {origin} nach {dest}.\n\n\
                  Bei Fragen stehen wir Ihnen gerne zur Verfügung.\n\n\
-                 Mit freundlichen Grüßen,\nIhr AUST-Umzüge-Team"
+                 Mit freundlichen Grüßen,\n{team}"
             )
         }
     };

@@ -112,6 +112,17 @@ pub async fn all_domains(pool: &sqlx::PgPool) -> Result<Vec<(String, TenantId)>,
         .await
 }
 
+/// Whether Postgres enforces row-level security for this pool's role — i.e. the
+/// role is neither superuser nor BYPASSRLS. Only then may a second company exist:
+/// otherwise every unfiltered query would see all companies' rows.
+pub async fn rls_enforced(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error> {
+    let (bypasses,): (bool,) =
+        sqlx::query_as("SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname = current_user")
+            .fetch_one(pool)
+            .await?;
+    Ok(!bypasses)
+}
+
 /// Every tenant's id and slug, read across tenants (startup, per-tenant jobs).
 pub async fn all(pool: &sqlx::PgPool) -> Result<Vec<(TenantId, String)>, sqlx::Error> {
     let mut tx = bypass(pool).await?;

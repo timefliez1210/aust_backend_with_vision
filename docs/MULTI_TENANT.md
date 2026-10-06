@@ -106,6 +106,24 @@ company is created there or with `tenant-create`.
    — an upload wins. A clearing KVA keeps the derived page 2 unless one is uploaded.
 6. Restart the backend (tenants, domains and slugs are read at startup).
 
+## Guarantees added after review (2026-10-07)
+
+- Creating a company (API "Firmen" and `tenant-create`) is refused while the
+  database role bypasses row-level security — the role switch comes first.
+- Migrations run on their own connection with the RLS bypass open, so a backfill
+  reaches every company's rows. `CREATE EXTENSION` needs a superuser: after the
+  role switch, create new extensions by hand before deploying the migration.
+- Links between tenant tables cannot cross companies: every single-column foreign
+  key onto a parent's `id` has a twin on `(tenant_id, column)`
+  (`20261007120000_tenant_review_fixes.sql`; `rls_tests` fails for a new link
+  without one).
+- Daily-briefing slots, Telegram sessions and chat bindings are per company (one
+  person can talk to several companies' bots).
+- Password reset and worker code login find the person by email across companies
+  (email is unique system-wide for users and employees), then continue inside
+  that person's company. Customer login stays per domain (customer emails are
+  per company).
+
 ## Known gaps
 
 - Unscoped code (no token, no listed `Origin`) still counts as Aust:
@@ -113,9 +131,10 @@ company is created there or with `tenant-create`.
   working; a request from an unlisted host lands with Aust, as today.
 - The customer app (`capacitor://localhost`) is Aust's app; another company's
   app would need its own build with a tenant header.
+- `GET /api/v1/estimates/images/{*key}` serves stored files without login (as
+  before multi-tenancy); keys contain UUIDs, a per-tenant prefix would close it.
 - Storage keys have no tenant prefix. Objects are only reached through their
   row (which RLS guards), and keys carry row UUIDs, so tenants cannot collide;
   a per-tenant prefix would only help bulk export/deletion.
 - New tenants need a backend restart (tenants, slugs and templates are read at
   startup).
-- 46 `tokio::spawn` sites in request and job code still use the plain spawn.

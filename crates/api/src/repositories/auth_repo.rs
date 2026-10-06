@@ -47,11 +47,14 @@ pub(crate) async fn fetch_user_by_email_lower(
     pool: &PgPool,
     email_lower: &str,
 ) -> Result<Option<UserRow>, sqlx::Error> {
+    // Before login the company is unknown: look across companies (users.email is
+    // unique system-wide); the row says which company it is.
+    let mut tx = aust_core::tenant::bypass(pool).await?;
     sqlx::query_as(
         "SELECT id, email, password_hash, role, tenant_id, is_superuser FROM users WHERE LOWER(email) = $1",
     )
     .bind(email_lower)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await
 }
 

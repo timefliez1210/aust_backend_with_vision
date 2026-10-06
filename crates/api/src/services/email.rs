@@ -234,6 +234,17 @@ pub(crate) fn offer_mail_subject(p: &aust_core::tenant::TenantProfile) -> String
     format!("Ihr Umzugsangebot — {}", p.brand_name)
 }
 
+/// The team signature of an AI-written offer mail ("Ihr AUST-Umzüge-Team").
+pub(crate) fn offer_mail_team(p: &aust_core::tenant::TenantProfile) -> String {
+    format!("Ihr {}-Team", p.brand_name.split_whitespace().collect::<Vec<_>>().join("-"))
+}
+
+/// Subject of the admin password-reset mail ("Passwort-Reset Code – AUST Admin").
+pub(crate) fn reset_mail_subject(p: &aust_core::tenant::TenantProfile) -> String {
+    let brand = p.brand_name.split_whitespace().next().unwrap_or(&p.short_name);
+    format!("Passwort-Reset Code – {brand} Admin")
+}
+
 /// The cover letter drafted when an offer is approved; Alex edits and sends it.
 pub(crate) fn offer_mail_draft_body(p: &aust_core::tenant::TenantProfile) -> String {
     format!(
@@ -257,6 +268,8 @@ mod tests {
     fn aust_offer_mail_texts_are_unchanged() {
         let p = crate::test_helpers::aust_profile();
         assert_eq!(offer_mail_subject(&p), "Ihr Umzugsangebot — AUST Umzüge");
+        assert_eq!(offer_mail_team(&p), "Ihr AUST-Umzüge-Team");
+        assert_eq!(reset_mail_subject(&p), "Passwort-Reset Code – AUST Admin");
         assert_eq!(
             offer_mail_draft_body(&p),
             "Sehr geehrte/r [Name],\n\nanbei erhalten Sie Ihr persönliches Umzugsangebot.\n\n\

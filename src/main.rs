@@ -34,6 +34,16 @@ where
     });
 }
 
+/// The notifier of a tenant without a Telegram bot: drops every message.
+struct NoBot;
+
+#[async_trait::async_trait]
+impl TelegramNotifier for NoBot {
+    async fn post(&self, _chat_id: i64, _body: String) -> aust_assistant::Result<i64> {
+        Ok(0)
+    }
+}
+
 /// Whether the running tenant has a Telegram bot. Jobs whose only output is a
 /// Telegram message skip tenants without one.
 fn has_bot(cfg: &Config) -> bool {
@@ -79,7 +89,21 @@ async fn main() -> Result<()> {
     // which must not be treated as an error.
     let mut migrator = sqlx::migrate!("./migrations");
     migrator.set_ignore_missing(true);
-    migrator.run(&db).await?;
+    //
+    // On their own connection with the row-level security bypass open: after the
+    // role switch the app role is itself subject to FORCE ROW LEVEL SECURITY, and a
+    // backfill without a tenant would otherwise only reach Aust's rows — then a
+    // CHECK added after it fails on every other company's (docs/MULTI_TENANT.md).
+    // A separate connection, closed afterwards, so the bypass never reaches the pool.
+    {
+        use sqlx::Connection;
+        let mut conn = sqlx::PgConnection::connect(&config.database.url).await?;
+        sqlx::query("SELECT set_config('app.tenant_bypass', 'on', false)")
+            .execute(&mut conn)
+            .await?;
+        migrator.run(&mut conn).await?;
+        conn.close().await?;
+    }
     tracing::info!("Migrations completed");
 
     // `aust_backend tenant-create <slug> <name> <admin-email>`: onboard a company,
@@ -134,12 +158,7 @@ async fn main() -> Result<()> {
     // security, i.e. the app's role is neither superuser nor BYPASSRLS
     // (scripts/db-app-role.sql). Otherwise every unfiltered query would mix them.
     if tenants.len() > 1 {
-        let (bypasses,): (bool,) = sqlx::query_as(
-            "SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname = current_user",
-        )
-        .fetch_one(&db)
-        .await?;
-        if bypasses {
+        if !tenant::rls_enforced(&db).await? {
             anyhow::bail!(
                 "{} tenants, but the database role bypasses row-level security — \
                  run scripts/db-app-role.sql and connect as aust_app (docs/MULTI_TENANT.md)",
@@ -420,18 +439,20 @@ async fn main() -> Result<()> {
     }
 
     // ── Assistant event consumer ───────────────────────────────────────────────
-    // One consumer per tenant with a bot: it sees only its tenant's domain events
-    // (inquiry.created, offer.drafted, status.changed, …) and posts to its bot.
+    // One consumer per tenant: it sees only its tenant's domain events
+    // (inquiry.created, offer.drafted, status.changed, …) and posts to its bot. A
+    // tenant without a bot still consumes them (posting nowhere), so its events
+    // don't pile up until the retention sweep.
     for tenant_id in tenant_ids.iter().copied() {
         let cfg = state.config.clone();
         let db = state.db.clone();
         let services_arc = Arc::new(state.services.clone());
         tokio::spawn(tenant::scope(tenant_id, async move {
-            if !has_bot(&cfg) {
-                return;
-            }
-            let notifier: Arc<dyn TelegramNotifier> =
-                Arc::new(TelegramNotifierImpl::new(cfg.telegram().bot_token.clone()));
+            let notifier: Arc<dyn TelegramNotifier> = if has_bot(&cfg) {
+                Arc::new(TelegramNotifierImpl::new(cfg.telegram().bot_token.clone()))
+            } else {
+                Arc::new(NoBot)
+            };
             let consumer = AssistantEventConsumer::new(db, services_arc, notifier);
             let shutdown = tokio_util::sync::CancellationToken::new();
             consumer.run_forever(Duration::from_secs(5), shutdown).await;

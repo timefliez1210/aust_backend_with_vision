@@ -16,6 +16,26 @@ pub struct NewTenant {
     pub admin_password: String,
 }
 
+/// Refuse a second company unless Postgres keeps companies apart for this role.
+///
+/// **Why**: superusers skip row-level security. A company created while the
+/// backend still connects as one would see every row of every other company
+/// right away — and the next start would refuse to boot (two tenants, no RLS).
+/// The prod role switch (`scripts/db-app-role.sql`) comes first.
+///
+/// Unit tests run as a superuser and create companies on purpose; they skip this
+/// check, which `rls_guard_refuses_a_superuser` tests directly.
+pub(crate) async fn ensure_rls_enforced(db: &PgPool) -> Result<(), ApiError> {
+    if cfg!(test) || aust_core::tenant::rls_enforced(db).await? {
+        return Ok(());
+    }
+    Err(ApiError::Conflict(
+        "Neue Firmen erst nach dem Datenbank-Rollenwechsel: das Backend verbindet sich noch \
+         als Superuser, der die Trennung der Firmen umgeht (docs/MULTI_TENANT.md)."
+            .into(),
+    ))
+}
+
 /// Create a company (`tenants` row) and its first administrator.
 ///
 /// **Caller**: `aust_backend tenant-create` (src/main.rs).
@@ -37,6 +57,7 @@ pub async fn create_tenant(
     if name.trim().is_empty() || !admin_email.contains('@') {
         return Err(ApiError::Validation("Name und Admin-E-Mail sind Pflicht".into()));
     }
+    ensure_rls_enforced(db).await?;
 
     // Password hashing first: nothing is written if it fails.
     let password: String = {
@@ -102,5 +123,12 @@ mod tests {
         assert_eq!(profile.brand_name, "Zweite Umzüge");
 
         assert!(create_tenant(&pool, "Zweite!", "x", "a@b.de").await.is_err(), "bad slug");
+    }
+
+    /// The test database connects as a superuser: exactly the situation in which
+    /// a second company must be refused.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn rls_guard_refuses_a_superuser(pool: PgPool) {
+        assert!(!aust_core::tenant::rls_enforced(&pool).await.unwrap());
     }
 }
