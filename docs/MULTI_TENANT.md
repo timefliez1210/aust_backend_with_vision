@@ -55,6 +55,24 @@ rolled back alone.
 | 5 | Per-company uniqueness (exception to additive-only, approved 2026-10-05): `customers.email` (among unmerged rows), `invoices`/`storage_invoices.invoice_number`, `expense_categories.name`, `calendar_capacity_overrides.override_date`, `settings` and `invoice_number_counters` keys are unique per tenant; KVA numbers: Aust keeps `offer_number_seq`, others count in `offer_number_counters`. The migration merges prod's two exact duplicate customers into the older row like the app's merge does. `employees.email` and `users.email` stay globally unique — they identify the tenant at login | no | done |
 | 6 | Public requests by domain (`tenants.domains`, `Origin`/`Referer` → scope; CORS allows those hosts); console branding from `GET /api/v1/tenant` (`lib/tenant.svelte.ts`, Aust defaults, no flash); company profile + templates via `/api/v1/admin/tenant`; `aust_backend tenant-create <slug> <name> <admin-email>` | no | done — hosting the console on its own domain is a deploy decision |
 
+## Rolling back the first deploy
+
+The previous image cannot simply run on the new schema: its `ON CONFLICT` clauses
+name single-column keys that the new migrations replaced. To go back:
+
+1. `cd /opt/aust && docker compose stop backend`
+2. `docker exec -i aust_postgres psql -U aust -d aust_backend -v ON_ERROR_STOP=1 < scripts/rollback-multi-tenant.sql`
+   — one transaction; refuses if a second company exists. Keeps every row written
+   since the deploy; drops only what the new code uses and restores the old keys.
+   The merge of the two duplicate customers stays.
+3. `docker tag aust_backend:previous aust_backend:latest && docker compose up -d backend`
+
+The console does not need to roll back (it works against the old backend). Last
+resort: the backup the deploy took before migrating (`/opt/aust/backups/`).
+Tested on a copy of the prod data: migrate → roll back → old image → its console
+responses equal those of a never-migrated copy; redeploying afterwards re-applies
+every migration.
+
 ## Prod: switch to a non-superuser role (enforces step 3)
 
 Superusers skip row-level security, and prod connects as the superuser `aust`.
