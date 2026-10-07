@@ -263,7 +263,7 @@ const HEADERS: [&str; 12] = [
 /// actually holds in his book.
 const WIDTHS: [f64; 12] = [12.0, 20.0, 32.0, 12.0, 12.0, 12.0, 12.0, 12.0, 12.0, 16.0, 12.0, 40.0];
 
-fn sheet_xml(year: i32, rows: &[ExportRow]) -> String {
+fn sheet_xml(company: &str, year: i32, rows: &[ExportRow]) -> String {
     let mut xml = String::from(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cols>"#,
@@ -283,7 +283,7 @@ fn sheet_xml(year: i32, rows: &[ExportRow]) -> String {
         cell_xml(
             0,
             2,
-            &Cell::Text("Aust Umzüge & Haushaltsauflösungen".to_string()),
+            &Cell::Text(company.to_string()),
             style::PLAIN
         ),
     ));
@@ -484,10 +484,11 @@ fn summary_sheet_xml(year: i32, rows: &[ExportRow]) -> String {
 /// Build the .xlsx for one year of the register.
 ///
 /// `rows` must already be in register (number) order — this writes them out as given.
-pub(crate) fn build_xlsx(year: i32, rows: &[ExportRow]) -> Result<Vec<u8>, ApiError> {
+/// `company` is printed under the title (the tenant's full name).
+pub(crate) fn build_xlsx(company: &str, year: i32, rows: &[ExportRow]) -> Result<Vec<u8>, ApiError> {
     build_two_sheet_workbook(
         [&year.to_string(), "Monatsübersicht"],
-        sheet_xml(year, rows),
+        sheet_xml(company, year, rows),
         summary_sheet_xml(year, rows),
     )
 }
@@ -532,6 +533,8 @@ pub(crate) fn build_two_sheet_workbook(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const COMPANY: &str = "Aust Umzüge & Haushaltsauflösungen";
 
     fn d(y: i32, m: u32, day: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, day).expect("valid date")
@@ -635,7 +638,7 @@ mod tests {
 
     #[test]
     fn builds_a_readable_zip_with_every_required_part() {
-        let bytes = build_xlsx(2026, &sample_rows()).expect("export");
+        let bytes = build_xlsx(COMPANY, 2026, &sample_rows()).expect("export");
         let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).expect("valid zip");
         let names: Vec<String> = (0..zip.len())
             .map(|i| zip.by_index(i).expect("entry").name().to_string())
@@ -654,7 +657,7 @@ mod tests {
 
     #[test]
     fn sheet_carries_alex_column_order_and_the_bezahlt_marker() {
-        let xml = sheet_xml(2026, &sample_rows());
+        let xml = sheet_xml(COMPANY, 2026, &sample_rows());
         for h in HEADERS {
             assert!(xml.contains(&esc(h)), "header {h} missing");
         }
@@ -667,7 +670,7 @@ mod tests {
     /// Totals must sum the rows, and must land below the last entry rather than on it.
     #[test]
     fn totals_row_sums_the_year() {
-        let xml = sheet_xml(2026, &sample_rows());
+        let xml = sheet_xml(COMPANY, 2026, &sample_rows());
         assert!(xml.contains(r#"<row r="8">"#), "totals row expected at 5 + 2 rows + 1 blank");
         assert!(xml.contains("Summe 2026"));
         assert!(xml.contains("<v>2558</v>"), "netto 1488.00 + 1070.00");
@@ -748,7 +751,7 @@ mod tests {
             is_settled: false,
             ..Default::default()
         });
-        let xml = sheet_xml(2026, &rows);
+        let xml = sheet_xml(COMPANY, 2026, &rows);
         // ">Bezahlt<" is the cell value; the "Bezahlt am" header does not match it.
         let settled_marks = xml.matches(">Bezahlt<").count();
         assert_eq!(
@@ -770,7 +773,7 @@ mod tests {
             is_draft: true,
             ..Default::default()
         });
-        let xml = sheet_xml(2026, &rows);
+        let xml = sheet_xml(COMPANY, 2026, &rows);
         assert!(xml.contains("Noch nicht versendet"), "the draft row must still be printed");
 
         // The netto total of the two issued rows, unchanged by the draft.
@@ -797,7 +800,7 @@ mod tests {
 
     #[test]
     fn workbook_declares_both_sheets() {
-        let bytes = build_xlsx(2026, &sample_rows()).expect("export");
+        let bytes = build_xlsx(COMPANY, 2026, &sample_rows()).expect("export");
         let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).expect("valid zip");
         let names: Vec<String> = (0..zip.len())
             .map(|i| zip.by_index(i).expect("entry").name().to_string())
@@ -807,7 +810,7 @@ mod tests {
 
     #[test]
     fn an_empty_year_still_produces_a_valid_file() {
-        let bytes = build_xlsx(2027, &[]).expect("export");
+        let bytes = build_xlsx(COMPANY, 2027, &[]).expect("export");
         assert!(zip::ZipArchive::new(Cursor::new(bytes)).is_ok());
     }
 }

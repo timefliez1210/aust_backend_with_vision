@@ -88,8 +88,8 @@ impl OtpBackend for CustomerOtpBackend {
         customer_auth_repo::mark_otp_used(pool, otp_id).await
     }
 
-    fn otp_email_subject(&self) -> &str {
-        "Ihr Zugangscode — Aust Umzüge"
+    fn otp_email_subject(&self, p: &aust_core::tenant::TenantProfile) -> String {
+        format!("Ihr Zugangscode — {}", p.short_name)
     }
 
     fn request_success_message(&self) -> &str {
@@ -109,7 +109,7 @@ async fn request_otp(
     let resp = otp_service::handle_request_otp(
         &CustomerOtpBackend,
         &state.db,
-        &state.config.email,
+        &state.config.email(),
         &body.email,
     )
     .await?;
@@ -471,7 +471,7 @@ async fn accept_inquiry(
 
     // Notify admin via Telegram
     notify_admin_telegram(
-        &state.config.telegram,
+        &state.config.telegram(),
         &format!("✅ Kunde hat Angebot angenommen: {customer_name}"),
     )
     .await;
@@ -528,7 +528,7 @@ async fn reject_inquiry(
 
     // Notify admin via Telegram
     notify_admin_telegram(
-        &state.config.telegram,
+        &state.config.telegram(),
         &format!("❌ Kunde hat Angebot abgelehnt: {customer_name}"),
     )
     .await;
@@ -637,4 +637,18 @@ async fn logout_everywhere(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let revoked = customer_auth_repo::delete_all_sessions(&state.db, claims.customer_id).await?;
     Ok(Json(serde_json::json!({ "ok": true, "revoked": revoked })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Golden: same subject as before the company name moved into the tenant profile.
+    #[test]
+    fn aust_otp_subject_is_unchanged() {
+        assert_eq!(
+            CustomerOtpBackend.otp_email_subject(&crate::test_helpers::aust_profile()),
+            "Ihr Zugangscode — Aust Umzüge"
+        );
+    }
 }

@@ -194,7 +194,7 @@ pub(crate) async fn fetch_by_email(
     email: &str,
 ) -> Result<Option<CustomerRow>, ApiError> {
     let row = sqlx::query_as(
-        "SELECT id, email, name, salutation, first_name, last_name, phone, customer_type, company_name, billing_address_id FROM customers WHERE email = $1",
+        "SELECT id, email, name, salutation, first_name, last_name, phone, customer_type, company_name, billing_address_id FROM customers WHERE email = $1 AND merged_into IS NULL",
     )
     .bind(email)
     .fetch_optional(pool)
@@ -228,7 +228,7 @@ pub(crate) async fn upsert(
         r#"
         INSERT INTO customers (id, email, name, salutation, first_name, last_name, phone, customer_type, company_name, created_at, updated_at)
         VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8, 'private'), $9, $10, $10)
-        ON CONFLICT (email) DO UPDATE SET
+        ON CONFLICT (tenant_id, email) WHERE merged_into IS NULL DO UPDATE SET
             name         = COALESCE(EXCLUDED.name,         customers.name),
             salutation   = COALESCE(EXCLUDED.salutation,   customers.salutation),
             first_name   = COALESCE(EXCLUDED.first_name,   customers.first_name),
@@ -329,7 +329,7 @@ pub(crate) async fn create_recipient(
         r#"
         INSERT INTO customers (id, email, name, salutation, first_name, last_name, phone, customer_type, created_at, updated_at)
         VALUES ($1, $2, $3, $4, $5, $6, $7, 'private', $8, $8)
-        ON CONFLICT (email) DO UPDATE SET
+        ON CONFLICT (tenant_id, email) WHERE merged_into IS NULL DO UPDATE SET
             name = COALESCE(NULLIF(EXCLUDED.name, ''), customers.name),
             salutation = COALESCE(NULLIF(EXCLUDED.salutation, ''), customers.salutation),
             first_name = COALESCE(NULLIF(EXCLUDED.first_name, ''), customers.first_name),

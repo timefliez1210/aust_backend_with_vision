@@ -1,10 +1,51 @@
 use crate::calendar::AvailabilityResult;
 use crate::EmailError;
 use aust_core::models::{InquirySource, MissingField, MovingInquiry};
+use aust_core::tenant::TenantProfile;
 use aust_assistant::llm::{AssistantLlmProvider, ModelTier};
 use aust_llm_providers::LlmMessage;
 use std::sync::Arc;
 use tracing::{debug, info};
+
+/// System prompt for the follow-up mail that asks a customer for missing details.
+fn followup_system_prompt(p: &TenantProfile) -> String {
+    format!(
+        r#"Du bist der freundliche E-Mail-Assistent von {brand}, einem Umzugsunternehmen in {city}.
+Deine Aufgabe ist es, fehlende Informationen für ein Umzugsangebot höflich und professionell einzuholen.
+
+Regeln:
+- Schreibe auf Deutsch, freundlich und professionell (Sie-Form)
+- Bedanke dich für die Anfrage (nur bei der ersten E-Mail)
+- Frage gezielt nach den fehlenden Informationen
+- Erwähne kurz, welche Daten wir bereits haben (damit der Kunde sieht, dass wir aufmerksam sind)
+- Halte die E-Mail kurz und übersichtlich
+- Nummeriere die fehlenden Informationen, damit der Kunde einfach antworten kann
+- Unterschreibe mit "Mit freundlichen Grüßen,\nIhr {brand} Team"
+- Schreibe NUR den E-Mail-Text, keine Betreffzeile
+- Erwähne, dass Fotos der Räumlichkeiten als Alternative zur Gegenstandsliste akzeptiert werden (nur wenn Volume fehlt)
+- Wenn ein Terminhinweis gegeben wird (Wunschtermin nicht verfügbar), informiere den Kunden darüber und schlage die Alternativen vor
+- Keine Emojis"#,
+        brand = p.brand_name,
+        city = p.city,
+    )
+}
+
+/// System prompt for revising a draft along the owner's instructions.
+fn revise_system_prompt(p: &TenantProfile) -> String {
+    format!(
+        r#"Du bist der E-Mail-Assistent von {brand}.
+Der Geschäftsführer hat einen E-Mail-Entwurf überprüft und möchte Änderungen.
+
+Regeln:
+- Schreibe auf Deutsch, freundlich und professionell (Sie-Form)
+- Setze die Anweisungen des Geschäftsführers genau um
+- Behalte den allgemeinen Ton und die Struktur bei, sofern nicht anders gewünscht
+- Unterschreibe mit "Mit freundlichen Grüßen,\nIhr {brand} Team"
+- Schreibe NUR den überarbeiteten E-Mail-Text, keine Erklärungen oder Kommentare
+- Keine Emojis"#,
+        brand = p.brand_name,
+    )
+}
 
 pub struct EmailResponder {
     /// Email replies are generated through the assistant's LLM (Josie's model
@@ -13,11 +54,13 @@ pub struct EmailResponder {
     /// "Network error: error sending request" failures the old non-retrying,
     /// 60 s `LlmProvider::complete()` path produced on Ollama Cloud.
     llm: Arc<dyn AssistantLlmProvider>,
+    /// The company the mailbox belongs to — names and phone in every reply.
+    profile: TenantProfile,
 }
 
 impl EmailResponder {
-    pub fn new(llm: Arc<dyn AssistantLlmProvider>) -> Self {
-        Self { llm }
+    pub fn new(llm: Arc<dyn AssistantLlmProvider>, profile: TenantProfile) -> Self {
+        Self { llm, profile }
     }
 
     /// Generate a response email for a new or ongoing inquiry.
@@ -50,9 +93,9 @@ impl EmailResponder {
 
         let subject = match inquiry.source {
             InquirySource::QuoteForm => {
-                "Re: Ihr kostenloses Angebot bei AUST Umzüge".to_string()
+                format!("Re: Ihr kostenloses Angebot bei {}", self.profile.brand_name)
             }
-            _ => "Re: Ihre Anfrage bei AUST Umzüge".to_string(),
+            _ => format!("Re: Ihre Anfrage bei {}", self.profile.brand_name),
         };
 
         Ok(EmailResponse {
@@ -108,21 +151,7 @@ impl EmailResponder {
             String::new()
         };
 
-        let system_prompt = r#"Du bist der freundliche E-Mail-Assistent von AUST Umzüge, einem Umzugsunternehmen in Hildesheim.
-Deine Aufgabe ist es, fehlende Informationen für ein Umzugsangebot höflich und professionell einzuholen.
-
-Regeln:
-- Schreibe auf Deutsch, freundlich und professionell (Sie-Form)
-- Bedanke dich für die Anfrage (nur bei der ersten E-Mail)
-- Frage gezielt nach den fehlenden Informationen
-- Erwähne kurz, welche Daten wir bereits haben (damit der Kunde sieht, dass wir aufmerksam sind)
-- Halte die E-Mail kurz und übersichtlich
-- Nummeriere die fehlenden Informationen, damit der Kunde einfach antworten kann
-- Unterschreibe mit "Mit freundlichen Grüßen,\nIhr AUST Umzüge Team"
-- Schreibe NUR den E-Mail-Text, keine Betreffzeile
-- Erwähne, dass Fotos der Räumlichkeiten als Alternative zur Gegenstandsliste akzeptiert werden (nur wenn Volume fehlt)
-- Wenn ein Terminhinweis gegeben wird (Wunschtermin nicht verfügbar), informiere den Kunden darüber und schlage die Alternativen vor
-- Keine Emojis"#;
+        let system_prompt = followup_system_prompt(&self.profile);
 
         let user_prompt = format!(
             "Der Kunde hat folgende Anfrage geschickt:\n\n---\n{original_body}\n---\n\n\
@@ -149,48 +178,7 @@ Regeln:
 
     /// Generate a confirmation email when all data is collected.
     fn generate_confirmation(&self, inquiry: &MovingInquiry) -> EmailResponse {
-        let name = inquiry.name.as_deref().unwrap_or("Kunde");
-        let services = format_services(inquiry);
-
-        let body = format!(
-            "Sehr geehrte/r {name},\n\n\
-             vielen Dank für Ihre vollständigen Angaben! Wir haben alle Informationen \
-             erhalten und erstellen nun Ihr individuelles Angebot.\n\n\
-             Zusammenfassung Ihrer Anfrage:\n\
-             - Auszugsadresse: {departure}\n\
-             - Einzugsadresse: {arrival}\n\
-             - Wunschtermin: {date}\n\
-             - Geschätztes Volumen: {volume}\n\
-             {services}\
-             \n\
-             Sie erhalten Ihr kostenloses Angebot in Kürze per E-Mail.\n\n\
-             Bei Rückfragen erreichen Sie uns jederzeit unter 05121 – 7558379.\n\n\
-             Mit freundlichen Grüßen,\n\
-             Ihr AUST Umzüge Team",
-            departure = inquiry.departure_address.as_deref().unwrap_or("-"),
-            arrival = inquiry.arrival_address.as_deref().unwrap_or("-"),
-            date = inquiry
-                .scheduled_date
-                .map(|d| d.format("%d.%m.%Y").to_string())
-                .unwrap_or_else(|| "-".to_string()),
-            volume = inquiry
-                .volume_m3
-                .map(|v| format!("{v:.1} m³"))
-                .or_else(|| inquiry.items_list.as_ref().map(|_| "gemäß Gegenstandsliste".to_string()))
-                .or_else(|| {
-                    if inquiry.has_photos {
-                        Some("wird anhand Ihrer Fotos geschätzt".to_string())
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or_else(|| "-".to_string()),
-        );
-
-        EmailResponse {
-            subject: "Ihr Umzugsangebot wird erstellt – AUST Umzüge".to_string(),
-            body,
-        }
+        confirmation(&self.profile, inquiry)
     }
 
     /// Revise a draft email based on the admin's instructions.
@@ -203,16 +191,7 @@ Regeln:
         admin_instructions: &str,
         subject: &str,
     ) -> Result<EmailResponse, EmailError> {
-        let system_prompt = r#"Du bist der E-Mail-Assistent von AUST Umzüge.
-Der Geschäftsführer hat einen E-Mail-Entwurf überprüft und möchte Änderungen.
-
-Regeln:
-- Schreibe auf Deutsch, freundlich und professionell (Sie-Form)
-- Setze die Anweisungen des Geschäftsführers genau um
-- Behalte den allgemeinen Ton und die Struktur bei, sofern nicht anders gewünscht
-- Unterschreibe mit "Mit freundlichen Grüßen,\nIhr AUST Umzüge Team"
-- Schreibe NUR den überarbeiteten E-Mail-Text, keine Erklärungen oder Kommentare
-- Keine Emojis"#;
+        let system_prompt = revise_system_prompt(&self.profile);
 
         let user_prompt = format!(
             "Hier ist der aktuelle Entwurf:\n\n---\n{original_draft}\n---\n\n\
@@ -377,6 +356,54 @@ fn format_known_data(inquiry: &MovingInquiry) -> String {
 }
 
 /// Format the selected additional services.
+/// Confirmation mail once every detail of an inquiry is in.
+fn confirmation(p: &TenantProfile, inquiry: &MovingInquiry) -> EmailResponse {
+    let name = inquiry.name.as_deref().unwrap_or("Kunde");
+    let services = format_services(inquiry);
+
+    let body = format!(
+        "Sehr geehrte/r {name},\n\n\
+         vielen Dank für Ihre vollständigen Angaben! Wir haben alle Informationen \
+         erhalten und erstellen nun Ihr individuelles Angebot.\n\n\
+         Zusammenfassung Ihrer Anfrage:\n\
+         - Auszugsadresse: {departure}\n\
+         - Einzugsadresse: {arrival}\n\
+         - Wunschtermin: {date}\n\
+         - Geschätztes Volumen: {volume}\n\
+         {services}\
+         \n\
+         Sie erhalten Ihr kostenloses Angebot in Kürze per E-Mail.\n\n\
+         Bei Rückfragen erreichen Sie uns jederzeit unter {phone}.\n\n\
+         Mit freundlichen Grüßen,\n\
+         Ihr {brand} Team",
+        departure = inquiry.departure_address.as_deref().unwrap_or("-"),
+        arrival = inquiry.arrival_address.as_deref().unwrap_or("-"),
+        date = inquiry
+            .scheduled_date
+            .map(|d| d.format("%d.%m.%Y").to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        volume = inquiry
+            .volume_m3
+            .map(|v| format!("{v:.1} m³"))
+            .or_else(|| inquiry.items_list.as_ref().map(|_| "gemäß Gegenstandsliste".to_string()))
+            .or_else(|| {
+                if inquiry.has_photos {
+                    Some("wird anhand Ihrer Fotos geschätzt".to_string())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| "-".to_string()),
+        phone = p.phone,
+        brand = p.brand_name,
+    );
+
+    EmailResponse {
+        subject: format!("Ihr Umzugsangebot wird erstellt – {}", p.brand_name),
+        body,
+    }
+}
+
 fn format_services(inquiry: &MovingInquiry) -> String {
     let mut services = Vec::new();
     if inquiry.service_packing {
@@ -409,3 +436,84 @@ pub struct EmailResponse {
 }
 
 use chrono::NaiveDate;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn aust() -> TenantProfile {
+        TenantProfile {
+            id: aust_core::tenant::AUST,
+            name: "Aust Umzüge & Haushaltsauflösungen".into(),
+            short_name: "Aust Umzüge".into(),
+            brand_name: "AUST Umzüge".into(),
+            owner_name: "Alex Aust".into(),
+            phone: "05121 – 7558379".into(),
+            city: "Hildesheim".into(),
+            review_url: String::new(),
+            depot_address: String::new(),
+        }
+    }
+
+    /// Golden: Aust's prompts are character for character what they were before the
+    /// brand and town moved into the tenant profile.
+    #[test]
+    fn aust_prompts_are_unchanged() {
+        assert_eq!(followup_system_prompt(&aust()), r#"Du bist der freundliche E-Mail-Assistent von AUST Umzüge, einem Umzugsunternehmen in Hildesheim.
+Deine Aufgabe ist es, fehlende Informationen für ein Umzugsangebot höflich und professionell einzuholen.
+
+Regeln:
+- Schreibe auf Deutsch, freundlich und professionell (Sie-Form)
+- Bedanke dich für die Anfrage (nur bei der ersten E-Mail)
+- Frage gezielt nach den fehlenden Informationen
+- Erwähne kurz, welche Daten wir bereits haben (damit der Kunde sieht, dass wir aufmerksam sind)
+- Halte die E-Mail kurz und übersichtlich
+- Nummeriere die fehlenden Informationen, damit der Kunde einfach antworten kann
+- Unterschreibe mit "Mit freundlichen Grüßen,\nIhr AUST Umzüge Team"
+- Schreibe NUR den E-Mail-Text, keine Betreffzeile
+- Erwähne, dass Fotos der Räumlichkeiten als Alternative zur Gegenstandsliste akzeptiert werden (nur wenn Volume fehlt)
+- Wenn ein Terminhinweis gegeben wird (Wunschtermin nicht verfügbar), informiere den Kunden darüber und schlage die Alternativen vor
+- Keine Emojis"#);
+        assert_eq!(revise_system_prompt(&aust()), r#"Du bist der E-Mail-Assistent von AUST Umzüge.
+Der Geschäftsführer hat einen E-Mail-Entwurf überprüft und möchte Änderungen.
+
+Regeln:
+- Schreibe auf Deutsch, freundlich und professionell (Sie-Form)
+- Setze die Anweisungen des Geschäftsführers genau um
+- Behalte den allgemeinen Ton und die Struktur bei, sofern nicht anders gewünscht
+- Unterschreibe mit "Mit freundlichen Grüßen,\nIhr AUST Umzüge Team"
+- Schreibe NUR den überarbeiteten E-Mail-Text, keine Erklärungen oder Kommentare
+- Keine Emojis"#);
+    }
+
+    /// Golden: Aust's confirmation mail is unchanged.
+    #[test]
+    fn aust_confirmation_is_unchanged() {
+        let inquiry = MovingInquiry {
+            name: Some("Frau Schilling".into()),
+            departure_address: Some("Steinbergstr. 3, 31139 Hildesheim".into()),
+            arrival_address: Some("Kaiserstr. 32, 31134 Hildesheim".into()),
+            scheduled_date: chrono::NaiveDate::from_ymd_opt(2026, 11, 2),
+            volume_m3: Some(24.0),
+            service_packing: true,
+            ..Default::default()
+        };
+        let mail = confirmation(&aust(), &inquiry);
+        assert_eq!(mail.subject, "Ihr Umzugsangebot wird erstellt – AUST Umzüge");
+        assert_eq!(
+            mail.body,
+            "Sehr geehrte/r Frau Schilling,\n\nvielen Dank für Ihre vollständigen Angaben! Wir haben \
+             alle Informationen erhalten und erstellen nun Ihr individuelles Angebot.\n\n\
+             Zusammenfassung Ihrer Anfrage:\n\
+             - Auszugsadresse: Steinbergstr. 3, 31139 Hildesheim\n\
+             - Einzugsadresse: Kaiserstr. 32, 31134 Hildesheim\n\
+             - Wunschtermin: 02.11.2026\n\
+             - Geschätztes Volumen: 24.0 m³\n\
+             - Zusatzleistungen: Einpackservice\n\
+             \n\
+             Sie erhalten Ihr kostenloses Angebot in Kürze per E-Mail.\n\n\
+             Bei Rückfragen erreichen Sie uns jederzeit unter 05121 – 7558379.\n\n\
+             Mit freundlichen Grüßen,\nIhr AUST Umzüge Team"
+        );
+    }
+}

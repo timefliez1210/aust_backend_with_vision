@@ -123,7 +123,7 @@ pub(crate) async fn upsert_pricing(
         sqlx::query(
             "INSERT INTO settings (key, value, updated_at)
              VALUES ($1, $2, NOW())
-             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
+             ON CONFLICT (tenant_id, key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
         )
         .bind(key)
         .bind(value)
@@ -184,7 +184,11 @@ pub(crate) async fn get_next_numbers(db: &PgPool) -> Result<NextNumbers, ApiErro
             current_year(),
         )
         .await?,
-        next_offer_number: next_for_seq(db, "offer_number_seq").await?,
+        next_offer_number: if crate::repositories::offer_repo::uses_aust_sequence() {
+            next_for_seq(db, "offer_number_seq").await?
+        } else {
+            crate::repositories::offer_repo::peek_next_counter(db).await?
+        },
     })
 }
 
@@ -206,7 +210,11 @@ pub(crate) async fn set_next_invoice(db: &PgPool, n: i64) -> Result<(), ApiError
 }
 
 pub(crate) async fn set_next_offer(db: &PgPool, n: i64) -> Result<(), ApiError> {
-    set_next_for_seq(db, "offer_number_seq", n).await
+    if crate::repositories::offer_repo::uses_aust_sequence() {
+        set_next_for_seq(db, "offer_number_seq", n).await
+    } else {
+        Ok(crate::repositories::offer_repo::set_next_counter(db, n).await?)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -265,7 +273,7 @@ pub(crate) async fn set_kva_followup_days(db: &PgPool, days: i64) -> Result<(), 
     sqlx::query(
         "INSERT INTO settings (key, value, updated_at)
          VALUES ($1, $2, NOW())
-         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
+         ON CONFLICT (tenant_id, key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
     )
     .bind(KEY_KVA_FOLLOWUP_DAYS)
     .bind(serde_json::json!(days))
@@ -410,7 +418,7 @@ pub(crate) async fn upsert_positions(
         sqlx::query(
             "INSERT INTO settings (key, value, updated_at)
              VALUES ($1, $2, NOW())
-             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
+             ON CONFLICT (tenant_id, key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
         )
         .bind(position_key(key))
         .bind(serde_json::json!(cents))
@@ -428,7 +436,7 @@ mod tests {
     async fn put(db: &PgPool, key: &str, value: serde_json::Value) {
         sqlx::query(
             "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW())
-             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+             ON CONFLICT (tenant_id, key) DO UPDATE SET value = EXCLUDED.value",
         )
         .bind(key)
         .bind(value)

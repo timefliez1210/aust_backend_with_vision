@@ -19,7 +19,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::repositories::{address_repo, invoice_repo, CustomerRow};
+use crate::repositories::{address_repo, invoice_repo, tenant_repo, CustomerRow};
+use aust_core::tenant::TenantProfile;
 use crate::services::invoice_number;
 use crate::ApiError;
 use crate::AppState;
@@ -76,7 +77,7 @@ pub struct CreateInvoiceRequest {
 /// All fields are optional — if omitted the server falls back to the default template.
 #[derive(Debug, Deserialize, Default)]
 pub struct SendInvoiceRequest {
-    /// Custom email subject. Falls back to "Ihre Rechnung Nr. {n} — Aust Umzüge…".
+    /// Custom email subject. Falls back to "Ihre Rechnung Nr. {n} — <Firmenname>".
     pub subject: Option<String>,
     /// Custom email body. Falls back to the standard payment-request template.
     pub body: Option<String>,
@@ -402,7 +403,7 @@ async fn create_invoice(
             });
             let agg1 = format!("invoice:{first_id}");
             let agg2 = format!("invoice:{final_id}");
-            tokio::spawn(async move {
+            aust_core::tenant::spawn(async move {
                 if let Err(e) = emitter.emit("invoice.issued", &agg1, p1).await {
                     tracing::warn!("Failed to emit invoice.issued (partial_first): {e}");
                 }
@@ -470,7 +471,7 @@ async fn create_invoice(
                 "brutto_cents": offer_brutto,
             });
             let aggregate = format!("invoice:{inv_id}");
-            tokio::spawn(async move {
+            aust_core::tenant::spawn(async move {
                 if let Err(e) = emitter.emit("invoice.issued", &aggregate, payload).await {
                     tracing::warn!("Failed to emit invoice.issued event: {e}");
                 }
@@ -534,7 +535,7 @@ async fn update_invoice_number(
         .await
         .map_err(|e| {
             if let sqlx::Error::Database(ref db_err) = e
-                && db_err.constraint() == Some("invoices_invoice_number_key") {
+                && db_err.constraint() == Some("invoices_tenant_invoice_number_key") {
                     return ApiError::BadRequest(format!(
                         "Rechnungsnummer {new_number} wird bereits verwendet"
                     ));
@@ -893,6 +894,24 @@ async fn update_invoice(
 /// # Errors
 /// - 400 if the sendability gate is not met
 /// - 404 if invoice PDF is not yet generated
+/// Default subject of an invoice mail.
+fn invoice_mail_subject(p: &TenantProfile, invoice_num: &str) -> String {
+    format!("Ihre Rechnung Nr. {invoice_num} — {}", p.name)
+}
+
+/// Default body of an invoice mail.
+fn invoice_mail_body(p: &TenantProfile, display_name: &str, invoice_num: &str) -> String {
+    format!(
+        "Sehr geehrte/r {display_name},\n\n\
+         im Anhang finden Sie Ihre Rechnung Nr. {invoice_num}.\n\n\
+         Bitte überweisen Sie den Rechnungsbetrag innerhalb von 7 Tagen \
+         unter Angabe der Rechnungsnummer auf unser Konto.\n\n\
+         Mit freundlichen Grüßen\n\
+         {}",
+        p.name
+    )
+}
+
 async fn send_invoice(
     State(state): State<Arc<AppState>>,
     Path((inquiry_id, inv_id)): Path<(Uuid, Uuid)>,
@@ -956,24 +975,14 @@ async fn send_invoice(
 
     let display_name = customer_name.as_deref().unwrap_or("Kunde");
     let invoice_num = &row.invoice_number;
-    let subject = req.subject.unwrap_or_else(|| {
-        format!("Ihre Rechnung Nr. {invoice_num} — Aust Umzüge & Haushaltsauflösungen")
-    });
-    let body = req.body.unwrap_or_else(|| {
-        format!(
-            "Sehr geehrte/r {display_name},\n\n\
-             im Anhang finden Sie Ihre Rechnung Nr. {invoice_num}.\n\n\
-             Bitte überweisen Sie den Rechnungsbetrag innerhalb von 7 Tagen \
-             unter Angabe der Rechnungsnummer auf unser Konto.\n\n\
-             Mit freundlichen Grüßen\n\
-             Aust Umzüge & Haushaltsauflösungen"
-        )
-    });
+    let profile = tenant_repo::profile(&state.db).await?;
+    let subject = req.subject.unwrap_or_else(|| invoice_mail_subject(&profile, invoice_num));
+    let body = req.body.unwrap_or_else(|| invoice_mail_body(&profile, display_name, invoice_num));
 
     let filename = format!("Rechnung_{invoice_num}.pdf");
     let email = crate::services::email::build_email_with_attachment(
-        &state.config.email.username,
-        "Aust Umzüge & Haushaltsauflösungen",
+        &state.config.email().username,
+        &profile.name,
         &customer_email,
         &subject,
         &body,
@@ -984,11 +993,11 @@ async fn send_invoice(
     .map_err(|e| ApiError::Internal(format!("Failed to build invoice email: {e}")))?;
 
     crate::services::email::send_email(
-        &state.config.email.smtp_host,
-        state.config.email.smtp_port,
-        &state.config.email.smtp_tls,
-        &state.config.email.username,
-        &state.config.email.password,
+        &state.config.email().smtp_host,
+        state.config.email().smtp_port,
+        &state.config.email().smtp_tls,
+        &state.config.email().username,
+        &state.config.email().password,
         email,
     )
     .await
@@ -1851,6 +1860,24 @@ fn build_invoice_response(row: InvoiceRow, offer_netto_cents: i64) -> InvoiceRes
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Golden: Aust's default invoice mail is word for word what it was before the
+    /// company name moved into the tenant profile.
+    #[test]
+    fn aust_invoice_mail_is_unchanged() {
+        let p = crate::test_helpers::aust_profile();
+        assert_eq!(
+            invoice_mail_subject(&p, "2026-42"),
+            "Ihre Rechnung Nr. 2026-42 — Aust Umzüge & Haushaltsauflösungen"
+        );
+        assert_eq!(
+            invoice_mail_body(&p, "Frau Schilling", "2026-42"),
+            "Sehr geehrte/r Frau Schilling,\n\nim Anhang finden Sie Ihre Rechnung Nr. 2026-42.\n\n\
+             Bitte überweisen Sie den Rechnungsbetrag innerhalb von 7 Tagen unter Angabe der \
+             Rechnungsnummer auf unser Konto.\n\nMit freundlichen Grüßen\n\
+             Aust Umzüge & Haushaltsauflösungen"
+        );
+    }
     use invoice_repo::InvoiceRow;
 
     /// Build a manual `full` invoice row with the given stored line items.

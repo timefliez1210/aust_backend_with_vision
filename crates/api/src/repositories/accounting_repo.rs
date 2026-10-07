@@ -1480,7 +1480,7 @@ pub(crate) async fn set_hourly_calc(
     let mut tx = pool.begin().await?;
     sqlx::query(
         "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW())
-         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
+         ON CONFLICT (tenant_id, key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
     )
     .bind(KEY_HOURLY_CALC)
     .bind(serde_json::to_value(value).unwrap_or_default())
@@ -1517,7 +1517,7 @@ pub(crate) async fn set_default_rate(pool: &PgPool, cents: i64, actor: &str) -> 
             .await?;
     sqlx::query(
         "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW())
-         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
+         ON CONFLICT (tenant_id, key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
     )
     .bind(KEY_DEFAULT_RATE)
     .bind(serde_json::json!(cents))

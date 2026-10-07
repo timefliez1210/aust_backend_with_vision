@@ -23,20 +23,24 @@ use tower_http::trace::TraceLayer;
 pub fn create_router(state: AppState) -> Router {
     let shared_state = Arc::new(state);
 
-    let allowed_origins = [
+    // Aust's sites, local dev and the app — plus every host listed in a tenant's
+    // `domains` (registered at startup), so other companies' sites can call too.
+    const FIXED_ORIGINS: [&str; 6] = [
         "https://www.aust-umzuege.de",
         "https://aust-umzuege.de",
         "http://localhost:5173",
         "http://localhost:4173",
         "capacitor://localhost",
         "http://localhost",
-    ]
-    .into_iter()
-    .filter_map(|o| o.parse::<HeaderValue>().ok())
-    .collect::<Vec<_>>();
+    ];
+    let allow_origin = tower_http::cors::AllowOrigin::predicate(|origin: &HeaderValue, _| {
+        let Ok(origin) = origin.to_str() else { return false };
+        FIXED_ORIGINS.contains(&origin)
+            || (origin.starts_with("https://") && aust_core::tenant::by_origin(origin).is_some())
+    });
 
     let cors = CorsLayer::new()
-        .allow_origin(allowed_origins)
+        .allow_origin(allow_origin)
         .allow_methods([
             axum::http::Method::GET,
             axum::http::Method::POST,
@@ -58,6 +62,8 @@ pub fn create_router(state: AppState) -> Router {
         .nest("/admin/vehicles", routes::vehicles::router())
         .nest("/admin/storage", routes::storage::router())
         .nest("/admin/profit", routes::profit::router())
+        .nest("/admin/tenant", routes::tenant::admin_router())
+        .nest("/platform", routes::platform::router())
         .nest("/auth", routes::auth::protected_router())
         .route_layer(axum::middleware::from_fn_with_state(
             shared_state.clone(),
@@ -118,7 +124,9 @@ pub fn create_router(state: AppState) -> Router {
                 .merge(employee_routes)
                 .layer(axum::extract::DefaultBodyLimit::max(250 * 1024 * 1024)),
         )
-        // Layer order (outermost → innermost): cors → security_headers → request_id → trace
+        // Layer order (outermost → innermost): cors → security_headers → request_id →
+        // trace → tenant by origin (authenticated routes scope again inside)
+        .layer(axum::middleware::from_fn(middleware::scope_by_origin))
         .layer(axum::middleware::from_fn(middleware::set_request_id))
         .layer(TraceLayer::new_for_http())
         .layer(axum::middleware::from_fn(middleware::set_security_headers))
@@ -126,11 +134,77 @@ pub fn create_router(state: AppState) -> Router {
         .with_state(shared_state)
 }
 
+/// Open the application pool.
+///
+/// Every connection handed out carries the caller's tenant in the session setting
+/// `app.tenant_id` (see `aust_core::tenant`): set when a connection is opened and
+/// again each time an idle one is reused, so a connection never keeps the previous
+/// task's tenant.
 pub async fn create_pool(database_url: &str, max_connections: u32) -> Result<PgPool, sqlx::Error> {
-    sqlx::postgres::PgPoolOptions::new()
-        .max_connections(max_connections)
+    tenant_aware(sqlx::postgres::PgPoolOptions::new().max_connections(max_connections))
         .connect(database_url)
         .await
 }
 
+/// Pool options whose connections carry the caller's tenant (see [`create_pool`]).
+/// Tests that depend on the tenant build their pool with this too.
+pub fn tenant_aware(options: sqlx::postgres::PgPoolOptions) -> sqlx::postgres::PgPoolOptions {
+    options
+        .after_connect(|conn, _meta| Box::pin(async move { set_session_tenant(conn).await }))
+        .before_acquire(|conn, _meta| {
+            Box::pin(async move { set_session_tenant(conn).await.map(|()| true) })
+        })
+}
 
+async fn set_session_tenant(conn: &mut sqlx::PgConnection) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT set_config('app.tenant_id', $1, false)")
+        .bind(aust_core::tenant::session_value())
+        .execute(conn)
+        .await
+        .map(|_| ())
+}
+
+
+
+#[cfg(test)]
+mod rls_tests;
+
+#[cfg(test)]
+mod tenant_pool_tests {
+    use aust_core::tenant::{self, TenantId, AUST};
+
+    async fn setting(pool: &sqlx::PgPool) -> (String, uuid::Uuid) {
+        sqlx::query_as("SELECT current_setting('app.tenant_id', true), current_tenant_id()")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// One connection, reused across three tasks: each sees its own tenant, never the
+    /// previous task's.
+    #[tokio::test]
+    async fn every_acquire_carries_the_callers_tenant() {
+        let url = std::env::var("TEST_DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://aust:aust_dev_password@localhost/aust_backend_test".into());
+        let pool = crate::create_pool(&url, 1).await.unwrap();
+        crate::test_helpers::test_db_pool().await; // migrations → current_tenant_id()
+
+        let other = TenantId(uuid::Uuid::now_v7());
+        let fresh = tenant::scope(other, setting(&pool)).await;
+        assert_eq!(fresh, (other.0.to_string(), other.0));
+
+        let reused = tenant::scope(AUST, setting(&pool)).await;
+        assert_eq!(reused, (AUST.0.to_string(), AUST.0));
+
+        let mut tx = tenant::scope(other, pool.begin()).await.unwrap();
+        let in_tx: (uuid::Uuid,) = sqlx::query_as("SELECT current_tenant_id()")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(in_tx.0, other.0, "a transaction keeps the tenant it was opened for");
+        tx.rollback().await.unwrap();
+
+        // Outside any scope: unset, and the database falls back to Aust.
+        assert_eq!(setting(&pool).await, (String::new(), AUST.0));
+    }
+}

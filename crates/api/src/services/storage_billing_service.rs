@@ -21,9 +21,9 @@ use aust_storage::StorageProvider;
 
 use crate::repositories::{address_repo, customer_repo, invoice_repo, storage_repo};
 use crate::repositories::storage_repo::StorageContractRow;
+use crate::repositories::tenant_repo;
 use crate::ApiError;
-
-const FROM_NAME: &str = "Aust Umzüge & Haushaltsauflösungen";
+use aust_core::tenant::TenantProfile;
 
 /// Hourly billing tick: for every active contract that is due this calendar month
 /// and not yet billed, generate the invoice + notify Telegram. Errors on a single
@@ -275,21 +275,13 @@ pub async fn approve_and_send(
     let greeting = customer.formal_greeting();
     let period = format!("{} {}", german_month(invoice.period_month as u32), invoice.period_year);
     let num = &invoice.invoice_number;
-    let subject = format!("Ihre Rechnung Nr. {num} — Lagerung {period}");
-    let body = format!(
-        "{greeting}\n\n\
-         vielen Dank, dass Sie bei uns einlagern. Im Anhang finden Sie Ihre Rechnung \
-         Nr. {num} für den Monat {period}.\n\n\
-         Bitte begleichen Sie den Rechnungsbetrag innerhalb einer Woche unter Angabe \
-         der Rechnungsnummer auf unser Konto.\n\n\
-         Mit freundlichen Grüßen\n\
-         {FROM_NAME}"
-    );
+    let profile = tenant_repo::profile(db).await?;
+    let (subject, body) = storage_invoice_mail(&profile, &greeting, num, &period);
     let filename = format!("Rechnung_{num}.pdf");
 
     let message = crate::services::email::build_email_with_attachment(
-        &config.email.username,
-        FROM_NAME,
+        &config.email().username,
+        &profile.name,
         &email,
         &subject,
         &body,
@@ -300,11 +292,11 @@ pub async fn approve_and_send(
     .map_err(|e| ApiError::Internal(format!("E-Mail konnte nicht erstellt werden: {e}")))?;
 
     crate::services::email::send_email(
-        &config.email.smtp_host,
-        config.email.smtp_port,
-        &config.email.smtp_tls,
-        &config.email.username,
-        &config.email.password,
+        &config.email().smtp_host,
+        config.email().smtp_port,
+        &config.email().smtp_tls,
+        &config.email().username,
+        &config.email().password,
         message,
     )
     .await
@@ -358,10 +350,10 @@ async fn notify_approval(
     let url = format!(
         "{}/bot{}/sendMessage",
         crate::services::telegram_service::telegram_api_base(),
-        config.telegram.bot_token,
+        config.telegram().bot_token,
     );
     let payload = serde_json::json!({
-        "chat_id": config.telegram.admin_chat_id,
+        "chat_id": config.telegram().admin_chat_id,
         "text": text,
         "parse_mode": "Markdown",
         "reply_markup": keyboard,
@@ -373,6 +365,22 @@ async fn notify_approval(
 }
 
 // ── Small helpers ─────────────────────────────────────────────────────────────
+
+/// Subject and body of the mail that carries a monthly storage invoice.
+fn storage_invoice_mail(p: &TenantProfile, greeting: &str, num: &str, period: &str) -> (String, String) {
+    let subject = format!("Ihre Rechnung Nr. {num} — Lagerung {period}");
+    let body = format!(
+        "{greeting}\n\n\
+         vielen Dank, dass Sie bei uns einlagern. Im Anhang finden Sie Ihre Rechnung \
+         Nr. {num} für den Monat {period}.\n\n\
+         Bitte begleichen Sie den Rechnungsbetrag innerhalb einer Woche unter Angabe \
+         der Rechnungsnummer auf unser Konto.\n\n\
+         Mit freundlichen Grüßen\n\
+         {company}",
+        company = p.name,
+    );
+    (subject, body)
+}
 
 fn address_lines(address: Option<&address_repo::AddressRow>) -> (String, String) {
     let Some(a) = address else {
@@ -421,6 +429,26 @@ fn german_month(month: u32) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Golden: Aust's storage-invoice mail is word for word what it was before the
+    /// company name moved into the tenant profile.
+    #[test]
+    fn aust_storage_invoice_mail_is_unchanged() {
+        let (subject, body) = storage_invoice_mail(
+            &crate::test_helpers::aust_profile(),
+            "Sehr geehrte Frau Schilling,",
+            "2026-17",
+            "Oktober 2026",
+        );
+        assert_eq!(subject, "Ihre Rechnung Nr. 2026-17 — Lagerung Oktober 2026");
+        assert_eq!(
+            body,
+            "Sehr geehrte Frau Schilling,\n\nvielen Dank, dass Sie bei uns einlagern. Im Anhang \
+             finden Sie Ihre Rechnung Nr. 2026-17 für den Monat Oktober 2026.\n\nBitte begleichen \
+             Sie den Rechnungsbetrag innerhalb einer Woche unter Angabe der Rechnungsnummer auf \
+             unser Konto.\n\nMit freundlichen Grüßen\nAust Umzüge & Haushaltsauflösungen"
+        );
+    }
 
     fn contract(start: NaiveDate, end: Option<NaiveDate>, billing_day: i16) -> StorageContractRow {
         StorageContractRow {

@@ -289,9 +289,12 @@ pub(super) async fn send_draft_email(
         ApiError::BadRequest("Kein Empfänger hinterlegt — bitte Adresse ergänzen.".into())
     })?;
 
-    let subject = draft
-        .subject
-        .unwrap_or_else(|| "Ihr Umzugsangebot — AUST Umzüge".into());
+    let subject = match draft.subject {
+        Some(s) => s,
+        None => crate::services::email::offer_mail_subject(
+            &crate::repositories::tenant_repo::profile(&state.db).await?,
+        ),
+    };
     let body = draft.body_text.unwrap_or_default();
 
     let mut attachments: Vec<OutboundAttachment> = Vec::new();
@@ -343,7 +346,7 @@ pub(super) async fn send_draft_email(
         });
     }
 
-    let email_cfg = &state.config.email;
+    let email_cfg = &state.config.email();
     let message = build_message(&OutboundEmail {
         from_address: &email_cfg.from_address,
         from_name: &email_cfg.from_name,
@@ -381,7 +384,7 @@ pub(super) async fn send_draft_email(
         let emitter = state.events.clone();
         let payload = serde_json::json!({ "offer_id": oid, "inquiry_id": iid });
         let aggregate = format!("offer:{oid}");
-        tokio::spawn(async move {
+        aust_core::tenant::spawn(async move {
             if let Err(e) = emitter.emit("offer.sent", &aggregate, payload).await {
                 tracing::warn!("Failed to emit offer.sent event: {e}");
             }
@@ -530,7 +533,7 @@ pub(super) async fn reply_to_thread(
     let recipient = recipient.unwrap_or_default();
 
     let subject = request.subject.or(thread_subject);
-    let from_address = &state.config.email.from_address;
+    let from_address = &state.config.email().from_address;
     let id = Uuid::now_v7();
     let now = Utc::now();
 
@@ -595,7 +598,7 @@ pub(super) async fn compose_email(
 
     // Create draft message
     let message_id = Uuid::now_v7();
-    let from_address = &state.config.email.from_address;
+    let from_address = &state.config.email().from_address;
     admin_repo::insert_compose_draft(
         &state.db, message_id, thread_id, from_address,
         &request.customer_email, &request.subject, &request.body_text, now,

@@ -378,7 +378,7 @@ pub(crate) async fn generate_inquiry_offer(
     // Generate personalised email draft in the background (non-blocking)
     {
         let state = Arc::clone(&state);
-        tokio::spawn(async move {
+        aust_core::tenant::spawn(async move {
             generate_offer_email_draft(&state, inquiry_id).await;
         });
     }
@@ -408,6 +408,13 @@ pub(crate) async fn generate_offer_email_draft(state: &AppState, inquiry_id: Uui
 
     let origin = origin_city.as_deref().unwrap_or("dem Abholort");
     let dest = dest_city.as_deref().unwrap_or("dem Zielort");
+    let team = match crate::repositories::tenant_repo::profile(&state.db).await {
+        Ok(p) => crate::services::email::offer_mail_team(&p),
+        Err(e) => {
+            tracing::error!(%inquiry_id, "Offer mail draft skipped, tenant profile not loaded: {e}");
+            return;
+        }
+    };
 
     // Ask LLM for a personalised German email body; fall back to a static template on error
     let prompt = format!(
@@ -416,7 +423,7 @@ pub(crate) async fn generate_offer_email_draft(state: &AppState, inquiry_id: Uui
          Die E-Mail soll das beigefügte Angebot kurz vorstellen, Professionalität und \
          Zuverlässigkeit betonen und zur Kontaktaufnahme einladen. \
          Nur den Textkörper, keinen Betreff. Maximal 5 Sätze. \
-         Unterschrift: 'Mit freundlichen Grüßen,\\nIhr AUST-Umzüge-Team'"
+         Unterschrift: 'Mit freundlichen Grüßen,\\n{team}'"
     );
     let body = match state.llm.complete(&[LlmMessage::user(prompt)]).await {
         Ok(b) => b,
@@ -426,7 +433,7 @@ pub(crate) async fn generate_offer_email_draft(state: &AppState, inquiry_id: Uui
                 "Sehr geehrte(r) {name},\n\n\
                  anbei erhalten Sie unser Angebot für Ihren Umzug von {origin} nach {dest}.\n\n\
                  Bei Fragen stehen wir Ihnen gerne zur Verfügung.\n\n\
-                 Mit freundlichen Grüßen,\nIhr AUST-Umzüge-Team"
+                 Mit freundlichen Grüßen,\n{team}"
             )
         }
     };
@@ -446,7 +453,7 @@ pub(crate) async fn generate_offer_email_draft(state: &AppState, inquiry_id: Uui
         Uuid::now_v7(),
         thread_id,
         "outbound",
-        &state.config.email.from_address,
+        &state.config.email().from_address,
         &email,
         "Ihr Umzugsangebot",
         &body,
@@ -544,7 +551,7 @@ pub(crate) async fn trigger_estimate_upload(
 
     // Spawn background processing (same pipeline as public submission)
     let state_bg = Arc::clone(&state);
-    tokio::spawn(async move {
+    aust_core::tenant::spawn(async move {
         if let Err(e) = process_submission_background(
             Arc::clone(&state_bg),
             inquiry_id,
@@ -650,7 +657,7 @@ pub(crate) async fn trigger_video_upload(
     tracing::info!(inquiry_id = %inquiry_id, %s3_key, "Video uploaded to S3 before spawn");
 
     let state_bg = Arc::clone(&state);
-    tokio::spawn(async move {
+    aust_core::tenant::spawn(async move {
         if let Err(e) =
             process_video_background(state_bg.clone(), inquiry_id, estimation_id, video_bytes, mime_type, s3_key).await
         {
@@ -966,7 +973,7 @@ pub(crate) async fn retry_estimation(
         let dep_addr = departure_address;
         let arr_addr = arrival_address;
         let s3_keys_bg = s3_keys;
-        tokio::spawn(async move {
+        aust_core::tenant::spawn(async move {
             if let Err(e) = process_submission_background(
                 Arc::clone(&state_bg),
                 inquiry_id,
@@ -1019,7 +1026,7 @@ pub(crate) async fn retry_estimation(
         );
 
         let state_bg = Arc::clone(&state);
-        tokio::spawn(async move {
+        aust_core::tenant::spawn(async move {
             if let Err(e) = process_video_background(
                 Arc::clone(&state_bg),
                 inquiry_id,

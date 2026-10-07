@@ -129,6 +129,21 @@ pub struct TokenClaims {
     /// until they expire.
     #[serde(default)]
     pub typ: TokenType,
+    /// The user's company (`tenants.id`). Tokens issued before multi-tenancy have
+    /// none and count as Aust — see [`TokenClaims::tenant`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tid: Option<crate::tenant::TenantId>,
+    /// Platform superuser (`users.is_superuser`) — only tells the console to show
+    /// the "Firmen" tab. The platform routes re-check the database on every call.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub su: bool,
+}
+
+impl TokenClaims {
+    /// The tenant this token acts for.
+    pub fn tenant(&self) -> crate::tenant::TenantId {
+        self.tid.unwrap_or(crate::tenant::AUST)
+    }
 }
 
 /// What a signed token may be used for.

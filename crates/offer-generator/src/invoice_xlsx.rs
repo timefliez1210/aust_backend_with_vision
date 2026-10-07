@@ -223,7 +223,8 @@ pub enum InvoiceType {
 /// - `OfferError::Template` if the template ZIP is corrupt or not valid UTF-8
 /// - `OfferError::Template` if ZIP reassembly fails
 pub fn generate_invoice_xlsx(data: &InvoiceData) -> Result<Vec<u8>, OfferError> {
-    let mut template_zip = ZipArchive::new(Cursor::new(TEMPLATE_BYTES))
+    let template = crate::templates::for_current(crate::templates::TemplateKind::Invoice, TEMPLATE_BYTES)?;
+    let mut template_zip = ZipArchive::new(Cursor::new(&*template))
         .map_err(|e| OfferError::Template(format!("Failed to read invoice template ZIP: {e}")))?;
 
     // Build cell modifications and determine which rows are used

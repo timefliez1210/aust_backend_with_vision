@@ -21,6 +21,9 @@ use uuid::Uuid;
 use crate::repositories::{
     customer_repo, invoice_reminder_repo, invoice_repo, review_repo, storage_repo,
 };
+use aust_core::tenant::TenantProfile;
+
+use crate::repositories::tenant_repo;
 use crate::routes::admin_emails;
 use crate::ApiError;
 
@@ -33,11 +36,6 @@ pub(crate) const DEFAULT_REVIEW_SNOOZE_DAYS: u32 = 3;
 /// Human label per dunning level. Index = `level - 1`.
 pub(crate) const DUNNING_LEVEL_LABEL: [&str; 3] =
     ["Zahlungserinnerung", "1. Mahnung", "2. Mahnung"];
-
-/// Google-review link sent to customers in the review request email.
-/// Direct write-a-review URL for Aust Umzüge & Haushaltsauflösungen.
-const GOOGLE_REVIEW_URL: &str =
-    "https://www.google.com/search?q=Aust+Umz%C3%BCge+%26+Haushaltsaufl%C3%B6sungen+Reviews";
 
 /// Label for a dunning level, clamped to the three we have copy for.
 pub(crate) fn dunning_label(level: i32) -> &'static str {
@@ -128,7 +126,8 @@ pub(crate) async fn send_dunning(
         .unwrap_or("Sehr geehrte Damen und Herren");
     let label = dunning_label(row.level);
     let subject = format!("{label}: Rechnung {}", row.invoice_number);
-    let body = build_dunning_email(name, &row.invoice_number, label, row.level);
+    let profile = tenant_repo::profile(db).await?;
+    let body = build_dunning_email(&profile, name, &row.invoice_number, label, row.level);
 
     admin_emails::send_plain_email(email_config, email, &subject, &body)
         .await
@@ -151,7 +150,13 @@ pub(crate) async fn snooze_dunning(
     Ok(remind_after)
 }
 
-fn build_dunning_email(name: &str, invoice_number: &str, label: &str, level: i32) -> String {
+fn build_dunning_email(
+    p: &TenantProfile,
+    name: &str,
+    invoice_number: &str,
+    label: &str,
+    level: i32,
+) -> String {
     let urgency = match level {
         1 => "Möglicherweise ist die Zahlung in Bearbeitung — bitte prüfen Sie Ihre Unterlagen.",
         2 => "Wir bitten Sie dringend, den ausstehenden Betrag umgehend zu begleichen.",
@@ -166,7 +171,8 @@ fn build_dunning_email(name: &str, invoice_number: &str, label: &str, level: i32
          diese E-Mail als gegenstandslos zu betrachten.\n\n\
          Bei Fragen stehen wir Ihnen gerne zur Verfügung.\n\n\
          Mit freundlichen Grüßen\n\
-         Ihr Team von Aust Umzüge & Haushaltsauflösungen",
+         Ihr Team von {company}",
+        company = p.name,
     )
 }
 
@@ -330,7 +336,8 @@ pub(crate) async fn decide_review_request(
                 .as_deref()
                 .ok_or_else(|| ApiError::BadRequest("Kunde hat keine E-Mail-Adresse".into()))?;
             let subject = "Wie war Ihr Umzug? Wir freuen uns über Ihre Bewertung!";
-            let body = build_review_email(&customer.display_name());
+            let profile = tenant_repo::profile(db).await?;
+            let body = build_review_email(&profile, &customer.display_name());
 
             admin_emails::send_plain_email(email_config, email, subject, &body)
                 .await
@@ -355,21 +362,24 @@ pub(crate) async fn decide_review_request(
     }
 }
 
-fn build_review_email(customer_name: &str) -> String {
+fn build_review_email(p: &TenantProfile, customer_name: &str) -> String {
     format!(
         "Guten Tag {customer_name},\n\n\
-         vielen Dank, dass Sie Aust Umzüge & Haushaltsauflösungen für Ihren Umzug gewählt haben.\n\n\
+         vielen Dank, dass Sie {company} für Ihren Umzug gewählt haben.\n\n\
          Wir würden uns sehr freuen, wenn Sie uns eine kurze Bewertung hinterlassen würden:\n\
-         {GOOGLE_REVIEW_URL}\n\n\
+         {review_url}\n\n\
          Ihre Meinung hilft uns, unsere Dienstleistungen stetig zu verbessern.\n\n\
          Mit freundlichen Grüßen\n\
-         Ihr Team von Aust Umzüge & Haushaltsauflösungen",
+         Ihr Team von {company}",
+        company = p.name,
+        review_url = p.review_url,
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_helpers::aust_profile;
 
     #[test]
     fn dunning_labels_climb_and_clamp() {
@@ -383,21 +393,40 @@ mod tests {
 
     #[test]
     fn dunning_email_carries_number_and_escalates_tone() {
-        let first = build_dunning_email("Frau Schilling", "2026-0042", dunning_label(1), 1);
+        let p = aust_profile();
+        let first = build_dunning_email(&p, "Frau Schilling", "2026-0042", dunning_label(1), 1);
         assert!(first.contains("Frau Schilling"));
         assert!(first.contains("2026-0042"));
         assert!(first.contains("Zahlungserinnerung"));
         assert!(first.contains("in Bearbeitung"));
 
-        let last = build_dunning_email("Frau Schilling", "2026-0042", dunning_label(3), 3);
+        let last = build_dunning_email(&p, "Frau Schilling", "2026-0042", dunning_label(3), 3);
         assert!(last.contains("2. Mahnung"));
         assert!(last.contains("rechtlichen Schritten"));
     }
 
+    /// Golden: Aust's mails are word for word what they were before the texts moved
+    /// into the tenant profile.
     #[test]
-    fn review_email_links_google() {
-        let body = build_review_email("Herr Aust");
-        assert!(body.contains("Herr Aust"));
-        assert!(body.contains(GOOGLE_REVIEW_URL));
+    fn aust_mails_are_unchanged() {
+        let p = aust_profile();
+        assert_eq!(
+            build_dunning_email(&p, "Frau Schilling", "2026-0042", dunning_label(1), 1),
+            "Guten Tag Frau Schilling,\n\nZahlungserinnerung für Rechnung 2026-0042\n\n\
+             laut unseren Unterlagen ist die oben genannte Rechnung noch offen.\n\
+             Möglicherweise ist die Zahlung in Bearbeitung — bitte prüfen Sie Ihre Unterlagen.\n\n\
+             Sollten Sie die Zahlung bereits veranlasst haben, bitten wir Sie, diese E-Mail als \
+             gegenstandslos zu betrachten.\n\nBei Fragen stehen wir Ihnen gerne zur Verfügung.\n\n\
+             Mit freundlichen Grüßen\nIhr Team von Aust Umzüge & Haushaltsauflösungen"
+        );
+        assert_eq!(
+            build_review_email(&p, "Herr Aust"),
+            "Guten Tag Herr Aust,\n\nvielen Dank, dass Sie Aust Umzüge & Haushaltsauflösungen für \
+             Ihren Umzug gewählt haben.\n\nWir würden uns sehr freuen, wenn Sie uns eine kurze \
+             Bewertung hinterlassen würden:\n\
+             https://www.google.com/search?q=Aust+Umz%C3%BCge+%26+Haushaltsaufl%C3%B6sungen+Reviews\n\n\
+             Ihre Meinung hilft uns, unsere Dienstleistungen stetig zu verbessern.\n\n\
+             Mit freundlichen Grüßen\nIhr Team von Aust Umzüge & Haushaltsauflösungen"
+        );
     }
 }

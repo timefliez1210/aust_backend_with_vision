@@ -251,7 +251,8 @@ pub(crate) async fn run_offer_computation(
             ..Default::default()
         }
     } else {
-        build_fahrt_item(config, pricing.fahrt_rate_per_km, origin.as_ref(), destination.as_ref(), stop_address.as_ref(), distance).await
+        let depot = crate::repositories::tenant_repo::profile(db).await?.depot_address;
+        build_fahrt_item(config, &depot, pricing.fahrt_rate_per_km, origin.as_ref(), destination.as_ref(), stop_address.as_ref(), distance).await
     };
 
     let line_items: Vec<OfferLineItem> = if let Some(ref items) = overrides.line_items {
@@ -377,7 +378,7 @@ pub(crate) async fn run_offer_computation(
 /// # Parameters
 /// - `db` — live PostgreSQL connection pool
 /// - `storage` — S3-compatible storage for uploading the PDF
-/// - `config` — application config (company depot address, rate per km, etc.)
+/// - `config` — application config (ORS key, pricing defaults)
 /// - `inquiry_id` — the inquiry to generate an offer for
 /// - `valid_days` — optional number of days until the offer expires
 ///
@@ -969,8 +970,9 @@ pub(crate) fn detect_salutation_and_greeting(name: &str) -> (String, String) {
 /// `distance_km`.
 ///
 /// # Parameters
-/// - `config` — provides `company.depot_address` (ORS start/end point) and
-///   `company.fahrt_rate_per_km` (EUR per km)
+/// - `config` — provides the ORS API key
+/// - `depot` — the tenant's depot (ORS start/end point)
+/// - `rate` — EUR per km
 /// - `origin` — moving-out address; `None` triggers fallback
 /// - `destination` — moving-in address; `None` triggers fallback
 /// - `stop` — optional intermediate stop address (e.g. storage facility)
@@ -986,17 +988,17 @@ pub(crate) fn detect_salutation_and_greeting(name: &str) -> (String, String) {
 /// Fallback: `flat_total = distance_km × 2.0 × fahrt_rate_per_km`
 async fn build_fahrt_item(
     config: &Config,
+    depot: &str,
     rate: f64,
     origin: Option<&AddressRow>,
     destination: Option<&AddressRow>,
     stop: Option<&AddressRow>,
     distance_km: f64,
 ) -> OfferLineItem {
-    let depot = config.company.depot_address.clone();
 
     // Waypoints come from route_plan so the admin map (GET /inquiries/{id}/route) and this
     // price are always the same trip — they used to be built independently and disagreed.
-    let flat_total = if let Some(waypoints) = route_plan::build_waypoints(&depot, origin, destination, stop) {
+    let flat_total = if let Some(waypoints) = route_plan::build_waypoints(depot, origin, destination, stop) {
         let route_addrs: Vec<String> = waypoints.into_iter().map(|w| w.address).collect();
 
         let calculator = RouteCalculator::new(config.maps.api_key.clone());

@@ -1,4 +1,6 @@
 use serde::Deserialize;
+use std::collections::HashMap;
+use std::sync::LazyLock;
 
 /// Root application configuration, deserialized from `config/*.toml` and
 /// environment variable overrides (`AUST__SECTION__KEY`).
@@ -22,6 +24,63 @@ pub struct Config {
     pub vision_service: VisionServiceConfig,
     #[serde(default)]
     pub company: CompanyConfig,
+    /// Mailbox and Telegram of every tenant other than Aust, keyed by
+    /// `tenants.slug` (`[tenants.<slug>]`, env `AUST__TENANTS__<SLUG>__…`). Aust
+    /// keeps the top-level `email` and `telegram`. Read through
+    /// [`Config::email`] / [`Config::telegram`], never directly.
+    #[serde(default)]
+    pub tenants: HashMap<String, TenantIntegrations>,
+}
+
+/// One tenant's own mailbox and Telegram bot.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TenantIntegrations {
+    pub email: EmailConfig,
+    pub telegram: TelegramConfig,
+}
+
+/// A tenant without its own mailbox gets one that cannot connect — never Aust's.
+static DISABLED_EMAIL: LazyLock<EmailConfig> = LazyLock::new(|| EmailConfig {
+    imap_host: String::new(),
+    imap_port: 0,
+    smtp_host: String::new(),
+    smtp_port: 0,
+    username: String::new(),
+    password: String::new(),
+    poll_interval_secs: 60,
+    from_address: String::new(),
+    from_name: String::new(),
+    smtp_tls: default_smtp_tls(),
+});
+
+/// A tenant without its own bot gets one that cannot post — never Aust's.
+static DISABLED_TELEGRAM: LazyLock<TelegramConfig> = LazyLock::new(|| TelegramConfig {
+    bot_token: String::new(),
+    admin_chat_id: 0,
+    flash_contact_bot_token: String::new(),
+});
+
+impl Config {
+    /// The mailbox of the running tenant (`aust_core::tenant`): Aust's top-level
+    /// `email` for Aust and outside any tenant scope, otherwise `[tenants.<slug>]`.
+    pub fn email(&self) -> &EmailConfig {
+        match crate::tenant::current_slug() {
+            None => &self.email,
+            Some(slug) => self.tenants.get(slug).map(|t| &t.email).unwrap_or(&DISABLED_EMAIL),
+        }
+    }
+
+    /// The Telegram bot of the running tenant — see [`Config::email`].
+    pub fn telegram(&self) -> &TelegramConfig {
+        match crate::tenant::current_slug() {
+            None => &self.telegram,
+            Some(slug) => self
+                .tenants
+                .get(slug)
+                .map(|t| &t.telegram)
+                .unwrap_or(&DISABLED_TELEGRAM),
+        }
+    }
 }
 
 /// HTTP server bind address and port.
@@ -329,16 +388,14 @@ impl Default for ServerConfig {
     }
 }
 
-/// Company-specific pricing and logistics constants.
+/// Default prices, used for any key a tenant has not set in `settings`.
 ///
-/// **Caller**: `offer-generator` pricing engine uses `depot_address` as the
-/// route start/end point and `fahrt_rate_per_km` to calculate the Anfahrt
-/// (travel surcharge) line item. `rate_per_person_hour_cents` controls the
-/// base labor rate. Service line-item prices are also configurable here.
+/// **Caller**: `settings_repo::get_pricing` (per-key fallback). The depot is per
+/// company and lives in `tenants.depot_address`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CompanyConfig {
-    /// Full street address of the company depot, used as the origin when
-    /// calculating the outbound travel distance for the Anfahrt line item.
+    /// No longer read — the depot is `tenants.depot_address`. Kept so existing
+    /// config files still parse.
     pub depot_address: String,
     /// Euro amount charged per kilometre for the Anfahrt/Abfahrt line item.
     /// For example, `1.5` means €1.50/km.

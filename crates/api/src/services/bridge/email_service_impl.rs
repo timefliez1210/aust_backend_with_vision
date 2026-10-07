@@ -166,7 +166,7 @@ impl EmailService for EmailServiceImpl {
         // Note: ad-hoc sends are not persisted into email_messages — that table
         // requires a thread_id (NOT NULL, FK to email_threads) and these messages
         // by definition have no thread. Threaded correspondence goes via draft_reply.
-        crate::routes::admin_emails::send_plain_email(&self.config.email, to, subject, body)
+        crate::routes::admin_emails::send_plain_email(&self.config.email(), to, subject, body)
             .await
             .map_err(|e| ServiceError::Db(anyhow::anyhow!("E-Mail-Versand fehlgeschlagen: {e}")))?;
         Ok(())

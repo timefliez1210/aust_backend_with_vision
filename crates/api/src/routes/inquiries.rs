@@ -623,7 +623,7 @@ async fn update_inquiry(
             "new_status": new_status,
         });
         let aggregate = format!("inquiry:{id}");
-        tokio::spawn(async move {
+        aust_core::tenant::spawn(async move {
             if let Err(e) = emitter.emit("status.changed", &aggregate, payload).await {
                 tracing::warn!("Failed to emit status.changed event: {e}");
             }
@@ -825,8 +825,9 @@ async fn get_inquiry_route(
     let destination = address_repo::fetch_optional(&state.db, inquiry.destination_address_id).await?;
     let stop = address_repo::fetch_optional(&state.db, inquiry.stop_address_id).await?;
 
+    let depot = crate::repositories::tenant_repo::profile(&state.db).await?.depot_address;
     let waypoints = route_plan::build_waypoints(
-        &state.config.company.depot_address,
+        &depot,
         origin.as_ref(),
         destination.as_ref(),
         stop.as_ref(),

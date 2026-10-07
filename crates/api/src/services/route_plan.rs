@@ -43,7 +43,7 @@ fn format_address(addr: &AddressRow) -> String {
 /// the full loop, not the one-way customer distance stored on the inquiry.
 ///
 /// # Parameters
-/// - `depot` — `config.company.depot_address`, used as both first and last stop
+/// - `depot` — the tenant's `depot_address`, used as both first and last stop
 /// - `origin` — Auszug address; `None` yields `None`
 /// - `destination` — Einzug address; `None` yields `None`
 /// - `stop` — optional Zwischenstopp (storage, Wertstoffhof, ZAH)

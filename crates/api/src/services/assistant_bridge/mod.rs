@@ -13,5 +13,6 @@ pub mod media;
 pub mod notifier_impl;
 pub mod telegram_input;
 pub mod telegram_output;
+pub(crate) mod soul;
 
 pub use notifier_impl::TelegramNotifierImpl;

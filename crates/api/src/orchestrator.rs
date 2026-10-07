@@ -62,8 +62,8 @@ pub async fn run_offer_event_handler(
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .expect("reqwest client builder");
-    let bot_token = &state.config.telegram.bot_token;
-    let chat_id = state.config.telegram.admin_chat_id;
+    let bot_token = &state.config.telegram().bot_token;
+    let chat_id = state.config.telegram().admin_chat_id;
     let mut editing: Option<EditingOffer> = None;
 
     info!("Offer event handler started");
@@ -193,7 +193,7 @@ pub async fn run_offer_event_handler(
                             reply_to_text.as_deref(),
                             state.assistant_llm.clone(),
                             &state.tool_registry,
-                            &state.soul,
+                            &*crate::services::assistant_bridge::soul::for_current(&state).await,
                             state.services.clone(),
                         )
                         .await;
@@ -262,7 +262,7 @@ pub async fn run_offer_event_handler(
                             reply_to_text.as_deref(),
                             state.assistant_llm.clone(),
                             &state.tool_registry,
-                            &state.soul,
+                            &*crate::services::assistant_bridge::soul::for_current(&state).await,
                             state.services.clone(),
                         )
                         .await;
@@ -507,7 +507,7 @@ async fn handle_complete_inquiry(
             "customer_id": customer_id,
         });
         let aggregate = format!("inquiry:{inquiry_id}");
-        tokio::spawn(async move {
+        aust_core::tenant::spawn(async move {
             if let Err(e) = emitter.emit("inquiry.created", &aggregate, payload).await {
                 tracing::warn!("Failed to emit inquiry.created event: {e}");
             }

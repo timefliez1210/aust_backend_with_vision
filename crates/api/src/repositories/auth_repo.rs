@@ -12,6 +12,8 @@ pub(crate) struct UserRow {
     pub email: String,
     pub password_hash: String,
     pub role: String,
+    pub tenant_id: aust_core::tenant::TenantId,
+    pub is_superuser: bool,
 }
 
 /// Password reset OTP row.
@@ -24,14 +26,16 @@ pub(crate) struct ResetRow {
 /// Fetch a user by email (exact match).
 ///
 /// **Caller**: `login` handler
-/// **Why**: Verifies credentials during login.
+/// **Why**: Verifies credentials during login. Runs before the tenant is known, so
+/// it looks across tenants (`tenant::bypass`); the row says which tenant it is.
 pub(crate) async fn fetch_user_by_email(
     pool: &PgPool,
     email: &str,
 ) -> Result<Option<UserRow>, sqlx::Error> {
-    sqlx::query_as("SELECT id, email, password_hash, role FROM users WHERE email = $1")
+    let mut tx = aust_core::tenant::bypass(pool).await?;
+    sqlx::query_as("SELECT id, email, password_hash, role, tenant_id, is_superuser FROM users WHERE email = $1")
         .bind(email)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await
 }
 
@@ -43,11 +47,14 @@ pub(crate) async fn fetch_user_by_email_lower(
     pool: &PgPool,
     email_lower: &str,
 ) -> Result<Option<UserRow>, sqlx::Error> {
+    // Before login the company is unknown: look across companies (users.email is
+    // unique system-wide); the row says which company it is.
+    let mut tx = aust_core::tenant::bypass(pool).await?;
     sqlx::query_as(
-        "SELECT id, email, password_hash, role FROM users WHERE LOWER(email) = $1",
+        "SELECT id, email, password_hash, role, tenant_id, is_superuser FROM users WHERE LOWER(email) = $1",
     )
     .bind(email_lower)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await
 }
 
@@ -105,7 +112,7 @@ pub(crate) async fn fetch_user_by_id(
     user_id: Uuid,
 ) -> Result<Option<UserRow>, sqlx::Error> {
     sqlx::query_as(
-        "SELECT id, email, password_hash, role FROM users WHERE id = $1",
+        "SELECT id, email, password_hash, role, tenant_id, is_superuser FROM users WHERE id = $1",
     )
     .bind(user_id)
     .fetch_optional(pool)

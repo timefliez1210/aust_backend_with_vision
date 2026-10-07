@@ -262,7 +262,7 @@ pub async fn set_capacity(pool: &PgPool, date: NaiveDate, capacity: i32) -> Resu
         r#"
         INSERT INTO calendar_capacity_overrides (id, override_date, capacity, created_at)
         VALUES (gen_random_uuid(), $1, $2, NOW())
-        ON CONFLICT (override_date) DO UPDATE SET capacity = EXCLUDED.capacity
+        ON CONFLICT (tenant_id, override_date) DO UPDATE SET capacity = EXCLUDED.capacity
         "#,
     )
     .bind(date)

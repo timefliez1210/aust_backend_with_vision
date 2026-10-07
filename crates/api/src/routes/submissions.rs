@@ -407,7 +407,7 @@ async fn handle_ar_submission(
     let item_manifest_str = form.item_manifest.unwrap_or_default();
     let intrinsics_str = form.intrinsics;
     let poses_str = form.poses;
-    tokio::spawn(async move {
+    aust_core::tenant::spawn(async move {
         if let Err(e) = process_ar_submission_background(
             Arc::clone(&state_bg),
             inquiry_id,
@@ -1198,7 +1198,7 @@ async fn video_inquiry(
     let state_bg = Arc::clone(&state);
     let dep_addr = departure_address.clone();
     let arr_addr = arrival_address.clone();
-    tokio::spawn(async move {
+    aust_core::tenant::spawn(async move {
         // Distance calculation (once, shared across all videos)
         let api_key = &state_bg.config.maps.api_key;
         if !api_key.is_empty() {
@@ -1450,7 +1450,7 @@ async fn manual_inquiry(
     let state_bg = Arc::clone(&state);
     let dep_addr = departure_address.to_string();
     let arr_addr = arrival_address.to_string();
-    tokio::spawn(async move {
+    aust_core::tenant::spawn(async move {
         let api_key = &state_bg.config.maps.api_key;
         if !api_key.is_empty() {
             let calculator = aust_distance_calculator::RouteCalculator::new(api_key.clone());
@@ -1969,7 +1969,7 @@ pub(crate) async fn handle_submission(
         let state_bg = Arc::clone(&state);
         let dep_addr = departure_address.clone();
         let arr_addr = arrival_address.clone();
-        tokio::spawn(async move {
+        aust_core::tenant::spawn(async move {
             let api_key = &state_bg.config.maps.api_key;
             if !api_key.is_empty() {
                 let calculator = aust_distance_calculator::RouteCalculator::new(api_key.clone());
@@ -2035,7 +2035,7 @@ pub(crate) async fn handle_submission(
     let state_bg = Arc::clone(&state);
     let dep_addr = departure_address.clone();
     let arr_addr = arrival_address.clone();
-    tokio::spawn(async move {
+    aust_core::tenant::spawn(async move {
         if let Err(e) = process_submission_background(
             state_bg,
             inquiry_id,

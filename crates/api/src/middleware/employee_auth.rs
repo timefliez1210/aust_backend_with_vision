@@ -63,9 +63,16 @@ pub async fn require_employee_auth(
 
     let now = Utc::now();
 
-    let row: Option<(Uuid, String)> = sqlx::query_as(
+    // The token is all we have: look it up across tenants, then run the request
+    // inside the tenant the session belongs to.
+    let mut session_lookup = aust_core::tenant::bypass(&state.db).await.map_err(|e| {
+        tracing::error!("Session lookup transaction failed: {e}");
+        unauthorized("Authentifizierung fehlgeschlagen")
+    })?;
+
+    let row: Option<(Uuid, String, aust_core::tenant::TenantId)> = sqlx::query_as(
         r#"
-        SELECT es.employee_id, e.email
+        SELECT es.employee_id, e.email, es.tenant_id
         FROM employee_sessions es
         JOIN employees e ON es.employee_id = e.id
         WHERE es.token = $1 AND es.expires_at > $2
@@ -73,14 +80,14 @@ pub async fn require_employee_auth(
     )
     .bind(token)
     .bind(now)
-    .fetch_optional(&state.db)
+    .fetch_optional(&mut *session_lookup)
     .await
     .map_err(|e| {
         tracing::error!("Employee session lookup failed: {e}");
         unauthorized("Authentifizierung fehlgeschlagen")
     })?;
 
-    let (employee_id, email) =
+    let (employee_id, email, tenant) =
         row.ok_or_else(|| unauthorized("Ungültiges oder abgelaufenes Token"))?;
 
     let token = token.to_string();
@@ -90,5 +97,5 @@ pub async fn require_employee_auth(
         token,
     });
 
-    Ok(next.run(request).await)
+    Ok(aust_core::tenant::scope(tenant, next.run(request)).await)
 }

@@ -266,7 +266,7 @@ mod tests {
         let counter_clone = counter.clone();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
+        aust_core::tenant::spawn(async move {
             loop {
                 if let Ok((mut stream, _)) = listener.accept().await {
                     counter_clone.fetch_add(1, Ordering::SeqCst);

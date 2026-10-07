@@ -93,6 +93,7 @@ pub fn test_config() -> Config {
         calendar: CalendarConfig::default(),
         vision_service: VisionServiceConfig::default(),
         company: CompanyConfig::default(),
+        tenants: Default::default(),
     }
 }
 
@@ -144,7 +145,9 @@ pub fn generate_test_jwt() -> String {
         role: aust_core::models::UserRole::Admin,
         exp: (Utc::now().timestamp() + 86400) as usize,
         iat: Utc::now().timestamp() as usize,
-            typ: aust_core::models::TokenType::Access,
+        typ: aust_core::models::TokenType::Access,
+        tid: None,
+        su: false,
     };
 
     encode(
@@ -505,4 +508,20 @@ pub async fn insert_test_inquiry_full(
     .await
     .expect("insert test inquiry");
     id
+}
+
+/// Aust's profile with the literal strings the code used before multi-tenancy.
+/// `tenant_repo` asserts the seeded row equals this.
+pub fn aust_profile() -> aust_core::tenant::TenantProfile {
+    aust_core::tenant::TenantProfile {
+        id: aust_core::tenant::AUST,
+        name: "Aust Umzüge & Haushaltsauflösungen".into(),
+        short_name: "Aust Umzüge".into(),
+        brand_name: "AUST Umzüge".into(),
+        owner_name: "Alex Aust".into(),
+        phone: "05121 – 7558379".into(),
+        city: "Hildesheim".into(),
+        review_url: "https://www.google.com/search?q=Aust+Umz%C3%BCge+%26+Haushaltsaufl%C3%B6sungen+Reviews".into(),
+        depot_address: "Borsigstr 6 31135 Hildesheim".into(),
+    }
 }

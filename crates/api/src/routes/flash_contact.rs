@@ -81,8 +81,8 @@ async fn create_flash_contact(
         .expect("reqwest client builder");
     crate::services::telegram_service::send_telegram_message(
         &client,
-        &state.config.telegram.bot_token,
-        state.config.telegram.admin_chat_id,
+        &state.config.telegram().bot_token,
+        state.config.telegram().admin_chat_id,
         &message,
     )
     .await;

@@ -345,21 +345,27 @@ pub(crate) async fn handle_offer_approval(
         return;
     };
 
-    let body = "Sehr geehrte/r [Name],\n\n\
-        anbei erhalten Sie Ihr persönliches Umzugsangebot.\n\n\
-        Bei Rückfragen stehen wir Ihnen gerne unter 05121 – 7558379 zur Verfügung.\n\n\
-        Mit freundlichen Grüßen,\n\
-        Ihr AUST Umzüge Team";
+    let profile = match crate::repositories::tenant_repo::profile(&state.db).await {
+        Ok(p) => p,
+        Err(e) => {
+            error!("Offer {offer_id}: tenant profile not loaded: {e}");
+            send_telegram_message(client, bot_token, chat_id, "Fehler: Firmendaten nicht geladen.")
+                .await;
+            return;
+        }
+    };
+    let subject = crate::services::email::offer_mail_subject(&profile);
+    let body = crate::services::email::offer_mail_draft_body(&profile);
 
     let _ = email_repo::insert_message(
         &state.db,
         Uuid::now_v7(),
         thread_id,
         "outbound",
-        &state.config.email.from_address,
+        &state.config.email().from_address,
         &customer_email,
-        "Ihr Umzugsangebot — AUST Umzüge",
-        body,
+        &subject,
+        &body,
         false,
         "draft",
     )
@@ -807,7 +813,7 @@ pub(crate) async fn handle_offer_edit(
                 generated.offer.price_cents as f64 / 100.0
             );
 
-            send_offer_to_telegram(&state.config.telegram, &generated).await;
+            send_offer_to_telegram(&state.config.telegram(), &generated).await;
         }
         Err(e) => {
             error!("Failed to regenerate offer: {e}");

@@ -14,6 +14,7 @@ use serde::Serialize;
 use validator::Validate;
 
 use aust_core::models::{AuthToken, CreateUser, LoginRequest, TokenClaims, TokenType, UserRole};
+use aust_core::tenant::TenantId;
 
 use crate::repositories::auth_repo;
 use crate::{ApiError, AppState};
@@ -53,6 +54,8 @@ pub fn protected_router() -> Router<Arc<AppState>> {
 /// - `user_id` — UUID placed in the `sub` claim
 /// - `email` — stored in the token claims for display purposes
 /// - `role` — `UserRole` enum stored in the claims for middleware authorisation
+/// - `tenant` — the user's company, stored as the `tid` claim
+/// - `superuser` — platform superuser, stored as the `su` claim (UI hint only)
 /// - `jwt_secret` — HMAC-SHA256 signing secret from config
 /// - `expiry_hours` — access token lifetime in hours
 ///
@@ -66,6 +69,8 @@ fn create_tokens(
     user_id: Uuid,
     email: &str,
     role: UserRole,
+    tenant: TenantId,
+    superuser: bool,
     jwt_secret: &str,
     expiry_hours: u64,
 ) -> Result<AuthToken, ApiError> {
@@ -78,6 +83,8 @@ fn create_tokens(
         iat: now,
         exp: now + (expiry_hours as usize * 3600),
         typ: TokenType::Access,
+        tid: Some(tenant),
+        su: superuser,
     };
 
     let access_token = encode(
@@ -95,6 +102,8 @@ fn create_tokens(
         iat: now,
         exp: now + (7 * 24 * 3600),
         typ: TokenType::Refresh,
+        tid: Some(tenant),
+        su: superuser,
     };
 
     let refresh_token = encode(
@@ -158,6 +167,8 @@ async fn login(
         user.id,
         &user.email,
         role,
+        user.tenant_id,
+        user.is_superuser,
         &state.config.auth.jwt_secret,
         state.config.auth.jwt_expiry_hours,
     )?;
@@ -204,7 +215,8 @@ async fn refresh_token(
     // Re-read the account rather than trusting the token's own claims. Re-signing
     // `claims.role` meant a demoted or revoked administrator could refresh admin rights
     // indefinitely — the only thing that ever expired was the token, never the privilege.
-    let user = auth_repo::fetch_user_by_id(&state.db, claims.sub)
+    // A public route: the token's own tenant decides where to look.
+    let user = aust_core::tenant::scope(claims.tenant(), auth_repo::fetch_user_by_id(&state.db, claims.sub))
         .await?
         .ok_or_else(|| ApiError::Unauthorized("Benutzer nicht gefunden".into()))?;
 
@@ -212,6 +224,8 @@ async fn refresh_token(
         user.id,
         &user.email,
         UserRole::from_db_str(&user.role),
+        user.tenant_id,
+        user.is_superuser,
         secret,
         state.config.auth.jwt_expiry_hours,
     )?;
@@ -236,7 +250,7 @@ async fn refresh_token(
 ///
 /// # Errors
 /// - `500` if Argon2 hashing fails (should not occur in normal operation)
-fn hash_password(password: &str) -> Result<String, ApiError> {
+pub(crate) fn hash_password(password: &str) -> Result<String, ApiError> {
     let salt = SaltString::generate(&mut OsRng);
     let hash = Argon2::default()
         .hash_password(password.as_bytes(), &salt)
@@ -394,6 +408,16 @@ async fn reset_password_request(
     let user = auth_repo::fetch_user_by_email_lower(&state.db, &email).await?;
 
     if let Some(user) = user {
+        // Everything after the lookup happens in the user's own company: its
+        // mailbox, its reset rows.
+        aust_core::tenant::scope(user.tenant_id, send_reset_code(&state, &user)).await?;
+    }
+
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// Store a fresh reset code for `user` and mail it. Runs in the user's company.
+async fn send_reset_code(state: &AppState, user: &auth_repo::UserRow) -> Result<(), ApiError> {
         // Generate 6-digit OTP
         let otp: u32 = rand::rng().random_range(100_000..=999_999);
         let otp_str = format!("{otp:06}");
@@ -413,24 +437,24 @@ async fn reset_password_request(
             "Ihr Passwort-Reset-Code lautet:\n\n  {otp_str}\n\nDer Code ist 15 Minuten gültig.\n\nFalls Sie kein Passwort-Reset angefordert haben, können Sie diese E-Mail ignorieren."
         );
         let _ = crate::services::email::send_email(
-            &state.config.email.smtp_host,
-            state.config.email.smtp_port,
-            &state.config.email.smtp_tls,
-            &state.config.email.username,
-            &state.config.email.password,
+            &state.config.email().smtp_host,
+            state.config.email().smtp_port,
+            &state.config.email().smtp_tls,
+            &state.config.email().username,
+            &state.config.email().password,
             crate::services::email::build_plain_email(
-                &state.config.email.from_address,
-                &state.config.email.from_name,
+                &state.config.email().from_address,
+                &state.config.email().from_name,
                 &user.email,
-                "Passwort-Reset Code – AUST Admin",
+                &crate::services::email::reset_mail_subject(
+                    &crate::repositories::tenant_repo::profile(&state.db).await?,
+                ),
                 &body_text,
             )
             .map_err(|e| ApiError::Internal(e.to_string()))?,
         )
         .await;
-    }
-
-    Ok(Json(serde_json::json!({ "ok": true })))
+        Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -472,6 +496,17 @@ async fn reset_password_verify(
         .await?
         .ok_or_else(|| ApiError::Validation("Ungültiger oder abgelaufener Code".into()))?;
 
+    // The rest happens in the user's own company (its reset rows).
+    aust_core::tenant::scope(user.tenant_id, verify_reset_code(&state, &user, &body)).await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// Check `body.otp` against `user`'s latest reset code and set the new password.
+async fn verify_reset_code(
+    state: &AppState,
+    user: &auth_repo::UserRow,
+    body: &ResetVerifyBody,
+) -> Result<(), ApiError> {
     // Fetch the latest unused, unexpired token for this user
     let reset = auth_repo::fetch_valid_reset(&state.db, user.id)
         .await?
@@ -504,6 +539,5 @@ async fn reset_password_verify(
     auth_repo::update_password_tx(&mut tx, user.id, &new_hash, now).await?;
 
     tx.commit().await?;
-
-    Ok(Json(serde_json::json!({ "ok": true })))
+    Ok(())
 }

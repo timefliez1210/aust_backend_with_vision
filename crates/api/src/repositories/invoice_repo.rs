@@ -178,7 +178,7 @@ pub(crate) async fn next_invoice_numbers(
     let (last,): (i64,) = sqlx::query_as(
         "INSERT INTO invoice_number_counters (year, last_value)
          VALUES ($1, $2)
-         ON CONFLICT (year) DO UPDATE
+         ON CONFLICT (tenant_id, year) DO UPDATE
              SET last_value = invoice_number_counters.last_value + $2
          RETURNING last_value",
     )
@@ -460,7 +460,7 @@ pub(crate) async fn count_unpaid(
 ///
 /// **Caller**: `invoices::update_invoice_number`
 /// **Why**: Recovery path when the system counter fell out of sync with manually-sent
-/// invoices. The `invoices_invoice_number_key` UNIQUE constraint guards collisions;
+/// invoices. The `invoices_tenant_invoice_number_key` UNIQUE constraint guards collisions;
 /// the caller maps that violation to a friendly message.
 pub(crate) async fn update_invoice_number(
     pool: &PgPool,
@@ -508,7 +508,7 @@ pub(crate) async fn advance_invoice_sequence(
     sqlx::query(
         "INSERT INTO invoice_number_counters (year, last_value)
          VALUES ($1, $2)
-         ON CONFLICT (year) DO UPDATE
+         ON CONFLICT (tenant_id, year) DO UPDATE
              SET last_value = GREATEST(invoice_number_counters.last_value, EXCLUDED.last_value)",
     )
     .bind(year)
@@ -546,7 +546,7 @@ pub(crate) async fn set_next_invoice_number(
     sqlx::query(
         "INSERT INTO invoice_number_counters (year, last_value)
          VALUES ($1, $2)
-         ON CONFLICT (year) DO UPDATE SET last_value = EXCLUDED.last_value",
+         ON CONFLICT (tenant_id, year) DO UPDATE SET last_value = EXCLUDED.last_value",
     )
     .bind(year)
     .bind(n - 1)
@@ -1196,7 +1196,7 @@ mod tests {
              FROM invoices
              WHERE invoice_number ~ '^[0-9]{4}-[0-9]+$'
              GROUP BY 1
-             ON CONFLICT (year) DO NOTHING",
+             ON CONFLICT (tenant_id, year) DO NOTHING",
         )
         .execute(&pool)
         .await

@@ -110,13 +110,21 @@ pub(crate) trait OtpBackend: Send + Sync {
     ) -> impl std::future::Future<Output = Result<(), sqlx::Error>> + Send;
 
     /// The email subject line for the OTP email.
-    fn otp_email_subject(&self) -> &str;
+    fn otp_email_subject(&self, p: &aust_core::tenant::TenantProfile) -> String;
 
     /// The success message returned after requesting an OTP.
     fn request_success_message(&self) -> &str;
 
     /// Label used in tracing logs (e.g. "Customer", "Employee").
     fn user_label(&self) -> &str;
+}
+
+/// Body of the mail that carries a login code.
+pub(crate) fn otp_email_body(p: &aust_core::tenant::TenantProfile, code: &str) -> String {
+    format!(
+        "Guten Tag,\n\nIhr Zugangscode lautet: {code}\n\nDieser Code ist 10 Minuten gültig.\n\nMit freundlichen Grüßen,\n{}",
+        p.short_name
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -178,12 +186,11 @@ pub(crate) async fn handle_request_otp(
         let code_hash = hash_otp(&code)?;
         backend.insert_otp(pool, &email, &code_hash, expires_at).await?;
 
-        let subject = backend.otp_email_subject();
-        let body_text = format!(
-            "Guten Tag,\n\nIhr Zugangscode lautet: {code}\n\nDieser Code ist 10 Minuten gültig.\n\nMit freundlichen Grüßen,\nAust Umzüge"
-        );
+        let profile = crate::repositories::tenant_repo::profile(pool).await?;
+        let subject = backend.otp_email_subject(&profile);
+        let body_text = otp_email_body(&profile, &code);
 
-        send_otp_email(email_config, &email, subject, &body_text)
+        send_otp_email(email_config, &email, &subject, &body_text)
             .await
             .map_err(|e| {
                 tracing::error!(label = backend.user_label(), "Failed to send OTP email: {e}");
@@ -332,4 +339,20 @@ pub(crate) async fn send_otp_email(
     )
     .await
     .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Golden: Aust's login-code mail is word for word what it was before the
+    /// company name moved into the tenant profile.
+    #[test]
+    fn aust_otp_mail_is_unchanged() {
+        assert_eq!(
+            otp_email_body(&crate::test_helpers::aust_profile(), "042137"),
+            "Guten Tag,\n\nIhr Zugangscode lautet: 042137\n\nDieser Code ist 10 Minuten gültig.\n\n\
+             Mit freundlichen Grüßen,\nAust Umzüge"
+        );
+    }
 }

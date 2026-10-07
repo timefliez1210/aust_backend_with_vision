@@ -1065,6 +1065,7 @@ async fn employee_hours_export(
         month_label,
         target_hours: target,
         entries,
+        supervisor: crate::repositories::tenant_repo::profile(&state.db).await?.owner_name,
     })
     .map_err(|e| ApiError::Internal(format!("Timesheet XLSX generation failed: {e}")))?;
 
@@ -2034,7 +2035,7 @@ async fn invoice_reminder_action(
     match body.action.as_str() {
         "send" => {
             let (level, _label) =
-                billing_reminder_service::send_dunning(&state.db, &state.config.email, id).await?;
+                billing_reminder_service::send_dunning(&state.db, &state.config.email(), id).await?;
             Ok(Json(serde_json::json!({ "status": "sent", "level": level })))
         }
         "later" => {
@@ -2180,7 +2181,7 @@ async fn create_review_request(
 
     let outcome = billing_reminder_service::decide_review_request(
         &state.db,
-        &state.config.email,
+        &state.config.email(),
         id,
         &body.action,
         body.remind_after_days,
@@ -3037,6 +3038,7 @@ async fn export_rechnungsausgangsbuch(
     require_admin(&claims)?;
 
     let year = q.year.unwrap_or_else(|| Utc::now().date_naive().year());
+    let company = crate::repositories::tenant_repo::profile(&state.db).await?.name;
     let Json(items) = rechnungsausgangsbuch(State(state), Extension(claims)).await?;
 
     let rows: Vec<register_export::ExportRow> = items
@@ -3066,7 +3068,7 @@ async fn export_rechnungsausgangsbuch(
         })
         .collect();
 
-    let bytes = register_export::build_xlsx(year, &rows)?;
+    let bytes = register_export::build_xlsx(&company, year, &rows)?;
     let filename = format!("Rechnungsausgangsbuch_{year}.xlsx");
 
     Response::builder()
@@ -3729,7 +3731,7 @@ mod tests {
     /// (`test_app_state`, not `#[sqlx::test]`) and pick their year from the wall
     /// clock — `2040 + timestamp % 50`. That bucket repeats, so a second run inside
     /// the same window collided with its own leftovers on
-    /// `invoices_invoice_number_key` and the test failed for reasons that had
+    /// `invoices_tenant_invoice_number_key` and the test failed for reasons that had
     /// nothing to do with the code under test. Clearing the year first makes the
     /// tests idempotent without giving up the isolated-year trick.
     #[cfg(test)]

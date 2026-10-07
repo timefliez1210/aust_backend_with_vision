@@ -80,12 +80,22 @@ struct FormSubmission {
 /// 2. Detect email type from body text markers and parse key/value fields.
 /// 3. Fall back to free-text mode, storing the body in `notes` for the LLM
 ///    responder to extract data in a subsequent step.
-pub struct EmailParser;
+pub struct EmailParser {
+    /// Addresses containing this are the company's own and never the customer's
+    /// (e.g. the signature of a forwarded mail).
+    own_marker: String,
+}
 
 impl EmailParser {
-    /// Creates a new `EmailParser`.
+    /// Creates a new `EmailParser` for Aust's mailbox.
     pub fn new() -> Self {
-        Self
+        Self { own_marker: "aust-umzuege".to_string() }
+    }
+
+    /// A parser for another company's mailbox: its own addresses are those on
+    /// `domain` (the domain of the mailbox's From address).
+    pub fn for_domain(domain: &str) -> Self {
+        Self { own_marker: format!("@{}", domain.to_lowercase()) }
     }
 
     /// Parse an incoming email into a `MovingInquiry`, extracting as much
@@ -336,7 +346,7 @@ impl EmailParser {
             .or_else(|| extract_field(body, "Email"))
             .or_else(|| extract_section_field(body, "Kontaktdaten", "E-Mail"))
             .or_else(|| extract_section_field(body, "Kontaktdaten", "Email"))
-            .or_else(|| extract_email_from_body(body, &email.from));
+            .or_else(|| extract_email_from_body(body, &email.from, &self.own_marker));
 
         debug!("Extracted a form email address: {}", form_email.is_some());
 
@@ -680,7 +690,8 @@ fn extract_multiline_field(body: &str, key: &str) -> Option<String> {
 /// # Parameters
 /// - `body` — Plain-text email body to scan.
 /// - `sender` — IMAP `From:` address to exclude (usually `angebot@aust-umzuege.de`).
-fn extract_email_from_body(body: &str, sender: &str) -> Option<String> {
+/// - `own_marker` — anything containing it is the company's own address.
+fn extract_email_from_body(body: &str, sender: &str, own_marker: &str) -> Option<String> {
     let sender_lower = sender.to_lowercase();
     // Simple email regex: word chars + dots/hyphens @ domain
     for word in body.split_whitespace() {
@@ -689,7 +700,7 @@ fn extract_email_from_body(body: &str, sender: &str) -> Option<String> {
             let candidate = word.to_lowercase();
             // Skip the sender/company address
             if candidate != sender_lower
-                && !candidate.contains("aust-umzuege")
+                && !candidate.contains(own_marker)
                 && !candidate.contains("noreply")
                 && !candidate.contains("no-reply")
             {

@@ -17,10 +17,12 @@ pub mod inquiry_appointments;
 pub mod invoices;
 pub mod offers;
 pub(crate) mod overview;
+pub mod platform;
 pub mod profit;
 pub(crate) mod shared;
 pub mod storage;
 pub mod submissions;
+pub mod tenant;
 pub mod vehicles;
 
 use crate::AppState;
@@ -50,6 +52,7 @@ pub fn public_api_router() -> Router<Arc<AppState>> {
         .nest("/media", estimates::public_router())
         .route("/distance/calculate", post(distance::calculate))
         .merge(flash_contact::router())
+        .merge(tenant::public_router())
 }
 
 /// Unauthenticated form submissions, kept separate so `lib.rs` can rate-limit them.

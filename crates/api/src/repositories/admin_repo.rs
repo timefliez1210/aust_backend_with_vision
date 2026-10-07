@@ -1091,7 +1091,7 @@ pub(crate) async fn upsert_customer_for_compose(
         r#"
         INSERT INTO customers (id, email, created_at, updated_at)
         VALUES ($1, $2, $3, $3)
-        ON CONFLICT (email) DO UPDATE SET updated_at = $3
+        ON CONFLICT (tenant_id, email) WHERE merged_into IS NULL DO UPDATE SET updated_at = $3
         RETURNING id
         "#,
     )
