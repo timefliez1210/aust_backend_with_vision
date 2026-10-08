@@ -1125,6 +1125,22 @@ Download the invoice PDF.
 
 ---
 
+### GET /api/v1/inquiries/{id}/invoices/{inv_id}/line-items
+
+The invoice's current positions in the manual editor's shape — seeds "Manuelle Rechnung"
+with the KVA lines instead of a blank table. A manual invoice returns its stored items; an
+offer-derived one returns the KVA positions plus Zusatzleistungen exactly as the PDF prints
+them (price pinned to the invoice's stored base).
+
+**Auth**: Bearer JWT
+
+**Response** `200 OK`
+```ts
+Array<{ description: string; quantity: number; unit_price_cents: number /* netto */; remark: string | null }>
+```
+
+---
+
 ### POST /api/v1/inquiries/{id}/invoices/{inv_id}/send
 
 Send the invoice by email to the customer.

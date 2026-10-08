@@ -49,6 +49,7 @@ pub(crate) fn router() -> Router<Arc<AppState>> {
             get(get_invoice).patch(update_invoice),
         )
         .route("/{id}/invoices/{inv_id}/pdf", get(get_invoice_pdf))
+        .route("/{id}/invoices/{inv_id}/line-items", get(get_invoice_line_items))
         .route("/{id}/invoices/{inv_id}/send", post(send_invoice))
         .route("/{id}/invoices/{inv_id}/number", patch(update_invoice_number))
 }
@@ -122,6 +123,18 @@ pub struct ManualLineItem {
     pub unit_price_cents: i64,
     #[serde(default)]
     pub remark: Option<String>,
+}
+
+impl From<InvoiceLineItem> for ManualLineItem {
+    /// Generator lines carry EUR floats; the editor works in netto cents.
+    fn from(it: InvoiceLineItem) -> Self {
+        Self {
+            description: it.description,
+            quantity: it.quantity,
+            unit_price_cents: (it.unit_price * 100.0).round() as i64,
+            remark: it.remark,
+        }
+    }
 }
 
 /// A single extra service as provided by the API caller.
@@ -428,19 +441,7 @@ async fn create_invoice(
         let inv_id = Uuid::now_v7();
 
         // Full invoice: KVA line items, falling back to a lump-sum if none stored
-        let kva_nr = invoice_context.offer.offer_number.as_deref().unwrap_or("");
-        let kva_items = kva_line_items_from_offer(&invoice_context, kva_nr);
-        let full_line_items = if kva_items.is_empty() {
-            vec![InvoiceLineItem {
-                pos: 1,
-                description: format!("Umzugsdienstleistung gemäß Angebot Nr. {kva_nr}"),
-                quantity: 1.0,
-                unit_price: offer_netto as f64 / 100.0,
-                remark: None,
-            }]
-        } else {
-            kva_items
-        };
+        let full_line_items = full_invoice_line_items(&invoice_context, &[]);
         let data = build_invoice_data_from_items(
             &invoice_context,
             InvoiceType::Full,
@@ -571,6 +572,32 @@ async fn get_invoice(
 
     let offer_netto = get_offer_netto(&state.db, inquiry_id).await?;
     Ok(Json(build_invoice_response(row, offer_netto)))
+}
+
+/// `GET /api/v1/inquiries/{id}/invoices/{inv_id}/line-items` — The invoice's
+/// current positions in the manual editor's shape.
+///
+/// **Caller**: Admin dashboard — `ManualInvoiceEditor` when switching a full invoice
+/// to "Manuelle Rechnung".
+/// **Why**: Alex wants to start from the KVA positions (rename, delete, add) instead
+/// of a blank table. A manual invoice returns its stored items; an offer-derived one
+/// returns the KVA lines plus Zusatzleistungen exactly as the PDF prints them, with
+/// the price pinned to the invoice's stored base like every rebuild.
+async fn get_invoice_line_items(
+    State(state): State<Arc<AppState>>,
+    Path((inquiry_id, inv_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<Vec<ManualLineItem>>, ApiError> {
+    let row = fetch_invoice_by_inquiry(&state.db, inv_id, inquiry_id).await?;
+    let items = if row.is_manual {
+        manual_line_items(&row)
+    } else {
+        let mut ctx = load_invoice_context(&state.db, inquiry_id, row.base_netto_cents).await?;
+        pin_price_to_invoice_base(&mut ctx, row.base_netto_cents);
+        let extras: Vec<ExtraServiceRequest> =
+            serde_json::from_value(row.extra_services.clone()).unwrap_or_default();
+        full_invoice_line_items(&ctx, &extras)
+    };
+    Ok(Json(items.into_iter().map(ManualLineItem::from).collect()))
 }
 
 /// `GET /api/v1/inquiries/{id}/invoices/{inv_id}/pdf` — Download invoice PDF.
@@ -749,40 +776,7 @@ async fn update_invoice(
                 );
                 items
             }
-            _ => {
-                // Full invoice: base line + extras
-                let offer_netto = invoice_context.offer.price_cents;
-                let kva_nr = invoice_context.offer.offer_number.as_deref().unwrap_or("");
-                let kva_items = kva_line_items_from_offer(&invoice_context, kva_nr);
-                let base_items = if kva_items.is_empty() {
-                    vec![InvoiceLineItem {
-                        pos: 1,
-                        description: format!(
-                            "Umzugsdienstleistung gemäß Angebot Nr. {kva_nr}"
-                        ),
-                        quantity: 1.0,
-                        unit_price: offer_netto as f64 / 100.0,
-                        remark: None,
-                    }]
-                } else {
-                    kva_items
-                };
-                let extra_offset = base_items.len() as u32 + 1;
-                let extra_items: Vec<InvoiceLineItem> = extras
-                    .iter()
-                    .enumerate()
-                    .map(|(i, e)| InvoiceLineItem {
-                        pos: extra_offset + i as u32,
-                        description: e.description.clone(),
-                        quantity: 1.0,
-                        unit_price: e.price_cents as f64 / 100.0,
-                        remark: None,
-                    })
-                    .collect();
-                let mut items = base_items;
-                items.extend(extra_items);
-                items
-            }
+            _ => full_invoice_line_items(&invoice_context, extras),
         };
 
         let mut data = build_invoice_data_from_items(
@@ -1260,6 +1254,35 @@ fn manual_line_items(row: &InvoiceRow) -> Vec<InvoiceLineItem> {
 // Final-invoice line-item helpers
 // ---------------------------------------------------------------------------
 
+/// The positions of an offer-derived full invoice: the KVA's line items (or one
+/// lump-sum line when the offer has none), followed by the Zusatzleistungen.
+///
+/// **Callers**: invoice creation, both regeneration paths, and
+/// `get_invoice_line_items`, which seeds the manual editor with exactly what the
+/// invoice prints today.
+fn full_invoice_line_items(ctx: &InvoiceContext, extras: &[ExtraServiceRequest]) -> Vec<InvoiceLineItem> {
+    let kva_nr = ctx.offer.offer_number.as_deref().unwrap_or("");
+    let mut items = kva_line_items_from_offer(ctx, kva_nr);
+    if items.is_empty() {
+        items.push(InvoiceLineItem {
+            pos: 1,
+            description: format!("Umzugsdienstleistung gemäß Angebot Nr. {kva_nr}"),
+            quantity: 1.0,
+            unit_price: ctx.offer.price_cents as f64 / 100.0,
+            remark: None,
+        });
+    }
+    let extra_offset = items.len() as u32 + 1;
+    items.extend(extras.iter().enumerate().map(|(i, e)| InvoiceLineItem {
+        pos: extra_offset + i as u32,
+        description: e.description.clone(),
+        quantity: 1.0,
+        unit_price: e.price_cents as f64 / 100.0,
+        remark: None,
+    }));
+    items
+}
+
 /// Convert offer `line_items_json` (OfferLineItem array) to InvoiceLineItem vec.
 ///
 /// Returns an empty vec when `line_items_json` is NULL or cannot be parsed —
@@ -1597,38 +1620,7 @@ async fn regenerate_invoice_pdf(
             );
             (InvoiceType::PartialFinal, items)
         }
-        _ => {
-            // Full invoice
-            let offer_netto = ctx.offer.price_cents;
-            let kva_nr = ctx.offer.offer_number.as_deref().unwrap_or("");
-            let kva_items = kva_line_items_from_offer(&ctx, kva_nr);
-            let base_items = if kva_items.is_empty() {
-                vec![InvoiceLineItem {
-                    pos: 1,
-                    description: format!("Umzugsdienstleistung gemäß Angebot Nr. {kva_nr}"),
-                    quantity: 1.0,
-                    unit_price: offer_netto as f64 / 100.0,
-                    remark: None,
-                }]
-            } else {
-                kva_items
-            };
-            let extra_offset = base_items.len() as u32 + 1;
-            let extra_items: Vec<InvoiceLineItem> = extras
-                .iter()
-                .enumerate()
-                .map(|(i, e)| InvoiceLineItem {
-                    pos: extra_offset + i as u32,
-                    description: e.description.clone(),
-                    quantity: 1.0,
-                    unit_price: e.price_cents as f64 / 100.0,
-                    remark: None,
-                })
-                .collect();
-            let mut items = base_items;
-            items.extend(extra_items);
-            (InvoiceType::Full, items)
-        }
+        _ => (InvoiceType::Full, full_invoice_line_items(&ctx, &extras)),
     };
 
     let mut data = build_invoice_data_from_items(&ctx, inv_type, &row.invoice_number, today, items);
@@ -2075,6 +2067,65 @@ mod tests {
         assert_eq!(resp.line_items.len(), 2);
         assert_eq!(resp.total_netto_cents, 64_250); // 642,50 €
         assert_eq!(resp.total_brutto_cents, 76_458); // 642,50 × 1,19 = 764,575 → 764,58 €
+    }
+
+    fn ctx_with_offer(line_items_json: Option<serde_json::Value>, persons: Option<i32>) -> InvoiceContext {
+        InvoiceContext {
+            offer: ActiveOfferRow {
+                price_cents: 346_100,
+                offer_number: Some("2026-0105".into()),
+                line_items_json,
+                persons,
+            },
+            customer: CustomerRow {
+                id: Uuid::nil(), email: None, name: None, salutation: None,
+                first_name: None, last_name: None, phone: None,
+                customer_type: None, company_name: None, billing_address_id: None,
+            },
+            billing_street: String::new(),
+            billing_city: String::new(),
+            service_street: String::new(),
+            service_city: String::new(),
+            destination_street: String::new(),
+            destination_city: String::new(),
+            moving_date: None,
+        }
+    }
+
+    /// The manual editor is seeded with what the invoice prints: one line per KVA
+    /// position (labor flattened to hours × rate × persons, Nürnberger dropped),
+    /// then the Zusatzleistungen — all as netto cents.
+    #[test]
+    fn editor_seed_carries_the_kva_positions_and_extras() {
+        let kva = serde_json::json!([
+            {"description": "Umzugshelfer", "quantity": 8.0, "unit_price": 35.0, "is_labor": true},
+            {"description": "Halteverbotszone", "quantity": 1.0, "unit_price": 120.0},
+            {"description": "Nürnberger Versicherung", "quantity": 1.0, "unit_price": 0.0},
+            {"description": "Fahrkostenpauschale", "quantity": 0.0, "unit_price": 0.0, "flat_total": 450.0}
+        ]);
+        let ctx = ctx_with_offer(Some(kva), Some(6));
+        let extras = [ExtraServiceRequest { description: "Klavier".into(), price_cents: 15_050 }];
+
+        let items: Vec<ManualLineItem> = full_invoice_line_items(&ctx, &extras)
+            .into_iter()
+            .map(ManualLineItem::from)
+            .collect();
+
+        let got: Vec<(&str, i64)> = items.iter().map(|i| (i.description.as_str(), i.unit_price_cents)).collect();
+        assert_eq!(
+            got,
+            [("Umzugshelfer", 168_000), ("Halteverbotszone", 12_000), ("Fahrkostenpauschale", 45_000), ("Klavier", 15_050)]
+        );
+        assert!(items.iter().all(|i| i.quantity == 1.0));
+    }
+
+    /// Without stored KVA positions the editor still gets one editable lump-sum line.
+    #[test]
+    fn editor_seed_falls_back_to_a_lump_sum() {
+        let items = full_invoice_line_items(&ctx_with_offer(None, None), &[]);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].description, "Umzugsdienstleistung gemäß Angebot Nr. 2026-0105");
+        assert_eq!(ManualLineItem::from(items[0].clone()).unit_price_cents, 346_100);
     }
 
     #[test]
