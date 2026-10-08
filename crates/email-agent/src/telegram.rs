@@ -154,12 +154,16 @@ impl TelegramBot {
 
     /// Send a draft email to the admin for approval.
     /// Shows the draft text with Approve / Edit / Deny inline buttons.
+    /// `header` is the context block above the draft ("Einordnung", who the
+    /// customer is, open points for Alex). Sent as plain text: customer names and
+    /// LLM output routinely contain `*` and `_`, which break Telegram Markdown.
     pub async fn send_draft_for_approval(
         &self,
         draft_id: &str,
         customer_email: &str,
         subject: &str,
         body: &str,
+        header: Option<&str>,
     ) -> Result<DraftMessage, EmailError> {
         // Truncate body for Telegram (max 4096 chars)
         let display_body = if body.len() > 3000 {
@@ -167,11 +171,15 @@ impl TelegramBot {
         } else {
             body.to_string()
         };
+        let header = header
+            .map(|h| format!("{}\n\n", crate::text::truncate_on_char_boundary(h, 700)))
+            .unwrap_or_default();
 
         let text = format!(
-            "📧 *Neuer E-Mail-Entwurf*\n\n\
-             *An:* `{customer_email}`\n\
-             *Betreff:* {subject}\n\n\
+            "📧 Neuer E-Mail-Entwurf\n\n\
+             {header}\
+             An: {customer_email}\n\
+             Betreff: {subject}\n\n\
              ─────────────────\n\
              {display_body}\n\
              ─────────────────\n\n\
@@ -198,7 +206,6 @@ impl TelegramBot {
         let payload = serde_json::json!({
             "chat_id": self.admin_chat_id,
             "text": text,
-            "parse_mode": "Markdown",
             "reply_markup": inline_keyboard,
         });
 

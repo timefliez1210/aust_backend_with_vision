@@ -1,10 +1,13 @@
 use crate::calendar::{AvailabilityResult, ScheduleEntry};
 use crate::telegram::{ApprovalDecision, CalendarCommand, TelegramBot};
+use crate::context::MailContext;
+use crate::email_notification::strip_quoted_history;
+use crate::intent::{self, Classification, MailIntent};
 use crate::{EmailParser, EmailResponder, EmailResponse, ImapClient, SmtpClient};
 use aust_core::notifications::{self, MuteCallback, NotificationKind};
 use aust_core::config::{EmailConfig, TelegramConfig};
 use chrono::Datelike;
-use aust_core::models::{MovingInquiry, ParsedEmail};
+use aust_core::models::{InquirySource, MovingInquiry, ParsedEmail};
 use aust_assistant::llm::AssistantLlmProvider;
 use aust_storage::StorageProvider;
 use chrono::NaiveDate;
@@ -28,6 +31,8 @@ struct PendingDraft {
     pub thread_id: Option<Uuid>,
     /// DB message ID for the stored draft (so we can update status on approve/deny).
     pub db_message_id: Option<Uuid>,
+    /// Context shown above the draft in Telegram (Einordnung, Kunde, offene Punkte).
+    pub header: Option<String>,
 }
 
 /// Pending capacity override request waiting for Alex's decision.
@@ -504,75 +509,14 @@ impl EmailProcessor {
         } else {
             customer_email.clone()
         };
-
-        // Get or create inquiry for this customer
-        let inquiry = self
-            .inquiries
-            .entry(inquiry_key.clone())
-            .or_insert_with(|| MovingInquiry {
-                id: Uuid::now_v7(),
-                email: inquiry_key.clone(),
-                ..Default::default()
-            });
-
-        // Merge extracted data into existing inquiry
-        merge_inquiry(inquiry, &updated);
-
-        // Ensure the email field is always the real customer email.
-        if !updated.email.is_empty() {
-            inquiry.email = updated.email.clone();
-        }
-
-        // Snapshot values we need for DB storage (before releasing the borrow on self.inquiries)
-        let customer_email_final = inquiry.email.clone();
-
-        // Try to extract additional data from free-text via LLM
-        if matches!(
-            updated.source,
-            aust_core::models::InquirySource::DirectEmail
-                | aust_core::models::InquirySource::MediaEmail
-        ) {
-            match self
-                .responder
-                .extract_data_from_text(inquiry, &email.body_text)
-                .await
-            {
-                Ok(enriched) => {
-                    merge_inquiry(inquiry, &enriched);
-                }
-                Err(e) => {
-                    warn!("LLM data extraction failed: {e}");
-                }
-            }
-        }
-
-        // Check calendar availability if a preferred date is set
-        let availability = if let Some(date) = inquiry.scheduled_date {
-            match crate::calendar::check_availability(
-                &self.db,
-                date,
-                self.default_capacity,
-                self.alternatives_count,
-                self.search_window_days,
-            )
-            .await
-            {
-                Ok(avail) => Some(avail),
-                Err(e) => {
-                    warn!("Calendar availability check failed: {e}");
-                    None
-                }
-            }
+        let customer_email_final = if updated.email.is_empty() {
+            inquiry_key.clone()
         } else {
-            None
+            updated.email.clone()
         };
 
-        // If date is fully booked, send capacity question to Alex via Telegram
-        let inquiry_snapshot = inquiry.clone();
-
-        // Store inbound email in database (after inquiry borrow is released).
-        // `refs` puts In-Reply-To ahead of the References chain so the nearest
-        // ancestor is tried first.
+        // Store inbound email in database. `refs` puts In-Reply-To ahead of the
+        // References chain so the nearest ancestor is tried first.
         let mut refs: Vec<String> = email.in_reply_to.clone().into_iter().collect();
         refs.extend(email.references.iter().cloned());
 
@@ -580,11 +524,16 @@ impl EmailProcessor {
             .find_or_create_thread(
                 &customer_email_final,
                 &email.subject,
-                &inquiry_snapshot,
+                &updated,
                 &refs,
                 &email.from,
             )
             .await;
+
+        // What we already know about the sender — loaded before this mail is stored,
+        // so the thread history is the conversation *before* it.
+        let ctx = MailContext::load(&self.db, &customer_email_final, thread_id, None).await;
+
         let stored = self
             .store_inbound_email(
                 thread_id,
@@ -599,67 +548,82 @@ impl EmailProcessor {
                 &email.attachments,
             )
             .await;
-        let thread_id = Some(thread_id);
 
-        if let Some(ref avail) = availability
-            && !avail.requested_date_available {
-                info!(
-                    "Date {} is fully booked, sending capacity question to Telegram",
-                    avail.requested_date
-                );
-                self.send_capacity_question_to_admin(
-                    &inquiry_snapshot,
-                    avail.clone(),
+        // Decide what the mail wants before drafting anything. The quoted history
+        // is cut: it is our own text, and it made replies look like new inquiries.
+        let (own_text, _) = strip_quoted_history(&email.body_text);
+        let today = chrono::Utc::now().with_timezone(&chrono_tz::Europe::Berlin).date_naive();
+        let facts = ctx.facts(today);
+        let is_quote_form = updated.source == InquirySource::QuoteForm;
+        let classification = if is_quote_form {
+            // The website's quote form is a new inquiry by construction.
+            Classification { intent: MailIntent::NewInquiry, needs_reply: true, summary: String::new() }
+        } else if intent::is_automated(&email.from, &email.subject, &email.body_text) {
+            Classification { intent: MailIntent::Automated, needs_reply: false, summary: String::new() }
+        } else {
+            match self.responder.classify(&email.subject, &own_text, &facts).await {
+                Some(c) => c,
+                None => intent::fallback(ctx.has_committed_job()),
+            }
+        };
+        info!(
+            "Inbound email classified as {:?} (needs_reply: {}, committed job: {})",
+            classification.intent,
+            classification.needs_reply,
+            ctx.has_committed_job()
+        );
+
+        // Intake (ask for moving details, build a KVA once complete) only for a
+        // genuinely new request. Anyone with a KVA or a booked job is answered from
+        // what we know about them — asking them for their moving date again was the
+        // auto-responder's main failure.
+        let intake = is_quote_form || (classification.intent.is_intake() && !ctx.has_committed_job());
+        let header = draft_header(&classification, &ctx, &[]);
+
+        if intake {
+            self.run_intake(
+                &email,
+                &updated,
+                &inquiry_key,
+                &customer_email_final,
+                &own_text,
+                Some(thread_id),
+                header,
+            )
+            .await;
+        } else if !classification.needs_reply {
+            if !notifications::is_muted(&self.db, NotificationKind::EmailIncoming).await {
+                let text = format!("{header}\n\nKein Antwort-Entwurf nötig.");
+                let tg = self.telegram.lock().await;
+                tg.send_with_markup(
+                    tg.admin_chat_id(),
+                    &text,
+                    Some(notifications::mute_keyboard(NotificationKind::EmailIncoming)),
                 )
                 .await;
             }
-
-        // If inquiry has enough data, forward to offer pipeline
-        if inquiry_snapshot.is_complete() {
-            info!(
-                "Inquiry {} is complete, forwarding to offer pipeline",
-                inquiry_snapshot.id
-            );
-            if let Some(tx) = &self.offer_tx {
-                let _ = tx.send(ApprovalDecision::InquiryComplete(Box::new(inquiry_snapshot.clone())));
-            }
-            // Remove from HashMap so a future submission from the same customer
-            // (e.g. a new inquiry months later) starts fresh rather than merging
-            // into this completed entry's already-filled fields.
-            self.inquiries.remove(&inquiry_key);
-        }
-
-        // Generate draft response only for incomplete inquiries.
-        // When complete, the offer pipeline creates the customer-facing email draft instead —
-        // no "wird erstellt" confirmation needed, the offer email IS the response.
-        if !inquiry_snapshot.is_complete() {
+        } else {
             match self
                 .responder
-                .generate_response(&inquiry_snapshot, &email.body_text, availability.as_ref())
+                .generate_contextual_reply(&email.subject, &own_text, &classification, &facts)
                 .await
             {
-                Ok(response) => {
-                    // `customer_email_final` comes from the parsed inquiry, not from the
-                    // envelope. A web-form submission is always sent by
-                    // angebot@aust-umzuege.de with the real address inside the JSON, so
-                    // addressing the draft to `email.from` mailed our own inbox: the
-                    // customer never heard back, and the reply landed in INBOX unseen and
-                    // was processed as a fresh inquiry.
+                Ok(reply) => {
+                    let header = draft_header(&classification, &ctx, &reply.open_points);
+                    let response = EmailResponse { subject: reply_subject(&email.subject), body: reply.body };
                     self.submit_draft_for_approval(
                         &customer_email_final,
                         response,
                         email.message_id.clone(),
-                        thread_id,
+                        Some(thread_id),
+                        Some(header),
                     )
                     .await;
                 }
                 Err(e) => {
-                    error!("Failed to generate response (thread {thread_id:?}): {e}");
+                    error!("Failed to generate contextual reply (thread {thread_id}): {e}");
                     let tg = self.telegram.lock().await;
-                    tg.send_status_message(&format!(
-                        "Fehler bei Antwort-Generierung: {e}"
-                    ))
-                    .await;
+                    tg.send_status_message(&format!("Fehler bei Antwort-Generierung: {e}")).await;
                 }
             }
         }
@@ -690,6 +654,136 @@ impl EmailProcessor {
         }
     }
 
+    /// The intake flow for a new request: merge the parsed data into the open
+    /// in-memory inquiry, check the date, forward a complete inquiry to the offer
+    /// pipeline, or draft a mail asking for what is missing.
+    // one param per piece of the mail the intake needs
+    #[allow(clippy::too_many_arguments)]
+    async fn run_intake(
+        &mut self,
+        email: &ParsedEmail,
+        updated: &MovingInquiry,
+        inquiry_key: &str,
+        customer_email: &str,
+        own_text: &str,
+        thread_id: Option<Uuid>,
+        header: String,
+    ) {
+        // Get or create inquiry for this customer
+        let inquiry = self
+            .inquiries
+            .entry(inquiry_key.to_string())
+            .or_insert_with(|| MovingInquiry {
+                id: Uuid::now_v7(),
+                email: inquiry_key.to_string(),
+                ..Default::default()
+            });
+
+        // Merge extracted data into existing inquiry
+        merge_inquiry(inquiry, updated);
+
+        // Ensure the email field is always the real customer email.
+        if !updated.email.is_empty() {
+            inquiry.email = updated.email.clone();
+        }
+
+        // Try to extract additional data from free-text via LLM
+        if matches!(
+            updated.source,
+            InquirySource::DirectEmail | InquirySource::MediaEmail
+        ) {
+            match self.responder.extract_data_from_text(inquiry, own_text).await {
+                Ok(enriched) => {
+                    merge_inquiry(inquiry, &enriched);
+                }
+                Err(e) => {
+                    warn!("LLM data extraction failed: {e}");
+                }
+            }
+        }
+        let inquiry_snapshot = inquiry.clone();
+
+        // Check calendar availability if a preferred date is set
+        let availability = if let Some(date) = inquiry_snapshot.scheduled_date {
+            match crate::calendar::check_availability(
+                &self.db,
+                date,
+                self.default_capacity,
+                self.alternatives_count,
+                self.search_window_days,
+            )
+            .await
+            {
+                Ok(avail) => Some(avail),
+                Err(e) => {
+                    warn!("Calendar availability check failed: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // If date is fully booked, send capacity question to Alex via Telegram
+        if let Some(ref avail) = availability
+            && !avail.requested_date_available {
+                info!(
+                    "Date {} is fully booked, sending capacity question to Telegram",
+                    avail.requested_date
+                );
+                self.send_capacity_question_to_admin(&inquiry_snapshot, avail.clone())
+                    .await;
+            }
+
+        // If inquiry has enough data, forward to offer pipeline. The offer email
+        // the pipeline drafts IS the response — no "wird erstellt" mail.
+        if inquiry_snapshot.is_complete() {
+            info!(
+                "Inquiry {} is complete, forwarding to offer pipeline",
+                inquiry_snapshot.id
+            );
+            if let Some(tx) = &self.offer_tx {
+                let _ = tx.send(ApprovalDecision::InquiryComplete(Box::new(inquiry_snapshot.clone())));
+            }
+            // Remove from HashMap so a future submission from the same customer
+            // (e.g. a new inquiry months later) starts fresh rather than merging
+            // into this completed entry's already-filled fields.
+            self.inquiries.remove(inquiry_key);
+            return;
+        }
+
+        match self
+            .responder
+            .generate_response(&inquiry_snapshot, own_text, availability.as_ref())
+            .await
+        {
+            Ok(response) => {
+                // `customer_email` comes from the parsed inquiry, not from the
+                // envelope. A web-form submission is always sent by
+                // angebot@aust-umzuege.de with the real address inside the JSON, so
+                // addressing the draft to `email.from` mailed our own inbox: the
+                // customer never heard back, and the reply landed in INBOX unseen and
+                // was processed as a fresh inquiry.
+                self.submit_draft_for_approval(
+                    customer_email,
+                    response,
+                    email.message_id.clone(),
+                    thread_id,
+                    Some(header),
+                )
+                .await;
+            }
+            Err(e) => {
+                error!("Failed to generate response (thread {thread_id:?}): {e}");
+                let tg = self.telegram.lock().await;
+                tg.send_status_message(&format!(
+                    "Fehler bei Antwort-Generierung: {e}"
+                ))
+                .await;
+            }
+        }
+    }
+
     /// Send a draft response to Telegram for approval.
     async fn submit_draft_for_approval(
         &mut self,
@@ -697,6 +791,7 @@ impl EmailProcessor {
         response: EmailResponse,
         in_reply_to: String,
         thread_id: Option<Uuid>,
+        header: Option<String>,
     ) {
         let draft_id = Uuid::now_v7().to_string();
 
@@ -740,6 +835,7 @@ impl EmailProcessor {
             },
             thread_id,
             db_message_id,
+            header,
         };
 
         let tg = self.telegram.lock().await;
@@ -749,6 +845,7 @@ impl EmailProcessor {
                 customer_email,
                 &response.subject,
                 &response.body,
+                draft.header.as_deref(),
             )
             .await
         {
@@ -786,6 +883,7 @@ impl EmailProcessor {
                 &draft.customer_email,
                 &draft.subject,
                 &draft.body,
+                draft.header.as_deref(),
             )
             .await
         {
@@ -1587,5 +1685,35 @@ fn merge_inquiry(target: &mut MovingInquiry, source: &MovingInquiry) {
     }
     if matches!(target.source, aust_core::models::InquirySource::DirectEmail) {
         target.source = source.source;
+    }
+}
+
+/// The Telegram block above a draft: what the mail wants, who the customer is,
+/// and what Alex has to settle before sending.
+fn draft_header(c: &Classification, ctx: &MailContext, open_points: &[String]) -> String {
+    let mut h = format!("🧭 {}", c.intent.label());
+    if !c.summary.is_empty() {
+        h.push_str(&format!(": {}", c.summary));
+    }
+    h.push_str(&format!("\n👤 {}", ctx.summary()));
+    if !open_points.is_empty() {
+        h.push_str("\n\n❗ Offene Punkte für dich:");
+        for p in open_points {
+            h.push_str(&format!("\n- {p}"));
+        }
+    }
+    h
+}
+
+/// "Re: <subject>" without stacking prefixes.
+fn reply_subject(subject: &str) -> String {
+    let s = subject.trim();
+    let lower = s.to_lowercase();
+    if lower.starts_with("re:") || lower.starts_with("aw:") {
+        s.to_string()
+    } else if s.is_empty() {
+        "Ihre Nachricht".to_string()
+    } else {
+        format!("Re: {s}")
     }
 }

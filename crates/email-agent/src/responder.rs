@@ -24,11 +24,50 @@ Regeln:
 - Schreibe NUR den E-Mail-Text, keine Betreffzeile
 - Erwähne, dass Fotos der Räumlichkeiten als Alternative zur Gegenstandsliste akzeptiert werden (nur wenn Volume fehlt)
 - Wenn ein Terminhinweis gegeben wird (Wunschtermin nicht verfügbar), informiere den Kunden darüber und schlage die Alternativen vor
+- Beantworte keine Fragen mit erfundenen Fakten (Adressen, Preise, Termine, Fristen) — schreibe stattdessen, dass wir uns dazu melden
 - Keine Emojis"#,
         brand = p.brand_name,
         city = p.city,
     )
 }
+
+/// System prompt for a reply to someone we already know (or a question that is
+/// not an intake). The reply may only state facts from the context block: the
+/// old prompt had none and invented warehouse addresses and start dates.
+fn contextual_system_prompt(p: &TenantProfile) -> String {
+    format!(
+        r#"Du schreibst Antwort-Entwürfe für {brand} ({company}), ein Umzugs- und Entrümpelungsunternehmen in {city}. Inhaber: {owner}. Telefon: {phone}.
+Der Inhaber prüft jeden Entwurf, bevor er verschickt wird.
+
+Du bekommst: die neue E-Mail des Kunden, die Einordnung, und ALLES, was wir über den Kunden wissen (Aufträge, Angebote, Rechnungen, bisheriger Verlauf).
+
+Regeln:
+- Beantworte genau das, was der Kunde wissen will oder mitteilt. Keine Fragen nach Umzugsdaten, die für sein Anliegen keine Rolle spielen.
+- Nenne NUR Fakten, die im Kontext stehen (Termine, Uhrzeiten, Preise, Angebotsnummern, Adressen). Erfinde NIEMALS Adressen, Termine, Preise, Fristen, Verfügbarkeiten oder Zusagen.
+- Was du nicht aus dem Kontext beantworten kannst: schreibe, dass wir uns dazu kurzfristig melden (oder dass der Kunde uns unter {phone} erreicht), und führe den Punkt unten unter OFFENE PUNKTE auf.
+- Hat der Kunde schon einen Auftrag/Termin, beziehe dich darauf (z. B. "für Ihren Termin am 14.10.").
+- Annahme eines Angebots: bedanke dich. Steht im Kontext "Termin (fest)", darfst du ihn bestätigen. Steht dort nur "Wunschtermin", schreibe NICHT "wir bestätigen den Termin", sondern z. B. "Wir haben den 14.10. für Sie vorgesehen und bestätigen Ihnen den Termin in Kürze verbindlich." und nimm "Termin verbindlich bestätigen" in die OFFENEN PUNKTE auf.
+- Ablehnung: kurz und freundlich bedanken, nicht nachhaken.
+- Terminänderung oder Stornierung: nichts zusagen, nur bestätigen, dass die Nachricht angekommen ist und wir uns melden.
+- Deutsch, Sie-Form, freundlich, kurz. Absätze durch eine Leerzeile trennen. Keine Emojis, keine Betreffzeile, keine Platzhalter wie [Name], kein Markdown (keine Sternchen).
+- Anrede mit dem Namen aus dem Kontext, falls bekannt.
+- Unterschreibe mit "Mit freundlichen Grüßen\n{owner}\n{brand}"
+
+Ausgabeformat — genau so:
+<der E-Mail-Text>
+=== OFFENE PUNKTE ===
+- <Punkt, den der Inhaber klären muss>
+(oder "keine", wenn nichts offen ist)"#,
+        brand = p.brand_name,
+        company = p.name,
+        city = p.city,
+        owner = p.owner_name,
+        phone = p.phone,
+    )
+}
+
+/// Marker between the reply text and the open points in the contextual reply.
+const OPEN_POINTS_MARKER: &str = "=== OFFENE PUNKTE ===";
 
 /// System prompt for revising a draft along the owner's instructions.
 fn revise_system_prompt(p: &TenantProfile) -> String {
@@ -39,6 +78,7 @@ Der Geschäftsführer hat einen E-Mail-Entwurf überprüft und möchte Änderung
 Regeln:
 - Schreibe auf Deutsch, freundlich und professionell (Sie-Form)
 - Setze die Anweisungen des Geschäftsführers genau um
+- Erfinde keine Fakten (Adressen, Termine, Preise, Fristen), die weder im Entwurf noch in der Anweisung stehen
 - Behalte den allgemeinen Ton und die Struktur bei, sofern nicht anders gewünscht
 - Unterschreibe mit "Mit freundlichen Grüßen,\nIhr {brand} Team"
 - Schreibe NUR den überarbeiteten E-Mail-Text, keine Erklärungen oder Kommentare
@@ -102,6 +142,66 @@ impl EmailResponder {
             subject,
             body: response_body,
         })
+    }
+
+    /// Decide what an incoming mail wants. `None` when the LLM fails or answers
+    /// garbage; the caller then falls back on [`crate::intent::fallback`].
+    pub(crate) async fn classify(
+        &self,
+        subject: &str,
+        body: &str,
+        facts: &str,
+    ) -> Option<crate::intent::Classification> {
+        let messages = vec![
+            LlmMessage::system(crate::intent::SYSTEM_PROMPT.to_string()),
+            LlmMessage::user(crate::intent::user_prompt(subject, body, facts)),
+        ];
+        match self.llm.chat(ModelTier::Main, &messages).await {
+            Ok(r) => {
+                let parsed = crate::intent::parse(&r);
+                if parsed.is_none() {
+                    tracing::warn!("Intent classifier returned unparseable output");
+                }
+                parsed
+            }
+            Err(e) => {
+                tracing::warn!("Intent classification failed: {e}");
+                None
+            }
+        }
+    }
+
+    /// Draft a reply grounded in what we know about the customer. Returns the
+    /// mail and the points Alex has to settle himself (never sent to the customer).
+    pub(crate) async fn generate_contextual_reply(
+        &self,
+        subject: &str,
+        body: &str,
+        classification: &crate::intent::Classification,
+        facts: &str,
+    ) -> Result<ContextualReply, EmailError> {
+        let user_prompt = format!(
+            "Was wir über den Kunden wissen:\n{facts}\n\n\
+             Einordnung der neuen E-Mail: {label}{summary}\n\n\
+             === Neue E-Mail des Kunden ===\nBetreff: {subject}\n\n{body}\n\n\
+             Schreibe den Antwort-Entwurf.",
+            label = classification.intent.label(),
+            summary = if classification.summary.is_empty() {
+                String::new()
+            } else {
+                format!(" — {}", classification.summary)
+            },
+        );
+        let messages = vec![
+            LlmMessage::system(contextual_system_prompt(&self.profile)),
+            LlmMessage::user(user_prompt),
+        ];
+        let response = self
+            .llm
+            .chat(ModelTier::Main, &messages)
+            .await
+            .map_err(|e| EmailError::Llm(e.to_string()))?;
+        Ok(split_open_points(&response))
     }
 
     /// Use the LLM to generate a natural, friendly German follow-up email
@@ -429,6 +529,29 @@ fn format_services(inquiry: &MovingInquiry) -> String {
     }
 }
 
+/// A contextual reply draft plus what only Alex can answer.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ContextualReply {
+    pub body: String,
+    pub open_points: Vec<String>,
+}
+
+/// Split the LLM output at [`OPEN_POINTS_MARKER`]. Without the marker the whole
+/// text is the mail.
+fn split_open_points(response: &str) -> ContextualReply {
+    let (body, rest) = match response.find(OPEN_POINTS_MARKER) {
+        Some(i) => (&response[..i], &response[i + OPEN_POINTS_MARKER.len()..]),
+        None => (response, ""),
+    };
+    let open_points = rest
+        .lines()
+        .map(|l| l.trim().trim_start_matches(['-', '*', '•']).trim())
+        .filter(|l| !l.is_empty() && !l.eq_ignore_ascii_case("keine") && !l.eq_ignore_ascii_case("keine."))
+        .map(str::to_string)
+        .collect();
+    ContextualReply { body: body.trim().to_string(), open_points }
+}
+
 #[derive(Debug, Clone)]
 pub struct EmailResponse {
     pub subject: String,
@@ -473,6 +596,7 @@ Regeln:
 - Schreibe NUR den E-Mail-Text, keine Betreffzeile
 - Erwähne, dass Fotos der Räumlichkeiten als Alternative zur Gegenstandsliste akzeptiert werden (nur wenn Volume fehlt)
 - Wenn ein Terminhinweis gegeben wird (Wunschtermin nicht verfügbar), informiere den Kunden darüber und schlage die Alternativen vor
+- Beantworte keine Fragen mit erfundenen Fakten (Adressen, Preise, Termine, Fristen) — schreibe stattdessen, dass wir uns dazu melden
 - Keine Emojis"#);
         assert_eq!(revise_system_prompt(&aust()), r#"Du bist der E-Mail-Assistent von AUST Umzüge.
 Der Geschäftsführer hat einen E-Mail-Entwurf überprüft und möchte Änderungen.
@@ -480,10 +604,33 @@ Der Geschäftsführer hat einen E-Mail-Entwurf überprüft und möchte Änderung
 Regeln:
 - Schreibe auf Deutsch, freundlich und professionell (Sie-Form)
 - Setze die Anweisungen des Geschäftsführers genau um
+- Erfinde keine Fakten (Adressen, Termine, Preise, Fristen), die weder im Entwurf noch in der Anweisung stehen
 - Behalte den allgemeinen Ton und die Struktur bei, sofern nicht anders gewünscht
 - Unterschreibe mit "Mit freundlichen Grüßen,\nIhr AUST Umzüge Team"
 - Schreibe NUR den überarbeiteten E-Mail-Text, keine Erklärungen oder Kommentare
 - Keine Emojis"#);
+    }
+
+    #[test]
+    fn open_points_are_split_off() {
+        let r = split_open_points(
+            "Sehr geehrte Frau Sharma,\n\nwir melden uns.\n\nMit freundlichen Grüßen\n=== OFFENE PUNKTE ===\n- Lageradresse nennen\n* Starttermin klären\n",
+        );
+        assert_eq!(r.body, "Sehr geehrte Frau Sharma,\n\nwir melden uns.\n\nMit freundlichen Grüßen");
+        assert_eq!(r.open_points, vec!["Lageradresse nennen", "Starttermin klären"]);
+
+        let r = split_open_points("Danke!\n=== OFFENE PUNKTE ===\nkeine");
+        assert!(r.open_points.is_empty());
+        let r = split_open_points("Nur Text");
+        assert_eq!(r.body, "Nur Text");
+    }
+
+    #[test]
+    fn contextual_prompt_forbids_invention() {
+        let p = contextual_system_prompt(&aust());
+        assert!(p.contains("Erfinde NIEMALS"));
+        assert!(p.contains("05121 – 7558379"));
+        assert!(p.contains(OPEN_POINTS_MARKER));
     }
 
     /// Golden: Aust's confirmation mail is unchanged.
@@ -515,5 +662,88 @@ Regeln:
              Bei Rückfragen erreichen Sie uns jederzeit unter 05121 – 7558379.\n\n\
              Mit freundlichen Grüßen,\nIhr AUST Umzüge Team"
         );
+    }
+}
+
+/// Live check of the classifier and the grounded reply against real mails.
+/// `set -a; . ./.env; cargo test -p aust-email-agent live_replies -- --ignored --nocapture`
+#[cfg(test)]
+mod live {
+    use super::*;
+    use crate::context::{JobFacts, MailContext};
+    use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
+
+    fn llm() -> Arc<dyn AssistantLlmProvider> {
+        let base = std::env::var("AUST__LLM__OLLAMA__BASE_URL").unwrap_or("https://ollama.com".into());
+        let key = std::env::var("AUST__LLM__OLLAMA__API_KEY").ok();
+        let model = std::env::var("AUST__LLM__OLLAMA__ASSISTANT_MODEL").unwrap_or("gpt-oss:120b".into());
+        Arc::new(aust_assistant::llm::OllamaAssistantLlm::new(base, key).with_models(model.clone(), model))
+    }
+
+    fn sharma() -> MailContext {
+        MailContext {
+            customer_name: Some("Vera Sharma".into()),
+            customer_phone: None,
+            jobs: vec![JobFacts {
+                status: "accepted".into(),
+                service_type: Some("entruempelung".into()),
+                scheduled_date: NaiveDate::from_ymd_opt(2026, 10, 14),
+                end_date: NaiveDate::from_ymd_opt(2026, 10, 15),
+                start_time: NaiveTime::from_hms_opt(8, 0, 0),
+                origin: Some("Knollenstr. 5, 31134 Hildesheim".into()),
+                destination: None,
+                volume_m3: Some(165.0),
+                offer_number: Some("2026-0359".into()),
+                offer_brutto_cents: Some(615_000),
+                offer_sent_at: Some(DateTime::parse_from_rfc3339("2026-10-05T20:52:25Z").unwrap().with_timezone(&Utc)),
+                created_at: DateTime::parse_from_rfc3339("2026-10-05T19:24:45Z").unwrap().with_timezone(&Utc),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn live_replies() {
+        let r = EmailResponder::new(llm(), tests_profile());
+        let today = NaiveDate::from_ymd_opt(2026, 10, 6).unwrap();
+        let cases: Vec<(&str, &str, &str, MailContext)> = vec![
+            ("Sharma Fragen", "Re: Ihr Umzugsangebot",
+             "Hallo Herr Aust,\n\nDanke für das Angebot. Auf dieser Grundlage möchten wir die Entrümpelung und Einlagerung mit Ihnen machen.\n\nIch habe noch ein paar Fragen:\nKönnen Sie die Bohrlöcher auch verdecken?\nWo ist Ihr Lager? Könnte man die 6 Monate noch später verlängern falls nötig? Wie sind da die Vorlauffristen?\nNehmen Sie den Bauschutt auch mit und entsorgen ihn? (Auf dem Dachboden über der Garage)\nAb wann können Sie starten und muss die ganze Zeit jemand anwesend sein?\n\nGerne können Sie mich anrufen wenn es passt und wir besprechen die Details.\n\nViele Grüße\nVera Sharma",
+             sharma()),
+            ("Annahme", "AW: Ihr Umzugsangebot",
+             "Guten Tag,\n\nwir nehmen Ihr Angebot gerne an. Bitte bestätigen Sie uns den Termin.\n\nMfG\nThomas Krüger",
+             MailContext { customer_name: Some("Thomas Krüger".into()), jobs: vec![JobFacts { status: "offer_sent".into(), service_type: Some("umzug".into()), end_date: None, origin: Some("Almsstr. 3, 31134 Hildesheim".into()), destination: Some("Podbielskistr. 10, 30177 Hannover".into()), volume_m3: Some(28.0), offer_number: Some("2026-0340".into()), offer_brutto_cents: Some(189_000), ..sharma().jobs[0].clone() }], ..Default::default() }),
+            ("Neue Anfrage", "Umzug Dezember",
+             "Hallo, wir ziehen im Dezember mit einer 3-Zimmer-Wohnung von Hildesheim nach Hannover. Was würde das ungefähr kosten?\nGruß Lena Bauer",
+             MailContext::default()),
+            ("Dank", "Re: Rechnung 2026-37",
+             "Vielen Dank, ist überwiesen. Die Jungs waren super!\nViele Grüße",
+             MailContext { customer_name: Some("Petra Lange".into()), jobs: vec![JobFacts { status: "paid".into(), ..sharma().jobs[0].clone() }], ..Default::default() }),
+        ];
+        for (name, subject, body, ctx) in cases {
+            let facts = ctx.facts(today);
+            let c = r.classify(subject, body, &facts).await;
+            println!("\n================ {name} ================\n{c:?}");
+            let Some(c) = c else { continue };
+            if c.needs_reply && !(c.intent.is_intake() && !ctx.has_committed_job()) {
+                let reply = r.generate_contextual_reply(subject, body, &c, &facts).await.unwrap();
+                println!("--- Entwurf ---\n{}\n--- Offene Punkte ---\n{:#?}", reply.body, reply.open_points);
+            }
+        }
+    }
+
+    fn tests_profile() -> TenantProfile {
+        TenantProfile {
+            id: aust_core::tenant::AUST,
+            name: "Aust Umzüge & Haushaltsauflösungen".into(),
+            short_name: "Aust Umzüge".into(),
+            brand_name: "AUST Umzüge".into(),
+            owner_name: "Alex Aust".into(),
+            phone: "05121 – 7558379".into(),
+            city: "Hildesheim".into(),
+            review_url: String::new(),
+            depot_address: String::new(),
+        }
     }
 }

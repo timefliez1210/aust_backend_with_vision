@@ -35,6 +35,7 @@ async fn main() {
              (alternativ können Sie uns Fotos der Räumlichkeiten senden)\n\n\
              Mit freundlichen Grüßen,\n\
              Ihr AUST Umzüge Team",
+            None,
         )
         .await
     {

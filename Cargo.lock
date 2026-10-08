@@ -414,6 +414,7 @@ dependencies = [
  "aust-llm-providers",
  "aust-storage",
  "chrono",
+ "chrono-tz",
  "futures",
  "lettre",
  "mail-parser",

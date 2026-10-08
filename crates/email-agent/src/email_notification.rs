@@ -78,7 +78,7 @@ fn split_chunks(s: &str, max: usize) -> Vec<String> {
 /// Cut the quoted history off a reply. Returns the kept text and whether anything
 /// was cut. Never cuts the whole mail: a body that *starts* with a quote marker
 /// is kept as is.
-fn strip_quoted_history(body: &str) -> (String, bool) {
+pub(crate) fn strip_quoted_history(body: &str) -> (String, bool) {
     let lines: Vec<&str> = body.lines().collect();
     // The first marker decides; one on the very first line means the whole mail
     // is a quote (a forward, say), and it is kept.

@@ -18,9 +18,11 @@ IMAP poll → parse email → extract JSON attachment or plain text
 
 | File | Purpose |
 |------|---------|
-| `src/processor.rs` | Main orchestrator, state machine for drafts/approvals |
+| `src/processor.rs` | Main orchestrator, state machine for drafts/approvals. Per mail: thread → `MailContext` → classify → intake (`run_intake`) only for a new request from someone without a KVA/job; otherwise a grounded reply, or no draft (thanks/bounce/auto-reply) |
 | `src/parser.rs` | Email content parsing (HTML → text, JSON attachment extraction) |
-| `src/responder.rs` | LLM-powered response generation/revising |
+| `src/responder.rs` | LLM calls: `classify`, `generate_contextual_reply` (may only state facts from the context block; unknowns go to "OFFENE PUNKTE" for Alex, never into the mail), intake follow-up, revise. Live check: `set -a; . ./.env; cargo test -p aust-email-agent live_replies -- --ignored --nocapture` |
+| `src/context.rs` | `MailContext`: the sender's jobs (status, dates, addresses, KVA no. + brutto price), invoices, last 6 thread messages; `facts()` = the reply's only source of truth, `summary()` = the 👤 line in Telegram |
+| `src/intent.rs` | `MailIntent` (12 kinds), classifier prompt + JSON parse, no-LLM bounce/auto-reply filter, fallback when the LLM fails |
 | `src/telegram.rs` | Telegram Bot integration (inline keyboards, calendar commands, `/benachrichtigungen` + `nmute:`/`nunmute:`/`nset:` mute callbacks — the single getUpdates poller, so every bot button lands here) |
 | `src/email_notification.rs` | "📩 Neue E-Mail" text: full body, quoted reply history cut, split into ≤3500-char messages (max 4) |
 
