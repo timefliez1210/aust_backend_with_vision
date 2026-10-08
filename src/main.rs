@@ -42,6 +42,15 @@ impl TelegramNotifier for NoBot {
     async fn post(&self, _chat_id: i64, _body: String) -> aust_assistant::Result<i64> {
         Ok(0)
     }
+
+    async fn post_with_markup(
+        &self,
+        _chat_id: i64,
+        _body: String,
+        _markup: serde_json::Value,
+    ) -> aust_assistant::Result<i64> {
+        Ok(0)
+    }
 }
 
 /// Whether the running tenant has a Telegram bot. Jobs whose only output is a
@@ -483,9 +492,14 @@ async fn main() -> Result<()> {
                         .ok()
                         .flatten();
                         if let Some((chat_id,)) = owner_chat {
-                            let _ = TelegramNotifierImpl::new(cfg.telegram().bot_token.clone())
-                                .post(chat_id, format!("⏰ {n} ausstehende Aktion(en) sind abgelaufen. Bitte erneut versuchen."))
-                                .await;
+                            let _ = aust_assistant::notify(
+                                &db,
+                                &TelegramNotifierImpl::new(cfg.telegram().bot_token.clone()),
+                                chat_id,
+                                aust_core::notifications::NotificationKind::ActionExpired,
+                                format!("⏰ {n} ausstehende Aktion(en) sind abgelaufen. Bitte erneut versuchen."),
+                            )
+                            .await;
                         }
                     }
                     Err(e) => tracing::warn!("expire_stale failed: {e}"),
@@ -536,7 +550,8 @@ async fn main() -> Result<()> {
 
     // ── Daily briefing tick ───────────────────────────────────────────────────
     // Every 60s: post the daily briefing to the owner chat at the fixed slots
-    // (07:00 + 15:00 Europe/Berlin). Idempotent per (date, slot) via
+    // (07:00 + 15:00 Europe/Berlin), and at 21:00 tomorrow's appointments that
+    // start before 09:00 (if any). Idempotent per (date, slot) via
     // agent_briefing_log, so this cadence just polls whether a slot is due.
     {
         let (db, cfg) = (state.db.clone(), state.config.clone());
@@ -550,9 +565,14 @@ async fn main() -> Result<()> {
                 if let Err(e) = aust_assistant::hooks::briefing::run_briefing_tick(&db, &notifier).await {
                     tracing::warn!("Daily briefing tick failed: {e}");
                 }
+                if let Err(e) =
+                    aust_assistant::hooks::briefing::run_evening_preview_tick(&db, &notifier).await
+                {
+                    tracing::warn!("Evening preview tick failed: {e}");
+                }
             }
         });
-        tracing::info!("Daily briefing tick started (60 s interval, slots 07:00 + 15:00)");
+        tracing::info!("Daily briefing tick started (60 s interval, slots 07:00 + 15:00, preview 21:00)");
     }
 
     // Create router and start server

@@ -2,6 +2,7 @@ pub mod config;
 pub mod error;
 pub mod events;
 pub mod models;
+pub mod notifications;
 pub mod services;
 pub mod tenant;
 

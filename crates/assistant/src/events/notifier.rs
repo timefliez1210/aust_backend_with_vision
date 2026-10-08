@@ -5,6 +5,9 @@
 
 use async_trait::async_trait;
 
+use aust_core::notifications::{self, NotificationKind};
+use sqlx::PgPool;
+
 use crate::error::Result;
 
 /// Send plain-text messages to a Telegram chat.
@@ -16,6 +19,32 @@ use crate::error::Result;
 pub trait TelegramNotifier: Send + Sync {
     /// Post a plain-text message to the given chat and return the Telegram message ID.
     async fn post(&self, chat_id: i64, body: String) -> Result<i64>;
+
+    /// Post with an inline keyboard (`reply_markup`).
+    async fn post_with_markup(
+        &self,
+        chat_id: i64,
+        body: String,
+        markup: serde_json::Value,
+    ) -> Result<i64>;
+}
+
+/// Post a mutable notification: skipped when the office muted `kind`, otherwise
+/// sent with a "🔕 Stumm schalten" button. Returns `None` when muted.
+pub async fn notify(
+    pool: &PgPool,
+    notifier: &dyn TelegramNotifier,
+    chat_id: i64,
+    kind: NotificationKind,
+    body: String,
+) -> Result<Option<i64>> {
+    if notifications::is_muted(pool, kind).await {
+        return Ok(None);
+    }
+    notifier
+        .post_with_markup(chat_id, body, notifications::mute_keyboard(kind))
+        .await
+        .map(Some)
 }
 
 // ── Mock for tests ────────────────────────────────────────────────────────────
@@ -51,5 +80,14 @@ impl TelegramNotifier for MockNotifier {
             .expect("mutex poisoned")
             .push((chat_id, body));
         Ok(0)
+    }
+
+    async fn post_with_markup(
+        &self,
+        chat_id: i64,
+        body: String,
+        _markup: serde_json::Value,
+    ) -> Result<i64> {
+        self.post(chat_id, body).await
     }
 }

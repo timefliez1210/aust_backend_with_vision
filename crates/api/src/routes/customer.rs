@@ -471,7 +471,7 @@ async fn accept_inquiry(
 
     // Notify admin via Telegram
     notify_admin_telegram(
-        &state.config.telegram(),
+        &state,
         &format!("✅ Kunde hat Angebot angenommen: {customer_name}"),
     )
     .await;
@@ -528,7 +528,7 @@ async fn reject_inquiry(
 
     // Notify admin via Telegram
     notify_admin_telegram(
-        &state.config.telegram(),
+        &state,
         &format!("❌ Kunde hat Angebot abgelehnt: {customer_name}"),
     )
     .await;
@@ -595,24 +595,15 @@ async fn download_inquiry_pdf(
 
 // --- Helpers ---
 
-/// Send a notification to the admin via Telegram.
-async fn notify_admin_telegram(config: &aust_core::config::TelegramConfig, text: &str) {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .expect("reqwest client builder");
-    let api_url = format!(
-        "https://api.telegram.org/bot{}/sendMessage",
-        config.bot_token
-    );
-    let payload = serde_json::json!({
-        "chat_id": config.admin_chat_id,
-        "text": text,
-    });
-
-    if let Err(e) = client.post(&api_url).json(&payload).send().await {
-        tracing::error!("Failed to send Telegram notification: {e}");
-    }
+/// Tell the office the customer answered the KVA in the app (mutable).
+async fn notify_admin_telegram(state: &AppState, text: &str) {
+    let _ = crate::services::telegram_service::send_admin_notification(
+        &state.db,
+        state.config.telegram(),
+        aust_core::notifications::NotificationKind::CustomerResponse,
+        text,
+    )
+    .await;
 }
 
 /// `POST /api/v1/customer/auth/logout` — end this session.

@@ -177,7 +177,7 @@ pub struct DailyBriefing;
 impl Tool for DailyBriefing {
     fn name(&self) -> &'static str { "daily_briefing" }
     fn description(&self) -> &'static str {
-        "Erstellt die tägliche Übersicht (Termine, überfällige Rechnungen, offene Angebote, unbearbeitete E-Mails)."
+        "Erstellt die tägliche Übersicht: Termine heute/morgen mit Team, offene/überfällige Rechnungen, erledigte Aufträge ohne Rechnung, neue Anfragen, KVAs ohne Antwort, unbeantwortete E-Mails, fehlende Stunden, Fahrzeug-Fristen."
     }
     fn params_schema(&self) -> Value { json!({ "type": "object", "properties": {} }) }
     fn safety(&self) -> Safety { Safety::Read }

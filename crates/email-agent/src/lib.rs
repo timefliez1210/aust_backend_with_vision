@@ -1,6 +1,7 @@
 pub mod calendar;
 pub mod error;
 
+mod email_notification;
 mod imap_client;
 mod parser;
 mod processor;

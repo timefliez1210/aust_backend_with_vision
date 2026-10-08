@@ -23,7 +23,9 @@
 
 use chrono::{NaiveDate, Timelike};
 use chrono_tz::Europe::Berlin;
-use reqwest::Client;
+use aust_core::notifications::NotificationKind;
+
+use crate::services::telegram_service::send_admin_notification_with_base;
 use sqlx::PgPool;
 use tracing::{info, warn};
 
@@ -129,11 +131,6 @@ async fn fire_due_followups(
         return Ok(());
     }
 
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .expect("reqwest client builder");
-
     for c in candidates {
         if !should_ping(c.followup_last_pinged_on, today) {
             continue;
@@ -148,23 +145,21 @@ async fn fire_due_followups(
             c.scheduled_date,
             today,
         );
-        let api_url = format!("{}/bot{}/sendMessage", tg_base_url, tg_config.bot_token);
-        let payload = serde_json::json!({
-            "chat_id": tg_config.admin_chat_id,
-            "text": message,
-        });
-
-        match client.post(&api_url).json(&payload).send().await {
-            Ok(resp) if resp.status().is_success() => {
+        match send_admin_notification_with_base(
+            db,
+            tg_config,
+            tg_base_url,
+            NotificationKind::KvaFollowup,
+            &message,
+        )
+        .await
+        {
+            Ok(true) => {
                 info!("KVA follow-up pinged for {}", c.id);
                 offer_repo::mark_followup_pinged(db, c.id, today).await?;
             }
-            Ok(resp) => {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                warn!("Telegram KVA follow-up failed ({status}): {body}");
-            }
-            Err(e) => warn!("Failed to send KVA follow-up: {e}"),
+            Ok(false) => {}
+            Err(e) => warn!("Telegram KVA follow-up failed: {e}"),
         }
     }
 

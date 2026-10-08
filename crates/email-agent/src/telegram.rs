@@ -1,4 +1,5 @@
 use crate::EmailError;
+use aust_core::notifications::{mute_keyboard, NotificationKind};
 use reqwest::Client;
 use serde::Deserialize;
 use tracing::{debug, error, info, warn};
@@ -79,6 +80,15 @@ pub enum ApprovalDecision {
         callback_data: String,
         callback_query_id: String,
     },
+    /// A "🔕 Stumm schalten" / "🔔 Wieder einschalten" / settings-toggle press.
+    NotificationMute {
+        callback: aust_core::notifications::MuteCallback,
+        chat_id: i64,
+        message_id: i64,
+        callback_query_id: String,
+    },
+    /// `/benachrichtigungen` — list every notification kind with on/off buttons.
+    NotificationSettings,
     /// A photo or document (PDF) message from a chat that may be bound to the
     /// assistant agent. The orchestrator downloads the file via `getFile`,
     /// rasterizes PDFs, and forwards the images to the assistant.
@@ -129,6 +139,10 @@ impl TelegramBot {
             admin_chat_id,
             last_update_id: None,
         }
+    }
+
+    pub fn admin_chat_id(&self) -> i64 {
+        self.admin_chat_id
     }
 
     fn api_url(&self, method: &str) -> String {
@@ -264,7 +278,12 @@ impl TelegramBot {
                 && let Some(text) = &message.text {
                     let is_admin = message.chat.id == self.admin_chat_id;
                     if is_admin {
-                        if let Some(cmd) = Self::parse_calendar_command(text) {
+                        if Self::is_notification_settings_command(text) {
+                            responses.push(ApprovalResponse {
+                                draft_id: "notification_settings".to_string(),
+                                decision: ApprovalDecision::NotificationSettings,
+                            });
+                        } else if let Some(cmd) = Self::parse_calendar_command(text) {
                             responses.push(ApprovalResponse {
                                 draft_id: "calendar_command".to_string(),
                                 decision: ApprovalDecision::CalendarCommand(cmd),
@@ -380,6 +399,20 @@ impl TelegramBot {
                     chat_id,
                     message_id,
                     callback_data: data.to_string(),
+                    callback_query_id: callback.id.clone(),
+                },
+            });
+        }
+
+        // Mute buttons — answered by the processor once the switch is stored.
+        if let Some(cb) = aust_core::notifications::parse_callback(data) {
+            let msg = callback.message.as_ref();
+            return Some(ApprovalResponse {
+                draft_id: "notification_mute".to_string(),
+                decision: ApprovalDecision::NotificationMute {
+                    callback: cb,
+                    chat_id: msg.map(|m| m.chat.id).unwrap_or(self.admin_chat_id),
+                    message_id: msg.map(|m| m.message_id).unwrap_or(0),
                     callback_query_id: callback.id.clone(),
                 },
             });
@@ -519,25 +552,79 @@ impl TelegramBot {
         }
     }
 
-    /// Notify admin that a draft was sent successfully.
+    /// Notify admin that a draft was sent successfully. The caller checks the
+    /// mute switch.
     pub async fn notify_sent(&self, customer_email: &str, subject: &str) {
-        let text = format!(
-            "📬 E-Mail gesendet!\n\n*An:* `{customer_email}`\n*Betreff:* {subject}",
-        );
-        let payload = serde_json::json!({
-            "chat_id": self.admin_chat_id,
-            "text": text,
-            "parse_mode": "Markdown",
-        });
+        let text = format!("📬 E-Mail gesendet\n\nAn: {customer_email}\nBetreff: {subject}");
+        self.send_with_markup(
+            self.admin_chat_id,
+            &text,
+            Some(mute_keyboard(NotificationKind::EmailSent)),
+        )
+        .await;
+    }
 
+    /// Send a plain-text message (no Markdown) with an optional inline keyboard.
+    /// Returns the message id, `None` on failure (logged).
+    pub async fn send_with_markup(
+        &self,
+        chat_id: i64,
+        text: &str,
+        markup: Option<serde_json::Value>,
+    ) -> Option<i64> {
+        let mut payload = serde_json::json!({ "chat_id": chat_id, "text": text });
+        if let Some(m) = markup {
+            payload["reply_markup"] = m;
+        }
+        let resp = match self.client.post(self.api_url("sendMessage")).json(&payload).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                error!("Failed to send Telegram message: {e}");
+                return None;
+            }
+        };
+        match resp.json::<TelegramResponse<MessageResult>>().await {
+            Ok(r) if r.ok => r.result.map(|m| m.message_id),
+            Ok(r) => {
+                error!("Telegram sendMessage error: {}", r.description.unwrap_or_default());
+                None
+            }
+            Err(e) => {
+                error!("Parse sendMessage response failed: {e}");
+                None
+            }
+        }
+    }
+
+    /// Replace the inline keyboard of a sent message.
+    pub async fn edit_reply_markup(&self, chat_id: i64, message_id: i64, markup: serde_json::Value) {
+        let payload = serde_json::json!({
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "reply_markup": markup,
+        });
         if let Err(e) = self
             .client
-            .post(self.api_url("sendMessage"))
+            .post(self.api_url("editMessageReplyMarkup"))
             .json(&payload)
             .send()
             .await
         {
-            error!("Failed to send notification: {e}");
+            error!("Failed to edit reply markup: {e}");
+        }
+    }
+
+    /// Answer a callback query with a short toast.
+    pub async fn answer_callback_with_text(&self, callback_id: &str, text: &str) {
+        let payload = serde_json::json!({ "callback_query_id": callback_id, "text": text });
+        if let Err(e) = self
+            .client
+            .post(self.api_url("answerCallbackQuery"))
+            .json(&payload)
+            .send()
+            .await
+        {
+            error!("Failed to answer callback: {e}");
         }
     }
 
@@ -655,35 +742,32 @@ impl TelegramBot {
         None
     }
 
-    /// Notify admin about an incoming email.
-    pub async fn notify_new_email(&self, from: &str, subject: &str, preview: &str) {
-        let preview_short = if preview.len() > 200 {
-            format!("{}...", crate::text::truncate_on_char_boundary(preview, 200))
-        } else {
-            preview.to_string()
-        };
+    /// `/benachrichtigungen` (or `/stumm`) opens the notification switches.
+    fn is_notification_settings_command(text: &str) -> bool {
+        matches!(
+            text.trim().split('@').next().unwrap_or(""),
+            "/benachrichtigungen" | "/stumm"
+        )
+    }
 
-        let text = format!(
-            "📩 *Neue E-Mail eingegangen*\n\n\
-             *Von:* `{from}`\n\
-             *Betreff:* {subject}\n\n\
-             {preview_short}"
-        );
-
-        let payload = serde_json::json!({
-            "chat_id": self.admin_chat_id,
-            "text": text,
-            "parse_mode": "Markdown",
-        });
-
-        if let Err(e) = self
-            .client
-            .post(self.api_url("sendMessage"))
-            .json(&payload)
-            .send()
-            .await
-        {
-            error!("Failed to send new email notification: {e}");
+    /// Notify admin about an incoming email, with its full text (split over
+    /// several messages when long). The caller checks the mute switch; the mute
+    /// button sits under the last message.
+    pub async fn notify_new_email(
+        &self,
+        from: &str,
+        subject: &str,
+        body: &str,
+        attachments: &[String],
+    ) {
+        let msgs = crate::email_notification::format_email_notification(from, subject, body, attachments);
+        let last = msgs.len().saturating_sub(1);
+        for (i, text) in msgs.iter().enumerate() {
+            let markup = (i == last).then(|| mute_keyboard(NotificationKind::EmailIncoming));
+            if self.send_with_markup(self.admin_chat_id, text, markup).await.is_none() {
+                // Stop rather than deliver a mail with a hole in the middle.
+                break;
+            }
         }
     }
 }

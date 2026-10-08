@@ -14,7 +14,9 @@
 
 use chrono::{NaiveDate, Timelike};
 use chrono_tz::Europe::Berlin;
-use reqwest::Client;
+use aust_core::notifications::NotificationKind;
+
+use crate::services::telegram_service::send_admin_notification_with_base;
 use sqlx::PgPool;
 use tracing::{info, warn};
 
@@ -79,10 +81,6 @@ async fn fire_due_reminders(
     today: NaiveDate,
 ) -> anyhow::Result<()> {
     let reminders = vehicle_repo::fetch_active_reminders(db).await?;
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .expect("reqwest client builder");
 
     for r in reminders {
         // Dedupe: at most one ping per reminder per calendar day.
@@ -94,23 +92,22 @@ async fn fire_due_reminders(
         }
 
         let message = format_message(&r.vehicle_label, &r.reminder_label, r.due_date, today);
-        let api_url = format!("{}/bot{}/sendMessage", tg_base_url, tg_config.bot_token);
-        let payload = serde_json::json!({
-            "chat_id": tg_config.admin_chat_id,
-            "text": message,
-        });
-
-        match client.post(&api_url).json(&payload).send().await {
-            Ok(resp) if resp.status().is_success() => {
+        // Muted: not marked pinged, so it resumes the day the office unmutes it.
+        match send_admin_notification_with_base(
+            db,
+            tg_config,
+            tg_base_url,
+            NotificationKind::Vehicle,
+            &message,
+        )
+        .await
+        {
+            Ok(true) => {
                 info!("Vehicle reminder pinged for {}", r.id);
                 vehicle_repo::mark_pinged(db, r.id, today).await?;
             }
-            Ok(resp) => {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                warn!("Telegram vehicle reminder failed ({status}): {body}");
-            }
-            Err(e) => warn!("Failed to send vehicle reminder: {e}"),
+            Ok(false) => {}
+            Err(e) => warn!("Telegram vehicle reminder failed: {e}"),
         }
     }
 

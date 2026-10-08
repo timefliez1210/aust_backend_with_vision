@@ -752,7 +752,13 @@ async fn notify_hours_logged(
     let name = format!("{} {}", ctx.first_name, ctx.last_name);
     let label = ctx.job_label.unwrap_or_else(|| "—".into());
     let text = format_hours_log_message(&name, &label, is_job, clock_in, clock_out, break_minutes);
-    crate::services::telegram_service::send_admin_message(&state.config.telegram(), &text).await;
+    let _ = crate::services::telegram_service::send_admin_notification(
+        &state.db,
+        state.config.telegram(),
+        aust_core::notifications::NotificationKind::HoursLogged,
+        &text,
+    )
+    .await;
 }
 
 /// Build the German "worker logged hours" message for the office.
@@ -1476,8 +1482,9 @@ mod tests {
             admin_chat_id: 42,
             flash_contact_bot_token: "TEST_FLASH".into(),
         };
-        crate::services::telegram_service::send_admin_message_with_base(&cfg, &base, "🕒 hallo")
-            .await;
+        crate::services::telegram_service::post_admin_with_base(&cfg, &base, "🕒 hallo", None)
+            .await
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(counter.load(Ordering::SeqCst), 1);
     }

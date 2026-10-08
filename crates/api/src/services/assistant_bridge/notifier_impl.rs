@@ -30,14 +30,26 @@ impl TelegramNotifierImpl {
 #[async_trait]
 impl TelegramNotifier for TelegramNotifierImpl {
     async fn post(&self, chat_id: i64, body: String) -> aust_assistant::Result<i64> {
+        self.send(serde_json::json!({ "chat_id": chat_id, "text": body })).await
+    }
+
+    async fn post_with_markup(
+        &self,
+        chat_id: i64,
+        body: String,
+        markup: serde_json::Value,
+    ) -> aust_assistant::Result<i64> {
+        self.send(serde_json::json!({ "chat_id": chat_id, "text": body, "reply_markup": markup }))
+            .await
+    }
+}
+
+impl TelegramNotifierImpl {
+    async fn send(&self, payload: serde_json::Value) -> aust_assistant::Result<i64> {
         let url = format!(
             "https://api.telegram.org/bot{}/sendMessage",
             self.bot_token
         );
-        let payload = serde_json::json!({
-            "chat_id": chat_id,
-            "text": body,
-        });
 
         let resp = self
             .client

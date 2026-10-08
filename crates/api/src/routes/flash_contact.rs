@@ -75,14 +75,10 @@ async fn create_flash_contact(
 
     // Immediate Telegram notification
     let message = format_immediate_message(&contact);
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .expect("reqwest client builder");
-    crate::services::telegram_service::send_telegram_message(
-        &client,
-        &state.config.telegram().bot_token,
-        state.config.telegram().admin_chat_id,
+    let _ = crate::services::telegram_service::send_admin_notification(
+        &state.db,
+        state.config.telegram(),
+        aust_core::notifications::NotificationKind::Callback,
         &message,
     )
     .await;

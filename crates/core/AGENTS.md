@@ -13,6 +13,7 @@ table — the one exception; see below.)
 | `src/models/offer.rs` | Offer state | `OfferStatus`, `Offer`, `PricingBreakdown`, `PricingInput`, `PricingResult` |
 | `src/models/snapshots.rs` | Structured services + canonical response | `Services`, `InquiryResponse` (built by `crates/api/src/services/inquiry_builder.rs`) |
 | `src/models/volume.rs` | Estimation methods | `EstimationMethod` enum |
+| `src/notifications.rs` | Telegram mute switches | `NotificationKind` (stable keys + German labels), `is_muted`/`set_muted` on `telegram_muted_notifications`, mute/unmute/settings keyboards. Approval prompts, errors and self-set reminders have no kind and always arrive |
 | `src/models/user.rs` | Auth | `TokenClaims`, `UserRole` |
 | `src/models/{address,customer,employee,note,email}.rs` | Row/DTO structs (`Address`, `Customer`, `Employee`, `Note`, `EmailThread`/`EmailMessage`, etc.) | plain data, no logic |
 | `src/services/` | Trait abstractions consumed by `crates/assistant` | see below |

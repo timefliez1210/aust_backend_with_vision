@@ -5,6 +5,7 @@ use crate::repositories::{inquiry_repo, offer_repo};
 use crate::services::offer_builder::{build_offer_with_overrides, GeneratedOffer, OfferOverrides};
 use crate::AppState;
 use aust_core::config::TelegramConfig;
+use aust_core::notifications::{self, NotificationKind};
 use aust_llm_providers::{LlmMessage, LlmProvider};
 use reqwest::{
     multipart::{Form, Part},
@@ -253,31 +254,68 @@ pub(crate) fn telegram_api_base() -> String {
         .unwrap_or_else(|_| "https://api.telegram.org".to_string())
 }
 
-/// Send a plain-text notification to the admin chat (own client, never panics).
+/// Send a mutable notification to the admin chat: skipped when the office muted
+/// `kind`, otherwise sent with a "🔕 Stumm schalten" button. Never panics.
 ///
-/// **Caller**: ad-hoc notifications outside the offer pipeline (e.g. a worker
-/// logging their hours). Mirrors `send_telegram_message` but builds its own
-/// client so callers without one can fire-and-forget.
-pub(crate) async fn send_admin_message(config: &TelegramConfig, text: &str) {
-    send_admin_message_with_base(config, &telegram_api_base(), text).await;
+/// **Caller**: ad-hoc notifications outside the offer pipeline (a worker logging
+/// hours, a Rückrufwunsch, a customer answering a KVA, vehicle deadlines, KVA
+/// follow-ups).
+///
+/// Returns `Ok(true)` when sent, `Ok(false)` when muted, `Err` when Telegram
+/// failed — callers that dedupe (mark "pinged") only do so on `Ok(true)`.
+pub(crate) async fn send_admin_notification(
+    db: &PgPool,
+    config: &TelegramConfig,
+    kind: NotificationKind,
+    text: &str,
+) -> Result<bool, String> {
+    send_admin_notification_with_base(db, config, &telegram_api_base(), kind, text).await
 }
 
-/// Like `send_admin_message` but with an explicit base URL (tests pass a mock).
-pub(crate) async fn send_admin_message_with_base(config: &TelegramConfig, base: &str, text: &str) {
-    let client = match Client::builder()
+/// Like `send_admin_notification` but with an explicit base URL (tests pass a mock).
+pub(crate) async fn send_admin_notification_with_base(
+    db: &PgPool,
+    config: &TelegramConfig,
+    base: &str,
+    kind: NotificationKind,
+    text: &str,
+) -> Result<bool, String> {
+    if notifications::is_muted(db, kind).await {
+        return Ok(false);
+    }
+    post_admin_with_base(config, base, text, Some(notifications::mute_keyboard(kind)))
+        .await
+        .map(|()| true)
+}
+
+/// POST one `sendMessage` to the admin chat. Builds its own client.
+pub(crate) async fn post_admin_with_base(
+    config: &TelegramConfig,
+    base: &str,
+    text: &str,
+    markup: Option<serde_json::Value>,
+) -> Result<(), String> {
+    let client = Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            error!("Failed to build Telegram client: {e}");
-            return;
-        }
-    };
+        .map_err(|e| format!("Failed to build Telegram client: {e}"))?;
     let url = format!("{base}/bot{}/sendMessage", config.bot_token);
-    let payload = serde_json::json!({ "chat_id": config.admin_chat_id, "text": text });
-    if let Err(e) = client.post(&url).json(&payload).send().await {
-        error!("Failed to send Telegram admin message: {e}");
+    let mut payload = serde_json::json!({ "chat_id": config.admin_chat_id, "text": text });
+    if let Some(m) = markup {
+        payload["reply_markup"] = m;
+    }
+    match client.post(&url).json(&payload).send().await {
+        Ok(resp) if resp.status().is_success() => Ok(()),
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            error!("Telegram admin message failed ({status}): {body}");
+            Err(format!("Telegram HTTP {status}"))
+        }
+        Err(e) => {
+            error!("Failed to send Telegram admin message: {e}");
+            Err(e.to_string())
+        }
     }
 }
 

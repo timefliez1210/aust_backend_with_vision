@@ -21,7 +21,8 @@ IMAP poll → parse email → extract JSON attachment or plain text
 | `src/processor.rs` | Main orchestrator, state machine for drafts/approvals |
 | `src/parser.rs` | Email content parsing (HTML → text, JSON attachment extraction) |
 | `src/responder.rs` | LLM-powered response generation/revising |
-| `src/telegram.rs` | Telegram Bot integration (inline keyboards, calendar commands) |
+| `src/telegram.rs` | Telegram Bot integration (inline keyboards, calendar commands, `/benachrichtigungen` + `nmute:`/`nunmute:`/`nset:` mute callbacks — the single getUpdates poller, so every bot button lands here) |
+| `src/email_notification.rs` | "📩 Neue E-Mail" text: full body, quoted reply history cut, split into ≤3500-char messages (max 4) |
 
 ## Char-Boundary Safety
 

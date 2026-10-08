@@ -21,7 +21,7 @@ into the `aust-email-agent` Telegram poller.
 | `driver.rs` | Main processing loop: input → LLM → tool calls → reply. Also home of the grounding guard that blocks any reply UUID not backed by a real tool result (prevents fabricated IDs) |
 | `events/consumer.rs` | `AssistantEventConsumer` — polls `domain_events` (via `aust_core::events`) and dispatches by kind |
 | `events/handlers.rs` | Per-event-kind handlers, each given a `TelegramNotifier` to post to Alex without a dependency on `crates/api` |
-| `events/notifier.rs` | `TelegramNotifier` trait + `MockNotifier` |
+| `events/notifier.rs` | `TelegramNotifier` trait + `MockNotifier`; `notify()` = mute-aware post with the 🔕 button (kinds in `aust_core::notifications`) |
 | `memory/durable.rs` | Append-only `agent_memory` CRUD with supersession |
 | `memory/episodic.rs` | `agent_episodes` with 768-dim embeddings + similarity retrieval |
 | `memory/retrieval.rs` | `assemble_bundle` — pulls all three layers, caps by token budget |
@@ -32,7 +32,7 @@ into the `aust-email-agent` Telegram poller.
 | `tools/testing.rs` | `cfg(test)`-only mock implementation of every `aust_core::services` trait + `mock_bundle()` factory, used across the tool unit tests |
 | `hooks/post_action.rs` | Reflection hook: parses MemoryProposal, auto-stores if confidence ≥ 0.7 |
 | `hooks/consolidate.rs` | Nightly job: clusters episodes by tag, calls LLM, stores high-confidence patterns |
-| `hooks/briefing.rs` | Daily briefing assembler + scheduler (`run_briefing_tick`): auto-posts to the owner chat at 07:00 + 15:00 Europe/Berlin, once per slot/day via the `agent_briefing_log` claim. Driven by a 60s loop in `src/main.rs`. |
+| `hooks/briefing.rs` | Daily briefing assembler + schedulers. `run_briefing_tick` posts at 07:00 + 15:00 Europe/Berlin (today's appointments with route/m³/crew, tomorrow, open/overdue invoices, finished jobs without invoice, pipeline, unanswered mail, missing hours, vehicle deadlines); `run_evening_preview_tick` posts at 21:00 tomorrow's appointments starting before 09:00, only if any. Once per slot/day via the `agent_briefing_log` claim; driven by a 60s loop in `src/main.rs`. |
 | `hooks/reminders.rs` | Reminder tick: reconciles auto-nags (email unanswered, invoice dunning, review requests — each "open row ⇒ exactly one active recurring reminder" until it closes) and fires due ones. Short interval, `tokio::spawn` loop in `src/main.rs` |
 | `learning/features.rs` | `OfferFeatures` struct + extractor |
 | `learning/observations.rs` | Records offer adjustments to `offer_observations` |

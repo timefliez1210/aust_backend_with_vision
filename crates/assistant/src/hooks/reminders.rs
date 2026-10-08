@@ -27,7 +27,9 @@ use sqlx::PgPool;
 use tracing::{info, warn};
 
 use crate::error::Result;
-use crate::events::notifier::TelegramNotifier;
+use aust_core::notifications::NotificationKind;
+
+use crate::events::notifier::{notify, TelegramNotifier};
 
 const OPEN_HOUR: u32 = 7;
 const CLOSE_HOUR: u32 = 20;
@@ -240,8 +242,8 @@ async fn reconcile_review_reminders(pool: &PgPool) -> Result<()> {
 
 /// Fire every active reminder whose `due_at` has passed.
 async fn fire_due_reminders(pool: &PgPool, notifier: &dyn TelegramNotifier) -> Result<()> {
-    let due: Vec<(uuid::Uuid, i64, String, String, i32)> = sqlx::query_as(
-        "SELECT id, chat_id, text, recurrence, recur_hours FROM agent_reminders \
+    let due: Vec<(uuid::Uuid, i64, String, String, i32, Option<String>)> = sqlx::query_as(
+        "SELECT id, chat_id, text, recurrence, recur_hours, source FROM agent_reminders \
          WHERE active AND due_at <= NOW() ORDER BY due_at ASC LIMIT 50",
     )
     .fetch_all(pool)
@@ -249,7 +251,7 @@ async fn fire_due_reminders(pool: &PgPool, notifier: &dyn TelegramNotifier) -> R
 
     let now = Utc::now();
 
-    for (id, chat_id, text, recurrence, recur_hours) in due {
+    for (id, chat_id, text, recurrence, recur_hours, source) in due {
         let recurring = recurrence == "recurring";
 
         // Recurring reminder that came due outside business hours: snap it to the
@@ -264,8 +266,14 @@ async fn fire_due_reminders(pool: &PgPool, notifier: &dyn TelegramNotifier) -> R
             continue;
         }
 
+        // Auto-nags can be muted; a muted one still advances below, silently, so it
+        // doesn't pile up. Reminders Alex set himself have no kind and always fire.
         let body = format!("⏰ Erinnerung: {text}");
-        if let Err(e) = notifier.post(chat_id, body).await {
+        let sent = match NotificationKind::for_reminder_source(source.as_deref()) {
+            Some(kind) => notify(pool, notifier, chat_id, kind, body).await.map(|_| ()),
+            None => notifier.post(chat_id, body).await.map(|_| ()),
+        };
+        if let Err(e) = sent {
             // Leave it due so the next tick retries rather than dropping the ping.
             warn!(reminder = %id, "Reminder notify failed, will retry: {e}");
             continue;

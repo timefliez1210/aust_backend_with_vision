@@ -33,7 +33,7 @@ pub mod tools;
 pub mod voice;
 
 pub use error::{AssistantError, Result};
-pub use events::notifier::{MockNotifier, TelegramNotifier};
+pub use events::notifier::{notify, MockNotifier, TelegramNotifier};
 pub use llm::{AssistantLlmProvider, ModelTier, OllamaAssistantLlm};
 pub use roles::Role;
 pub use soul::Soul;

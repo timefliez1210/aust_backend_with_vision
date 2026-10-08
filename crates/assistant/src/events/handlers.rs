@@ -13,7 +13,9 @@ use tracing::{info, warn};
 use aust_core::events::DomainEvent;
 
 use crate::error::Result;
-use super::notifier::TelegramNotifier;
+use aust_core::notifications::NotificationKind;
+
+use super::notifier::{notify, TelegramNotifier};
 
 // ── Helper: look up the first Owner chat_id ──────────────────────────────────
 
@@ -66,7 +68,7 @@ pub async fn handle_inquiry_created(
         "📥 Neue Anfrage von {name}, {volume:.1} m³, {from} → {to}. Ich rechne.\n\n\
          Soll ich vorab eine Besichtigung eintragen? Sag mir einfach das Wunschdatum, dann lege ich sie an."
     );
-    let _ = notifier.post(chat_id, msg).await;
+    let _ = notify(pool, notifier, chat_id, NotificationKind::InquiryCreated, msg).await;
     Ok(())
 }
 
@@ -154,7 +156,7 @@ pub async fn handle_offer_drafted(
          Bitte über das Admin-Panel prüfen und senden — der Agent-Sendpfad \
          wird verdrahtet, sobald OfferService::send (SMTP + PDF-Anhang) bereit ist."
     );
-    let _ = notifier.post(chat_id, msg).await;
+    let _ = notify(pool, notifier, chat_id, NotificationKind::Offer, msg).await;
     Ok(())
 }
 
@@ -170,7 +172,7 @@ pub async fn handle_offer_sent(
 
     let name = payload_str(&event.payload, "customer_name");
     let msg = format!("📨 Angebot an {name} verschickt.");
-    let _ = notifier.post(chat_id, msg).await;
+    let _ = notify(pool, notifier, chat_id, NotificationKind::Offer, msg).await;
     Ok(())
 }
 
@@ -197,7 +199,7 @@ pub async fn handle_status_changed(
     let name = payload_str(payload, "customer_name");
     let old = payload_str(payload, "old_status");
     let msg = format!("🔄 {name}: {old} → {new_status}.");
-    let _ = notifier.post(chat_id, msg).await;
+    let _ = notify(pool, notifier, chat_id, NotificationKind::StatusChange, msg).await;
     Ok(())
 }
 
@@ -218,7 +220,7 @@ pub async fn handle_invoice_issued(
     let brutto = brutto_cents as f64 / 100.0;
 
     let msg = format!("🧾 Rechnung {number} an {name}: {brutto:.2} €.");
-    let _ = notifier.post(chat_id, msg).await;
+    let _ = notify(pool, notifier, chat_id, NotificationKind::Invoice, msg).await;
     Ok(())
 }
 
@@ -238,7 +240,7 @@ pub async fn handle_invoice_overdue(
     let days = p["days_overdue"].as_i64().unwrap_or(0);
 
     let msg = format!("⚠️ Rechnung {number} überfällig: {name}, {days} Tage.");
-    let _ = notifier.post(chat_id, msg).await;
+    let _ = notify(pool, notifier, chat_id, NotificationKind::Invoice, msg).await;
     Ok(())
 }
 

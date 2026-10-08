@@ -1,6 +1,7 @@
 use crate::calendar::{AvailabilityResult, ScheduleEntry};
 use crate::telegram::{ApprovalDecision, CalendarCommand, TelegramBot};
 use crate::{EmailParser, EmailResponder, EmailResponse, ImapClient, SmtpClient};
+use aust_core::notifications::{self, MuteCallback, NotificationKind};
 use aust_core::config::{EmailConfig, TelegramConfig};
 use chrono::Datelike;
 use aust_core::models::{MovingInquiry, ParsedEmail};
@@ -479,15 +480,13 @@ impl EmailProcessor {
         // subject routinely carries a name (root AGENTS.md).
         info!("Processing inbound email ({} attachments)", email.attachments.len());
 
-        // Notify Alex about the new email
-        {
+        // Notify Alex about the new email — full text, unless he muted these.
+        if !notifications::is_muted(&self.db, NotificationKind::EmailIncoming).await {
+            let attachments: Vec<String> =
+                email.attachments.iter().map(|a| a.filename.clone()).collect();
             let tg = self.telegram.lock().await;
-            tg.notify_new_email(
-                &customer_email,
-                &email.subject,
-                crate::text::truncate_on_char_boundary(&email.body_text, 300),
-            )
-            .await;
+            tg.notify_new_email(&customer_email, &email.subject, &email.body_text, &attachments)
+                .await;
         }
 
         // Parse the email first so we can use the real customer email as the HashMap key.
@@ -832,6 +831,66 @@ impl EmailProcessor {
     }
 
     /// Check Telegram for approval decisions and process them.
+    /// A mute button was pressed: store the switch, flip the button, confirm.
+    async fn handle_mute_callback(
+        &self,
+        callback: MuteCallback,
+        chat_id: i64,
+        message_id: i64,
+        callback_query_id: &str,
+    ) {
+        let (kind, mute) = match callback {
+            MuteCallback::Single(kind, mute) => (kind, mute),
+            MuteCallback::SettingsToggle(kind) => {
+                (kind, !notifications::is_muted(&self.db, kind).await)
+            }
+        };
+        let tg = self.telegram.lock().await;
+        if let Err(e) = notifications::set_muted(&self.db, kind, mute).await {
+            error!("Failed to store notification mute: {e}");
+            tg.answer_callback_with_text(callback_query_id, "Fehler — bitte nochmal versuchen")
+                .await;
+            return;
+        }
+        info!(kind = kind.key(), mute, "Notification switch changed");
+
+        let markup = match callback {
+            MuteCallback::Single(..) if mute => notifications::unmute_keyboard(kind),
+            MuteCallback::Single(..) => notifications::mute_keyboard(kind),
+            MuteCallback::SettingsToggle(_) => {
+                let muted = notifications::muted_kinds(&self.db).await.unwrap_or_default();
+                notifications::settings_message(&muted).1
+            }
+        };
+        if message_id != 0 {
+            tg.edit_reply_markup(chat_id, message_id, markup).await;
+        }
+        let toast = if mute {
+            format!("🔕 {} stumm geschaltet. /benachrichtigungen zum Einschalten.", kind.label())
+        } else {
+            format!("🔔 {} wieder eingeschaltet.", kind.label())
+        };
+        tg.answer_callback_with_text(callback_query_id, &toast).await;
+    }
+
+    /// `/benachrichtigungen`: every kind with an on/off button.
+    async fn send_notification_settings(&self) {
+        let muted = match notifications::muted_kinds(&self.db).await {
+            Ok(m) => m,
+            Err(e) => {
+                error!("Failed to load notification switches: {e}");
+                let tg = self.telegram.lock().await;
+                tg.send_status_message("Fehler beim Laden der Benachrichtigungs-Einstellungen.")
+                    .await;
+                return;
+            }
+        };
+        let (text, markup) = notifications::settings_message(&muted);
+        let tg = self.telegram.lock().await;
+        let chat = tg.admin_chat_id();
+        tg.send_with_markup(chat, &text, Some(markup)).await;
+    }
+
     async fn check_approvals(&mut self) {
         let poll_result = {
             let mut tg = self.telegram.lock().await;
@@ -852,6 +911,19 @@ impl EmailProcessor {
         };
 
         for response in responses {
+            match response.decision {
+                ApprovalDecision::NotificationMute { callback, chat_id, message_id, callback_query_id } => {
+                    self.handle_mute_callback(callback, chat_id, message_id, &callback_query_id)
+                        .await;
+                    continue;
+                }
+                ApprovalDecision::NotificationSettings => {
+                    self.send_notification_settings().await;
+                    continue;
+                }
+                _ => {}
+            }
+
             // Handle calendar commands
             if response.draft_id == "calendar_command" {
                 if let ApprovalDecision::CalendarCommand(cmd) = response.decision {
@@ -1274,8 +1346,10 @@ impl EmailProcessor {
                     .await;
                 }
 
-                let tg = self.telegram.lock().await;
-                tg.notify_sent(&draft.customer_email, &draft.subject).await;
+                if !notifications::is_muted(&self.db, NotificationKind::EmailSent).await {
+                    let tg = self.telegram.lock().await;
+                    tg.notify_sent(&draft.customer_email, &draft.subject).await;
+                }
             }
             Err(e) => {
                 error!("Failed to send email (thread {:?}): {e}", draft.thread_id);
@@ -1293,10 +1367,16 @@ impl EmailProcessor {
     pub async fn run(&mut self, poll_interval_secs: u64) {
         info!("Email processor started — polling every {poll_interval_secs}s");
 
-        let tg = self.telegram.lock().await;
-        tg.send_status_message("🟢 E-Mail-Agent gestartet. Ich überwache das Postfach.")
+        if !notifications::is_muted(&self.db, NotificationKind::AgentStarted).await {
+            let tg = self.telegram.lock().await;
+            let chat = tg.admin_chat_id();
+            tg.send_with_markup(
+                chat,
+                "🟢 E-Mail-Agent gestartet. Ich überwache das Postfach.",
+                Some(notifications::mute_keyboard(NotificationKind::AgentStarted)),
+            )
             .await;
-        drop(tg);
+        }
 
         let telegram_poll_secs = 2; // Telegram needs fast polling for button responses
         let mut imap_countdown = 0u64; // fetch emails on first iteration

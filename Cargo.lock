@@ -381,6 +381,7 @@ dependencies = [
  "sqlx",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "uuid",
  "validator",
 ]
@@ -540,6 +541,7 @@ dependencies = [
  "axum",
  "config",
  "dotenvy",
+ "serde_json",
  "sqlx",
  "tokio",
  "tokio-util",
