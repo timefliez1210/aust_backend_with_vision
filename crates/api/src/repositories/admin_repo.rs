@@ -392,7 +392,16 @@ pub(crate) async fn update_customer(
     sqlx::query_as(
         r#"
         UPDATE customers SET
-            name = COALESCE($2, name),
+            -- `name` is the legacy full name that the inquiry list, invoice and
+            -- KVA headers read. A caller that edits only first/last must not
+            -- leave it stale, so rebuild it from the structured parts.
+            name = COALESCE(
+                $2,
+                CASE WHEN $4::text IS NOT NULL OR $5::text IS NOT NULL
+                     THEN NULLIF(concat_ws(' ', COALESCE($4, first_name), COALESCE($5, last_name)), '')
+                END,
+                name
+            ),
             salutation = COALESCE($3, salutation),
             first_name = COALESCE($4, first_name),
             last_name = COALESCE($5, last_name),
@@ -1663,4 +1672,39 @@ pub(crate) async fn fetch_thread_documents(
 
     docs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     Ok(docs)
+}
+
+#[cfg(test)]
+mod tests {
+    /// Editing only the structured name (the inquiry page's customer form) must
+    /// rebuild the legacy `name` that list views and invoice/KVA headers read —
+    /// "Annemarie Lange" stayed on every document after the last name was fixed.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn editing_last_name_rebuilds_the_legacy_name(pool: sqlx::PgPool) {
+        let id = crate::test_helpers::insert_test_customer(&pool).await;
+        sqlx::query("UPDATE customers SET name = 'Annemarie Lange', first_name = 'Annemarie', last_name = 'Lange' WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let row = super::update_customer(&pool, id, None, None, None, Some("Langer"), None, None, None, None, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.name.as_deref(), Some("Annemarie Langer"));
+        assert_eq!(row.last_name.as_deref(), Some("Langer"));
+
+        // An explicit `name` still wins, and untouched names stay as they are.
+        let row = super::update_customer(&pool, id, Some("Frau Langer"), None, Some("Anne"), None, None, None, None, None, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.name.as_deref(), Some("Frau Langer"));
+        let row = super::update_customer(&pool, id, None, None, None, None, Some("0511"), None, None, None, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.name.as_deref(), Some("Frau Langer"));
+    }
 }

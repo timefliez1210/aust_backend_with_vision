@@ -385,8 +385,8 @@ pub(super) async fn update_customer(
 
     let repo_row = admin_repo::update_customer(
         &state.db, id,
-        request.name.as_deref(), salutation,
-        request.first_name.as_deref(), request.last_name.as_deref(),
+        trim_opt(request.name.as_deref()), salutation,
+        trim_opt(request.first_name.as_deref()), trim_opt(request.last_name.as_deref()),
         request.phone.as_deref(), email_update,
         customer_type, request.company_name.as_deref(),
         billing_address_id,
