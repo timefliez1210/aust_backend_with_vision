@@ -250,6 +250,7 @@ struct OrderListItem {
     id: Uuid,
     customer_name: Option<String>,
     customer_email: Option<String>,
+    customer_phone: Option<String>,
     origin_city: Option<String>,
     destination_city: Option<String>,
     #[serde(rename = "volume_m3")]
@@ -315,7 +316,7 @@ async fn list_orders(
     let orders: Vec<OrderListItem> = repo_orders
         .into_iter()
         .map(|r| OrderListItem {
-            id: r.id, customer_name: r.customer_name, customer_email: r.customer_email,
+            id: r.id, customer_name: r.customer_name, customer_email: r.customer_email, customer_phone: r.customer_phone,
             origin_city: r.origin_city, destination_city: r.destination_city,
             estimated_volume_m3: r.estimated_volume_m3, status: r.status,
             scheduled_date: r.scheduled_date, offer_price_brutto: r.offer_price_brutto,
@@ -568,6 +569,7 @@ async fn get_employee(
             serde_json::json!({
                 "inquiry_id": a.inquiry_id,
                 "customer_name": a.customer_name,
+                "customer_phone": a.customer_phone,
                 "origin_city": a.origin_city,
                 "destination_city": a.destination_city,
                 "booking_date": a.booking_date,
@@ -717,6 +719,7 @@ async fn employee_hours_summary(
             serde_json::json!({
                 "inquiry_id": r.inquiry_id,
                 "customer_name": r.customer_name,
+                "customer_phone": r.customer_phone,
                 "origin_city": r.origin_city,
                 "destination_city": r.destination_city,
                 "booking_date": r.booking_date,
@@ -755,6 +758,8 @@ async fn employee_hours_summary(
             serde_json::json!({
                 "calendar_item_id": r.calendar_item_id,
                 "title": r.title,
+                "customer_name": r.customer_name,
+                "customer_phone": r.customer_phone,
                 "category": r.category,
                 "location": r.location,
                 "scheduled_date": r.scheduled_date,
@@ -795,6 +800,7 @@ async fn employee_hours_summary(
                 "inquiry_id": r.inquiry_id,
                 "kind": r.kind,
                 "customer_name": r.customer_name,
+                "customer_phone": r.customer_phone,
                 "location": r.location,
                 "scheduled_date": r.scheduled_date,
                 "start_time": r.start_time,

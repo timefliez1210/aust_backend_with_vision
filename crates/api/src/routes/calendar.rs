@@ -84,6 +84,9 @@ struct ScheduleCalendarItem {
     total_days: i32,
     scheduled_date: NaiveDate,
     description: Option<String>,
+    /// Linked customer (Termine can have one) — shown as a tap-to-call link.
+    customer_name: Option<String>,
+    customer_phone: Option<String>,
 }
 
 /// A lightweight appointment (Besichtigung etc.) rendered on the calendar,
@@ -94,6 +97,7 @@ struct ScheduleAppointment {
     inquiry_id: Uuid,
     kind: String,
     customer_name: Option<String>,
+    customer_phone: Option<String>,
     start_time: Option<NaiveTime>,
     end_time: Option<NaiveTime>,
     assignee_name: Option<String>,
@@ -352,6 +356,8 @@ async fn get_schedule(
             total_days: r.total_days,
             scheduled_date: r.scheduled_date,
             description: r.description,
+            customer_name: r.customer_name,
+            customer_phone: r.customer_phone,
         });
     }
 
@@ -367,6 +373,7 @@ async fn get_schedule(
             inquiry_id: r.inquiry_id,
             kind: r.kind,
             customer_name: r.customer_name,
+            customer_phone: r.customer_phone,
             start_time: r.start_time,
             end_time: r.end_time,
             assignee_name: r.assignee_name,

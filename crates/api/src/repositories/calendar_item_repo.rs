@@ -30,6 +30,9 @@ pub(crate) struct CalendarItemRow {
     pub customer_type: Option<String>,
     #[sqlx(default)]
     pub company_name: Option<String>,
+    /// Customer's phone, so the calendar can offer a tap-to-call link.
+    #[sqlx(default)]
+    pub customer_phone: Option<String>,
     #[sqlx(default)]
     pub employee_notes: Option<String>,
     #[sqlx(default)]
@@ -73,7 +76,7 @@ pub(crate) async fn fetch_item_row(pool: &PgPool, id: Uuid) -> Result<CalendarIt
                ci.scheduled_date, ci.start_time, ci.end_time,
                ci.duration_hours::float8 AS duration_hours,
                ci.status, ci.created_at, ci.updated_at,
-               ci.customer_id, c.name AS customer_name, c.customer_type, c.company_name,
+               ci.customer_id, c.name AS customer_name, c.customer_type, c.company_name, c.phone AS customer_phone,
                ci.employee_notes, ci.end_date, ci.has_pauschale
         FROM calendar_items ci
         LEFT JOIN customers c ON c.id = ci.customer_id
@@ -101,7 +104,7 @@ pub(crate) async fn list_items_by_month(
                ci.scheduled_date, ci.start_time, ci.end_time,
                ci.duration_hours::float8 AS duration_hours,
                ci.status, ci.created_at, ci.updated_at,
-               ci.customer_id, c.name AS customer_name, c.customer_type, c.company_name,
+               ci.customer_id, c.name AS customer_name, c.customer_type, c.company_name, c.phone AS customer_phone,
                ci.employee_notes, ci.end_date, ci.has_pauschale
         FROM calendar_items ci
         LEFT JOIN customers c ON c.id = ci.customer_id
@@ -126,7 +129,7 @@ pub(crate) async fn list_items_all(pool: &PgPool) -> Result<Vec<CalendarItemRow>
                ci.scheduled_date, ci.start_time, ci.end_time,
                ci.duration_hours::float8 AS duration_hours,
                ci.status, ci.created_at, ci.updated_at,
-               ci.customer_id, c.name AS customer_name, c.customer_type, c.company_name,
+               ci.customer_id, c.name AS customer_name, c.customer_type, c.company_name, c.phone AS customer_phone,
                ci.employee_notes, ci.end_date, ci.has_pauschale
         FROM calendar_items ci
         LEFT JOIN customers c ON c.id = ci.customer_id

@@ -1086,6 +1086,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sending_a_kva_mail_never_rewinds_an_invoiced_inquiry() {
+        // Report d6098bc6: a reply in a thread with an active KVA (which attaches the
+        // offer PDF) knocked an invoiced job back to "Angebot gesendet".
+        use crate::test_helpers::{get_quote_status, insert_test_quote_with_status};
+        let state = crate::test_helpers::test_app_state().await;
+        let pool = state.db.clone();
+        let now = Utc::now();
+
+        for (from, expected) in [
+            ("offer_ready", "offer_sent"),
+            ("rejected", "offer_sent"),
+            ("offer_sent", "offer_sent"),
+            ("accepted", "accepted"),
+            ("completed", "completed"),
+            ("invoiced", "invoiced"),
+            ("paid", "paid"),
+        ] {
+            let id = insert_test_quote_with_status(&pool, from).await;
+            admin_repo::mark_inquiry_offer_sent(&pool, id, now)
+                .await
+                .expect("mark offer sent");
+            assert_eq!(get_quote_status(&pool, id).await, expected, "from {from}");
+        }
+    }
+
+    #[tokio::test]
     async fn opening_a_thread_marks_it_read_but_not_handled() {
         let state = crate::test_helpers::test_app_state().await;
         let pool = state.db.clone();

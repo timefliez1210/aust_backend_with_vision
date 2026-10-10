@@ -53,6 +53,8 @@ pub(crate) struct ScheduleCalendarItemRow {
     pub total_days: i32,
     pub scheduled_date: NaiveDate,
     pub description: Option<String>,
+    pub customer_name: Option<String>,
+    pub customer_phone: Option<String>,
 }
 
 /// One employee assignment row returned by `fetch_inquiry_employees` /
@@ -288,7 +290,9 @@ pub(crate) async fn fetch_schedule_calendar_items(
             ), '')                                                      AS employee_names,
             (gs.day::date - ci.scheduled_date)::int + 1                AS day_number,
             (COALESCE(ci.end_date, ci.scheduled_date) - ci.scheduled_date)::int + 1 AS total_days,
-            ci.scheduled_date
+            ci.scheduled_date,
+            c.name                                                      AS customer_name,
+            NULLIF(TRIM(c.phone), '')                                   AS customer_phone
         FROM calendar_items ci
         CROSS JOIN LATERAL generate_series(
             ci.scheduled_date,
@@ -297,9 +301,10 @@ pub(crate) async fn fetch_schedule_calendar_items(
         ) AS gs(day)
         LEFT JOIN calendar_item_employees cie ON cie.calendar_item_id = ci.id AND cie.job_date = gs.day::date
         LEFT JOIN employees e ON cie.employee_id = e.id
+        LEFT JOIN customers c ON c.id = ci.customer_id
         WHERE gs.day::date BETWEEN $1 AND $2
           AND ci.status NOT IN ('cancelled')
-        GROUP BY gs.day, ci.id
+        GROUP BY gs.day, ci.id, c.id
         ORDER BY gs.day
         "#,
     )

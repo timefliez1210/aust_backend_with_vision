@@ -468,6 +468,7 @@ pub(crate) struct ScheduleAppointmentRow {
     pub notes: Option<String>,
     pub status: String,
     pub customer_name: Option<String>,
+    pub customer_phone: Option<String>,
     /// Names of the assigned crew (comma-separated), for the calendar card.
     pub crew_names: Option<String>,
     /// Number of assigned crew members.
@@ -492,6 +493,7 @@ pub(crate) async fn fetch_for_schedule_range(
                    NULLIF(TRIM(COALESCE(c.first_name, '') || ' ' || COALESCE(c.last_name, '')), ''),
                    c.name, c.email
                ) AS customer_name,
+               NULLIF(TRIM(c.phone), '') AS customer_phone,
                crew.crew_names,
                COALESCE(crew.crew_count, 0) AS crew_count
         FROM inquiry_appointments a

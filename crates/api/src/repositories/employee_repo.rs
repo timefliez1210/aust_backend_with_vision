@@ -1695,6 +1695,7 @@ pub(crate) async fn fetch_hours_target(
 pub(crate) struct AdminAssignmentRow {
     pub inquiry_id: Uuid,
     pub customer_name: Option<String>,
+    pub customer_phone: Option<String>,
     pub origin_city: Option<String>,
     pub destination_city: Option<String>,
     pub booking_date: Option<NaiveDate>,
@@ -1715,6 +1716,7 @@ pub(crate) async fn fetch_admin_assignments(
         r#"
         SELECT ie.inquiry_id,
                COALESCE(c.first_name || ' ' || c.last_name, c.name) AS customer_name,
+               NULLIF(TRIM(c.phone), '') AS customer_phone,
                oa.city AS origin_city,
                da.city AS destination_city,
                ie.job_date AS booking_date,
@@ -1746,6 +1748,7 @@ pub(crate) async fn fetch_admin_assignments(
 pub(crate) struct AdminHoursRow {
     pub inquiry_id: Uuid,
     pub customer_name: Option<String>,
+    pub customer_phone: Option<String>,
     pub origin_city: Option<String>,
     pub destination_city: Option<String>,
     pub booking_date: Option<NaiveDate>,
@@ -1775,6 +1778,7 @@ pub(crate) async fn fetch_admin_hours(
         r#"
         SELECT ie.inquiry_id,
                COALESCE(c.first_name || ' ' || c.last_name, c.name) AS customer_name,
+               NULLIF(TRIM(c.phone), '') AS customer_phone,
                oa.city AS origin_city,
                da.city AS destination_city,
                ie.job_date AS booking_date,
@@ -1815,6 +1819,8 @@ pub(crate) async fn fetch_admin_hours(
 pub(crate) struct AdminCalendarItemHoursRow {
     pub calendar_item_id: Uuid,
     pub title: String,
+    pub customer_name: Option<String>,
+    pub customer_phone: Option<String>,
     pub category: String,
     pub location: Option<String>,
     pub scheduled_date: Option<NaiveDate>,
@@ -1844,6 +1850,8 @@ pub(crate) async fn fetch_admin_calendar_item_hours(
         r#"
         SELECT cie.calendar_item_id,
                ci.title,
+               COALESCE(c.first_name || ' ' || c.last_name, c.name) AS customer_name,
+               NULLIF(TRIM(c.phone), '') AS customer_phone,
                ci.category,
                ci.location,
                cie.job_date AS scheduled_date,
@@ -1884,6 +1892,7 @@ pub(crate) struct AdminAppointmentHoursRow {
     pub inquiry_id: Uuid,
     pub kind: String,
     pub customer_name: Option<String>,
+    pub customer_phone: Option<String>,
     pub location: Option<String>,
     pub scheduled_date: Option<NaiveDate>,
     pub start_time: Option<NaiveTime>,
@@ -1915,6 +1924,7 @@ pub(crate) async fn fetch_admin_appointment_hours(
                a.inquiry_id,
                a.kind,
                COALESCE(c.first_name || ' ' || c.last_name, c.name) AS customer_name,
+               NULLIF(TRIM(c.phone), '') AS customer_phone,
                COALESCE(
                    NULLIF(TRIM(CONCAT_WS(', ',
                        NULLIF(TRIM(CONCAT_WS(' ', ad.street, ad.house_number)), ''),

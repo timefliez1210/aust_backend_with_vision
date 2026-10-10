@@ -491,6 +491,7 @@ pub(crate) struct OrderListItem {
     pub id: Uuid,
     pub customer_name: Option<String>,
     pub customer_email: Option<String>,
+    pub customer_phone: Option<String>,
     pub origin_city: Option<String>,
     pub destination_city: Option<String>,
     pub estimated_volume_m3: Option<f64>,
@@ -516,6 +517,7 @@ pub(crate) async fn list_orders_single_status(
         SELECT q.id,
                c.name AS customer_name,
                c.email AS customer_email,
+               NULLIF(TRIM(c.phone), '') AS customer_phone,
                oa.city AS origin_city,
                da.city AS destination_city,
                q.estimated_volume_m3,
@@ -556,6 +558,7 @@ pub(crate) async fn list_orders_all_statuses(
         SELECT q.id,
                c.name AS customer_name,
                c.email AS customer_email,
+               NULLIF(TRIM(c.phone), '') AS customer_phone,
                oa.city AS origin_city,
                da.city AS destination_city,
                q.estimated_volume_m3,
@@ -971,13 +974,22 @@ pub(crate) async fn mark_offer_sent(
     Ok(())
 }
 
-/// Update inquiry status to offer_sent.
+/// Advance inquiry status to offer_sent — only from a stage before it.
+///
+/// **Why the guard**: every email in a thread with an active KVA carries the offer PDF,
+/// so a plain reply sent after the job was invoiced used to knock the inquiry back from
+/// `invoiced` to `offer_sent` (report d6098bc6, Reinicke 2026-10-07). Re-sending the KVA
+/// to a customer who already accepted/was billed must not rewind the pipeline; a new
+/// offer after a rejection/expiry still counts as sent.
 pub(crate) async fn mark_inquiry_offer_sent(
     pool: &PgPool,
     inquiry_id: Uuid,
     now: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE inquiries SET status = 'offer_sent', updated_at = $1 WHERE id = $2")
+    sqlx::query(
+        "UPDATE inquiries SET status = 'offer_sent', updated_at = $1 WHERE id = $2
+         AND status IN ('pending','info_requested','estimating','estimated','offer_ready','rejected','expired')",
+    )
         .bind(now)
         .bind(inquiry_id)
         .execute(pool)

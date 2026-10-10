@@ -58,6 +58,7 @@ struct CalendarItemDetail {
     updated_at: DateTime<Utc>,
     customer_id: Option<Uuid>,
     customer_name: Option<String>,
+    customer_phone: Option<String>,
     employees: Vec<calendar_item_repo::CalendarItemEmployee>,
 }
 
@@ -266,6 +267,7 @@ async fn get_item(
         updated_at: item.updated_at,
         customer_id: item.customer_id,
         customer_name: item.customer_name,
+        customer_phone: item.customer_phone,
         employees,
     }))
 }
