@@ -815,7 +815,11 @@ fn representative_frame_per_item(
         .iter()
         .map(|e| e.get("frame_count").and_then(|c| c.as_u64()).unwrap_or(0) as usize)
         .collect();
-    if images.is_empty() || counts.iter().sum::<usize>() != images.len() {
+    // Checked: `frame_count` comes from the public request, and release builds wrap
+    // on overflow — a forged count could wrap the sum onto images.len() and then
+    // index past the end, and a panic aborts the whole backend.
+    let total = counts.iter().try_fold(0usize, |acc, c| acc.checked_add(*c))?;
+    if images.is_empty() || total != images.len() {
         return None;
     }
 
@@ -2830,6 +2834,16 @@ mod tests {
         assert_eq!(frames[1].as_ref().unwrap().0, vec![0u8]);
         assert!(frames[2].is_none());
         assert_eq!(frames[3].as_ref().unwrap().0, vec![1u8]);
+    }
+
+    #[test]
+    fn forged_frame_counts_that_overflow_are_rejected_not_indexed() {
+        let images = vec![(vec![0u8], "image/jpeg".to_string())];
+        let manifest = serde_json::json!([
+            {"label": "a", "frame_count": u64::MAX},
+            {"label": "b", "frame_count": 2},
+        ]);
+        assert!(representative_frame_per_item(&images, &manifest).is_none());
     }
 
     #[test]
