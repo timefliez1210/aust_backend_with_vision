@@ -71,6 +71,10 @@ services:
       - "127.0.0.1:8080:8080"
     volumes:
       - /opt/aust/migrations:/app/migrations:ro
+      # whisper.cpp model for Telegram voice notes (see AUST__VOICE__MODEL_PATH).
+      - /opt/aust/whisper:/app/whisper:ro
+      # Josie's local embedding model cache (downloaded on first use; writable, uid 1000).
+      - /opt/aust/models:/app/models
     depends_on:
       postgres:
         condition: service_healthy

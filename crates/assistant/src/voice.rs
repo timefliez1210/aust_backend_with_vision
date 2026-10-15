@@ -1,17 +1,19 @@
 //! Voice transcription adapter.
 //!
-//! # Phase 6 plan
-//! In Phase 6 a real `WhisperTranscriber` will be wired here, calling either
-//! a local Whisper endpoint or the OpenAI Whisper API. The `VoiceTranscriber`
-//! trait is defined now so the session input normalization path can accept
-//! audio without breaking the API. Until Phase 6 the only implementation is
-//! `NoopTranscriber` which returns `Err(VoiceUnsupported)`.
-//!
-//! Integration point: the driver loop calls `transcriber.transcribe(ogg_bytes)`
-//! when it receives a Telegram voice message update and feeds the result into
-//! the normal text input path.
+//! Telegram voice notes (OGG/Opus) are transcribed locally with whisper.cpp
+//! (`WhisperCppTranscriber`): no audio leaves the server. The driver never sees
+//! audio — the bridge transcribes, echoes the transcript to Alex, and runs a
+//! normal text turn on it. `NoopTranscriber` stands in when no model is set up.
 
 use async_trait::async_trait;
+
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::time::Duration;
+
+use tokio::process::Command;
+use tokio::sync::Semaphore;
+use tracing::{info, warn};
 
 use crate::error::{AssistantError, Result};
 
@@ -25,11 +27,11 @@ pub trait VoiceTranscriber: Send + Sync {
     ///
     /// # Errors
     /// - [`AssistantError::VoiceUnsupported`] when the implementation is a no-op stub.
-    /// - [`AssistantError::Internal`] on actual transcription failures (Phase 6).
+    /// - [`AssistantError::Internal`] on actual transcription failures.
     async fn transcribe(&self, ogg_bytes: &[u8]) -> Result<String>;
 }
 
-/// No-op transcriber used until Phase 6 wires a real speech-to-text backend.
+/// Transcriber for deployments without a whisper model configured.
 ///
 /// Always returns [`AssistantError::VoiceUnsupported`].
 pub struct NoopTranscriber;
@@ -41,6 +43,158 @@ impl VoiceTranscriber for NoopTranscriber {
     }
 }
 
+/// The transcriber this deployment's `[voice]` config describes: whisper.cpp when
+/// a model file is present, otherwise the no-op stand-in.
+pub fn from_config(cfg: &aust_core::config::VoiceConfig) -> std::sync::Arc<dyn VoiceTranscriber> {
+    let model = PathBuf::from(cfg.model_path.trim());
+    if cfg.model_path.trim().is_empty() || !model.is_file() {
+        if !cfg.model_path.trim().is_empty() {
+            warn!(model = %model.display(), "Voice model not found — voice notes disabled");
+        }
+        return std::sync::Arc::new(NoopTranscriber);
+    }
+    info!(model = %model.display(), "Voice notes enabled (whisper.cpp)");
+    std::sync::Arc::new(WhisperCppTranscriber::new(WhisperSettings {
+        bin: PathBuf::from(&cfg.whisper_bin),
+        model,
+        threads: cfg.threads,
+        prompt: cfg.prompt.clone(),
+        timeout: Duration::from_secs(cfg.timeout_secs),
+    }))
+}
+
+/// Settings for [`WhisperCppTranscriber`].
+#[derive(Debug, Clone)]
+pub struct WhisperSettings {
+    /// `whisper-cli` binary (whisper.cpp).
+    pub bin: PathBuf,
+    /// GGML model file, e.g. `ggml-small-q5_1.bin`.
+    pub model: PathBuf,
+    /// CPU threads for one transcription; 0 = all cores.
+    pub threads: usize,
+    /// Initial prompt biasing the decoder toward the domain vocabulary.
+    pub prompt: String,
+    /// Upper bound for one transcription before it is abandoned.
+    pub timeout: Duration,
+}
+
+/// Local speech-to-text via whisper.cpp's `whisper-cli`.
+///
+/// One transcription at a time (a semaphore): the production VPS has a single
+/// core shared with the API, Postgres and the mail poller, so parallel decodes
+/// would only slow everything down together. The decode runs under `nice` so the
+/// rest of the backend stays responsive while it works. Greedy decoding with
+/// flash attention: on the benchmark clip it gave the same text as beam search
+/// in two thirds of the time.
+pub struct WhisperCppTranscriber {
+    settings: WhisperSettings,
+    slots: Semaphore,
+}
+
+impl WhisperCppTranscriber {
+    pub fn new(settings: WhisperSettings) -> Self {
+        Self { settings, slots: Semaphore::new(1) }
+    }
+
+    fn threads(&self) -> usize {
+        match self.settings.threads {
+            0 => std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
+            n => n,
+        }
+    }
+}
+
+#[async_trait]
+impl VoiceTranscriber for WhisperCppTranscriber {
+    async fn transcribe(&self, ogg_bytes: &[u8]) -> Result<String> {
+        let _slot = self
+            .slots
+            .acquire()
+            .await
+            .map_err(|e| AssistantError::Internal(format!("Transkription nicht verfügbar: {e}")))?;
+        let started = std::time::Instant::now();
+
+        let dir = std::env::temp_dir().join(format!("aust-voice-{}", uuid::Uuid::now_v7()));
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .map_err(|e| AssistantError::Internal(format!("voice tmp dir: {e}")))?;
+        let result = self.run(&dir, ogg_bytes).await;
+        if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
+            warn!("voice tmp cleanup failed: {e}");
+        }
+        if let Ok(text) = &result {
+            info!(ms = started.elapsed().as_millis() as u64, chars = text.len(), "Voice note transcribed");
+        }
+        result
+    }
+}
+
+impl WhisperCppTranscriber {
+    async fn run(&self, dir: &std::path::Path, ogg_bytes: &[u8]) -> Result<String> {
+        let ogg = dir.join("in.ogg");
+        let wav = dir.join("in.wav");
+        tokio::fs::write(&ogg, ogg_bytes)
+            .await
+            .map_err(|e| AssistantError::Internal(format!("voice write: {e}")))?;
+
+        // whisper.cpp wants 16 kHz mono PCM.
+        let ffmpeg = Command::new("ffmpeg")
+            .args(["-loglevel", "error", "-y", "-i"])
+            .arg(&ogg)
+            .args(["-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le"])
+            .arg(&wav)
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .map_err(|e| AssistantError::Internal(format!("ffmpeg nicht startbar: {e}")))?;
+        if !ffmpeg.status.success() {
+            return Err(AssistantError::Internal(format!(
+                "ffmpeg: {}",
+                String::from_utf8_lossy(&ffmpeg.stderr).trim()
+            )));
+        }
+
+        let mut cmd = Command::new("nice");
+        cmd.args(["-n", "10"])
+            .arg(&self.settings.bin)
+            .arg("-m")
+            .arg(&self.settings.model)
+            .args(["-l", "de", "-bs", "1", "-bo", "1", "-fa", "-nt", "-np"])
+            .args(["-t", &self.threads().to_string()]);
+        if !self.settings.prompt.trim().is_empty() {
+            cmd.args(["--prompt", self.settings.prompt.trim()]);
+        }
+        cmd.arg("-f").arg(&wav).stdin(Stdio::null()).kill_on_drop(true);
+
+        let out = tokio::time::timeout(self.settings.timeout, cmd.output())
+            .await
+            .map_err(|_| AssistantError::Internal("Transkription hat zu lange gedauert".to_string()))?
+            .map_err(|e| AssistantError::Internal(format!("whisper-cli nicht startbar: {e}")))?;
+        if !out.status.success() {
+            return Err(AssistantError::Internal(format!(
+                "whisper-cli: {}",
+                String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or("").trim()
+            )));
+        }
+        let text = clean_transcript(&String::from_utf8_lossy(&out.stdout));
+        if text.is_empty() {
+            return Err(AssistantError::Internal("Keine Sprache erkannt".to_string()));
+        }
+        Ok(text)
+    }
+}
+
+/// Collapse whisper's line-per-segment output into one paragraph and drop the
+/// bracketed non-speech markers it emits on silence ("[Musik]", "(Stille)").
+pub(crate) fn clean_transcript(raw: &str) -> String {
+    raw.split_whitespace()
+        .filter(|w| {
+            !((w.starts_with('[') && w.ends_with(']')) || (w.starts_with('(') && w.ends_with(')')))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -50,5 +204,36 @@ mod tests {
         let t = NoopTranscriber;
         let err = t.transcribe(b"fake audio").await.unwrap_err();
         assert!(matches!(err, AssistantError::VoiceUnsupported));
+    }
+
+    #[test]
+    fn transcript_is_one_clean_paragraph() {
+        assert_eq!(
+            clean_transcript(" Trag den Umzug von Frau Lange\n am Freitag ein. [Musik]\n"),
+            "Trag den Umzug von Frau Lange am Freitag ein."
+        );
+        assert_eq!(clean_transcript("[BLANK_AUDIO]\n"), "");
+    }
+
+    /// Runs only where whisper.cpp and a model are installed:
+    /// `AUST_TEST_WHISPER_BIN=… AUST_TEST_WHISPER_MODEL=… AUST_TEST_VOICE_OGG=…`.
+    #[tokio::test]
+    async fn transcribes_a_real_voice_note_when_whisper_is_installed() {
+        let (Ok(bin), Ok(model), Ok(ogg)) = (
+            std::env::var("AUST_TEST_WHISPER_BIN"),
+            std::env::var("AUST_TEST_WHISPER_MODEL"),
+            std::env::var("AUST_TEST_VOICE_OGG"),
+        ) else {
+            return;
+        };
+        let t = WhisperCppTranscriber::new(WhisperSettings {
+            bin: bin.into(),
+            model: model.into(),
+            threads: 0,
+            prompt: String::new(),
+            timeout: Duration::from_secs(300),
+        });
+        let text = t.transcribe(&std::fs::read(ogg).unwrap()).await.unwrap();
+        assert!(text.split_whitespace().count() > 5, "{text}");
     }
 }

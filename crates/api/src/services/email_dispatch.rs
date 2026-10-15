@@ -143,25 +143,25 @@ pub async fn send_offer_email_custom(
 /// # Returns
 /// The thread UUID to insert the draft into, or `None` if creation failed.
 pub(crate) async fn find_or_create_offer_thread(
-    state: &AppState,
+    db: &sqlx::PgPool,
     inquiry_id: Uuid,
     customer_email: &str,
 ) -> Option<Uuid> {
     // 1. Thread already directly linked to this inquiry
-    if let Ok(Some(tid)) = email_repo::find_thread_by_inquiry(&state.db, inquiry_id).await {
+    if let Ok(Some(tid)) = email_repo::find_thread_by_inquiry(db, inquiry_id).await {
         return Some(tid);
     }
 
     // 2. Thread linked by customer (not yet linked to this inquiry)
-    if let Ok(Some(tid)) = email_repo::find_thread_by_inquiry_customer(&state.db, inquiry_id).await
+    if let Ok(Some(tid)) = email_repo::find_thread_by_inquiry_customer(db, inquiry_id).await
     {
         // Link thread to inquiry while we're here
-        let _ = email_repo::link_thread_to_inquiry(&state.db, tid, inquiry_id).await;
+        let _ = email_repo::link_thread_to_inquiry(db, tid, inquiry_id).await;
         return Some(tid);
     }
 
     // 3. No thread exists — create one (e.g. manually-created admin inquiry)
-    let customer = customer_repo::fetch_by_email(&state.db, customer_email)
+    let customer = customer_repo::fetch_by_email(db, customer_email)
         .await
         .unwrap_or(None);
 
@@ -170,7 +170,7 @@ pub(crate) async fn find_or_create_offer_thread(
         return None;
     };
 
-    let profile = match crate::repositories::tenant_repo::profile(&state.db).await {
+    let profile = match crate::repositories::tenant_repo::profile(db).await {
         Ok(p) => p,
         Err(e) => {
             error!("Cannot create email thread: tenant profile not loaded: {e}");
@@ -179,7 +179,7 @@ pub(crate) async fn find_or_create_offer_thread(
     };
     let thread_id = Uuid::now_v7();
     match email_repo::create_thread(
-        &state.db,
+        db,
         thread_id,
         customer.id,
         inquiry_id,

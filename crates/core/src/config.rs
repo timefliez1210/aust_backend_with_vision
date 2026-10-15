@@ -24,12 +24,78 @@ pub struct Config {
     pub vision_service: VisionServiceConfig,
     #[serde(default)]
     pub company: CompanyConfig,
+    /// Local speech-to-text for Telegram voice notes (`[voice]`, env `AUST__VOICE__…`).
+    #[serde(default)]
+    pub voice: VoiceConfig,
+    /// Josie's long-term memory (`[memory]`, env `AUST__MEMORY__…`).
+    #[serde(default)]
+    pub memory: MemoryConfig,
     /// Mailbox and Telegram of every tenant other than Aust, keyed by
     /// `tenants.slug` (`[tenants.<slug>]`, env `AUST__TENANTS__<SLUG>__…`). Aust
     /// keeps the top-level `email` and `telegram`. Read through
     /// [`Config::email`] / [`Config::telegram`], never directly.
     #[serde(default)]
     pub tenants: HashMap<String, TenantIntegrations>,
+}
+
+/// Josie's episodic memory search.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct MemoryConfig {
+    /// `"local"`: embed episodes in-process (multilingual MiniLM, ~240 MB model,
+    /// ~0.8 GB RAM while loaded) for meaning-based recall. `"off"`: German
+    /// full-text search only. Off by default so dev and tests never download it.
+    pub embeddings: String,
+    /// Where the embedding model is downloaded to / loaded from.
+    pub model_cache_dir: String,
+    /// Unload the model after this many idle seconds to give the RAM back.
+    pub idle_unload_secs: u64,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            embeddings: "off".to_string(),
+            model_cache_dir: "models".to_string(),
+            idle_unload_secs: 600,
+        }
+    }
+}
+
+/// Local whisper.cpp transcription of Telegram voice notes.
+///
+/// Off while `model_path` is empty (or the file is missing): Josie then answers
+/// voice notes with a short "nicht eingerichtet" instead of silently ignoring them.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct VoiceConfig {
+    /// whisper.cpp CLI binary.
+    pub whisper_bin: String,
+    /// GGML model file, e.g. `/opt/aust/whisper/ggml-small-q5_1.bin`.
+    pub model_path: String,
+    /// CPU threads per transcription; 0 = all cores.
+    pub threads: usize,
+    /// Abandon a transcription after this many seconds.
+    pub timeout_secs: u64,
+    /// Longest voice note accepted, in seconds.
+    pub max_duration_secs: u32,
+    /// Initial prompt biasing whisper toward the business vocabulary.
+    pub prompt: String,
+}
+
+impl Default for VoiceConfig {
+    fn default() -> Self {
+        Self {
+            whisper_bin: "whisper-cli".to_string(),
+            model_path: String::new(),
+            threads: 0,
+            timeout_secs: 300,
+            max_duration_secs: 300,
+            prompt: "Umzug, Besichtigung, Halteverbot, Kostenvoranschlag, KVA, Rechnung, Termin, \
+                     Crew, Möbellift, Einpackservice, Kubikmeter, Hildesheim."
+                .to_string(),
+        }
+    }
 }
 
 /// One tenant's own mailbox and Telegram bot.

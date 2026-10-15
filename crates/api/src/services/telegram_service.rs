@@ -370,7 +370,7 @@ pub(crate) async fn handle_offer_approval(
     };
 
     // Find or create an email thread for this inquiry so the draft is visible in the dashboard.
-    let thread_id = crate::services::email_dispatch::find_or_create_offer_thread(state, inquiry_id, &customer_email).await;
+    let thread_id = crate::services::email_dispatch::find_or_create_offer_thread(&state.db, inquiry_id, &customer_email).await;
 
     let Some(thread_id) = thread_id else {
         send_telegram_message(

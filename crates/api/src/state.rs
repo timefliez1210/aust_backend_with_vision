@@ -29,6 +29,8 @@ pub struct AppState {
     pub tool_registry: Arc<ToolRegistry>,
     /// Assistant soul — loaded from SOUL.md at startup (stub if file missing).
     pub soul: Arc<Soul>,
+    /// Speech-to-text for Telegram voice notes (no-op when no model is configured).
+    pub transcriber: Arc<dyn aust_assistant::voice::VoiceTranscriber>,
 }
 
 impl AppState {
@@ -50,6 +52,7 @@ impl AppState {
             storage.clone(),
         );
         let events = EventEmitter::new(db.clone());
+        let transcriber = aust_assistant::voice::from_config(&config_arc.voice);
         Self {
             config: config_arc,
             db,
@@ -62,6 +65,7 @@ impl AppState {
             assistant_llm,
             tool_registry,
             soul,
+            transcriber,
         }
     }
 }

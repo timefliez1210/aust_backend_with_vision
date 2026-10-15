@@ -200,34 +200,38 @@ pub struct SendInvoice;
 #[async_trait]
 impl Tool for SendInvoice {
     fn name(&self) -> &'static str { "send_invoice" }
-    fn description(&self) -> &'static str { "Sendet eine Rechnung per E-Mail. Erfordert Bestätigung." }
+    fn description(&self) -> &'static str {
+        "Sendet die Rechnung (PDF) per E-Mail an den Kunden — derselbe Weg wie 'Senden' im Dashboard: Rechnung danach 'versendet', Auftrag 'abgerechnet', Zahlungserinnerung in 7 Tagen. Schlussrechnungen erst nach Auftragsabschluss. 'to' muss die hinterlegte E-Mail des Kunden sein. Erfordert Bestätigung."
+    }
     fn params_schema(&self) -> Value {
         json!({
             "type": "object",
-            "properties": { "invoice_id": { "type": "string", "format": "uuid" } },
-            "required": ["invoice_id"]
+            "properties": {
+                "invoice_id": { "type": "string", "format": "uuid" },
+                "to":         { "type": "string", "minLength": 3, "description": "E-Mail des Kunden (zur Kontrolle)" }
+            },
+            "required": ["invoice_id", "to"]
         })
     }
     fn safety(&self) -> Safety { Safety::Confirm }
     fn min_role(&self) -> Role { Role::Owner }
 
     fn summarize(&self, args: &Value) -> String {
-        let id = args["invoice_id"].as_str().unwrap_or("?");
-        format!("Rechnung {id} per E-Mail an den Kunden senden?")
+        format!("Rechnung jetzt per E-Mail an {} senden?", args["to"].as_str().unwrap_or("?"))
     }
 
     async fn execute(&self, ctx: &ToolCtx, args: &Value) -> Result<Value> {
-        let _id = parse_uuid(args, "invoice_id", self.name())?;
+        let id = parse_uuid(args, "invoice_id", self.name())?;
+        let to = super::parse_str(args, "to", self.name())?;
         if !ctx.confirmed {
             return Ok(pending_confirmation(self.name(), args, self.summarize(args)));
         }
-        // The PDF send pipeline (S3 fetch + SMTP attach) is plumbed through the
-        // legacy route handler and not yet exposed via the InvoiceService trait.
-        // Returning NotWired surfaces the fact that the action did NOT happen,
-        // rather than the silent no-op the marker pattern previously produced.
-        Err(crate::error::AssistantError::NotWired(
-            "Rechnungsversand per E-Mail".to_string(),
-        ))
+        match ctx.services.invoices.send(id, to).await {
+            Ok(sent_to) => Ok(json!({ "ok": true, "summary": format!("Rechnung an {sent_to} gesendet") })),
+            // Not sendable yet / wrong address / no PDF: say so, nothing went out.
+            Err(aust_core::services::ServiceError::Validation(msg)) => Ok(json!({ "ok": false, "message": msg })),
+            Err(e) => Err(e.into()),
+        }
     }
 }
 
@@ -461,7 +465,7 @@ mod tests {
     #[tokio::test]
     async fn send_invoice_pending() {
         let services = testing::mock_bundle(uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
-        let r = SendInvoice.execute(&ctx(services), &json!({ "invoice_id": uuid::Uuid::new_v4() })).await.unwrap();
+        let r = SendInvoice.execute(&ctx(services), &json!({ "invoice_id": uuid::Uuid::new_v4(), "to": "kunde@example.com" })).await.unwrap();
         assert_eq!(r["status"], json!("pending_confirmation"));
     }
 

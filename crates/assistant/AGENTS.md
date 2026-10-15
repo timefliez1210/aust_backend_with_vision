@@ -9,6 +9,7 @@ into the `aust-email-agent` Telegram poller.
 
 | Module | Purpose |
 |--------|---------|
+| `message_refs.rs` | `telegram_message_refs`: entity IDs behind every bot message (notifications, Josie replies, keyboards, reminders); a Telegram reply resolves its referent from here |
 | `soul.rs` | Loads + validates SOUL.md at startup; exposes parsed sections |
 | `llm.rs` | Two-tier LLM routing (Main / Cheap) plus an image override, all config-driven — see Key Constraints |
 | `roles.rs` | `Role { Owner, Operator }` + satisfaction helpers |
@@ -17,21 +18,21 @@ into the `aust-email-agent` Telegram poller.
 | `audit.rs` | Immutable `agent_actions` log writer |
 | `confirmation.rs` | `pending_actions` queue: enqueue, resolve, expire |
 | `retention.rs` | GC sweepers for assistant-owned tables (`agent_actions`, sessions, episodes, …), independent per table, driven every 6h from `src/main.rs`; returns `(deleted, summarized)` counts |
-| `voice.rs` | `VoiceTranscriber` trait + `NoopTranscriber` (Phase 6) |
+| `voice.rs` | `VoiceTranscriber` + `WhisperCppTranscriber` (local whisper.cpp, one job at a time under `nice`, `[voice]` config) + `NoopTranscriber` when no model is set |
 | `driver.rs` | Main processing loop: input → LLM → tool calls → reply. Also home of the grounding guard that blocks any reply UUID not backed by a real tool result (prevents fabricated IDs) |
 | `events/consumer.rs` | `AssistantEventConsumer` — polls `domain_events` (via `aust_core::events`) and dispatches by kind |
 | `events/handlers.rs` | Per-event-kind handlers, each given a `TelegramNotifier` to post to Alex without a dependency on `crates/api` |
 | `events/notifier.rs` | `TelegramNotifier` trait + `MockNotifier`; `notify()` = mute-aware post with the 🔕 button (kinds in `aust_core::notifications`) |
 | `memory/durable.rs` | Append-only `agent_memory` CRUD with supersession |
-| `memory/episodic.rs` | `agent_episodes` with 768-dim embeddings + similarity retrieval |
+| `memory/episodic.rs` | `agent_episodes`: one row per write Josie performs and per confirmation outcome; hybrid recall (German FTS `search_tsv` + optional 384-dim `embedding_local` + entity-scope tags, recency-weighted) |
+| `memory/embedder.rs` | Optional in-process embeddings (fastembed, multilingual MiniLM Q, ~0.8 GB RAM while loaded, idle-unloaded); `[memory] embeddings = "local"\|"off"` |
 | `memory/retrieval.rs` | `assemble_bundle` — pulls all three layers, caps by token budget |
 | `memory/proposals.rs` | `pending_memory_proposals` — low-confidence memory proposals (reflection hook <0.7, nightly consolidation <0.8) queued for Alex's batch approval via Telegram; append-only, `approve` inserts into `agent_memory` |
 | `memory/session_mem.rs` | Session-scoped memory helpers backing `session.rs` |
 | `tools/mod.rs` | `Tool` trait, `Safety` enum, `ToolRegistry`, schema validation |
-| `tools/inquiries.rs`, `offers.rs`, `calendar.rs`, `customers.rs`, `emails.rs`, `invoices.rs`, `employees.rs`, `estimates.rs`, `addresses.rs`, `reminders.rs`, `reviews.rs`, `settings.rs`, `meta.rs` | ~88 tools total (see Tools below); one file per business domain, matching the `ServiceBundle` traits in `aust-core` |
+| `tools/inquiries.rs`, `offers.rs`, `calendar.rs`, `customers.rs`, `emails.rs`, `invoices.rs`, `employees.rs`, `estimates.rs`, `addresses.rs`, `reminders.rs`, `reviews.rs`, `settings.rs`, `meta.rs` | 91 tools, 89 registered (see Tools below); one file per business domain, matching the `ServiceBundle` traits in `aust-core` |
 | `tools/testing.rs` | `cfg(test)`-only mock implementation of every `aust_core::services` trait + `mock_bundle()` factory, used across the tool unit tests |
-| `hooks/post_action.rs` | Reflection hook: parses MemoryProposal, auto-stores if confidence ≥ 0.7 |
-| `hooks/consolidate.rs` | Nightly job: clusters episodes by tag, calls LLM, stores high-confidence patterns |
+| `hooks/reflection.rs` | Nightly learning (06:00 Berlin, slot `reflection`): reads last day's episodes + turns, proposes ≤3 lessons into `pending_memory_proposals`, posts each with ✅/❌ (`mp:<id>:ok\|no`); nothing stored without Alex's tap |
 | `hooks/briefing.rs` | Daily briefing assembler + schedulers. `run_briefing_tick` posts at 07:00 + 15:00 Europe/Berlin (today's appointments with route/m³/crew, tomorrow, open/overdue invoices, finished jobs without invoice, pipeline, unanswered mail, missing hours, vehicle deadlines); `run_evening_preview_tick` posts at 21:00 tomorrow's appointments starting before 09:00, only if any. Once per slot/day via the `agent_briefing_log` claim; driven by a 60s loop in `src/main.rs`. |
 | `hooks/reminders.rs` | Reminder tick: reconciles auto-nags (email unanswered, invoice dunning, review requests — each "open row ⇒ exactly one active recurring reminder" until it closes) and fires due ones. Short interval, `tokio::spawn` loop in `src/main.rs` |
 | `learning/features.rs` | `OfferFeatures` struct + extractor |
@@ -40,7 +41,7 @@ into the `aust-email-agent` Telegram poller.
 
 ## Tools
 
-88 tools across 13 domain files (counted via `impl Tool for`): `calendar.rs` (13),
+91 tools across 13 domain files (counted via `impl Tool for`; 89 registered in `ToolRegistry::new`): `calendar.rs` (13),
 `inquiries.rs`/`offers.rs`/`invoices.rs` (10 each), `meta.rs` (8), `customers.rs`/`emails.rs`/`reviews.rs`
 (7 each), `employees.rs` (5), `reminders.rs`/`estimates.rs`/`settings.rs` (3 each), `addresses.rs` (2).
 Every tool declares a `Safety` (Read/Write) and minimum `Role`; the `ToolRegistry` validates
@@ -53,14 +54,26 @@ directly (would create a circular dependency); `DraftOffer`/`CommitOfferDraft` g
 | File | Purpose |
 |------|---------|
 | `SOUL.md` | Persona (Josie), Hard Rules (no unconfirmed writes, no deletes, no fabricated data/IDs — must call the real tool, `create_feedback` on real defects), Domain Primer, Tone, Escalation. Has real content; three `TODO(alex)` markers remain for additional business rules, typical order sizes/seasonality, and specific escalation paths |
-| `tools_preamble.md` | Tool-calling etiquette injected into every turn |
-| `reflection_post_action.md` | Prompt template for post-action hook |
-| `consolidation_nightly.md` | Prompt template for nightly consolidation |
+| `tools_preamble.md` | Tool etiquette + Telegram-context/email/memory notes, tenant-neutral, injected into every system prompt (`driver::TOOLS_PREAMBLE`) |
+| `reflection_nightly.md` | Prompt for the nightly reflection |
 | `offer_drafting.md` | Context for offer drafting tool |
 
 ## Key Constraints
 
 - `driver.rs` is named `driver` not `loop` — `loop` is a reserved Rust keyword.
+- **Tool calls use the native protocol.** The model's own call is kept as an assistant
+  message with `tool_calls`, each result goes back as a `role: "tool"` message
+  (`LlmMessage::assistant_tool_calls` / `LlmMessage::tool_result`), capped at
+  `MAX_TOOL_RESULT_CHARS`. Never feed results back as `user` text.
+- **Sessions keep tool traces.** Each assistant `Turn` carries `tools` (one capped line
+  per call), so data and IDs a tool returned stay citable on the next message.
+  Confirm/Cancel/Edit taps are recorded via `driver::record_resolution`; after a confirm
+  the bridge runs a continuation turn (`Input::prior_action`) that finishes any open
+  steps or answers `FERTIG` (suppressed).
+- **Writes go through the admin code path.** Bridge impls in `crates/api/src/services/bridge/`
+  must call the same service the admin route calls (`services::inquiry_update`,
+  `services::calendar_item_update`, `admin_repo::update_customer`, …), never a parallel
+  `UPDATE`. A Josie write must look exactly like the same click in the admin UI.
 - No `unwrap()` in non-test code.
 - German for all user-facing strings (tool descriptions, Telegram replies).
 - **Josie's models come from `LlmConfig::ollama`, but not from its `model` field.**
@@ -80,7 +93,7 @@ directly (would create a circular dependency); `DraftOffer`/`CommitOfferDraft` g
   `chat_core` routes any turn carrying `images` to `vision_model` regardless of tier.
   `gemma4:31b` is the free multimodal option.
 - `LinfaPredictor::train` and `predict` are `unimplemented!("Phase 5")`.
-- `NoopTranscriber::transcribe` returns `Err(VoiceUnsupported)` — Phase 6 wires real ASR.
+- Voice notes need `AUST__VOICE__MODEL_PATH` (whisper GGML model); without it `NoopTranscriber` answers "nicht eingerichtet".
 - Tools never call `offer_builder` directly (would create circular dep); `DraftOffer`/`CommitOfferDraft` return a marker JSON via the `OfferService` trait instead.
 
 ## Testing
@@ -98,25 +111,17 @@ No dedicated `TEST_DATABASE_URL` convention in this crate. Two patterns coexist:
 
 ## Open phases
 
-Phases 0-3 shipped: soul, memory, registry, driver, Telegram wiring, real offer
-drafting, confirmation keyboards, event consumer and retention sweepers.
-
-- **Phase 4 deferred** — embedding-based episode clustering, because Ollama Cloud
-  offers no embedding model.
-- **Phase 5 TODO** — train `LinfaPredictor` on `offer_observations` (needs 50+ rows).
-- **Phase 6 TODO** — `WhisperTranscriber` for real voice input.
+Shipped 2026-10-14: native tool protocol, session tool traces + confirmation
+outcomes + continuation, admin write paths, Telegram message refs, voice
+(whisper.cpp), hybrid episodic memory, nightly reflection with Telegram approval,
+offer observations. Open: train `LinfaPredictor` once `offer_observations` has 50+ rows.
 
 ## Known partial wires
 
-- `SendInvoice`, `SendOfferToCustomer`, `UpdatePricing` return `AssistantError::NotWired`
-  on confirm — the PDF-send pipeline (S3 fetch + SMTP attach) is plumbed through the legacy
-  route handler, not yet exposed via `InvoiceService`/`OfferService`, and `SettingsService::update_pricing`
-  has no implementation yet.
+- `UpdatePricing` stays unregistered (`SettingsService::update_pricing` has no implementation).
 - `apply_nl_override` is rule-based (LLM variant deferred).
-- `post_action::reflect` and `hooks::consolidate` are not scheduled — and
-  would need to route through `pending_memory_proposals` before being safe
-  to schedule (auto-store at confidence ≥ 0.7 currently bypasses B6's
-  Confirm gate on `remember`).
-- `agent_owns_approval=true` (`events/handlers.rs::handle_offer_ready`) hands the
-  offer approval off to the admin panel. The send itself is still not wired, see
-  `SendOfferToCustomer` above.
+- `LinfaPredictor::train`/`predict` are still stubs; `offer_observations` is now filled
+  by `offer_builder::record_price_adjustment` whenever an offer is built with a manual
+  price/crew/hours/rate override — train once 50+ rows exist.
+- Albums are merged per poll batch only (photos of one album arriving in two polls
+  still make two turns).

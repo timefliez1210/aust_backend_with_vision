@@ -272,6 +272,8 @@ async fn main() -> Result<()> {
     // `/api/chat` path), not the generic provider — see EmailResponder.
     let llm_for_email = assistant_llm.clone();
     let tool_registry = std::sync::Arc::new(ToolRegistry::new());
+    // Episodic memory search: in-process embeddings when `[memory] embeddings = "local"`.
+    aust_assistant::memory::embedder::init(&config.memory);
     let soul: std::sync::Arc<Soul> = {
         let soul_path = std::path::Path::new("SOUL.md");
         match aust_assistant::soul::load(soul_path) {
@@ -498,6 +500,7 @@ async fn main() -> Result<()> {
                                 chat_id,
                                 aust_core::notifications::NotificationKind::ActionExpired,
                                 format!("⏰ {n} ausstehende Aktion(en) sind abgelaufen. Bitte erneut versuchen."),
+                                serde_json::json!({}),
                             )
                             .await;
                         }
@@ -573,6 +576,30 @@ async fn main() -> Result<()> {
             }
         });
         tracing::info!("Daily briefing tick started (60 s interval, slots 07:00 + 15:00, preview 21:00)");
+    }
+
+    // ── Nightly reflection (learning) ─────────────────────────────────────────
+    // Once a night from 06:00 Europe/Berlin: Josie reads the last day (episodes,
+    // confirmation outcomes, conversation) and posts up to 3 lessons for Alex to
+    // approve with ✅/❌. Nothing is stored without his tap. Idempotent per night
+    // via agent_briefing_log slot 'reflection'.
+    {
+        let (db, cfg, llm) = (state.db.clone(), state.config.clone(), state.assistant_llm.clone());
+        every_tenant(&tenant_ids, Duration::from_secs(60), move || {
+            let (db, cfg, llm) = (db.clone(), cfg.clone(), llm.clone());
+            async move {
+                if !has_bot(&cfg) {
+                    return;
+                }
+                let notifier = TelegramNotifierImpl::new(cfg.telegram().bot_token.clone());
+                if let Err(e) =
+                    aust_assistant::hooks::reflection::run_reflection_tick(&db, llm.as_ref(), &notifier).await
+                {
+                    tracing::warn!("Nightly reflection failed: {e}");
+                }
+            }
+        });
+        tracing::info!("Nightly reflection tick started (06:00 Europe/Berlin)");
     }
 
     // Create router and start server

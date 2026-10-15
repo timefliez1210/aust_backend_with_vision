@@ -18,6 +18,19 @@ COPY config ./config
 
 RUN cargo build --release
 
+# ---- whisper.cpp (local speech-to-text for Telegram voice notes) ----
+# Static build, so the runtime image gets one self-contained binary. AVX2/FMA/F16C
+# only: the image is built on the laptop (no AVX-512) and must also run on the VPS.
+FROM debian:bookworm-slim AS whisper
+ARG WHISPER_CPP_REF=v1.9.5
+RUN apt-get update && apt-get install -y git cmake g++ make ca-certificates --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/*
+RUN git clone --depth 1 --branch ${WHISPER_CPP_REF} https://github.com/ggml-org/whisper.cpp.git /whisper \
+    && cmake -S /whisper -B /whisper/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+         -DWHISPER_BUILD_TESTS=OFF -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
+    && cmake --build /whisper/build -j"$(nproc)" --target whisper-cli \
+    && cp /whisper/build/bin/whisper-cli /usr/local/bin/whisper-cli
+
 # ---- Runtime stage ----
 FROM debian:bookworm-slim
 
@@ -32,6 +45,7 @@ RUN echo "deb http://deb.debian.org/debian bookworm main contrib" > /etc/apt/sou
     libreoffice-calc \
     fonts-crosextra-carlito \
     poppler-utils \
+    libgomp1 \
     ffmpeg \
     libheif-examples \
     --no-install-recommends \
@@ -40,6 +54,9 @@ RUN echo "deb http://deb.debian.org/debian bookworm main contrib" > /etc/apt/sou
 WORKDIR /app
 
 COPY --from=builder /app/target/release/aust_backend ./aust_backend
+# The model is not baked in (~190–570 MB): it lives in /opt/aust/whisper on the
+# host, mounted at /app/whisper, and AUST__VOICE__MODEL_PATH points at it.
+COPY --from=whisper /usr/local/bin/whisper-cli /usr/local/bin/whisper-cli
 COPY config ./config
 COPY migrations ./migrations
 # Assistant persona file — the binary loads SOUL.md from the working dir at startup.

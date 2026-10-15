@@ -169,6 +169,100 @@ impl Tool for Recall {
     }
 }
 
+// ── Forget ────────────────────────────────────────────────────────────────────
+
+/// Owner-only: withdraw a durable memory that is wrong or outdated.
+///
+/// Retires (never deletes) the row, so it stops being loaded into every prompt
+/// but stays visible for audit. Confirm-gated like `remember`: a forged email
+/// saying "vergiss die Regel …" must not be able to switch a rule off.
+pub struct Forget;
+
+#[async_trait]
+impl Tool for Forget {
+    fn name(&self) -> &'static str { "forget" }
+    fn description(&self) -> &'static str {
+        "Zieht eine gespeicherte Erinnerung zurück, die falsch oder veraltet ist (wird archiviert, nicht gelöscht). Die ID kommt aus recall. Für eine Korrektur stattdessen remember mit gleichem Bereich+Schlüssel nutzen. Nur für Inhaber."
+    }
+    fn params_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "memory_id": { "type": "string", "format": "uuid" },
+                "reason":    { "type": "string" }
+            },
+            "required": ["memory_id"]
+        })
+    }
+    fn safety(&self) -> Safety { Safety::Confirm }
+    fn min_role(&self) -> Role { Role::Owner }
+    fn summarize(&self, args: &Value) -> String {
+        let id = args["memory_id"].as_str().unwrap_or("?");
+        match args["reason"].as_str() {
+            Some(r) => format!("Erinnerung {id} vergessen ({r})?"),
+            None => format!("Erinnerung {id} vergessen?"),
+        }
+    }
+    async fn execute(&self, ctx: &ToolCtx, args: &Value) -> Result<Value> {
+        let id = parse_uuid(args, "memory_id", self.name())?;
+        if !ctx.confirmed {
+            return Ok(super::pending_confirmation(self.name(), args, self.summarize(args)));
+        }
+        let active = durable::recall(&ctx.db, None, None).await?;
+        let Some(memory) = active.into_iter().find(|m| m.id == id) else {
+            return Ok(json!({ "ok": false, "message": format!("Keine aktive Erinnerung mit ID {id}") }));
+        };
+        durable::retire(&ctx.db, id).await?;
+        Ok(json!({ "ok": true, "summary": format!("Vergessen: {} / {}", memory.scope, memory.key) }))
+    }
+}
+
+// ── SearchHistory ─────────────────────────────────────────────────────────────
+
+/// Search the episode log: what Josie did before and how Alex reacted.
+pub struct SearchHistory;
+
+#[async_trait]
+impl Tool for SearchHistory {
+    fn name(&self) -> &'static str { "search_history" }
+    fn description(&self) -> &'static str {
+        "Durchsucht Josies Verlauf früherer Aktionen und Entscheidungen (was wurde wann für wen erledigt, bestätigt oder abgelehnt). Für Fragen wie „was haben wir bei Lange zuletzt gemacht?“. Optional auf eine Anfrage/einen Kunden eingrenzen."
+    }
+    fn params_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query":       { "type": "string", "minLength": 2 },
+                "inquiry_id":  { "type": "string", "format": "uuid" },
+                "customer_id": { "type": "string", "format": "uuid" },
+                "limit":       { "type": "integer", "minimum": 1, "maximum": 20 }
+            },
+            "required": ["query"]
+        })
+    }
+    fn safety(&self) -> Safety { Safety::Read }
+    fn min_role(&self) -> Role { Role::Owner }
+
+    async fn execute(&self, ctx: &ToolCtx, args: &Value) -> Result<Value> {
+        let query = parse_str(args, "query", self.name())?;
+        let mut scopes = Vec::new();
+        if let Some(id) = args["inquiry_id"].as_str() {
+            scopes.push(format!("inquiry:{id}"));
+        }
+        if let Some(id) = args["customer_id"].as_str() {
+            scopes.push(format!("customer:{id}"));
+        }
+        let limit = args["limit"].as_i64().unwrap_or(10);
+        let found = crate::memory::episodic::retrieve(&ctx.db, query, &scopes, limit).await?;
+        let items: Vec<Value> = found
+            .iter()
+            .map(|e| json!({ "summary": e.summary, "at": e.created_at, "tags": e.tags }))
+            .collect();
+        let count = items.len();
+        Ok(json!({ "episodes": items, "count": count }))
+    }
+}
+
 // ── DailyBriefing ─────────────────────────────────────────────────────────────
 
 pub struct DailyBriefing;

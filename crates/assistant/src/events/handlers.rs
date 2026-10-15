@@ -34,6 +34,16 @@ async fn owner_chat_id(pool: &PgPool) -> Option<i64> {
 
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
+/// The entities an event is about: its aggregate (`inquiry:<id>`) and every
+/// `*_id` in its payload — recorded with the notification so a reply resolves.
+fn event_refs(event: &DomainEvent) -> serde_json::Value {
+    let mut refs = crate::message_refs::from_payload(&event.payload);
+    if let (Some((kind, id)), Some(obj)) = (event.aggregate.split_once(':'), refs.as_object_mut()) {
+        obj.entry(format!("{kind}_id")).or_insert_with(|| serde_json::Value::String(id.to_string()));
+    }
+    refs
+}
+
 pub async fn handle_inquiry_created(
     event: &DomainEvent,
     pool: &PgPool,
@@ -68,7 +78,7 @@ pub async fn handle_inquiry_created(
         "📥 Neue Anfrage von {name}, {volume:.1} m³, {from} → {to}. Ich rechne.\n\n\
          Soll ich vorab eine Besichtigung eintragen? Sag mir einfach das Wunschdatum, dann lege ich sie an."
     );
-    let _ = notify(pool, notifier, chat_id, NotificationKind::InquiryCreated, msg).await;
+    let _ = notify(pool, notifier, chat_id, NotificationKind::InquiryCreated, msg, event_refs(event)).await;
     Ok(())
 }
 
@@ -156,7 +166,7 @@ pub async fn handle_offer_drafted(
          Bitte über das Admin-Panel prüfen und senden — der Agent-Sendpfad \
          wird verdrahtet, sobald OfferService::send (SMTP + PDF-Anhang) bereit ist."
     );
-    let _ = notify(pool, notifier, chat_id, NotificationKind::Offer, msg).await;
+    let _ = notify(pool, notifier, chat_id, NotificationKind::Offer, msg, event_refs(event)).await;
     Ok(())
 }
 
@@ -172,7 +182,7 @@ pub async fn handle_offer_sent(
 
     let name = payload_str(&event.payload, "customer_name");
     let msg = format!("📨 Angebot an {name} verschickt.");
-    let _ = notify(pool, notifier, chat_id, NotificationKind::Offer, msg).await;
+    let _ = notify(pool, notifier, chat_id, NotificationKind::Offer, msg, event_refs(event)).await;
     Ok(())
 }
 
@@ -199,7 +209,7 @@ pub async fn handle_status_changed(
     let name = payload_str(payload, "customer_name");
     let old = payload_str(payload, "old_status");
     let msg = format!("🔄 {name}: {old} → {new_status}.");
-    let _ = notify(pool, notifier, chat_id, NotificationKind::StatusChange, msg).await;
+    let _ = notify(pool, notifier, chat_id, NotificationKind::StatusChange, msg, event_refs(event)).await;
     Ok(())
 }
 
@@ -220,7 +230,7 @@ pub async fn handle_invoice_issued(
     let brutto = brutto_cents as f64 / 100.0;
 
     let msg = format!("🧾 Rechnung {number} an {name}: {brutto:.2} €.");
-    let _ = notify(pool, notifier, chat_id, NotificationKind::Invoice, msg).await;
+    let _ = notify(pool, notifier, chat_id, NotificationKind::Invoice, msg, event_refs(event)).await;
     Ok(())
 }
 
@@ -240,7 +250,7 @@ pub async fn handle_invoice_overdue(
     let days = p["days_overdue"].as_i64().unwrap_or(0);
 
     let msg = format!("⚠️ Rechnung {number} überfällig: {name}, {days} Tage.");
-    let _ = notify(pool, notifier, chat_id, NotificationKind::Invoice, msg).await;
+    let _ = notify(pool, notifier, chat_id, NotificationKind::Invoice, msg, event_refs(event)).await;
     Ok(())
 }
 

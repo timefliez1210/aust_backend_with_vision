@@ -17,7 +17,7 @@ pub const MAX_IMAGES: usize = 10;
 ///
 /// Two-step Telegram flow: `getFile` resolves a temporary `file_path`, then the
 /// bytes are fetched from the file CDN endpoint.
-async fn download_file(
+pub(crate) async fn download_file(
     client: &Client,
     bot_token: &str,
     file_id: &str,

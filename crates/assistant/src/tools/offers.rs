@@ -278,36 +278,47 @@ pub struct SendOfferToCustomer;
 impl Tool for SendOfferToCustomer {
     fn name(&self) -> &'static str { "send_offer_to_customer" }
     fn description(&self) -> &'static str {
-        "Sendet das aktive Angebot per E-Mail an den Kunden. Erfordert Bestätigung."
+        "Sendet den aktiven KVA (PDF) mit Anschreiben per E-Mail an den Kunden — im bestehenden E-Mail-Verlauf, genau wie 'Senden' im Admin-Postfach; danach steht das Angebot auf 'versendet'. 'to' muss die hinterlegte E-Mail des Kunden sein. Ohne 'cover_letter' das Standard-Anschreiben. Erfordert Bestätigung."
     }
     fn params_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "inquiry_id": { "type": "string", "format": "uuid" },
-                "email_template": { "type": "string" }
+                "inquiry_id":   { "type": "string", "format": "uuid" },
+                "to":           { "type": "string", "minLength": 3, "description": "E-Mail des Kunden (zur Kontrolle)" },
+                "cover_letter": { "type": "string", "description": "Optional eigenes Anschreiben" }
             },
-            "required": ["inquiry_id"]
+            "required": ["inquiry_id", "to"]
         })
     }
     fn safety(&self) -> Safety { Safety::Confirm }
     fn min_role(&self) -> Role { Role::Owner }
 
     fn summarize(&self, args: &Value) -> String {
-        let inquiry_id = args["inquiry_id"].as_str().unwrap_or("?");
-        format!("Angebot für Anfrage {inquiry_id} per E-Mail an den Kunden senden?")
+        let to = args["to"].as_str().unwrap_or("?");
+        format!("KVA jetzt per E-Mail an {to} senden?")
     }
 
     async fn execute(&self, ctx: &ToolCtx, args: &Value) -> Result<Value> {
-        let _inquiry_id = super::parse_uuid(args, "inquiry_id", self.name())?;
+        let inquiry_id = super::parse_uuid(args, "inquiry_id", self.name())?;
+        let to = super::parse_str(args, "to", self.name())?;
         if !ctx.confirmed {
             return Ok(super::pending_confirmation(self.name(), args, self.summarize(args)));
         }
-        // Offer-PDF send (S3 fetch + SMTP attach + status transition) is not yet
-        // exposed via the OfferService trait — see legacy /offers/:id/send route.
-        Err(crate::error::AssistantError::NotWired(
-            "Angebotsversand per E-Mail".to_string(),
-        ))
+        if ctx.services.offers.get_offer(inquiry_id).await?.is_none() {
+            return Ok(json!({ "ok": false, "message": "Für diese Anfrage gibt es keinen aktiven KVA." }));
+        }
+        // A draft in the customer's thread, sent through the admin send path: the
+        // PDF is attached there and the offer/inquiry move to "versendet".
+        let draft = ctx.services.emails.create_offer_draft(inquiry_id, args["cover_letter"].as_str()).await?;
+        if !draft.to_address.trim().eq_ignore_ascii_case(to.trim()) {
+            return Ok(json!({
+                "ok": false,
+                "message": format!("Der Kunde hat die Adresse {}, nicht {to} — nichts gesendet (Entwurf liegt im Postfach).", draft.to_address),
+            }));
+        }
+        let sent_to = ctx.services.emails.send_draft(draft.id).await?;
+        Ok(json!({ "ok": true, "summary": format!("KVA an {sent_to} gesendet") }))
     }
 }
 
@@ -526,7 +537,7 @@ mod new_offer_tests {
         let inquiry_id = uuid::Uuid::new_v4();
         let services = testing::mock_bundle(inquiry_id, uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
         let result = SendOfferToCustomer
-            .execute(&ctx(services), &json!({ "inquiry_id": inquiry_id }))
+            .execute(&ctx(services), &json!({ "inquiry_id": inquiry_id, "to": "kunde@example.com" }))
             .await
             .unwrap();
         assert_eq!(result["status"], json!("pending_confirmation"));

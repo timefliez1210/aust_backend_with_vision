@@ -74,7 +74,7 @@ impl LlmProvider for OllamaProvider {
             .map(|m| OllamaMessage {
                 role: match m.role {
                     LlmRole::System => "system".to_string(),
-                    LlmRole::User => "user".to_string(),
+                    LlmRole::User | LlmRole::Tool => "user".to_string(),
                     LlmRole::Assistant => "assistant".to_string(),
                 },
                 content: m.content.clone(),
@@ -144,7 +144,7 @@ impl OllamaProvider {
             .map(|m| OllamaMessage {
                 role: match m.role {
                     LlmRole::System => "system".to_string(),
-                    LlmRole::User => "user".to_string(),
+                    LlmRole::User | LlmRole::Tool => "user".to_string(),
                     LlmRole::Assistant => "assistant".to_string(),
                 },
                 content: m.content.clone(),

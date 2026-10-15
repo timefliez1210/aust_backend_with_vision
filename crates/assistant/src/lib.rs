@@ -26,6 +26,7 @@ pub mod hooks;
 pub mod learning;
 pub mod llm;
 pub mod memory;
+pub mod message_refs;
 pub mod roles;
 pub mod session;
 pub mod soul;

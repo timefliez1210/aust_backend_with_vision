@@ -89,11 +89,19 @@ impl Tool for ListThread {
 
 pub struct DraftReply;
 
+/// How Josie writes a customer reply. The facts come only from the instruction
+/// and the original mail — no invented dates, prices or promises.
+const DRAFT_PROMPT: &str = "Du schreibst im Namen von {company} eine Antwort-E-Mail an einen Kunden. \
+Deutsch, Sie-Form, freundlich und knapp, ohne Betreffzeile. Beginne mit einer passenden Anrede, \
+ende mit \"Mit freundlichen Grüßen\" und darunter \"{company}\". Verwende NUR Fakten aus der \
+Anweisung und der ursprünglichen E-Mail — erfinde keine Termine, Preise, Zusagen oder Namen. \
+Antworte ausschließlich mit dem E-Mail-Text.";
+
 #[async_trait]
 impl Tool for DraftReply {
     fn name(&self) -> &'static str { "draft_reply" }
     fn description(&self) -> &'static str {
-        "Erstellt einen E-Mail-Antwortentwurf basierend auf einer Klartext-Anweisung. Sendet NICHT."
+        "Schreibt eine Antwort auf eine E-Mail nach Alex' Anweisung und legt sie als ENTWURF im E-Mail-Verlauf ab (im Admin-Postfach sichtbar). Sendet NICHT. Zeig Alex den Text; gesendet wird erst nach seiner Freigabe mit send_email_draft."
     }
     fn params_schema(&self) -> Value {
         json!({
@@ -111,18 +119,82 @@ impl Tool for DraftReply {
     async fn execute(&self, ctx: &ToolCtx, args: &Value) -> Result<Value> {
         let email_id = parse_uuid(args, "email_id", self.name())?;
         let instruction = parse_str(args, "instruction_de", self.name())?;
-        // Fetch original for context (best-effort); the LLM call is left for the
-        // chat layer — here we just synthesize a placeholder draft.
-        let original = ctx.services.emails.get_email(email_id).await.ok();
+        let original = ctx.services.emails.get_email(email_id).await?;
         let company = aust_core::tenant::profile(&ctx.db).await?.short_name;
-        let draft = format!(
-            "Sehr geehrte Damen und Herren,\n\n[Entwurf basierend auf Anweisung: \"{instruction}\"]\n\nMit freundlichen Grüßen\n{company}"
+
+        let original_body: String = original.body_text.as_deref().unwrap_or("").chars().take(4000).collect();
+        let prompt = format!(
+            "{}\n\n## Ursprüngliche E-Mail\nVon: {}\nBetreff: {}\n\n{}\n\n## Anweisung von Alex\n{}",
+            DRAFT_PROMPT.replace("{company}", &company),
+            original.from_address.as_deref().unwrap_or("?"),
+            original.subject,
+            original_body,
+            instruction,
         );
+        let body = ctx
+            .llm
+            .chat(crate::llm::ModelTier::Main, &[aust_llm_providers::LlmMessage::user(prompt)])
+            .await?;
+        let body = body.trim();
+        if body.is_empty() {
+            return Ok(json!({ "ok": false, "message": "Kein Entwurf erzeugt — bitte erneut versuchen." }));
+        }
+        let draft = ctx.services.emails.create_reply_draft(email_id, body).await?;
         Ok(json!({
-            "draft": draft,
-            "email_id": email_id,
-            "original_subject": original.as_ref().map(|e| e.subject.clone()),
+            "ok": true,
+            "draft_id": draft.id,
+            "to": draft.to_address,
+            "subject": draft.subject,
+            "body": draft.body,
+            "summary": format!("Entwurf an {} im Postfach gespeichert (nicht gesendet)", draft.to_address),
         }))
+    }
+}
+
+// ── SendEmailDraft (Confirm) ──────────────────────────────────────────────────
+
+/// Send a mailbox draft — a reply from `draft_reply`, a KVA cover letter, or
+/// one Alex wrote in the dashboard — through the admin "Senden" path.
+pub struct SendEmailDraft;
+
+#[async_trait]
+impl Tool for SendEmailDraft {
+    fn name(&self) -> &'static str { "send_email_draft" }
+    fn description(&self) -> &'static str {
+        "Sendet einen gespeicherten E-Mail-Entwurf (z. B. aus draft_reply) im bestehenden Verlauf an den Kunden — mit Threading und ggf. KVA-Anhang, genau wie 'Senden' im Admin-Postfach. 'to' muss der Empfänger des Entwurfs sein. Erfordert Bestätigung."
+    }
+    fn params_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "draft_id": { "type": "string", "format": "uuid" },
+                "to":       { "type": "string", "minLength": 3, "description": "Empfänger laut Entwurf (zur Kontrolle)" }
+            },
+            "required": ["draft_id", "to"]
+        })
+    }
+    fn safety(&self) -> Safety { Safety::Confirm }
+    fn min_role(&self) -> Role { Role::Owner }
+    fn summarize(&self, args: &Value) -> String {
+        format!("E-Mail-Entwurf jetzt an {} senden?", args["to"].as_str().unwrap_or("?"))
+    }
+
+    async fn execute(&self, ctx: &ToolCtx, args: &Value) -> Result<Value> {
+        let draft_id = parse_uuid(args, "draft_id", self.name())?;
+        let to = parse_str(args, "to", self.name())?;
+        if !ctx.confirmed {
+            return Ok(pending_confirmation(self.name(), args, self.summarize(args)));
+        }
+        // Alex confirmed a recipient: refuse if the draft would go somewhere else.
+        let draft = ctx.services.emails.get_draft(draft_id).await?;
+        if !draft.to_address.trim().eq_ignore_ascii_case(to.trim()) {
+            return Ok(json!({
+                "ok": false,
+                "message": format!("Der Entwurf geht an {}, nicht an {to} — nichts gesendet.", draft.to_address),
+            }));
+        }
+        let sent_to = ctx.services.emails.send_draft(draft_id).await?;
+        Ok(json!({ "ok": true, "summary": format!("E-Mail an {sent_to} gesendet") }))
     }
 }
 
@@ -286,9 +358,27 @@ mod tests {
             )
             .await
             .unwrap();
-        let draft = r["draft"].as_str().unwrap();
-        assert!(draft.contains("Anweisung"));
-        assert!(draft.ends_with("\n\nMit freundlichen Grüßen\nAust Umzüge"));
+        // The model's text (mock: "ok") is saved as a real draft, not sent.
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["body"], "ok");
+        assert!(r["draft_id"].is_string());
+        assert!(r["summary"].as_str().unwrap().contains("nicht gesendet"));
+    }
+
+    #[tokio::test]
+    async fn send_email_draft_needs_confirmation_then_checks_the_recipient() {
+        let services = testing::mock_bundle(uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let args = json!({ "draft_id": uuid::Uuid::new_v4(), "to": "kunde@example.com" });
+        let pending = SendEmailDraft.execute(&ctx(services.clone()), &args).await.unwrap();
+        assert_eq!(pending["status"], "pending_confirmation");
+
+        let confirmed = ToolCtx { confirmed: true, ..ctx(services.clone()) };
+        let sent = SendEmailDraft.execute(&confirmed, &args).await.unwrap();
+        assert_eq!(sent["ok"], true);
+
+        let wrong = json!({ "draft_id": uuid::Uuid::new_v4(), "to": "jemand@anders.de" });
+        let refused = SendEmailDraft.execute(&ToolCtx { confirmed: true, ..ctx(services) }, &wrong).await.unwrap();
+        assert_eq!(refused["ok"], false, "a recipient mismatch must not send");
     }
 
     #[tokio::test]

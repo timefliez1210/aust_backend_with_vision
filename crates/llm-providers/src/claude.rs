@@ -61,7 +61,7 @@ impl LlmProvider for ClaudeProvider {
             .iter()
             .map(|m| ClaudeMessage {
                 role: match m.role {
-                    LlmRole::User => "user".to_string(),
+                    LlmRole::User | LlmRole::Tool => "user".to_string(),
                     LlmRole::Assistant => "assistant".to_string(),
                     LlmRole::System => "user".to_string(),
                 },

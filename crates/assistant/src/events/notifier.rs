@@ -31,20 +31,38 @@ pub trait TelegramNotifier: Send + Sync {
 
 /// Post a mutable notification: skipped when the office muted `kind`, otherwise
 /// sent with a "🔕 Stumm schalten" button. Returns `None` when muted.
+///
+/// `refs` names the entities the message is about (see `message_refs`), so a
+/// reply to it resolves to exactly those IDs. Pass `json!({})` for none.
 pub async fn notify(
     pool: &PgPool,
     notifier: &dyn TelegramNotifier,
     chat_id: i64,
     kind: NotificationKind,
     body: String,
+    refs: serde_json::Value,
 ) -> Result<Option<i64>> {
     if notifications::is_muted(pool, kind).await {
         return Ok(None);
     }
-    notifier
+    let message_id = notifier
         .post_with_markup(chat_id, body, notifications::mute_keyboard(kind))
-        .await
-        .map(Some)
+        .await?;
+    crate::message_refs::record(pool, chat_id, message_id, refs).await;
+    Ok(Some(message_id))
+}
+
+/// Post a plain message and record what it is about (see `notify`).
+pub async fn post_with_refs(
+    pool: &PgPool,
+    notifier: &dyn TelegramNotifier,
+    chat_id: i64,
+    body: String,
+    refs: serde_json::Value,
+) -> Result<i64> {
+    let message_id = notifier.post(chat_id, body).await?;
+    crate::message_refs::record(pool, chat_id, message_id, refs).await;
+    Ok(message_id)
 }
 
 // ── Mock for tests ────────────────────────────────────────────────────────────

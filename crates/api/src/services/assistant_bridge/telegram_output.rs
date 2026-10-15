@@ -35,6 +35,53 @@ pub async fn post_text(client: &Client, bot_token: &str, chat_id: i64, body: &st
     }
 }
 
+/// Telegram rejects messages over 4096 characters; stay under it with margin.
+const MAX_MESSAGE_CHARS: usize = 4000;
+
+/// Split `body` into Telegram-sized chunks, breaking at a newline (or else a
+/// space) near the limit so no line is cut mid-word.
+pub fn split_message(body: &str) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut rest: &str = body;
+    while rest.chars().count() > MAX_MESSAGE_CHARS {
+        let limit = rest
+            .char_indices()
+            .nth(MAX_MESSAGE_CHARS)
+            .map(|(i, _)| i)
+            .unwrap_or(rest.len());
+        let window = &rest[..limit];
+        let cut = window
+            .rfind('\n')
+            .filter(|i| *i > limit / 2)
+            .or_else(|| window.rfind(' ').filter(|i| *i > limit / 2))
+            .unwrap_or(limit);
+        chunks.push(rest[..cut].trim_end().to_string());
+        rest = rest[cut..].trim_start();
+    }
+    if !rest.is_empty() || chunks.is_empty() {
+        chunks.push(rest.to_string());
+    }
+    chunks
+}
+
+/// Post a reply of any length (split as needed) and return every message ID.
+pub async fn post_long_text(client: &Client, bot_token: &str, chat_id: i64, body: &str) -> Vec<i64> {
+    let mut ids = Vec::new();
+    for chunk in split_message(body) {
+        ids.push(post_text(client, bot_token, chat_id, &chunk).await);
+    }
+    ids
+}
+
+/// Show "schreibt …" while a turn runs (Telegram clears it after ~5 s or on reply).
+pub async fn send_typing(client: &Client, bot_token: &str, chat_id: i64) {
+    let url = format!("https://api.telegram.org/bot{bot_token}/sendChatAction");
+    let payload = serde_json::json!({ "chat_id": chat_id, "action": "typing" });
+    if let Err(e) = client.post(&url).json(&payload).send().await {
+        error!("send_typing failed: {e}");
+    }
+}
+
 /// Post an inline-keyboard message for a pending action.
 ///
 /// Buttons:
@@ -109,5 +156,26 @@ pub async fn edit_message_remove_keyboard(
     });
     if let Err(e) = client.post(&markup_url).json(&payload2).send().await {
         error!("edit_message_remove_keyboard (markup) failed: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_messages_are_not_split() {
+        assert_eq!(split_message("Hallo"), vec!["Hallo".to_string()]);
+    }
+
+    #[test]
+    fn long_messages_split_at_line_breaks_under_the_limit() {
+        let line = "x".repeat(99);
+        let body = (0..100).map(|_| line.clone()).collect::<Vec<_>>().join("\n");
+        let chunks = split_message(&body);
+        assert!(chunks.len() >= 3);
+        assert!(chunks.iter().all(|c| c.chars().count() <= MAX_MESSAGE_CHARS));
+        assert!(chunks.iter().all(|c| c.split('\n').all(|l| l.len() == 99)), "no line cut in half");
+        assert_eq!(chunks.join("\n"), body);
     }
 }

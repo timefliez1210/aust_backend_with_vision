@@ -18,5 +18,8 @@ pub mod vehicle_reminder_service;
 pub mod kva_followup_service;
 pub(crate) mod kva_export;
 pub mod bridge;
+pub mod inquiry_update;
+pub mod calendar_item_update;
+pub mod email_drafts;
 pub mod onboarding;
 pub mod letterhead;

@@ -27,7 +27,7 @@ pub use error::LlmError;
 pub use mock::MockLlmProvider;
 pub use ollama::OllamaProvider;
 pub use openai::OpenAiProvider;
-pub use traits::{LlmMessage, LlmProvider, LlmRole};
+pub use traits::{LlmMessage, LlmProvider, LlmRole, LlmToolCall};
 
 use aust_core::config::LlmConfig;
 use std::sync::Arc;

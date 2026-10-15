@@ -1,7 +1,6 @@
-//! Background hooks: post-action reflection, nightly consolidation, morning
-//! briefing, and the reminder tick.
+//! Background hooks: daily briefing, nightly reflection (learning), and the
+//! reminder tick.
 
 pub mod briefing;
-pub mod consolidate;
-pub mod post_action;
+pub mod reflection;
 pub mod reminders;

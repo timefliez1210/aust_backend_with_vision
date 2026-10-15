@@ -97,6 +97,14 @@ pub(crate) struct OfferOverrides {
     pub fahrt_reset: bool,
 }
 
+impl OfferOverrides {
+    /// Whether Alex overrode the engine's pricing judgement (price, crew, hours,
+    /// rate) — as opposed to correcting the job's facts (volume, positions).
+    pub(crate) fn is_manual_adjustment(&self) -> bool {
+        self.price_cents.is_some() || self.persons.is_some() || self.hours.is_some() || self.rate.is_some()
+    }
+}
+
 /// All data fetched and computed during offer generation, before PDF render / S3 / DB.
 ///
 /// Returned by `run_offer_computation` and consumed by both `build_offer_with_overrides`
@@ -774,6 +782,40 @@ pub(crate) async fn build_offer_with_overrides(
         customer_message,
     };
 
+    // Alex corrected the engine (price, crew, hours or rate): keep both numbers
+    // as a training row for the pricing predictor. Best-effort — the offer stands.
+    if overrides.is_manual_adjustment() {
+        let features = aust_assistant::learning::features::extract(&aust_assistant::learning::features::FeatureInput {
+            volume_m3: Some(volume),
+            distance_km: Some(distance),
+            origin_floor: origin.as_ref().and_then(|a| a.floor.as_deref()).map(|f| parse_floor(f) as i32),
+            destination_floor: destination.as_ref().and_then(|a| a.floor.as_deref()).map(|f| parse_floor(f) as i32),
+            origin_has_elevator: origin.as_ref().and_then(|a| a.elevator),
+            destination_has_elevator: destination.as_ref().and_then(|a| a.elevator),
+            has_packing: inquiry_services.packing,
+            has_assembly: inquiry_services.assembly || inquiry_services.disassembly,
+            scheduled_weekday: inquiry.scheduled_date.map(|d| chrono::Datelike::weekday(&d).number_from_monday()),
+            days_until_move: inquiry.scheduled_date.map(|d| (d - today).num_days()),
+            customer_repeat_count: 0,
+            proposed_price_cents: 0,
+        });
+        record_price_adjustment(
+            db,
+            config,
+            inquiry_id,
+            offer.id,
+            overrides,
+            features,
+            serde_json::json!({
+                "netto_cents": actual_netto_cents,
+                "persons": pricing_result.estimated_helpers,
+                "hours": pricing_result.estimated_hours,
+                "rate": rate_override,
+            }),
+        )
+        .await;
+    }
+
     Ok(GeneratedOffer {
         offer,
         pdf_bytes,
@@ -781,6 +823,54 @@ pub(crate) async fn build_offer_with_overrides(
         customer_name,
         summary,
     })
+}
+
+/// Record an offer Alex adjusted by hand in `offer_observations`.
+///
+/// `proposed` is what the engine computes for the same inquiry with no manual
+/// overrides (volume corrections and custom positions kept — those describe the
+/// job, not Alex's pricing judgement); `final` is what he set. The pairs are the
+/// training data for the offer-adjustment predictor; until now no code path
+/// wrote any, so the table stayed empty.
+async fn record_price_adjustment(
+    db: &PgPool,
+    config: &Config,
+    inquiry_id: Uuid,
+    offer_id: Uuid,
+    overrides: &OfferOverrides,
+    mut features: aust_assistant::learning::features::OfferFeatures,
+    final_offer: serde_json::Value,
+) {
+    let baseline = OfferOverrides {
+        volume_m3: overrides.volume_m3,
+        line_items: overrides.line_items.clone(),
+        ..Default::default()
+    };
+    let proposed = match run_offer_computation(db, config, inquiry_id, &baseline).await {
+        Ok(ctx) => serde_json::json!({
+            "netto_cents": ctx.actual_netto_cents,
+            "persons": ctx.pricing_result.estimated_helpers,
+            "hours": ctx.pricing_result.estimated_hours,
+            "rate": ctx.rate_override,
+        }),
+        Err(e) => {
+            tracing::warn!(%inquiry_id, "offer observation: baseline computation failed: {e}");
+            return;
+        }
+    };
+    features.proposed_price_cents = proposed["netto_cents"].as_i64().unwrap_or(0);
+    if let Err(e) = aust_assistant::learning::observations::record_observation(
+        db,
+        inquiry_id,
+        offer_id,
+        &features,
+        &proposed,
+        Some(&final_offer),
+    )
+    .await
+    {
+        tracing::warn!(%inquiry_id, "offer observation not recorded: {e}");
+    }
 }
 
 /// Does this service type get the clearing-job terms page instead of the Umzug one?

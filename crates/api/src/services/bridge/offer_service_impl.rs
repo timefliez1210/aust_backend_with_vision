@@ -10,7 +10,9 @@ use aust_core::services::{
     ComputedLineItem, OfferComputation, OfferDraft, OfferOverrides as CoreOfferOverrides,
     OfferPreview, OfferService, OfferVersion, ServiceError,
 };
+use crate::services::bridge::InquiryServiceImpl;
 use crate::services::telegram_service::parse_edit_instructions;
+use aust_core::services::InquiryService;
 use aust_core::Config;
 use aust_storage::StorageProvider;
 
@@ -232,13 +234,15 @@ impl OfferService for OfferServiceImpl {
         .await
         .map_err(super::map_sqlx)?;
 
-        sqlx::query(
-            "UPDATE inquiries SET status = 'accepted', accepted_at = NOW(), updated_at = NOW() WHERE id = $1",
-        )
-        .bind(inquiry_id)
-        .execute(&self.pool)
-        .await
-        .map_err(super::map_sqlx)?;
+        // The status goes through the admin path so `status.changed` fires.
+        InquiryServiceImpl::new(self.pool.clone())
+            .update_status(inquiry_id, "accepted", None)
+            .await?;
+        sqlx::query("UPDATE inquiries SET accepted_at = COALESCE(accepted_at, NOW()) WHERE id = $1")
+            .bind(inquiry_id)
+            .execute(&self.pool)
+            .await
+            .map_err(super::map_sqlx)?;
 
         Ok(())
     }
@@ -284,13 +288,10 @@ impl OfferService for OfferServiceImpl {
         .await
         .map_err(super::map_sqlx)?;
 
-        sqlx::query(
-            "UPDATE inquiries SET status = 'rejected', updated_at = NOW() WHERE id = $1",
-        )
-        .bind(inquiry_id)
-        .execute(&self.pool)
-        .await
-        .map_err(super::map_sqlx)?;
+        // The status goes through the admin path so `status.changed` fires.
+        InquiryServiceImpl::new(self.pool.clone())
+            .update_status(inquiry_id, "rejected", None)
+            .await?;
 
         Ok(())
     }

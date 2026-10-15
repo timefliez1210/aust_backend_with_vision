@@ -242,8 +242,9 @@ async fn reconcile_review_reminders(pool: &PgPool) -> Result<()> {
 
 /// Fire every active reminder whose `due_at` has passed.
 async fn fire_due_reminders(pool: &PgPool, notifier: &dyn TelegramNotifier) -> Result<()> {
-    let due: Vec<(uuid::Uuid, i64, String, String, i32, Option<String>)> = sqlx::query_as(
-        "SELECT id, chat_id, text, recurrence, recur_hours, source FROM agent_reminders \
+    #[allow(clippy::type_complexity)]
+    let due: Vec<(uuid::Uuid, i64, String, String, i32, Option<String>, Option<uuid::Uuid>)> = sqlx::query_as(
+        "SELECT id, chat_id, text, recurrence, recur_hours, source, source_ref FROM agent_reminders \
          WHERE active AND due_at <= NOW() ORDER BY due_at ASC LIMIT 50",
     )
     .fetch_all(pool)
@@ -251,7 +252,7 @@ async fn fire_due_reminders(pool: &PgPool, notifier: &dyn TelegramNotifier) -> R
 
     let now = Utc::now();
 
-    for (id, chat_id, text, recurrence, recur_hours, source) in due {
+    for (id, chat_id, text, recurrence, recur_hours, source, source_ref) in due {
         let recurring = recurrence == "recurring";
 
         // Recurring reminder that came due outside business hours: snap it to the
@@ -269,9 +270,15 @@ async fn fire_due_reminders(pool: &PgPool, notifier: &dyn TelegramNotifier) -> R
         // Auto-nags can be muted; a muted one still advances below, silently, so it
         // doesn't pile up. Reminders Alex set himself have no kind and always fire.
         let body = format!("⏰ Erinnerung: {text}");
+        // Recorded with the message, so "erledigt" / "verschieb auf morgen" as a
+        // reply names this reminder (and what it nags about) by ID.
+        let mut refs = serde_json::json!({ "reminder_id": id.to_string() });
+        if let Some(r) = source_ref {
+            refs["source_ref"] = serde_json::Value::String(r.to_string());
+        }
         let sent = match NotificationKind::for_reminder_source(source.as_deref()) {
-            Some(kind) => notify(pool, notifier, chat_id, kind, body).await.map(|_| ()),
-            None => notifier.post(chat_id, body).await.map(|_| ()),
+            Some(kind) => notify(pool, notifier, chat_id, kind, body, refs).await.map(|_| ()),
+            None => crate::events::notifier::post_with_refs(pool, notifier, chat_id, body, refs).await.map(|_| ()),
         };
         if let Err(e) = sent {
             // Leave it due so the next tick retries rather than dropping the ping.

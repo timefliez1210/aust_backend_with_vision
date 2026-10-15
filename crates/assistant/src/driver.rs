@@ -25,7 +25,7 @@ use crate::bindings;
 use crate::confirmation::{self, Resolution};
 use crate::error::{AssistantError, Result};
 use crate::llm::{AssistantLlmProvider, ChatResponse, ModelTier};
-use crate::memory::retrieval;
+use crate::memory::{episodic, retrieval};
 use crate::roles::Role;
 use crate::session::{self, Turn};
 use crate::soul::Soul;
@@ -47,6 +47,20 @@ pub struct Input {
     /// setzen") leaves implicit. Folded into the user turn, the retrieval query,
     /// and the grounding set so the assistant resolves the *correct* entity.
     pub quoted_text: Option<String>,
+    /// Entity IDs recorded for the replied-to bot message (`message_refs`). Exact,
+    /// unlike `quoted_text`, which usually only names a customer.
+    pub quoted_refs: Option<Value>,
+    /// A confirmed action that ran just before this turn, outside it (Alex tapped
+    /// Bestätigen). Set only on the continuation turn the bridge starts after a
+    /// confirmation, so the guards count the action as done in this turn and
+    /// the model can pick up the rest of the original task.
+    pub prior_action: Option<PriorAction>,
+}
+
+/// A tool that already ran, carried into the next turn (see `Input::prior_action`).
+pub struct PriorAction {
+    pub tool_name: String,
+    pub result: Value,
 }
 
 /// The result of processing one input turn.
@@ -57,6 +71,10 @@ pub struct TurnResult {
     pub awaiting_confirmation: bool,
     /// The ID of the pending action, if any.
     pub pending_action_id: Option<uuid::Uuid>,
+    /// Entity IDs this turn's tools acted on or returned — arguments first — so the
+    /// bridge can record them with the posted reply (`message_refs`). A later reply
+    /// to Josie's message then resolves "die" / "den Termin" to these exact IDs.
+    pub cited_ids: Vec<String>,
     /// German summary of the proposed action, populated when `awaiting_confirmation`
     /// is true. The Telegram bridge uses this as the keyboard message body instead
     /// of `reply` so Alex sees a concrete action ("Rechnung … an … senden?") rather
@@ -92,15 +110,45 @@ pub async fn process_turn(
     // Step 2: Load or create session.
     let mut session = session::load_or_create(pool, input.chat_id).await?;
     let session_id = session.id;
+    match session::roll_over_if_idle(pool, &mut session, llm.as_ref()).await {
+        Ok(true) => info!(chat_id = input.chat_id, "Session rolled over after idle period"),
+        Ok(false) => {}
+        Err(e) => warn!(chat_id = input.chat_id, "Session rollover failed: {e}"),
+    }
 
     // When this turn is a Telegram reply, the quoted message holds the referent
     // (often a bot notification with the inquiry/customer ID). Render it as a
     // labelled block so the model — and the retrieval/grounding steps below —
     // resolve "diese Anfrage" to the entity Alex actually pointed at, instead of
     // guessing a different customer (the Frederike mis-reminder).
-    let quoted_block = input.quoted_text.as_deref().map(|q| {
-        format!("[Zitierte Nachricht, auf die sich der Nutzer bezieht]\n{q}\n[Ende Zitat]")
-    });
+    let refs_line = input
+        .quoted_refs
+        .as_ref()
+        .map(crate::message_refs::render)
+        .filter(|l| !l.is_empty());
+    let quoted_block = match (input.quoted_text.as_deref(), refs_line.as_deref()) {
+        (None, None) => None,
+        (q, r) => {
+            let mut block = String::from("[Zitierte Nachricht, auf die sich der Nutzer bezieht]\n");
+            if let Some(q) = q {
+                block.push_str(q);
+                block.push('\n');
+            }
+            // The exact referent, from what the bot recorded when it sent that
+            // message — authoritative over any name in the text.
+            if let Some(r) = r {
+                block.push_str(&format!(
+                    "[Bezug laut System (verbindlich, nicht per Name suchen): {r}]\n"
+                ));
+            }
+            block.push_str("[Ende Zitat]");
+            Some(block)
+        }
+    };
+    if let Some(refs) = &input.quoted_refs {
+        // The quoted entities are this turn's subject: load their memories.
+        touch_scopes(&mut session.active_scopes, refs, MAX_ACTIVE_SCOPES);
+    }
 
     // Step 3: Assemble memory bundle using the session's accumulated entity scopes (S4).
     // `active_scopes` grows as tools reference entity IDs (inquiry_id, customer_id, etc.)
@@ -111,7 +159,7 @@ pub async fn process_turn(
         Some(q) => format!("{q}\n{}", input.text),
         None => input.text.clone(),
     };
-    let bundle = retrieval::assemble_bundle(pool, llm.as_ref(), &retrieval_query, &scope_refs)
+    let bundle = retrieval::assemble_bundle(pool, &retrieval_query, &scope_refs)
         .await
         .unwrap_or_default();
     debug!(load_log = ?bundle.load_log, "Memory bundle assembled");
@@ -151,6 +199,17 @@ pub async fn process_turn(
     // that no tool ever created). `unbacked_claim` checks the claim against this set.
     let mut tools_ran_this_turn: std::collections::HashSet<String> =
         std::collections::HashSet::new();
+    // One trace per tool call, persisted with the assistant turn (see `Turn::tools`).
+    let mut traces: Vec<String> = Vec::new();
+    // IDs for `TurnResult::cited_ids`, in the order the tools touched them.
+    let mut cited_ids: Vec<String> = Vec::new();
+    // Writes that went through this turn, kept as episodes once the turn is done.
+    let mut episodes: Vec<(String, Vec<String>)> = Vec::new();
+    if let Some(prior) = &input.prior_action {
+        grounded_ids.extend(extract_uuid_shapes(&prior.result.to_string()));
+        tools_acted_this_turn += 1;
+        tools_ran_this_turn.insert(prior.tool_name.clone());
+    }
     if !ctx_text.is_empty() {
         messages.push(aust_llm_providers::LlmMessage::user(format!(
             "[Gesprächsverlauf]\n{ctx_text}"
@@ -263,6 +322,18 @@ pub async fn process_turn(
                 break;
             }
             ChatResponse::ToolCalls(calls) => {
+                // Keep the model's own call in the transcript, so each result below
+                // answers a request it can see it made.
+                messages.push(aust_llm_providers::LlmMessage::assistant_tool_calls(
+                    "",
+                    calls
+                        .iter()
+                        .map(|c| aust_llm_providers::LlmToolCall {
+                            name: c.name.clone(),
+                            arguments: c.arguments.clone(),
+                        })
+                        .collect(),
+                ));
                 for call in calls {
                     debug!(tool = call.name, "LLM requested tool call");
 
@@ -270,64 +341,32 @@ pub async fn process_turn(
                     // When the LLM calls a tool with an inquiry_id or customer_id,
                     // add the corresponding scope so scoped memories are included
                     // in subsequent Telegram message turns. Persisted in session.
-                    let new_scopes = extract_scopes_from_args(&call.arguments, &session.active_scopes, 5);
-                    session.active_scopes.extend(new_scopes);
+                    touch_scopes(&mut session.active_scopes, &call.arguments, MAX_ACTIVE_SCOPES);
 
                     // Look up tool in registry (role-filtered).
                     let tool = match registry.get(&call.name, role) {
                         Some(t) => t,
                         None => {
                             warn!(tool = call.name, "Tool not found or not allowed for role");
-                            messages.push(aust_llm_providers::LlmMessage::user(format!(
-                                "[Tool-Fehler] Tool '{}' nicht verfügbar.",
-                                call.name
-                            )));
+                            messages.push(aust_llm_providers::LlmMessage::tool_result(
+                                &call.name,
+                                format!("[Tool-Fehler] Tool '{}' nicht verfügbar.", call.name),
+                            ));
                             continue;
                         }
                     };
 
-                    // Validate args (one retry on schema failure).
-                    let validated_args = match ToolRegistry::validate_args(tool, &call.arguments) {
-                        Ok(_) => call.arguments.clone(),
-                        Err(e) => {
-                            warn!(err = %e, "Tool arg validation failed — asking LLM to retry");
-                            messages.push(aust_llm_providers::LlmMessage::user(format!(
-                                "[Validierungsfehler] {e}. Bitte korrigiere die Argumente."
-                            )));
-                            // One retry: ask the LLM to fix its arguments.
-                            let retry_resp = llm
-                                .chat_with_tools(ModelTier::Main, &messages, &tool_schemas)
-                                .await?;
-                            match retry_resp {
-                                ChatResponse::ToolCalls(retry_calls) => {
-                                    match retry_calls.into_iter().find(|c| c.name == call.name) {
-                                        // The retry was never re-validated, so a model
-                                        // that got it wrong twice ran its second bad
-                                        // payload straight against a real write tool.
-                                        Some(rc) => match ToolRegistry::validate_args(tool, &rc.arguments) {
-                                            Ok(_) => rc.arguments,
-                                            Err(e) => {
-                                                warn!(
-                                                    tool = call.name,
-                                                    err = %e,
-                                                    "Retried tool call failed validation too — not executing"
-                                                );
-                                                messages.push(aust_llm_providers::LlmMessage::user(
-                                                    format!("[Validierungsfehler] {e}. Der Aufruf wurde nicht ausgeführt."),
-                                                ));
-                                                continue;
-                                            }
-                                        },
-                                        None => continue,
-                                    }
-                                }
-                                ChatResponse::Text(t) => {
-                                    reply = t;
-                                    break;
-                                }
-                            }
-                        }
-                    };
+                    // Invalid args are reported back as this call's result; the next
+                    // iteration lets the model correct them with the error in view.
+                    if let Err(e) = ToolRegistry::validate_args(tool, &call.arguments) {
+                        warn!(tool = call.name, err = %e, "Tool arg validation failed");
+                        messages.push(aust_llm_providers::LlmMessage::tool_result(
+                            &call.name,
+                            format!("[Validierungsfehler] {e}. Der Aufruf wurde nicht ausgeführt — bitte mit korrigierten Argumenten erneut aufrufen."),
+                        ));
+                        continue;
+                    }
+                    let validated_args = call.arguments.clone();
 
                     // For Confirm-safety tools, always enqueue.
                     // For Write-safety tools, enqueue when role is Operator (Owner executes immediately).
@@ -363,6 +402,12 @@ pub async fn process_turn(
                         .unwrap_or_else(|e| warn!("Audit write failed: {e}"));
 
                         tools_acted_this_turn += 1;
+                        traces.push(session::tool_trace(
+                            &call.name,
+                            &validated_args,
+                            &format!("wartet auf Bestätigung durch Alex (pending {pending_id})"),
+                        ));
+                        cite_arg_ids(&mut cited_ids, &validated_args);
                         let summary = tool.summarize(&validated_args);
                         pending_action_id = Some(pending_id);
                         awaiting_confirmation = true;
@@ -413,7 +458,14 @@ pub async fn process_turn(
 
                             // Every ID returned by a real tool call is now citable,
                             // and the tool itself now backs claims about its entity.
-                            grounded_ids.extend(extract_uuid_shapes(&result.to_string()));
+                            let result_text = result.to_string();
+                            grounded_ids.extend(extract_uuid_shapes(&result_text));
+                            traces.push(session::tool_trace(&call.name, &validated_args, &result_text));
+                            cite_arg_ids(&mut cited_ids, &validated_args);
+                            cited_ids.extend(extract_uuid_shapes(&result_text));
+                            if acted && !matches!(tool.safety(), Safety::Read) {
+                                episodes.push(write_episode(&input.text, &call.name, &validated_args, &result));
+                            }
                             if acted {
                                 tools_ran_this_turn.insert(call.name.clone());
                             } else {
@@ -424,14 +476,19 @@ pub async fn process_turn(
                             }
 
                             // Feed the tool result back into the conversation.
-                            messages.push(aust_llm_providers::LlmMessage::user(format!(
-                                "[Tool-Ergebnis: {}]\n{}",
-                                call.name, result
-                            )));
+                            messages.push(aust_llm_providers::LlmMessage::tool_result(
+                                &call.name,
+                                cap_tool_result(&result.to_string()),
+                            ));
                         }
                         Err(e) => {
                             warn!(tool = call.name, err = %e, "Tool execution failed");
                             let err_str = e.to_string();
+                            traces.push(session::tool_trace(
+                                &call.name,
+                                &validated_args,
+                                &format!("FEHLER: {err_str}"),
+                            ));
                             audit::record(
                                 pool,
                                 AuditEntry {
@@ -447,10 +504,10 @@ pub async fn process_turn(
                             .await
                             .unwrap_or_else(|e| warn!("Audit write failed: {e}"));
 
-                            messages.push(aust_llm_providers::LlmMessage::user(format!(
-                                "[Tool-Fehler: {}] {err_str}",
-                                call.name
-                            )));
+                            messages.push(aust_llm_providers::LlmMessage::tool_result(
+                                &call.name,
+                                format!("[Tool-Fehler] {err_str}"),
+                            ));
                         }
                     }
                 }
@@ -483,18 +540,81 @@ pub async fn process_turn(
     session::append_turn(
         pool,
         &mut session,
-        Turn::assistant(reply.clone()),
+        Turn::assistant(reply.clone()).with_tools(traces),
         llm.as_ref(),
     )
     .await
     .unwrap_or_else(|e| warn!("Failed to persist assistant turn: {e}"));
 
+    // Remember what was done — in the background: with local embeddings on, the
+    // first episode after a quiet spell loads the model, which must not hold up
+    // the reply.
+    if !episodes.is_empty() {
+        let pool = pool.clone();
+        aust_core::tenant::spawn(async move {
+            for (summary, tags) in episodes {
+                if let Err(e) = episodic::append(&pool, &summary, &tags, serde_json::json!({})).await {
+                    warn!("Failed to store episode: {e}");
+                }
+            }
+        });
+    }
+
     Ok(TurnResult {
         reply,
         awaiting_confirmation,
         pending_action_id,
+        cited_ids,
         pending_summary_de,
     })
+}
+
+/// One episode for a write a tool performed: what Alex asked, what ran, the
+/// outcome. Tagged with the tool and the entities it touched, so it surfaces
+/// when the conversation is about them again.
+fn write_episode(request: &str, tool: &str, args: &Value, result: &Value) -> (String, Vec<String>) {
+    let request: String = request.chars().take(160).collect();
+    let args_text: String = args.to_string().chars().take(200).collect();
+    let outcome = result["summary"]
+        .as_str()
+        .or(result["message"].as_str())
+        .map(|s| s.chars().take(160).collect::<String>())
+        .unwrap_or_else(|| "erledigt".to_string());
+    let today = chrono::Utc::now().with_timezone(&chrono_tz::Europe::Berlin).format("%d.%m.%Y");
+    let summary = format!("{today}: Alex: „{request}“ → {tool}({args_text}) → {outcome}");
+    (summary, episode_tags(tool, args))
+}
+
+/// Tags for an episode: the tool plus `inquiry:/customer:/employee:` scopes
+/// from its arguments (the same strings as `AgentSession::active_scopes`).
+fn episode_tags(tool: &str, args: &Value) -> Vec<String> {
+    let mut tags = vec![tool.to_string()];
+    touch_scopes(&mut tags, args, usize::MAX);
+    tags
+}
+
+/// Record how Alex resolved a confirmation in the chat's session history.
+///
+/// The tap happens outside any driver turn, so without this the next message
+/// had no idea whether the mail went out, the Termin was cancelled, or Alex
+/// declined — "hast du sie angeschrieben?" was answered from a pending summary.
+pub async fn record_resolution(pool: &PgPool, chat_id: i64, tool_name: &str, args: &Value, outcome: &str) {
+    let turn = Turn::assistant(format!("[Bestätigungsknopf] {tool_name}: {outcome}"))
+        .with_tools(vec![session::tool_trace(tool_name, args, outcome)]);
+    if let Err(e) = session::append_note(pool, chat_id, turn).await {
+        warn!(chat_id, tool_name, "Failed to record confirmation outcome in session: {e}");
+    }
+    // Also an episode: how Alex reacts to proposals (confirms, cancels, edits) is
+    // the strongest signal of what he wants — the input for nightly reflection.
+    let mut tags = episode_tags(tool_name, args);
+    tags.push("confirmation".to_string());
+    let today = chrono::Utc::now().with_timezone(&chrono_tz::Europe::Berlin).format("%d.%m.%Y");
+    let args_text: String = args.to_string().chars().take(200).collect();
+    let outcome_text: String = outcome.chars().take(200).collect();
+    let summary = format!("{today}: Vorschlag {tool_name}({args_text}) → {outcome_text}");
+    if let Err(e) = episodic::append(pool, &summary, &tags, serde_json::json!({})).await {
+        warn!(chat_id, tool_name, "Failed to store confirmation episode: {e}");
+    }
 }
 
 /// Parameters for resuming a confirmed pending action.
@@ -571,6 +691,12 @@ pub async fn resume_confirmed(
             )
             .await
             .unwrap_or_else(|e| warn!("Audit write failed after confirmation: {e}"));
+            let outcome = if v["ok"].as_bool() == Some(false) {
+                format!("bestätigt, aber NICHT ausgeführt: {}", v["message"].as_str().unwrap_or("Grund unbekannt"))
+            } else {
+                format!("bestätigt und ausgeführt → {v}")
+            };
+            record_resolution(pool, chat_id, &pending.tool_name, &args, &outcome).await;
             Ok(v)
         }
         Err(e) => {
@@ -589,9 +715,34 @@ pub async fn resume_confirmed(
             )
             .await
             .unwrap_or_else(|e2| warn!("Audit write failed after confirmation error: {e2}"));
+            record_resolution(pool, chat_id, &pending.tool_name, &args, &format!("bestätigt, aber FEHLER: {err_str}")).await;
             Err(e)
         }
     }
+}
+
+/// Push every `*_id` argument of a tool call onto `cited` (the entity it acts on).
+fn cite_arg_ids(cited: &mut Vec<String>, args: &Value) {
+    if let Some(obj) = crate::message_refs::from_payload(args).as_object() {
+        cited.extend(obj.values().filter_map(Value::as_str).map(str::to_lowercase));
+    }
+}
+
+/// Longest tool result fed back to the model, in characters. Inbox and calendar
+/// listings can run to tens of kilobytes and crowd the conversation out of the
+/// context window; past this the model is told to narrow its query.
+const MAX_TOOL_RESULT_CHARS: usize = 8_000;
+
+/// Cut an oversized tool result on a char boundary and say so in-band.
+pub fn cap_tool_result(result: &str) -> String {
+    if result.chars().count() <= MAX_TOOL_RESULT_CHARS {
+        return result.to_string();
+    }
+    let kept: String = result.chars().take(MAX_TOOL_RESULT_CHARS).collect();
+    format!(
+        "{kept}\n[… gekürzt: Ergebnis zu lang. Frag gezielter ab (Filter, Zeitraum, ID), \
+         wenn dir hier etwas fehlt.]"
+    )
 }
 
 /// Heuristic: does this reply assert that a write/side-effect was just completed?
@@ -843,12 +994,17 @@ pub(crate) fn ungrounded_uuids(
     seen
 }
 
-/// Extract entity scopes from a tool-call argument map (S4 helper).
+/// Entity scopes kept on a session, `"global"` included.
+const MAX_ACTIVE_SCOPES: usize = 5;
+
+/// Mark the entities a tool call touches as the session's most recent scopes (S4).
 ///
-/// Returns scope strings like `"inquiry:<uuid>"`, `"customer:<uuid>"`, etc.
-/// Caps at `max` to avoid blowing the memory bundle budget.
-pub(crate) fn extract_scopes_from_args(args: &serde_json::Value, existing: &[String], max: usize) -> Vec<String> {
-    let mut new_scopes = Vec::new();
+/// Scopes are kept least-recently-used first. A touched scope moves to the end;
+/// past `max` the oldest non-global scope is dropped. The previous version simply
+/// stopped adding at the cap, and since a chat's session never ends, every chat
+/// froze on the first four entities it ever saw — memories about any later
+/// customer or inquiry were never loaded again.
+pub(crate) fn touch_scopes(active: &mut Vec<String>, args: &serde_json::Value, max: usize) {
     for (key, prefix) in [
         ("inquiry_id", "inquiry"),
         ("customer_id", "customer"),
@@ -856,20 +1012,28 @@ pub(crate) fn extract_scopes_from_args(args: &serde_json::Value, existing: &[Str
     ] {
         if let Some(id_str) = args[key].as_str() {
             let scope = format!("{prefix}:{id_str}");
-            if !existing.contains(&scope) && !new_scopes.contains(&scope)
-                && existing.len() + new_scopes.len() < max
-            {
-                new_scopes.push(scope);
-            }
+            active.retain(|s| *s != scope);
+            active.push(scope);
         }
     }
-    new_scopes
+    while active.len() > max {
+        match active.iter().position(|s| s != "global") {
+            Some(i) => {
+                active.remove(i);
+            }
+            None => break,
+        }
+    }
 }
+
+/// How to work with the tools and the Telegram context — the same for every
+/// tenant, unlike the persona in SOUL.md.
+const TOOLS_PREAMBLE: &str = include_str!("../prompts/tools_preamble.md");
 
 fn build_system_prompt(soul: &Soul, memory_context: &str) -> String {
     let soul_text = soul.as_system_prompt();
     let now = current_datetime_context();
-    let base = format!("{soul_text}\n\n---\n\n{now}");
+    let base = format!("{soul_text}\n\n---\n\n{TOOLS_PREAMBLE}\n\n---\n\n{now}");
     if memory_context.is_empty() {
         base
     } else {
@@ -909,35 +1073,34 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// S4: extract_scopes_from_args must add inquiry/customer/employee scopes from tool args.
+    /// S4: tool args add inquiry/customer/employee scopes.
     #[test]
-    fn extract_scopes_adds_entity_scopes() {
-        let existing = vec!["global".to_string()];
-        let args = json!({ "inquiry_id": "018f5c30-0000-7000-8000-000000000001" });
-        let new_scopes = extract_scopes_from_args(&args, &existing, 5);
-        assert_eq!(new_scopes, vec!["inquiry:018f5c30-0000-7000-8000-000000000001"]);
+    fn touch_scopes_adds_entity_scopes() {
+        let mut active = vec!["global".to_string()];
+        touch_scopes(&mut active, &json!({ "inquiry_id": "i1", "customer_id": "c1" }), 5);
+        assert_eq!(active, vec!["global", "inquiry:i1", "customer:c1"]);
     }
 
-    /// S4: cap at max scopes.
+    /// S4: at the cap the least recently used entity goes, never "global" —
+    /// so a new customer still gets its memories loaded.
     #[test]
-    fn extract_scopes_caps_at_max() {
-        let existing: Vec<String> = (0..4).map(|i| format!("inquiry:id-{i}")).collect();
-        // 4 existing + "global" = 5, so we can add 0 more when max=5.
-        let mut existing_with_global = vec!["global".to_string()];
-        existing_with_global.extend(existing);
-        let args = json!({ "inquiry_id": "new-id", "customer_id": "cust-id" });
-        let new_scopes = extract_scopes_from_args(&args, &existing_with_global, 5);
-        assert!(new_scopes.is_empty(), "should not exceed max scopes");
+    fn touch_scopes_evicts_oldest_at_cap() {
+        let mut active: Vec<String> = std::iter::once("global".to_string())
+            .chain((0..4).map(|i| format!("inquiry:id-{i}")))
+            .collect();
+        touch_scopes(&mut active, &json!({ "customer_id": "new" }), 5);
+        assert_eq!(active.len(), 5);
+        assert_eq!(active[0], "global");
+        assert!(!active.contains(&"inquiry:id-0".to_string()));
+        assert_eq!(active.last().unwrap(), "customer:new");
     }
 
-    /// S4: duplicate scopes must not be added.
+    /// S4: touching a known scope moves it to the end instead of duplicating it.
     #[test]
-    fn extract_scopes_no_duplicates() {
-        let id = "018f5c30-0000-7000-8000-000000000002";
-        let existing = vec!["global".to_string(), format!("inquiry:{id}")];
-        let args = json!({ "inquiry_id": id });
-        let new_scopes = extract_scopes_from_args(&args, &existing, 10);
-        assert!(new_scopes.is_empty(), "duplicate scope must not be added");
+    fn touch_scopes_refreshes_without_duplicates() {
+        let mut active = vec!["global".to_string(), "inquiry:a".to_string(), "inquiry:b".to_string()];
+        touch_scopes(&mut active, &json!({ "inquiry_id": "a" }), 5);
+        assert_eq!(active, vec!["global", "inquiry:b", "inquiry:a"]);
     }
 
     fn ran(tools: &[&str]) -> std::collections::HashSet<String> {

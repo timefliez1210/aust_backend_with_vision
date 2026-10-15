@@ -178,7 +178,7 @@ pub async fn run_offer_event_handler(
                 )
                 .await;
             }
-            ApprovalDecision::AssistantText { chat_id, text, reply_to_text, .. } => {
+            ApprovalDecision::AssistantText { chat_id, text, reply_to_text, reply_to_message_id, .. } => {
                 // Check if this chat is bound to the assistant. If so, delegate to the bridge.
                 // If unbound, the EditInstructions variant (emitted in parallel) covers legacy flow.
                 match aust_assistant::bindings::resolve(&state.db, chat_id).await {
@@ -191,6 +191,7 @@ pub async fn run_offer_event_handler(
                             chat_id,
                             &text,
                             reply_to_text.as_deref(),
+                            reply_to_message_id,
                             state.assistant_llm.clone(),
                             &state.tool_registry,
                             &*crate::services::assistant_bridge::soul::for_current(&state).await,
@@ -208,7 +209,7 @@ pub async fn run_offer_event_handler(
             }
             ApprovalDecision::AssistantCallback {
                 chat_id,
-                message_id: _,
+                message_id,
                 callback_data,
                 callback_query_id,
             } => {
@@ -223,9 +224,11 @@ pub async fn run_offer_event_handler(
                             &client,
                             bot_token,
                             chat_id,
+                            message_id,
                             &callback_data,
                             state.assistant_llm.clone(),
                             &state.tool_registry,
+                            &*crate::services::assistant_bridge::soul::for_current(&state).await,
                             state.services.clone(),
                         )
                         .await;
@@ -245,6 +248,8 @@ pub async fn run_offer_event_handler(
                 mime_type,
                 caption,
                 reply_to_text,
+                reply_to_message_id,
+                extra_file_ids,
                 ..
             } => {
                 match aust_assistant::bindings::resolve(&state.db, chat_id).await {
@@ -256,10 +261,12 @@ pub async fn run_offer_event_handler(
                             bot_token,
                             chat_id,
                             &file_id,
+                            &extra_file_ids,
                             &kind,
                             mime_type.as_deref(),
                             caption.as_deref(),
                             reply_to_text.as_deref(),
+                            reply_to_message_id,
                             state.assistant_llm.clone(),
                             &state.tool_registry,
                             &*crate::services::assistant_bridge::soul::for_current(&state).await,
@@ -272,6 +279,42 @@ pub async fn run_offer_event_handler(
                     }
                     Err(e) => {
                         warn!(chat_id, "AssistantMedia: binding lookup failed: {e}");
+                    }
+                }
+            }
+            ApprovalDecision::AssistantVoice {
+                chat_id,
+                file_id,
+                duration,
+                reply_to_text,
+                reply_to_message_id,
+                ..
+            } => {
+                match aust_assistant::bindings::resolve(&state.db, chat_id).await {
+                    Ok(_binding) => {
+                        telegram_input::handle_voice_message(
+                            &state.db,
+                            &client,
+                            bot_token,
+                            chat_id,
+                            &file_id,
+                            duration,
+                            state.config.voice.max_duration_secs,
+                            reply_to_text.as_deref(),
+                            reply_to_message_id,
+                            state.transcriber.clone(),
+                            state.assistant_llm.clone(),
+                            &state.tool_registry,
+                            &*crate::services::assistant_bridge::soul::for_current(&state).await,
+                            state.services.clone(),
+                        )
+                        .await;
+                    }
+                    Err(aust_assistant::AssistantError::UnboundChat(_)) => {
+                        debug!(chat_id, "AssistantVoice: unbound chat — skipping");
+                    }
+                    Err(e) => {
+                        warn!(chat_id, "AssistantVoice: binding lookup failed: {e}");
                     }
                 }
             }

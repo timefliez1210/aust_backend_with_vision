@@ -732,7 +732,7 @@ fn slot_greeting(slot: &str) -> &'static str {
 }
 
 /// The owner's chat, if one is bound.
-async fn owner_chat(pool: &PgPool) -> Result<Option<i64>> {
+pub(crate) async fn owner_chat(pool: &PgPool) -> Result<Option<i64>> {
     let owner: Option<(i64,)> =
         sqlx::query_as("SELECT chat_id FROM telegram_chat_bindings WHERE role = 'owner' LIMIT 1")
             .fetch_optional(pool)
@@ -742,7 +742,7 @@ async fn owner_chat(pool: &PgPool) -> Result<Option<i64>> {
 
 /// Claim `(date, slot)` in `agent_briefing_log`. Only the tick that wins the
 /// insert may send, so restarts and overlapping ticks never double-post.
-async fn claim_slot(pool: &PgPool, date: NaiveDate, slot: &str, chat: i64) -> Result<bool> {
+pub(crate) async fn claim_slot(pool: &PgPool, date: NaiveDate, slot: &str, chat: i64) -> Result<bool> {
     let claimed: Option<(NaiveDate,)> = sqlx::query_as(
         "INSERT INTO agent_briefing_log (slot_date, slot, chat_id) VALUES ($1, $2, $3) \
          ON CONFLICT (tenant_id, slot_date, slot) DO NOTHING RETURNING slot_date",
@@ -756,7 +756,7 @@ async fn claim_slot(pool: &PgPool, date: NaiveDate, slot: &str, chat: i64) -> Re
 }
 
 /// Release a claim after a failed send so the next tick retries.
-async fn release_slot(pool: &PgPool, date: NaiveDate, slot: &str) {
+pub(crate) async fn release_slot(pool: &PgPool, date: NaiveDate, slot: &str) {
     let _ = sqlx::query("DELETE FROM agent_briefing_log WHERE slot_date = $1 AND slot = $2")
         .bind(date)
         .bind(slot)
@@ -794,7 +794,7 @@ pub async fn run_briefing_tick(pool: &PgPool, notifier: &dyn TelegramNotifier) -
     let deliver = async {
         let briefing = assemble_for(pool, today).await?;
         let body = briefing.to_telegram_text_with_greeting(slot_greeting(slot));
-        notify(pool, notifier, owner_chat, NotificationKind::Briefing, body).await?;
+        notify(pool, notifier, owner_chat, NotificationKind::Briefing, body, serde_json::json!({})).await?;
         Ok::<(), crate::error::AssistantError>(())
     };
 
@@ -833,7 +833,7 @@ pub async fn run_evening_preview_tick(pool: &PgPool, notifier: &dyn TelegramNoti
         let tomorrow = today + chrono::Duration::days(1);
         let appts = appointments_on(pool, tomorrow).await?;
         if let Some(body) = evening_preview_text(tomorrow, &appts) {
-            notify(pool, notifier, owner_chat, NotificationKind::EveningPreview, body).await?;
+            notify(pool, notifier, owner_chat, NotificationKind::EveningPreview, body, serde_json::json!({})).await?;
         }
         Ok::<(), crate::error::AssistantError>(())
     };

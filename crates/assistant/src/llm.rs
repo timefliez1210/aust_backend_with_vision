@@ -249,25 +249,7 @@ impl OllamaAssistantLlm {
         let model = self.select_model(tier, messages).to_string();
         let url = format!("{}/api/chat", self.base_url);
 
-        let ollama_messages: Vec<Value> = messages
-            .iter()
-            .map(|m| {
-                let mut msg = serde_json::json!({
-                    "role": match m.role {
-                        aust_llm_providers::LlmRole::System => "system",
-                        aust_llm_providers::LlmRole::User => "user",
-                        aust_llm_providers::LlmRole::Assistant => "assistant",
-                    },
-                    "content": m.content,
-                });
-                // Forward base64 images (photos / rasterized PDF pages) so the
-                // vision-capable model can see them. Omitted when empty.
-                if !m.images.is_empty() {
-                    msg["images"] = serde_json::json!(m.images);
-                }
-                msg
-            })
-            .collect();
+        let ollama_messages: Vec<Value> = messages.iter().map(ollama_message).collect();
 
         let mut body = serde_json::json!({
             "model": model,
@@ -312,6 +294,41 @@ impl OllamaAssistantLlm {
         let text = message["content"].as_str().unwrap_or_default().to_string();
         Ok(ChatResponse::Text(text))
     }
+}
+
+/// One message in Ollama `/api/chat` shape.
+///
+/// Tool calls travel natively: the model's own call stays on its `assistant`
+/// message (`tool_calls`), and the result comes back as a `tool` message naming
+/// the tool. Sending results as plain `user` text instead showed the model data
+/// it had no visible record of asking for, which weakened multi-step chaining.
+fn ollama_message(m: &LlmMessage) -> Value {
+    use aust_llm_providers::LlmRole;
+    let mut msg = serde_json::json!({
+        "role": match m.role {
+            LlmRole::System => "system",
+            LlmRole::User => "user",
+            LlmRole::Assistant => "assistant",
+            LlmRole::Tool => "tool",
+        },
+        "content": m.content,
+    });
+    // Forward base64 images (photos / rasterized PDF pages) so the
+    // vision-capable model can see them. Omitted when empty.
+    if !m.images.is_empty() {
+        msg["images"] = serde_json::json!(m.images);
+    }
+    if !m.tool_calls.is_empty() {
+        msg["tool_calls"] = m
+            .tool_calls
+            .iter()
+            .map(|c| serde_json::json!({ "function": { "name": c.name, "arguments": c.arguments } }))
+            .collect();
+    }
+    if let Some(name) = &m.tool_name {
+        msg["tool_name"] = serde_json::json!(name);
+    }
+    msg
 }
 
 #[async_trait]
@@ -416,11 +433,24 @@ mod tests {
     use super::*;
 
     fn msg(content: &str, images: Vec<String>) -> LlmMessage {
-        LlmMessage {
-            role: aust_llm_providers::LlmRole::User,
-            content: content.to_string(),
-            images,
-        }
+        LlmMessage::user_with_images(content, images)
+    }
+
+    #[test]
+    fn tool_messages_use_native_ollama_shape() {
+        let call = aust_llm_providers::LlmToolCall {
+            name: "get_inquiry".into(),
+            arguments: serde_json::json!({ "inquiry_id": "x" }),
+        };
+        let asked = ollama_message(&LlmMessage::assistant_tool_calls("", vec![call]));
+        assert_eq!(asked["role"], "assistant");
+        assert_eq!(asked["tool_calls"][0]["function"]["name"], "get_inquiry");
+        assert_eq!(asked["tool_calls"][0]["function"]["arguments"]["inquiry_id"], "x");
+
+        let answered = ollama_message(&LlmMessage::tool_result("get_inquiry", "{\"ok\":true}"));
+        assert_eq!(answered["role"], "tool");
+        assert_eq!(answered["tool_name"], "get_inquiry");
+        assert!(answered.get("tool_calls").is_none());
     }
 
     #[test]

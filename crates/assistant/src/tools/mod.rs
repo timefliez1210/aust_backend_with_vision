@@ -136,10 +136,8 @@ impl ToolRegistry {
         registry.register(Box::new(offers::CommitOfferDraft));
         registry.register(Box::new(offers::RecomputeOffer));
         registry.register(Box::new(offers::ApplyNaturalLanguageOverride));
-        // SendOfferToCustomer is unregistered until OfferService::send (SMTP + PDF
-        // attach) is plumbed — its execute() only returns NotWired, so exposing it
-        // would walk Alex to a confirmation for an action the agent cannot perform.
-        // Re-register here once the send path lands. Offer sending: use admin panel.
+        // Sends via EmailService::create_offer_draft + send_draft (admin send path).
+        registry.register(Box::new(offers::SendOfferToCustomer));
         registry.register(Box::new(offers::CancelOffer));
         registry.register(Box::new(offers::GetOfferHistory));
         registry.register(Box::new(offers::MarkOfferAccepted));
@@ -184,6 +182,7 @@ impl ToolRegistry {
         // SendEmail: wired in 51afc90 via EmailService::send (SMTP). Sends a
         // standalone email to any recipient without an inquiry/thread.
         registry.register(Box::new(emails::SendEmail));
+        registry.register(Box::new(emails::SendEmailDraft));
         registry.register(Box::new(emails::MarkEmailHandled));
         registry.register(Box::new(emails::CategorizeEmail));
 
@@ -196,10 +195,8 @@ impl ToolRegistry {
         registry.register(Box::new(invoices::RecordPayment));
         registry.register(Box::new(invoices::ListDueDunning));
         registry.register(Box::new(invoices::SendPaymentReminder));
-        // SendInvoice stays unregistered until the invoice SMTP+PDF send path is
-        // exposed via InvoiceService — it is NotWired-only today. Use the admin panel
-        // to send an invoice. Dunning mail (SendPaymentReminder) does not need the PDF
-        // pipeline — it is a plain email — so it is wired.
+        // Sends via InvoiceService::send (the dashboard send path).
+        registry.register(Box::new(invoices::SendInvoice));
         registry.register(Box::new(invoices::VoidInvoice));
 
         // Estimates
@@ -229,6 +226,8 @@ impl ToolRegistry {
         // Meta
         registry.register(Box::new(meta::Remember));
         registry.register(Box::new(meta::Recall));
+        registry.register(Box::new(meta::Forget));
+        registry.register(Box::new(meta::SearchHistory));
         registry.register(Box::new(meta::DailyBriefing));
         registry.register(Box::new(meta::WeeklyPipeline));
         registry.register(Box::new(meta::DailyMetrics));

@@ -45,5 +45,15 @@ pub async fn maybe_post_keyboard(
         if let Err(e) = confirmation::set_telegram_message_id(pool, pending_id, message_id).await {
             warn!("Could not persist telegram_message_id on pending_action {pending_id}: {e}");
         }
+        // A reply to the keyboard ("nein, an die andere Adresse") names the action
+        // and the entities it targets.
+        let mut refs = match confirmation::fetch(pool, pending_id).await {
+            Ok(p) => aust_assistant::message_refs::from_payload(&p.proposed_args),
+            Err(_) => serde_json::json!({}),
+        };
+        if let Some(obj) = refs.as_object_mut() {
+            obj.insert("pending_action_id".into(), serde_json::Value::String(pending_id.to_string()));
+        }
+        aust_assistant::message_refs::record(pool, chat_id, message_id, refs).await;
     }
 }

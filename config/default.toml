@@ -64,3 +64,22 @@ assembly_price = 25.00
 parking_ban_price = 100.00
 packing_price = 30.00
 saturday_surcharge_cents = 5000
+
+# Telegram voice notes → local whisper.cpp. Off while model_path is empty.
+# Prod: model in /opt/aust/whisper (mounted at /app/whisper), e.g.
+#   AUST__VOICE__MODEL_PATH=/app/whisper/ggml-small-q5_1.bin
+[voice]
+whisper_bin = "whisper-cli"
+model_path = ""
+threads = 0
+timeout_secs = 300
+max_duration_secs = 300
+
+# Josie's episodic memory. "local" = in-process multilingual embeddings
+# (~240 MB model in model_cache_dir, ~0.8 GB RAM while loaded, unloaded when idle);
+# "off" = German full-text search only. Prod: AUST__MEMORY__EMBEDDINGS=local,
+# AUST__MEMORY__MODEL_CACHE_DIR=/app/models (host /opt/aust/models).
+[memory]
+embeddings = "off"
+model_cache_dir = "models"
+idle_unload_secs = 600

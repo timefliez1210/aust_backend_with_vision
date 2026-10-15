@@ -23,6 +23,9 @@ async-trait = { workspace = true }
 reqwest = { workspace = true }
 tokio-util = { workspace = true }
 
+# In-process multilingual sentence embeddings for episodic memory (no cloud API).
+fastembed = { version = "7.1", default-features = false, features = ["ort-download-binaries-native-tls", "hf-hub-native-tls"] }
+
 # JSON Schema validation for tool arguments.
 jsonschema = "0.28"
 

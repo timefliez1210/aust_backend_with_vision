@@ -10,7 +10,12 @@ use aust_core::services::{
     EmployeeSchedulePatch, EmployeeWorkloadEntry, ServiceError,
 };
 
-use crate::repositories::{calendar_item_repo, inquiry_appointment_repo};
+use crate::repositories::{calendar_item_repo, inquiry_appointment_repo, inquiry_repo};
+use crate::services::bridge::InquiryServiceImpl;
+use crate::services::calendar_item_update::{self, UpdateItemBody};
+use crate::services::inquiry_update::{self, UpdateInquiryRequest};
+use crate::ApiError;
+use aust_core::services::InquiryService;
 
 /// Row shape for a single `calendar_items` read with time + location columns.
 type TerminRow = (
@@ -58,6 +63,34 @@ impl CalendarServiceImpl {
 
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    /// Reject unknown or inactive employees up front, as the admin assign does, so
+    /// a bad ID fails the call instead of being written or skipped silently.
+    async fn ensure_active_crew(&self, crew: &[Uuid]) -> Result<(), ServiceError> {
+        for employee_id in crew {
+            match inquiry_repo::check_employee_active(&self.pool, *employee_id)
+                .await
+                .map_err(super::map_sqlx)?
+            {
+                None => return Err(ServiceError::NotFound(format!("Mitarbeiter {employee_id} nicht gefunden"))),
+                Some(false) => return Err(ServiceError::Validation(format!("Mitarbeiter {employee_id} ist inaktiv"))),
+                Some(true) => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Edit a calendar item through the admin PATCH path (`calendar_item_update`).
+    async fn patch_item(&self, id: Uuid, body: UpdateItemBody) -> Result<(), ServiceError> {
+        calendar_item_update::update_item(&self.pool, id, body)
+            .await
+            .map(|_| ())
+            .map_err(|e| match e {
+                ApiError::NotFound(msg) => ServiceError::NotFound(msg),
+                ApiError::Validation(msg) | ApiError::BadRequest(msg) => ServiceError::Validation(msg),
+                other => ServiceError::Db(anyhow::anyhow!(other.to_string())),
+            })
     }
 }
 
@@ -303,34 +336,22 @@ impl CalendarService for CalendarServiceImpl {
         id: Uuid,
         patch: CalendarItemPatch,
     ) -> Result<CalendarItem, ServiceError> {
-        // Build a partial update.
-        sqlx::query(
-            r#"
-            UPDATE calendar_items SET
-                title = COALESCE($2, title),
-                category = COALESCE($3, category),
-                scheduled_date = COALESCE($4, scheduled_date),
-                end_date = COALESCE($5, end_date),
-                description = COALESCE($6, description),
-                start_time = COALESCE($7, start_time),
-                end_time = COALESCE($8, end_time),
-                location = COALESCE($9, location),
-                updated_at = NOW()
-            WHERE id = $1
-            "#,
+        // Same path as the admin calendar's PATCH (span + crew move with the date).
+        self.patch_item(
+            id,
+            UpdateItemBody {
+                title: patch.title,
+                description: patch.notes,
+                category: patch.category,
+                location: patch.location,
+                scheduled_date: patch.scheduled_date,
+                start_time: patch.start_time,
+                end_time: patch.end_time,
+                end_date: patch.end_date.map(|d| serde_json::json!(d.format("%Y-%m-%d").to_string())),
+                ..Default::default()
+            },
         )
-        .bind(id)
-        .bind(patch.title.as_deref())
-        .bind(patch.category.as_deref())
-        .bind(patch.scheduled_date)
-        .bind(patch.end_date)
-        .bind(patch.notes.as_deref())
-        .bind(patch.start_time)
-        .bind(patch.end_time)
-        .bind(patch.location.as_deref())
-        .execute(&self.pool)
-        .await
-        .map_err(super::map_sqlx)?;
+        .await?;
 
         let row: Option<TerminRow> = sqlx::query_as(
             "SELECT id, title, category, scheduled_date, end_date, start_time, end_time, location \
@@ -365,6 +386,13 @@ impl CalendarService for CalendarServiceImpl {
         Ok(())
     }
 
+    /// Put an inquiry on a day (first scheduling or a move) and staff it.
+    ///
+    /// Goes through `inquiry_update::update_inquiry`, the admin PATCH path, so the
+    /// existing crew moves with the job and `status.changed` is emitted. The job
+    /// appears in the calendar as itself (the Auftrag) — this used to also insert
+    /// a free-standing "moving" calendar item with no inquiry link and no crew,
+    /// which put every Josie-scheduled move in the calendar twice.
     async fn schedule_inquiry(
         &self,
         inquiry_id: Uuid,
@@ -374,90 +402,28 @@ impl CalendarService for CalendarServiceImpl {
         start_time: Option<NaiveTime>,
         end_time: Option<NaiveTime>,
     ) -> Result<CalendarItem, ServiceError> {
-        // Fetch inquiry title for the calendar item.
-        let title_row: Option<(String,)> = sqlx::query_as(
-            r#"
-            SELECT COALESCE(c.name, 'Umzug') AS title
-            FROM inquiries i
-            LEFT JOIN customers c ON i.customer_id = c.id
-            WHERE i.id = $1
-            "#,
-        )
-        .bind(inquiry_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(super::map_sqlx)?;
+        // Check the crew before touching the job, as the admin assign does.
+        self.ensure_active_crew(&crew).await?;
 
-        let title = title_row.map(|(t,)| t).unwrap_or_else(|| "Umzug".to_string());
-
-        // Update inquiry scheduled_date, status and (when supplied) times. NULL
-        // start/end leave the existing values intact via COALESCE.
-        // Capture the day the job currently sits on before moving it. Anyone
-        // already on the crew is pinned to that day in `inquiry_employees`, and
-        // the row does not follow the job on its own: a move done here used to
-        // leave the whole crew standing on the old date, where the worker app
-        // showed them a job that was no longer there and showed them nothing on
-        // the day it had moved to. Only `update_fields` shifted the crew, so a
-        // move made through this path silently stranded it.
-        let old_date: Option<NaiveDate> =
-            sqlx::query_scalar("SELECT scheduled_date FROM inquiries WHERE id = $1")
-                .bind(inquiry_id)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(super::map_sqlx)?
-                .flatten();
-
-        sqlx::query(
-            r#"
-            UPDATE inquiries SET
-                scheduled_date = $1,
-                status = 'scheduled',
-                start_time = COALESCE($3, start_time),
-                end_time = COALESCE($4, end_time),
-                updated_at = NOW()
-            WHERE id = $2
-            "#,
-        )
-        .bind(date)
-        .bind(inquiry_id)
-        .bind(start_time)
-        .bind(end_time)
-        .execute(&self.pool)
-        .await
-        .map_err(super::map_sqlx)?;
-
-        // Carry the existing crew across by the same delta the job moved. Rows
-        // that already carry recorded work stay put: those hours are historical
-        // fact about a day somebody actually worked. A row that would land on a
-        // day the same worker already holds is skipped rather than merged.
-        if let Some(old) = old_date.filter(|old| *old != date) {
-            sqlx::query(
-                r#"
-                UPDATE inquiry_employees
-                SET job_date = job_date + ($2::date - $3::date)
-                WHERE inquiry_id = $1
-                  AND clock_in IS NULL AND clock_out IS NULL AND actual_hours IS NULL
-                  AND NOT EXISTS (
-                      SELECT 1 FROM inquiry_employees other
-                      WHERE other.inquiry_id  = inquiry_employees.inquiry_id
-                        AND other.employee_id = inquiry_employees.employee_id
-                        AND other.job_date    = inquiry_employees.job_date
-                                                + ($2::date - $3::date)
-                  )
-                "#,
-            )
-            .bind(inquiry_id)
-            .bind(date)
-            .bind(old)
-            .execute(&self.pool)
+        let events = aust_core::events::EventEmitter::new(self.pool.clone());
+        let request = UpdateInquiryRequest {
+            scheduled_date: Some(date.format("%Y-%m-%d").to_string()),
+            status: Some("scheduled".to_string()),
+            start_time,
+            end_time,
+            ..Default::default()
+        };
+        let inquiry = inquiry_update::update_inquiry(&self.pool, &events, inquiry_id, request)
             .await
-            .map_err(super::map_sqlx)?;
-        }
+            .map_err(|e| match e {
+                ApiError::NotFound(msg) => ServiceError::NotFound(msg),
+                ApiError::Validation(msg) | ApiError::BadRequest(msg) => ServiceError::Validation(msg),
+                other => ServiceError::Db(anyhow::anyhow!(other.to_string())),
+            })?;
 
-        // Assign employees (use existing inquiry_employees table), carrying the
-        // job's shift times onto each crew row when provided.
+        // Staff the day, carrying the job's shift times onto each crew row.
         for employee_id in &crew {
-            let _ = sqlx::query(
+            sqlx::query(
                 r#"
                 INSERT INTO inquiry_employees (inquiry_id, employee_id, job_date, start_time, end_time)
                 VALUES ($1, $2, $3, $4, $5)
@@ -472,38 +438,27 @@ impl CalendarService for CalendarServiceImpl {
             .bind(start_time)
             .bind(end_time)
             .execute(&self.pool)
-            .await;
+            .await
+            .map_err(super::map_sqlx)?;
         }
 
-        // Create a calendar item referencing the inquiry.
-        let start = start_time.unwrap_or_else(|| NaiveTime::from_hms_opt(8, 0, 0).unwrap_or_default());
-        let new_id = calendar_item_repo::insert_item(
-            &self.pool,
-            &title,
-            notes,
-            "moving",
-            None,
-            Some(date),
-            start,
-            end_time,
-            0.0,
-            None,
-            None,
-        )
-        .await
-        .map_err(super::map_sqlx)?;
+        if let Some(text) = notes.map(str::trim).filter(|t| !t.is_empty()) {
+            InquiryServiceImpl::new(self.pool.clone())
+                .add_note(inquiry_id, text, "assistant")
+                .await?;
+        }
 
         Ok(CalendarItem {
-            id: new_id,
-            title,
+            id: inquiry_id,
+            title: inquiry.customer.as_ref().and_then(|c| c.name.clone()).unwrap_or_else(|| "Umzug".to_string()),
             category: "moving".to_string(),
             scheduled_date: Some(date),
             end_date: None,
-            start_time: Some(start),
-            end_time,
+            start_time: Some(inquiry.start_time),
+            end_time: Some(inquiry.end_time),
             location: None,
-            kind: "termin".to_string(),
-            inquiry_id: None,
+            kind: "auftrag".to_string(),
+            inquiry_id: Some(inquiry_id),
         })
     }
 
@@ -514,14 +469,9 @@ impl CalendarService for CalendarServiceImpl {
         new_crew: Option<Vec<Uuid>>,
     ) -> Result<CalendarItem, ServiceError> {
         if let Some(date) = new_date {
-            sqlx::query(
-                "UPDATE calendar_items SET scheduled_date = $1, updated_at = NOW() WHERE id = $2",
-            )
-            .bind(date)
-            .bind(termin_id)
-            .execute(&self.pool)
-            .await
-            .map_err(super::map_sqlx)?;
+            // Admin PATCH path: the span and the existing crew move with the date.
+            self.patch_item(termin_id, UpdateItemBody { scheduled_date: Some(date), ..Default::default() })
+                .await?;
         }
 
         if let Some(crew) = new_crew {
@@ -545,7 +495,7 @@ impl CalendarService for CalendarServiceImpl {
             .await
             .map_err(super::map_sqlx)?;
 
-            if let Some((Some(date),)) = date_row {
+            if let Some((Some(_),)) = date_row {
                 // Stale rows OUTSIDE the item's current date span are removed,
                 // but only when they carry no recorded hours — rows with clock
                 // data are historical fact. In-span rows (multi-day items) stay.
@@ -562,19 +512,11 @@ impl CalendarService for CalendarServiceImpl {
                 .bind(termin_id)
                 .execute(&self.pool)
                 .await;
+                // Every day of the span, with the item's times — as the admin assign does.
                 for employee_id in &crew {
-                    let _ = sqlx::query(
-                        r#"
-                        INSERT INTO calendar_item_employees (calendar_item_id, employee_id, job_date)
-                        VALUES ($1, $2, $3)
-                        ON CONFLICT DO NOTHING
-                        "#,
-                    )
-                    .bind(termin_id)
-                    .bind(employee_id)
-                    .bind(date)
-                    .execute(&self.pool)
-                    .await;
+                    calendar_item_repo::insert_item_employee(&self.pool, termin_id, *employee_id)
+                        .await
+                        .map_err(super::map_sqlx)?;
                 }
             }
         }
@@ -606,14 +548,8 @@ impl CalendarService for CalendarServiceImpl {
     }
 
     async fn cancel_termin(&self, id: Uuid, _reason: &str) -> Result<(), ServiceError> {
-        sqlx::query(
-            "UPDATE calendar_items SET status = 'cancelled', updated_at = NOW() WHERE id = $1",
-        )
-        .bind(id)
-        .execute(&self.pool)
-        .await
-        .map_err(super::map_sqlx)?;
-        Ok(())
+        self.patch_item(id, UpdateItemBody { status: Some("cancelled".to_string()), ..Default::default() })
+            .await
     }
 
     async fn assign_employee(
@@ -621,34 +557,18 @@ impl CalendarService for CalendarServiceImpl {
         calendar_item_id: Uuid,
         employee_id: Uuid,
     ) -> Result<(), ServiceError> {
-        let date_row: Option<(Option<NaiveDate>,)> = sqlx::query_as(
-            "SELECT scheduled_date FROM calendar_items WHERE id = $1",
-        )
-        .bind(calendar_item_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(super::map_sqlx)?;
-
-        let date = date_row
-            .ok_or_else(|| ServiceError::NotFound(format!("Kalendereintrag {calendar_item_id}")))?
-            .0
-            .unwrap_or_else(|| chrono::Local::now().date_naive());
-
-        sqlx::query(
-            r#"
-            INSERT INTO calendar_item_employees (calendar_item_id, employee_id, job_date)
-            VALUES ($1, $2, $3)
-            ON CONFLICT DO NOTHING
-            "#,
-        )
-        .bind(calendar_item_id)
-        .bind(employee_id)
-        .bind(date)
-        .execute(&self.pool)
-        .await
-        .map_err(super::map_sqlx)?;
-
-        Ok(())
+        // The admin assign path: checks both sides exist and staffs EVERY day of a
+        // multi-day Termin with the item's times. This used to insert day one only,
+        // without times, so the worker saw half a job.
+        if !calendar_item_repo::item_exists(&self.pool, calendar_item_id).await.map_err(super::map_sqlx)? {
+            return Err(ServiceError::NotFound(format!("Kalendereintrag {calendar_item_id}")));
+        }
+        if !calendar_item_repo::employee_exists(&self.pool, employee_id).await.map_err(super::map_sqlx)? {
+            return Err(ServiceError::NotFound(format!("Mitarbeiter {employee_id}")));
+        }
+        calendar_item_repo::insert_item_employee(&self.pool, calendar_item_id, employee_id)
+            .await
+            .map_err(super::map_sqlx)
     }
 
     async fn get_employee_assignments(
@@ -819,6 +739,7 @@ impl CalendarService for CalendarServiceImpl {
                 .map_err(super::map_sqlx)?;
         let (scheduled, end) = inq
             .ok_or_else(|| ServiceError::NotFound(format!("Anfrage {inquiry_id}")))?;
+        self.ensure_active_crew(&crew).await?;
         let first = date.or(scheduled).ok_or_else(|| {
             ServiceError::Validation(
                 "Anfrage hat kein geplantes Datum — bitte Datum angeben.".to_string(),
@@ -1015,6 +936,7 @@ impl CalendarService for CalendarServiceImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::repositories::calendar_repo;
 
     async fn try_pool() -> Option<PgPool> {
         let url = std::env::var("DATABASE_URL").ok()?;
@@ -1093,6 +1015,156 @@ mod tests {
         sqlx::query("DELETE FROM inquiries WHERE id = $1").bind(inquiry_id).execute(&pool).await.ok();
         sqlx::query("DELETE FROM employees WHERE id = $1").bind(employee_id).execute(&pool).await.ok();
         sqlx::query("DELETE FROM customers WHERE id = $1").bind(customer_id).execute(&pool).await.ok();
+    }
+
+    /// A move Josie schedules must show in the admin calendar exactly once, as the
+    /// Auftrag itself, with its crew. `schedule_inquiry` used to also insert an
+    /// unlinked "moving" calendar item, so every such job appeared twice and the
+    /// copy carried no crew.
+    #[tokio::test]
+    async fn josie_scheduled_move_shows_once_in_the_admin_calendar() {
+        let Some(pool) = try_pool().await else { return };
+
+        let customer_id = Uuid::now_v7();
+        let name = format!("Kalender Test {customer_id}");
+        sqlx::query("INSERT INTO customers (id, name, email) VALUES ($1, $2, $3)")
+            .bind(customer_id)
+            .bind(&name)
+            .bind(format!("{customer_id}@test.de"))
+            .execute(&pool)
+            .await
+            .expect("insert customer");
+        let inquiry_id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO inquiries (id, customer_id, status, source) VALUES ($1, $2, 'accepted', 'test')",
+        )
+        .bind(inquiry_id)
+        .bind(customer_id)
+        .execute(&pool)
+        .await
+        .expect("insert inquiry");
+        let employee_id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO employees (id, first_name, last_name, email) VALUES ($1, 'Lea', 'Kalender', $2)",
+        )
+        .bind(employee_id)
+        .bind(format!("{employee_id}@test.de"))
+        .execute(&pool)
+        .await
+        .expect("insert employee");
+
+        let day = NaiveDate::from_ymd_opt(2032, 3, 9).expect("valid date");
+        let svc = CalendarServiceImpl::new(pool.clone());
+        let item = svc
+            .schedule_inquiry(inquiry_id, day, vec![employee_id], Some("Klavier im 3. OG"), None, None)
+            .await
+            .expect("schedule");
+        assert_eq!(item.inquiry_id, Some(inquiry_id));
+        assert_eq!(item.kind, "auftrag");
+
+        // What the admin calendar (`GET /calendar/schedule`) reads.
+        let jobs = calendar_repo::fetch_schedule_inquiries(&pool, day, day).await.expect("schedule inquiries");
+        assert_eq!(jobs.iter().filter(|j| j.inquiry_id == inquiry_id).count(), 1, "the Auftrag shows once");
+        let items = calendar_repo::fetch_schedule_calendar_items(&pool, day, day).await.expect("schedule items");
+        assert!(
+            !items.iter().any(|i| i.title == name),
+            "no duplicate free-standing calendar item for the same move"
+        );
+
+        let crew: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT employee_id FROM inquiry_employees WHERE inquiry_id = $1 AND job_date = $2",
+        )
+        .bind(inquiry_id)
+        .bind(day)
+        .fetch_all(&pool)
+        .await
+        .expect("read crew");
+        assert_eq!(crew, vec![employee_id]);
+
+        let (status, notes): (String, Option<String>) =
+            sqlx::query_as("SELECT status::text, notes FROM inquiries WHERE id = $1")
+                .bind(inquiry_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read inquiry");
+        assert_eq!(status, "scheduled");
+        assert!(notes.unwrap_or_default().contains("Klavier im 3. OG"));
+
+        sqlx::query("DELETE FROM domain_events WHERE aggregate = $1").bind(format!("inquiry:{inquiry_id}")).execute(&pool).await.ok();
+        sqlx::query("DELETE FROM inquiry_employees WHERE inquiry_id = $1").bind(inquiry_id).execute(&pool).await.ok();
+        sqlx::query("DELETE FROM inquiries WHERE id = $1").bind(inquiry_id).execute(&pool).await.ok();
+        sqlx::query("DELETE FROM employees WHERE id = $1").bind(employee_id).execute(&pool).await.ok();
+        sqlx::query("DELETE FROM customers WHERE id = $1").bind(customer_id).execute(&pool).await.ok();
+    }
+
+    /// Josie moving a two-day Termin must move it like a drag in the admin
+    /// calendar: the end date follows the start and the crew lands on the new
+    /// days. The bridge used to write `scheduled_date` alone — the Termin ended
+    /// before it began (and dropped out of the calendar) and the crew stayed behind.
+    #[tokio::test]
+    async fn josie_moving_a_termin_carries_span_and_crew() {
+        let Some(pool) = try_pool().await else { return };
+
+        let start = NaiveDate::from_ymd_opt(2032, 5, 10).expect("valid date");
+        let end = NaiveDate::from_ymd_opt(2032, 5, 11).expect("valid date");
+        let item_id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO calendar_items (id, title, category, scheduled_date, end_date, start_time)
+             VALUES ($1, 'Lagerräumung Test', 'other', $2, $3, '08:00')",
+        )
+        .bind(item_id)
+        .bind(start)
+        .bind(end)
+        .execute(&pool)
+        .await
+        .expect("insert calendar item");
+        let employee_id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO employees (id, first_name, last_name, email) VALUES ($1, 'Tom', 'Termin', $2)",
+        )
+        .bind(employee_id)
+        .bind(format!("{employee_id}@test.de"))
+        .execute(&pool)
+        .await
+        .expect("insert employee");
+        for day in [start, end] {
+            sqlx::query(
+                "INSERT INTO calendar_item_employees (calendar_item_id, employee_id, job_date) VALUES ($1, $2, $3)",
+            )
+            .bind(item_id)
+            .bind(employee_id)
+            .bind(day)
+            .execute(&pool)
+            .await
+            .expect("insert crew");
+        }
+
+        let moved = NaiveDate::from_ymd_opt(2032, 5, 17).expect("valid date");
+        let svc = CalendarServiceImpl::new(pool.clone());
+        let item = svc.reassign_termin(item_id, Some(moved), None).await.expect("move");
+        assert_eq!(item.scheduled_date, Some(moved));
+        assert_eq!(item.end_date, NaiveDate::from_ymd_opt(2032, 5, 18), "the span moves with the start");
+
+        let days: Vec<NaiveDate> = sqlx::query_scalar(
+            "SELECT job_date FROM calendar_item_employees WHERE calendar_item_id = $1 ORDER BY job_date",
+        )
+        .bind(item_id)
+        .fetch_all(&pool)
+        .await
+        .expect("read crew");
+        assert_eq!(days, vec![moved, NaiveDate::from_ymd_opt(2032, 5, 18).expect("valid date")]);
+
+        svc.cancel_termin(item_id, "Test").await.expect("cancel");
+        let status: String = sqlx::query_scalar("SELECT status FROM calendar_items WHERE id = $1")
+            .bind(item_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read status");
+        assert_eq!(status, "cancelled");
+
+        sqlx::query("DELETE FROM calendar_item_employees WHERE calendar_item_id = $1").bind(item_id).execute(&pool).await.ok();
+        sqlx::query("DELETE FROM calendar_items WHERE id = $1").bind(item_id).execute(&pool).await.ok();
+        sqlx::query("DELETE FROM employees WHERE id = $1").bind(employee_id).execute(&pool).await.ok();
     }
 
     /// Regression (2026-07-13): a Besichtigung created via create_inquiry_appointment

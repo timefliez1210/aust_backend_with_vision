@@ -92,6 +92,21 @@ pub async fn list_pending(pool: &PgPool, limit: u32) -> Result<Vec<PendingPropos
     Ok(rows)
 }
 
+/// One proposal by ID, in any status.
+pub async fn get(pool: &PgPool, id: Uuid) -> Result<Option<PendingProposal>> {
+    Ok(sqlx::query_as(
+        r#"
+        SELECT id, session_id, proposed_at, kind, scope, key, value, confidence,
+               source_episodes, rationale, status, resolved_at, resolved_by, resolution_note
+        FROM pending_memory_proposals
+        WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?)
+}
+
 /// List proposals enqueued within the last `hours` hours, regardless of status.
 pub async fn list_recent(pool: &PgPool, hours: i64) -> Result<Vec<PendingProposal>> {
     let rows: Vec<PendingProposal> = sqlx::query_as(
@@ -134,8 +149,18 @@ pub async fn approve(pool: &PgPool, id: Uuid, resolved_by: Uuid) -> Result<()> {
         crate::error::AssistantError::NotFound(format!("pending proposal {id}"))
     })?;
 
-    // Insert into agent_memory.
+    // Insert into agent_memory, replacing (superseding) an active memory with
+    // the same scope + key — approving "Lange: nur per Mail" twice must not leave
+    // two competing rows that are both loaded into every prompt.
     let mem_id = Uuid::now_v7();
+    let previous: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM agent_memory WHERE scope = $1 AND key = $2 \
+         AND superseded_by IS NULL AND retired_at IS NULL ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(&scope)
+    .bind(&key)
+    .fetch_optional(&mut *tx)
+    .await?;
     sqlx::query(
         r#"
         INSERT INTO agent_memory (id, kind, scope, key, value, source, confidence)
@@ -150,6 +175,14 @@ pub async fn approve(pool: &PgPool, id: Uuid, resolved_by: Uuid) -> Result<()> {
     .bind(confidence as f64)
     .execute(&mut *tx)
     .await?;
+
+    if let Some(old) = previous {
+        sqlx::query("UPDATE agent_memory SET superseded_by = $1 WHERE id = $2")
+            .bind(mem_id)
+            .bind(old)
+            .execute(&mut *tx)
+            .await?;
+    }
 
     // Flip status.
     sqlx::query(

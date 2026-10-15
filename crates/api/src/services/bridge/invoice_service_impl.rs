@@ -434,4 +434,34 @@ impl InvoiceService for InvoiceServiceImpl {
 
         Ok(payment_id.0)
     }
+
+    async fn send(&self, invoice_id: Uuid, expected_to: &str) -> Result<String, ServiceError> {
+        let row: Option<(Uuid, Option<String>)> = sqlx::query_as(
+            "SELECT i.inquiry_id, c.email FROM invoices i
+             JOIN inquiries q ON q.id = i.inquiry_id
+             JOIN customers c ON c.id = q.customer_id
+             WHERE i.id = $1",
+        )
+        .bind(invoice_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(super::map_sqlx)?;
+        let (inquiry_id, email) = row.ok_or_else(|| ServiceError::NotFound(format!("Rechnung {invoice_id}")))?;
+        let email = email.unwrap_or_default();
+        if !email.trim().eq_ignore_ascii_case(expected_to.trim()) {
+            return Err(ServiceError::Validation(format!(
+                "Der Kunde hat die Adresse '{email}', nicht '{expected_to}' — nichts gesendet."
+            )));
+        }
+        crate::routes::invoices::send_invoice_mail(
+            &self.pool,
+            self.storage.as_ref(),
+            &self.config,
+            inquiry_id,
+            invoice_id,
+            Default::default(),
+        )
+        .await
+        .map_err(super::map_api)
+    }
 }

@@ -606,7 +606,37 @@ impl EmailService for MockEmailService {
     async fn send(&self, _to: &str, _subject: &str, _body: &str) -> Result<(), ServiceError> {
         Ok(())
     }
-}
+
+    async fn create_reply_draft(&self, _email_id: Uuid, body: &str) -> Result<aust_core::services::EmailDraft, ServiceError> {
+        Ok(aust_core::services::EmailDraft {
+            id: Uuid::new_v4(),
+            thread_id: Uuid::new_v4(),
+            to_address: "kunde@example.com".into(),
+            subject: Some("Re: Umzug".into()),
+            body: body.to_string(),
+        })
+    }
+    async fn create_offer_draft(&self, _inquiry_id: Uuid, body: Option<&str>) -> Result<aust_core::services::EmailDraft, ServiceError> {
+        Ok(aust_core::services::EmailDraft {
+            id: Uuid::new_v4(),
+            thread_id: Uuid::new_v4(),
+            to_address: "kunde@example.com".into(),
+            subject: Some("Ihr Kostenvoranschlag".into()),
+            body: body.unwrap_or("Anschreiben").to_string(),
+        })
+    }
+    async fn get_draft(&self, draft_id: Uuid) -> Result<aust_core::services::EmailDraft, ServiceError> {
+        Ok(aust_core::services::EmailDraft {
+            id: draft_id,
+            thread_id: Uuid::new_v4(),
+            to_address: "kunde@example.com".into(),
+            subject: Some("Re: Umzug".into()),
+            body: "Entwurf".into(),
+        })
+    }
+    async fn send_draft(&self, _draft_id: Uuid) -> Result<String, ServiceError> {
+        Ok("kunde@example.com".into())
+    }}
 
 // ── Invoice mock ──────────────────────────────────────────────────────────────
 
@@ -707,6 +737,9 @@ impl InvoiceService for MockInvoiceService {
 
     async fn mark_paid(&self, _invoice_id: Uuid) -> Result<(), ServiceError> {
         Ok(())
+    }
+    async fn send(&self, _invoice_id: Uuid, expected_to: &str) -> Result<String, ServiceError> {
+        Ok(expected_to.to_string())
     }
 }
 

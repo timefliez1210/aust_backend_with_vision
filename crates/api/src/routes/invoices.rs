@@ -912,7 +912,26 @@ async fn send_invoice(
     body: Option<Json<SendInvoiceRequest>>,
 ) -> Result<Json<InvoiceResponse>, ApiError> {
     let req = body.map(|Json(r)| r).unwrap_or_default();
-    let row = fetch_invoice_by_inquiry(&state.db, inv_id, inquiry_id).await?;
+    send_invoice_mail(&state.db, state.storage.as_ref(), &state.config, inquiry_id, inv_id, req).await?;
+    let updated_row = fetch_invoice_row(&state.db, inv_id).await?;
+    let offer_netto = get_offer_netto(&state.db, inquiry_id).await?;
+    Ok(Json(build_invoice_response(updated_row, offer_netto)))
+}
+
+/// Email an invoice PDF to the customer and advance its state — the one send
+/// path for the dashboard button and Josie's `send_invoice` tool. Checks that
+/// the invoice may go out yet, refuses a non-PDF file, then marks it sent, moves
+/// the inquiry to "invoiced" and schedules the 7-day payment reminder. Returns
+/// the address it went to.
+pub(crate) async fn send_invoice_mail(
+    db: &sqlx::PgPool,
+    storage: &dyn aust_storage::StorageProvider,
+    config: &aust_core::Config,
+    inquiry_id: Uuid,
+    inv_id: Uuid,
+    req: SendInvoiceRequest,
+) -> Result<String, ApiError> {
+    let row = fetch_invoice_by_inquiry(db, inv_id, inquiry_id).await?;
 
     // Sendability gate
     if row.invoice_type == "partial_first" {
@@ -922,7 +941,7 @@ async fn send_invoice(
             ));
         }
     } else {
-        let inq_status = invoice_repo::fetch_inquiry_status(&state.db, inquiry_id)
+        let inq_status = invoice_repo::fetch_inquiry_status(db, inquiry_id)
             .await?
             .unwrap_or_default();
         if inq_status != "completed" {
@@ -938,14 +957,13 @@ async fn send_invoice(
         .ok_or_else(|| ApiError::NotFound("Invoice PDF not yet generated".into()))?;
 
     // Load PDF bytes from S3
-    let pdf_bytes = state
-        .storage
+    let pdf_bytes = storage
         .download(&pdf_key)
         .await
         .map_err(|e| ApiError::Internal(format!("Failed to load invoice PDF: {e}")))?;
 
     // Load customer email
-    let (customer_email, customer_name) = invoice_repo::fetch_customer_for_invoice(&state.db, inquiry_id)
+    let (customer_email, customer_name) = invoice_repo::fetch_customer_for_invoice(db, inquiry_id)
         .await
         .map_err(|_| ApiError::NotFound("Customer not found for inquiry".into()))?
         .ok_or_else(|| ApiError::NotFound("Customer not found for inquiry".into()))?;
@@ -969,13 +987,13 @@ async fn send_invoice(
 
     let display_name = customer_name.as_deref().unwrap_or("Kunde");
     let invoice_num = &row.invoice_number;
-    let profile = tenant_repo::profile(&state.db).await?;
+    let profile = tenant_repo::profile(db).await?;
     let subject = req.subject.unwrap_or_else(|| invoice_mail_subject(&profile, invoice_num));
     let body = req.body.unwrap_or_else(|| invoice_mail_body(&profile, display_name, invoice_num));
 
     let filename = format!("Rechnung_{invoice_num}.pdf");
     let email = crate::services::email::build_email_with_attachment(
-        &state.config.email().username,
+        &config.email().username,
         &profile.name,
         &customer_email,
         &subject,
@@ -987,11 +1005,11 @@ async fn send_invoice(
     .map_err(|e| ApiError::Internal(format!("Failed to build invoice email: {e}")))?;
 
     crate::services::email::send_email(
-        &state.config.email().smtp_host,
-        state.config.email().smtp_port,
-        &state.config.email().smtp_tls,
-        &state.config.email().username,
-        &state.config.email().password,
+        &config.email().smtp_host,
+        config.email().smtp_port,
+        &config.email().smtp_tls,
+        &config.email().username,
+        &config.email().password,
         email,
     )
     .await
@@ -999,19 +1017,17 @@ async fn send_invoice(
 
     // Update invoice status
     let now = Utc::now();
-    invoice_repo::mark_sent(&state.db, inv_id, now).await?;
+    invoice_repo::mark_sent(db, inv_id, now).await?;
 
     // Auto-transition inquiry to 'invoiced' if still in an earlier stage
-    invoice_repo::transition_inquiry_to_invoiced(&state.db, inquiry_id, now).await?;
+    invoice_repo::transition_inquiry_to_invoiced(db, inquiry_id, now).await?;
 
     // Schedule a payment-reminder dashboard alert for 7 days from now
     let remind_after = now.date_naive() + chrono::Days::new(7);
-    let _ = crate::repositories::invoice_reminder_repo::create(&state.db, inv_id, remind_after).await;
+    let _ = crate::repositories::invoice_reminder_repo::create(db, inv_id, remind_after).await;
     // (non-fatal — invoice sending succeeds even if reminder creation fails)
 
-    let updated_row = fetch_invoice_row(&state.db, inv_id).await?;
-    let offer_netto = get_offer_netto(&state.db, inquiry_id).await?;
-    Ok(Json(build_invoice_response(updated_row, offer_netto)))
+    Ok(customer_email)
 }
 
 // ---------------------------------------------------------------------------

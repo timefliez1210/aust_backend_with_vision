@@ -51,6 +51,7 @@ pub struct RetentionReport {
     pub sessions_cleared: u64,
     pub episodes_embedding_dropped: u64,
     pub domain_events_archived: u64,
+    pub message_refs_deleted: u64,
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -91,6 +92,11 @@ pub async fn run_retention_pass(pool: &PgPool) -> RetentionReport {
         Err(e) => tracing::error!("sweep_domain_events failed: {e}"),
     }
 
+    match sweep_telegram_message_refs(pool, now).await {
+        Ok(deleted) => report.message_refs_deleted = deleted,
+        Err(e) => tracing::error!("sweep_telegram_message_refs failed: {e}"),
+    }
+
     tracing::info!(
         actions_deleted = report.actions_deleted,
         actions_summarized = report.actions_summarized,
@@ -98,6 +104,7 @@ pub async fn run_retention_pass(pool: &PgPool) -> RetentionReport {
         sessions_cleared = report.sessions_cleared,
         episodes_embedding_dropped = report.episodes_embedding_dropped,
         domain_events_archived = report.domain_events_archived,
+        message_refs_deleted = report.message_refs_deleted,
         "Retention pass complete"
     );
 
@@ -291,6 +298,19 @@ pub async fn sweep_agent_sessions(pool: &PgPool, now: DateTime<Utc>) -> Result<u
     Ok(result.rows_affected())
 }
 
+// ── telegram_message_refs ─────────────────────────────────────────────────────
+
+/// Delete message refs older than 180 days. Nobody replies to a half-year-old
+/// notification, and the bot messages themselves scroll away long before.
+pub async fn sweep_telegram_message_refs(pool: &PgPool, now: DateTime<Utc>) -> Result<u64> {
+    let cutoff = now - chrono::Duration::days(180);
+    let result = sqlx::query("DELETE FROM telegram_message_refs WHERE created_at < $1")
+        .bind(cutoff)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
 // ── agent_episodes ────────────────────────────────────────────────────────────
 
 /// For episodes older than 180 days that do NOT have a `keep` tag, set
@@ -303,9 +323,9 @@ pub async fn sweep_agent_episodes(pool: &PgPool, now: DateTime<Utc>) -> Result<u
     let result = sqlx::query(
         r#"
         UPDATE agent_episodes
-           SET embedding = NULL
+           SET embedding = NULL, embedding_local = NULL
          WHERE created_at < $1
-           AND embedding IS NOT NULL
+           AND (embedding IS NOT NULL OR embedding_local IS NOT NULL)
            AND NOT ('keep' = ANY(tags))
         "#,
     )

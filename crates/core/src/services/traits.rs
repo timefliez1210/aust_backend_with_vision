@@ -528,6 +528,16 @@ pub struct EmailDetail {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// An outbound draft saved in a mailbox thread (visible in the admin mailbox).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmailDraft {
+    pub id: Uuid,
+    pub thread_id: Uuid,
+    pub to_address: String,
+    pub subject: Option<String>,
+    pub body: String,
+}
+
 // ── Inquiry ───────────────────────────────────────────────────────────────────
 
 /// Read + mutate inquiries.
@@ -713,7 +723,8 @@ pub trait CalendarService: Send + Sync {
     async fn delete_item(&self, id: Uuid) -> Result<(), ServiceError>;
 
     /// Schedule an inquiry on a date with a crew. Optionally sets the start/end
-    /// time of day on the inquiry (and the created calendar item).
+    /// time of day on the inquiry. The inquiry itself is what shows in the
+    /// calendar; no separate calendar item is created.
     async fn schedule_inquiry(
         &self,
         inquiry_id: Uuid,
@@ -851,6 +862,21 @@ pub trait EmailService: Send + Sync {
     /// thread — it is for fresh follow-ups, re-activation or correspondence with
     /// historical contacts.
     async fn send(&self, to: &str, subject: &str, body: &str) -> Result<(), ServiceError>;
+
+    /// Save a reply to `email_id` as a draft in that email's thread — the same
+    /// row the admin "Antworten" composer creates. Nothing is sent.
+    async fn create_reply_draft(&self, email_id: Uuid, body: &str) -> Result<EmailDraft, ServiceError>;
+
+    /// Save the KVA cover letter for an inquiry as a draft in its thread (created
+    /// if missing). Sending it attaches the active offer PDF.
+    async fn create_offer_draft(&self, inquiry_id: Uuid, body: Option<&str>) -> Result<EmailDraft, ServiceError>;
+
+    /// A draft by ID (status `draft` only).
+    async fn get_draft(&self, draft_id: Uuid) -> Result<EmailDraft, ServiceError>;
+
+    /// Send a draft exactly as the admin "Senden" button does (threading, KVA
+    /// attachment, offer → sent, thread handled). Returns the recipient.
+    async fn send_draft(&self, draft_id: Uuid) -> Result<String, ServiceError>;
 }
 
 // ── Invoice ───────────────────────────────────────────────────────────────────
@@ -921,6 +947,12 @@ pub trait InvoiceService: Send + Sync {
     /// Prefer this over `update_status(id, "paid")`, which only writes the status
     /// column and would leave the dunning nag running.
     async fn mark_paid(&self, invoice_id: Uuid) -> Result<(), ServiceError>;
+
+    /// Email the invoice PDF to the customer through the dashboard's send path
+    /// (sendability check, PDF check, status → sent, inquiry → invoiced, payment
+    /// reminder). Refuses unless `expected_to` is the customer's address on file.
+    /// Returns the recipient.
+    async fn send(&self, invoice_id: Uuid, expected_to: &str) -> Result<String, ServiceError>;
 }
 
 // ── Employee ──────────────────────────────────────────────────────────────────

@@ -45,8 +45,8 @@ pub enum AssistantError {
     #[error("Validation error: {0}")]
     Validation(String),
 
-    /// Voice transcription is not yet supported (Phase 6).
-    #[error("Voice transcription not yet supported (Phase 6)")]
+    /// No speech-to-text model is configured on this deployment.
+    #[error("Voice transcription not configured")]
     VoiceUnsupported,
 
     /// A capability is not yet wired into the assistant — used by Confirm

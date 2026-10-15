@@ -10,10 +10,9 @@ use tracing::debug;
 use super::durable::{self, DurableMemory};
 use super::episodic::{self, Episode};
 use crate::error::Result;
-use crate::llm::AssistantLlmProvider;
 
 /// Token-budget constants.  Rough approximation: 1 token ≈ 4 characters.
-const GLOBAL_MEMORY_BUDGET: usize = 2_000;  // chars
+const GLOBAL_MEMORY_BUDGET: usize = 3_000;  // chars
 const SCOPED_MEMORY_BUDGET: usize = 3_000;
 const EPISODE_BUDGET: usize = 2_000;
 const MAX_EPISODES: i64 = 10;
@@ -25,7 +24,7 @@ pub struct MemoryBundle {
     pub global_memories: Vec<DurableMemory>,
     /// Active scope-specific durable memories.
     pub scoped_memories: Vec<DurableMemory>,
-    /// Relevant recent episodes.
+    /// Relevant past episodes (what Josie did, how Alex reacted).
     pub episodes: Vec<Episode>,
     /// List of what was loaded (for tracing / debug).
     pub load_log: Vec<String>,
@@ -71,25 +70,31 @@ impl MemoryBundle {
 ///
 /// # Parameters
 /// - `pool`           — DB connection pool.
-/// - `llm`            — LLM provider for generating the query embedding.
 /// - `query_text`     — The current user message, used for episode similarity search.
 /// - `active_scopes`  — Scope strings that should be included (e.g. `["customer:abc"]`).
 ///   Global scope is always included.
 pub async fn assemble_bundle(
     pool: &PgPool,
-    llm: &dyn AssistantLlmProvider,
     query_text: &str,
     active_scopes: &[&str],
 ) -> Result<MemoryBundle> {
     let mut bundle = MemoryBundle::default();
 
     // 1. Global durable memories (always included, budget-capped).
-    let globals = durable::recall(pool, Some("global"), None).await?;
+    // Rules and preferences first, then facts and patterns, newest first within
+    // each: when the budget runs out, a stale fact should drop, never a rule.
+    let mut globals = durable::recall(pool, Some("global"), None).await?;
+    globals.sort_by_key(|m| match m.kind.as_str() {
+        "rule" => 0,
+        "preference" => 1,
+        "fact" => 2,
+        _ => 3,
+    });
     let mut char_count = 0usize;
     for mem in globals {
         let len = mem.key.len() + mem.value.to_string().len();
         if char_count + len > GLOBAL_MEMORY_BUDGET {
-            break;
+            continue; // one oversized entry must not crowd out the rest
         }
         char_count += len;
         bundle.global_memories.push(mem);
@@ -110,7 +115,7 @@ pub async fn assemble_bundle(
         for mem in scoped {
             let len = mem.key.len() + mem.value.to_string().len();
             if scoped_char_count + len > SCOPED_MEMORY_BUDGET {
-                break;
+                continue;
             }
             scoped_char_count += len;
             bundle.scoped_memories.push(mem);
@@ -127,10 +132,11 @@ pub async fn assemble_bundle(
     );
 
     // 3. Episodic memories — similar to the current query.
-    let episodes = episodic::retrieve_similar(pool, llm, query_text, MAX_EPISODES)
+    let scopes: Vec<String> = active_scopes.iter().map(|s| s.to_string()).collect();
+    let episodes = episodic::retrieve(pool, query_text, &scopes, MAX_EPISODES)
         .await
         .unwrap_or_else(|e| {
-            tracing::warn!("Episode retrieval failed, falling back to recent: {e}");
+            tracing::warn!("Episode retrieval failed: {e}");
             vec![]
         });
 

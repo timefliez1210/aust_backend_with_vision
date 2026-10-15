@@ -72,6 +72,9 @@ pub enum ApprovalDecision {
         /// Telegram reply. Carries the referent (e.g. a bot notification with an
         /// inquiry/customer ID) the assistant needs to resolve "diese Anfrage".
         reply_to_text: Option<String>,
+        /// Telegram ID of the replied-to message. When it is a bot message, its
+        /// recorded entity IDs (`telegram_message_refs`) name the referent exactly.
+        reply_to_message_id: Option<i64>,
     },
     /// A `pa:<uuid>:<action>` callback from an assistant-bound chat.
     AssistantCallback {
@@ -107,6 +110,23 @@ pub enum ApprovalDecision {
         /// Text of the message Alex replied to / quoted, when the media is sent
         /// as a Telegram reply. See `AssistantText::reply_to_text`.
         reply_to_text: Option<String>,
+        /// See `AssistantText::reply_to_message_id`.
+        reply_to_message_id: Option<i64>,
+        /// Album this photo belongs to, if any.
+        media_group_id: Option<String>,
+        /// The album's other photos (`file_id`s), merged in after polling.
+        extra_file_ids: Vec<String>,
+    },
+    /// A voice note (or audio file) from a chat that may be bound to the
+    /// assistant. The orchestrator transcribes it and runs a normal text turn.
+    AssistantVoice {
+        chat_id: i64,
+        file_id: String,
+        /// Length in seconds as reported by Telegram.
+        duration: u32,
+        message_id: i64,
+        reply_to_text: Option<String>,
+        reply_to_message_id: Option<i64>,
     },
 }
 
@@ -312,10 +332,11 @@ impl TelegramBot {
                                 draft_id: "assistant_text".to_string(),
                                 decision: ApprovalDecision::AssistantText {
                                     chat_id: message.chat.id,
-                                    text: text.clone(),
+                                    text: message.assistant_text(text),
                                     message_id: message.message_id,
                                     from_user_id: message.from.as_ref().map(|u| u.id),
                                     reply_to_text: message.quoted_text(),
+                            reply_to_message_id: message.reply_to_message.as_ref().map(|m| m.message_id),
                                 },
                             });
                         }
@@ -331,10 +352,11 @@ impl TelegramBot {
                                 draft_id: "assistant_text".to_string(),
                                 decision: ApprovalDecision::AssistantText {
                                     chat_id: message.chat.id,
-                                    text: text.clone(),
+                                    text: message.assistant_text(text),
                                     message_id: message.message_id,
                                     from_user_id: message.from.as_ref().map(|u| u.id),
                                     reply_to_text: message.quoted_text(),
+                            reply_to_message_id: message.reply_to_message.as_ref().map(|m| m.message_id),
                                 },
                             });
                         }
@@ -368,17 +390,36 @@ impl TelegramBot {
                             file_id,
                             kind,
                             mime_type,
-                            caption: message.caption.clone(),
+                            caption: message.caption.as_deref().map(|c| message.assistant_text(c)),
                             message_id: message.message_id,
                             from_user_id: message.from.as_ref().map(|u| u.id),
                             reply_to_text: message.quoted_text(),
+                            reply_to_message_id: message.reply_to_message.as_ref().map(|m| m.message_id),
+                            media_group_id: message.media_group_id.clone(),
+                            extra_file_ids: Vec::new(),
                         },
                     });
                 }
             }
+            // Voice notes / audio files → transcription + a normal assistant turn.
+            if let Some(message) = &update.message
+                && let Some(audio) = message.voice.as_ref().or(message.audio.as_ref())
+            {
+                responses.push(ApprovalResponse {
+                    draft_id: "assistant_voice".to_string(),
+                    decision: ApprovalDecision::AssistantVoice {
+                        chat_id: message.chat.id,
+                        file_id: audio.file_id.clone(),
+                        duration: audio.duration,
+                        message_id: message.message_id,
+                        reply_to_text: message.quoted_text(),
+                        reply_to_message_id: message.reply_to_message.as_ref().map(|m| m.message_id),
+                    },
+                });
+            }
         }
 
-        Ok(responses)
+        Ok(merge_albums(responses))
     }
 
     /// Handle a callback query (inline button press).
@@ -389,7 +430,8 @@ impl TelegramBot {
     ) -> Option<ApprovalResponse> {
         // Intercept `pa:` prefix — route to assistant agent via orchestrator.
         // Do NOT answer the callback here; the orchestrator will do it after dispatch.
-        if data.starts_with("pa:") {
+        // `mp:` = Josie's nightly memory proposals (✅ Merken / ❌ Nein), same route.
+        if data.starts_with("pa:") || data.starts_with("mp:") {
             let chat_id = callback
                 .message
                 .as_ref()
@@ -787,7 +829,7 @@ mod tests {
 
     /// Helper that mirrors the `pa:` interception logic in `handle_callback`.
     fn is_assistant_callback(data: &str) -> bool {
-        data.starts_with("pa:")
+        data.starts_with("pa:") || data.starts_with("mp:")
     }
 
     #[test]
@@ -820,9 +862,11 @@ mod tests {
             message_id: 99,
             from_user_id: Some(7),
             reply_to_text: Some("Neue Anfrage von Frederike".to_string()),
+            reply_to_message_id: Some(55),
         };
         match d {
-            ApprovalDecision::AssistantText { chat_id, text, message_id, from_user_id, reply_to_text } => {
+            ApprovalDecision::AssistantText { chat_id, text, message_id, from_user_id, reply_to_text, reply_to_message_id } => {
+                assert_eq!(reply_to_message_id, Some(55));
                 assert_eq!(chat_id, 42);
                 assert_eq!(text, "Hallo");
                 assert_eq!(message_id, 99);
@@ -831,6 +875,72 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    fn media(chat_id: i64, file_id: &str, group: Option<&str>, caption: Option<&str>) -> ApprovalResponse {
+        ApprovalResponse {
+            draft_id: "assistant_media".to_string(),
+            decision: ApprovalDecision::AssistantMedia {
+                chat_id,
+                file_id: file_id.to_string(),
+                kind: "photo".to_string(),
+                mime_type: None,
+                caption: caption.map(str::to_string),
+                message_id: 1,
+                from_user_id: None,
+                reply_to_text: None,
+                reply_to_message_id: None,
+                media_group_id: group.map(str::to_string),
+                extra_file_ids: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn album_photos_merge_into_one_turn() {
+        let merged = merge_albums(vec![
+            media(1, "a", Some("g1"), None),
+            media(1, "b", Some("g1"), Some("Inventar Keller")),
+            media(1, "c", Some("g1"), None),
+            media(1, "solo", None, None),
+            media(2, "d", Some("g1"), None),
+        ]);
+        assert_eq!(merged.len(), 3, "one album turn, the single photo, the other chat's photo");
+        match &merged[0].decision {
+            ApprovalDecision::AssistantMedia { file_id, extra_file_ids, caption, .. } => {
+                assert_eq!(file_id, "a");
+                assert_eq!(extra_file_ids, &vec!["b".to_string(), "c".to_string()]);
+                assert_eq!(caption.as_deref(), Some("Inventar Keller"));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn voice_note_parses_from_the_bot_api_shape() {
+        let msg: TgMessage = serde_json::from_value(serde_json::json!({
+            "message_id": 3,
+            "chat": { "id": 1 },
+            "voice": { "file_id": "AwAC", "duration": 12, "mime_type": "audio/ogg" }
+        }))
+        .unwrap();
+        let v = msg.voice.as_ref().unwrap();
+        assert_eq!((v.file_id.as_str(), v.duration), ("AwAC", 12));
+    }
+
+    #[test]
+    fn forwarded_text_is_labelled_with_its_origin() {
+        let msg: TgMessage = serde_json::from_value(serde_json::json!({
+            "message_id": 1,
+            "chat": { "id": 1 },
+            "text": "Können Sie am Freitag kommen?",
+            "forward_origin": { "type": "user", "sender_user": { "first_name": "Petra", "last_name": "Lange" } }
+        }))
+        .unwrap();
+        assert_eq!(
+            msg.assistant_text("Können Sie am Freitag kommen?"),
+            "[Weitergeleitete Nachricht von Petra Lange]\nKönnen Sie am Freitag kommen?"
+        );
     }
 
     #[test]
@@ -854,10 +964,20 @@ mod tests {
                 caption: None,
                 reply_to_message: None,
                 quote: None,
+                media_group_id: None,
+                forward_origin: None,
+                voice: None,
+                audio: None,
             })),
             quote: Some(TgQuote { text: Some("Anfrage 1234".to_string()) }),
+            media_group_id: None,
+            forward_origin: None,
+            voice: None,
+            audio: None,
         };
-        assert_eq!(with_quote.quoted_text().as_deref(), Some("Anfrage 1234"));
+        let quoted = with_quote.quoted_text().unwrap();
+        assert!(quoted.contains("«Anfrage 1234»"), "{quoted}");
+        assert!(quoted.contains("voller Benachrichtigungstext"), "the full message must survive a partial quote");
 
         // Falls back to the replied-to message body when there is no partial quote.
         let reply_only = TgMessage {
@@ -878,8 +998,16 @@ mod tests {
                 caption: None,
                 reply_to_message: None,
                 quote: None,
+                media_group_id: None,
+                forward_origin: None,
+                voice: None,
+                audio: None,
             })),
             quote: None,
+            media_group_id: None,
+            forward_origin: None,
+            voice: None,
+            audio: None,
         };
         assert_eq!(reply_only.quoted_text().as_deref(), Some("Neue Anfrage von Frederike"));
 
@@ -894,6 +1022,10 @@ mod tests {
             caption: None,
             reply_to_message: None,
             quote: None,
+            media_group_id: None,
+            forward_origin: None,
+            voice: None,
+            audio: None,
         };
         assert_eq!(plain.quoted_text(), None);
     }
@@ -959,6 +1091,41 @@ struct CallbackMessage {
     chat: TgChat,
 }
 
+/// Fold the photos of one album into a single `AssistantMedia` decision.
+///
+/// Telegram sends an album as one update per photo, all sharing a
+/// `media_group_id` and normally arriving in the same poll. Handled one by one,
+/// each photo started its own assistant turn — five "Einen Moment …" messages
+/// and five answers for one inventory. The first photo keeps its caption and
+/// collects the rest; a caption on a later photo is used if the first had none.
+fn merge_albums(responses: Vec<ApprovalResponse>) -> Vec<ApprovalResponse> {
+    let mut out: Vec<ApprovalResponse> = Vec::with_capacity(responses.len());
+    for resp in responses {
+        if let ApprovalDecision::AssistantMedia { media_group_id: Some(group), chat_id, file_id, caption, .. } =
+            &resp.decision
+        {
+            let target = out.iter_mut().find(|r| {
+                matches!(&r.decision, ApprovalDecision::AssistantMedia {
+                    media_group_id: Some(g), chat_id: c, ..
+                } if g == group && c == chat_id)
+            });
+            if let Some(first) = target {
+                if let ApprovalDecision::AssistantMedia { extra_file_ids, caption: first_caption, .. } =
+                    &mut first.decision
+                {
+                    extra_file_ids.push(file_id.clone());
+                    if first_caption.is_none() {
+                        *first_caption = caption.clone();
+                    }
+                }
+                continue;
+            }
+        }
+        out.push(resp);
+    }
+    out
+}
+
 #[derive(Debug, Deserialize)]
 struct TgMessage {
     message_id: i64,
@@ -986,26 +1153,82 @@ struct TgMessage {
     /// when present, since it is exactly what Alex pointed at.
     #[serde(default)]
     quote: Option<TgQuote>,
+    /// Set on every message of a photo album; Telegram delivers each photo as
+    /// its own update, and they are merged into one assistant turn.
+    #[serde(default)]
+    media_group_id: Option<String>,
+    /// Where a forwarded message came from (Bot API 7.0+ `MessageOrigin`).
+    #[serde(default)]
+    forward_origin: Option<serde_json::Value>,
+    /// A recorded voice note (OGG/Opus).
+    #[serde(default)]
+    voice: Option<TgAudio>,
+    /// An audio file sent as music/audio rather than recorded in-app.
+    #[serde(default)]
+    audio: Option<TgAudio>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TgAudio {
+    file_id: String,
+    #[serde(default)]
+    duration: u32,
 }
 
 impl TgMessage {
+    /// Who a forwarded message originally came from, as a display name.
+    fn forwarded_from(&self) -> Option<String> {
+        let o = self.forward_origin.as_ref()?;
+        let name = match o["type"].as_str() {
+            Some("user") => {
+                let u = &o["sender_user"];
+                [u["first_name"].as_str(), u["last_name"].as_str()]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            }
+            Some("hidden_user") => o["sender_user_name"].as_str().unwrap_or_default().to_string(),
+            Some("chat") => o["sender_chat"]["title"].as_str().unwrap_or_default().to_string(),
+            Some("channel") => o["chat"]["title"].as_str().unwrap_or_default().to_string(),
+            _ => String::new(),
+        };
+        Some(if name.trim().is_empty() { "unbekannt".to_string() } else { name })
+    }
+
+    /// The text the assistant sees: a forwarded message is labelled with its
+    /// origin, so Josie treats it as someone else's words, not Alex's request.
+    fn assistant_text(&self, text: &str) -> String {
+        match self.forwarded_from() {
+            Some(from) => format!("[Weitergeleitete Nachricht von {from}]\n{text}"),
+            None => text.to_string(),
+        }
+    }
+
     /// The text Alex quoted/replied to, if any. Prefers the highlighted partial
     /// quote (Bot API 7.0+), then falls back to the full replied-to message's
     /// text or caption.
     fn quoted_text(&self) -> Option<String> {
-        if let Some(q) = self.quote.as_ref()
-            && let Some(t) = q.text.as_ref()
-            && !t.trim().is_empty()
-        {
-            return Some(t.clone());
-        }
-        let replied = self.reply_to_message.as_ref()?;
-        replied
-            .text
+        let full = self
+            .reply_to_message
             .as_ref()
-            .or(replied.caption.as_ref())
-            .filter(|t| !t.trim().is_empty())
-            .cloned()
+            .and_then(|r| r.text.as_ref().or(r.caption.as_ref()))
+            .filter(|t| !t.trim().is_empty());
+        let partial = self
+            .quote
+            .as_ref()
+            .and_then(|q| q.text.as_ref())
+            .filter(|t| !t.trim().is_empty());
+        match (partial, full) {
+            // The highlight says what Alex pointed at; the full message keeps the
+            // rest (name, date, ID) the highlight alone used to drop.
+            (Some(p), Some(f)) if p.trim() != f.trim() => {
+                Some(format!("Markiert: «{}»\nGanze Nachricht:\n{f}", p.trim()))
+            }
+            (Some(p), _) => Some(p.clone()),
+            (None, Some(f)) => Some(f.clone()),
+            (None, None) => None,
+        }
     }
 }
 

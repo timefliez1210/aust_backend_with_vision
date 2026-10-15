@@ -292,7 +292,7 @@ pub struct ScheduleInquiry;
 impl Tool for ScheduleInquiry {
     fn name(&self) -> &'static str { "schedule_inquiry" }
     fn description(&self) -> &'static str {
-        "Plant eine Anfrage erstmalig ein: setzt Datum + Crew, ändert den Status auf 'scheduled' UND legt einen Kalendereintrag an. NUR zum erstmaligen Verplanen verwenden. Wenn die Anfrage schon geplant ist und nur die Crew geändert werden soll, set_inquiry_crew nutzen (legt keinen doppelten Kalendereintrag an). Nur für Inhaber."
+        "Plant eine Anfrage ein oder verschiebt sie: setzt Datum (+ optional Uhrzeiten), Status 'scheduled' und fügt die angegebene Crew hinzu. Die Anfrage erscheint dadurch selbst als Auftrag im Kalender — es wird KEIN separater Kalendereintrag angelegt. Beim Verschieben wandert die bereits eingeteilte Crew automatisch mit. Um die Crew vollständig zu ersetzen, set_inquiry_crew nutzen. Nur für Inhaber."
     }
     fn params_schema(&self) -> Value {
         json!({

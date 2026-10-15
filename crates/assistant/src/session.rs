@@ -24,6 +24,12 @@ pub struct Turn {
     pub content: String,
     /// UTC timestamp.
     pub ts: chrono::DateTime<Utc>,
+    /// Compact traces of the tools that ran while producing this (assistant)
+    /// turn — "get_inquiry → {…}". Without them the next message only had the
+    /// final reply to go on: data a tool fetched was gone, and an ID that never
+    /// made it into the reply text could no longer be cited.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
 }
 
 impl Turn {
@@ -33,6 +39,7 @@ impl Turn {
             role: "user".to_string(),
             content: content.into(),
             ts: Utc::now(),
+            tools: Vec::new(),
         }
     }
 
@@ -42,7 +49,37 @@ impl Turn {
             role: "assistant".to_string(),
             content: content.into(),
             ts: Utc::now(),
+            tools: Vec::new(),
         }
+    }
+}
+
+/// Longest single tool trace kept in the session, in characters.
+pub const MAX_TRACE_CHARS: usize = 600;
+
+/// One line for `Turn::tools`: tool name, its arguments and a capped result.
+pub fn tool_trace(name: &str, args: &serde_json::Value, result: &str) -> String {
+    let mut line = format!("{name}({args}) → {result}");
+    if line.chars().count() > MAX_TRACE_CHARS {
+        line = line.chars().take(MAX_TRACE_CHARS).collect::<String>() + " …";
+    }
+    line
+}
+
+impl Turn {
+    /// Attach tool traces to this turn.
+    pub fn with_tools(mut self, tools: Vec<String>) -> Self {
+        self.tools = tools;
+        self
+    }
+
+    fn render(&self) -> String {
+        let mut out = format!("{}: {}", self.role, self.content);
+        for t in &self.tools {
+            out.push_str("\n  [Tool] ");
+            out.push_str(t);
+        }
+        out
     }
 }
 
@@ -77,7 +114,7 @@ impl AgentSession {
             parts.push(format!("[Zusammenfassung bisheriger Verlauf]\n{s}"));
         }
         for turn in &self.turns {
-            parts.push(format!("{}: {}", turn.role, turn.content));
+            parts.push(turn.render());
         }
         parts.join("\n")
     }
@@ -157,7 +194,44 @@ pub async fn summarise(
     llm: &dyn AssistantLlmProvider,
 ) -> Result<()> {
     let split = session.turns.len() / 2;
-    let to_summarise = session.turns.drain(..split).collect::<Vec<_>>();
+    summarise_first(pool, session, llm, split).await
+}
+
+/// Hours without a message after which the next one starts a fresh window.
+pub const IDLE_ROLLOVER_HOURS: i64 = 10;
+
+/// Fold every turn into the summary when the chat has been quiet overnight.
+///
+/// A chat's session never ends, so yesterday's 20 turns about other customers
+/// used to sit verbatim in front of this morning's first question. After a quiet
+/// spell they are compressed (IDs and open tasks kept, see `summarise`) and the
+/// new day starts with a clean turn window. Returns whether it rolled over.
+pub async fn roll_over_if_idle(
+    pool: &PgPool,
+    session: &mut AgentSession,
+    llm: &dyn AssistantLlmProvider,
+) -> Result<bool> {
+    let idle = session
+        .turns
+        .last()
+        .is_some_and(|t| Utc::now() - t.ts > chrono::Duration::hours(IDLE_ROLLOVER_HOURS));
+    if !idle {
+        return Ok(false);
+    }
+    let all = session.turns.len();
+    summarise_first(pool, session, llm, all).await?;
+    Ok(true)
+}
+
+/// Summarise the oldest `n` turns into `last_summary`, keep the rest, persist.
+async fn summarise_first(
+    pool: &PgPool,
+    session: &mut AgentSession,
+    llm: &dyn AssistantLlmProvider,
+    n: usize,
+) -> Result<()> {
+    let n = n.min(session.turns.len());
+    let to_summarise = session.turns.drain(..n).collect::<Vec<_>>();
 
     let turns_text: String = to_summarise
         .iter()
@@ -182,6 +256,17 @@ pub async fn summarise(
 
     session.last_summary = Some(summary);
     persist(pool, session).await
+}
+
+/// Append a turn for `chat_id` without an LLM at hand — for events that happen
+/// outside a driver turn, such as Alex tapping Bestätigen/Abbrechen. Never
+/// summarises; the next regular `append_turn` does that if the budget is
+/// exceeded.
+pub async fn append_note(pool: &PgPool, chat_id: i64, turn: Turn) -> Result<()> {
+    let mut session = load_or_create(pool, chat_id).await?;
+    session.turns.push(turn);
+    session.turn_count += 1;
+    persist(pool, &session).await
 }
 
 /// Persist the current in-memory session state to the database.
@@ -223,6 +308,39 @@ mod tests {
         let ctx = session.context_text();
         assert!(ctx.contains("user: Hallo"));
         assert!(ctx.contains("assistant: Guten Tag"));
+    }
+
+    #[test]
+    fn context_text_carries_tool_traces_into_the_next_turn() {
+        let id = "0199aaaa-0000-7000-8000-000000000001";
+        let trace = tool_trace("get_inquiry", &serde_json::json!({ "inquiry_id": id }), "{\"status\":\"estimated\"}");
+        let session = AgentSession {
+            id: Uuid::now_v7(),
+            chat_id: 1,
+            last_summary: None,
+            turns: vec![Turn::user("Status?"), Turn::assistant("Geschätzt.").with_tools(vec![trace])],
+            turn_count: 2,
+            active_scopes: vec!["global".to_string()],
+        };
+        let ctx = session.context_text();
+        assert!(ctx.contains("[Tool] get_inquiry"), "{ctx}");
+        assert!(ctx.contains(id), "the ID must stay citable on the next turn");
+    }
+
+    #[test]
+    fn tool_trace_is_capped() {
+        let long = "x".repeat(5_000);
+        let t = tool_trace("list_inbox", &serde_json::json!({}), &long);
+        assert!(t.chars().count() <= MAX_TRACE_CHARS + 2);
+    }
+
+    #[test]
+    fn old_turns_without_tools_still_deserialize() {
+        let t: Turn = serde_json::from_value(serde_json::json!({
+            "role": "user", "content": "Hallo", "ts": "2026-10-01T10:00:00Z"
+        }))
+        .unwrap();
+        assert!(t.tools.is_empty());
     }
 
     #[test]

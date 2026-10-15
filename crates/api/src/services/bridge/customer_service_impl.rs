@@ -5,6 +5,8 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::repositories::admin_repo;
+
 use aust_core::models::{CustomerSnapshot, InquiryListItem};
 use aust_core::services::{CustomerPatch, CustomerService, NewCustomer, ServiceError};
 
@@ -323,31 +325,32 @@ impl CustomerService for CustomerServiceImpl {
         id: Uuid,
         patch: CustomerPatch,
     ) -> Result<CustomerSnapshot, ServiceError> {
-        sqlx::query(
-            r#"
-            UPDATE customers SET
-                phone = COALESCE($2, phone),
-                email = COALESCE($3, email),
-                first_name = COALESCE($4, first_name),
-                last_name = COALESCE($5, last_name),
-                salutation = COALESCE($6, salutation),
-                name = CASE
-                    WHEN $4 IS NOT NULL OR $5 IS NOT NULL
-                    THEN COALESCE($4, first_name) || ' ' || COALESCE($5, last_name)
-                    ELSE name
-                END
-            WHERE id = $1
-            "#,
+        // The admin PATCH's query: keeps `name` in step with first/last the same
+        // way, and a taken email gets the same German message instead of a 500.
+        admin_repo::update_customer(
+            &self.pool,
+            id,
+            None,
+            patch.salutation.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+            patch.first_name.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+            patch.last_name.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+            patch.phone.as_deref().map(str::trim),
+            patch.email.as_deref().map(str::trim),
+            None,
+            None,
+            None,
+            None,
         )
-        .bind(id)
-        .bind(patch.phone.as_deref())
-        .bind(patch.email.as_deref())
-        .bind(patch.first_name.as_deref())
-        .bind(patch.last_name.as_deref())
-        .bind(patch.salutation.as_deref())
-        .execute(&self.pool)
         .await
-        .map_err(super::map_sqlx)?;
+        .map_err(|e| match e {
+            sqlx::Error::Database(ref db_err) if db_err.constraint() == Some("customers_tenant_email_key") => {
+                ServiceError::Validation(
+                    "Diese E-Mail-Adresse wird bereits von einem anderen Kunden verwendet".into(),
+                )
+            }
+            other => super::map_sqlx(other),
+        })?
+        .ok_or_else(|| ServiceError::NotFound(format!("Kunde {id} nicht gefunden")))?;
 
         self.get(id).await
     }

@@ -6,21 +6,36 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use aust_core::models::{
-    AppointmentSnapshot, InquiryListItem, InquiryResponse, InquiryStatus, Services,
+    AppointmentSnapshot, InquiryListItem, InquiryResponse, Services,
 };
 use aust_core::services::{InquiryService, NewAddress, NewInquiry, ServiceError};
 
 use crate::repositories::{address_repo, inquiry_appointment_repo, inquiry_repo};
 use crate::services::inquiry_builder;
+use crate::services::inquiry_update::{self, UpdateInquiryRequest};
+use aust_core::events::EventEmitter;
 use crate::ApiError;
 
 pub struct InquiryServiceImpl {
     pool: PgPool,
+    events: EventEmitter,
 }
 
 impl InquiryServiceImpl {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        let events = EventEmitter::new(pool.clone());
+        Self { pool, events }
+    }
+
+    /// Edit through the same path as `PATCH /inquiries/{id}` (see `inquiry_update`).
+    async fn update(&self, id: Uuid, request: UpdateInquiryRequest) -> Result<InquiryResponse, ServiceError> {
+        inquiry_update::update_inquiry(&self.pool, &self.events, id, request)
+            .await
+            .map_err(|e| match e {
+                ApiError::NotFound(msg) => ServiceError::NotFound(msg),
+                ApiError::Validation(msg) | ApiError::BadRequest(msg) => ServiceError::Validation(msg),
+                other => ServiceError::Db(anyhow::anyhow!(other.to_string())),
+            })
     }
 }
 
@@ -256,44 +271,8 @@ impl InquiryService for InquiryServiceImpl {
         new_status: &str,
         _reason: Option<&str>,
     ) -> Result<InquiryResponse, ServiceError> {
-        // Fetch current status.
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT status::text FROM inquiries WHERE id = $1")
-                .bind(id)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(super::map_sqlx)?;
-
-        let current_str = row
-            .ok_or_else(|| ServiceError::NotFound(format!("Anfrage {id}")))?
-            .0;
-
-        let current: InquiryStatus = current_str
-            .parse()
-            .map_err(|_| ServiceError::Validation(format!("Ungültiger Status: {current_str}")))?;
-
-        let target: InquiryStatus = new_status
-            .parse()
-            .map_err(|_| ServiceError::Validation(format!("Ungültiger Zielstatus: {new_status}")))?;
-
-        if !current.can_transition_to(&target) {
-            return Err(ServiceError::Validation(format!(
-                "Statusübergang von '{current}' nach '{target}' nicht erlaubt"
-            )));
-        }
-
-        sqlx::query("UPDATE inquiries SET status = $1, updated_at = NOW() WHERE id = $2")
-            .bind(new_status)
-            .bind(id)
-            .execute(&self.pool)
+        self.update(id, UpdateInquiryRequest { status: Some(new_status.to_string()), ..Default::default() })
             .await
-            .map_err(super::map_sqlx)?;
-
-        match inquiry_builder::build_inquiry_response(&self.pool, id).await {
-            Ok(r) => Ok(r),
-            Err(ApiError::NotFound(msg)) => Err(ServiceError::NotFound(msg)),
-            Err(other) => Err(ServiceError::Db(anyhow::anyhow!(other.to_string()))),
-        }
     }
 
     async fn set_services(
@@ -301,18 +280,8 @@ impl InquiryService for InquiryServiceImpl {
         id: Uuid,
         services: Services,
     ) -> Result<(), ServiceError> {
-        let services_json = serde_json::to_value(&services)
-            .map_err(|e| ServiceError::Validation(format!("Serialisierungsfehler: {e}")))?;
-
-        sqlx::query(
-            "UPDATE inquiries SET services = $1, updated_at = NOW() WHERE id = $2",
-        )
-        .bind(&services_json)
-        .bind(id)
-        .execute(&self.pool)
-        .await
-        .map_err(super::map_sqlx)?;
-
+        self.update(id, UpdateInquiryRequest { services: Some(services), ..Default::default() })
+            .await?;
         Ok(())
     }
 
@@ -362,5 +331,69 @@ impl InquiryService for InquiryServiceImpl {
         inquiry_builder::appointment_snapshot_full(&self.pool, row)
             .await
             .map_err(|e| ServiceError::Db(anyhow::anyhow!(e.to_string())))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn try_pool() -> Option<PgPool> {
+        let url = std::env::var("DATABASE_URL").ok()?;
+        sqlx::PgPool::connect(&url).await.ok()
+    }
+
+    /// Josie's status change must have the admin PATCH's side effects. It used to
+    /// be a bare `UPDATE inquiries SET status`, so no `status.changed` event went
+    /// out and nothing downstream of it (notifications, follow-ups) ever fired.
+    #[tokio::test]
+    async fn status_change_from_josie_emits_status_changed_like_the_admin_ui() {
+        let Some(pool) = try_pool().await else { return };
+
+        let customer_id = Uuid::now_v7();
+        sqlx::query("INSERT INTO customers (id, name, email) VALUES ($1, $2, $3)")
+            .bind(customer_id)
+            .bind("Status Test")
+            .bind(format!("status-{customer_id}@example.test"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let inquiry_id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO inquiries (id, customer_id, status, source) VALUES ($1, $2, 'estimated', 'test')",
+        )
+        .bind(inquiry_id)
+        .bind(customer_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let svc = InquiryServiceImpl::new(pool.clone());
+        let resp = svc.update_status(inquiry_id, "offer_ready", None).await.unwrap();
+        assert_eq!(resp.status.to_string(), "offer_ready");
+
+        // The event is emitted on a spawned task; give it a moment.
+        let aggregate = format!("inquiry:{inquiry_id}");
+        let mut payload: Option<serde_json::Value> = None;
+        for _ in 0..40 {
+            payload = sqlx::query_scalar(
+                "SELECT payload FROM domain_events WHERE kind = 'status.changed' AND aggregate = $1",
+            )
+            .bind(&aggregate)
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+            if payload.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let payload = payload.expect("status.changed must be emitted for a Josie status change");
+        assert_eq!(payload["old_status"], "estimated");
+        assert_eq!(payload["new_status"], "offer_ready");
+
+        sqlx::query("DELETE FROM domain_events WHERE aggregate = $1").bind(&aggregate).execute(&pool).await.ok();
+        sqlx::query("DELETE FROM inquiries WHERE id = $1").bind(inquiry_id).execute(&pool).await.ok();
+        sqlx::query("DELETE FROM customers WHERE id = $1").bind(customer_id).execute(&pool).await.ok();
     }
 }

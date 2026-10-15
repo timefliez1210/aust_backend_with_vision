@@ -41,6 +41,7 @@ pub async fn handle_text_message(
     chat_id: i64,
     text: &str,
     reply_to_text: Option<&str>,
+    reply_to_message_id: Option<i64>,
     llm: Arc<dyn AssistantLlmProvider>,
     registry: &ToolRegistry,
     soul: &Soul,
@@ -59,32 +60,15 @@ pub async fn handle_text_message(
         chat_id,
         images: Vec::new(),
         quoted_text: reply_to_text.map(|s| s.to_string()),
+        quoted_refs: quoted_refs(pool, chat_id, reply_to_message_id).await,
+        prior_action: None,
     };
 
+    telegram_output::send_typing(client, bot_token, chat_id).await;
     match driver::process_turn(pool, llm, registry, soul, services, input).await {
-        Ok(result) => {
-            if result.awaiting_confirmation {
-                // M3: avoid the duplicate message — when awaiting confirmation, the
-                // keyboard message body IS the user-visible reply. Post it once,
-                // attached to the inline keyboard, with the rich German summary
-                // built by the tool's `summarize()`.
-                let summary = result
-                    .pending_summary_de
-                    .as_deref()
-                    .unwrap_or(result.reply.as_str());
-                confirm_dispatcher::maybe_post_keyboard(
-                    pool,
-                    client,
-                    bot_token,
-                    chat_id,
-                    result.pending_action_id,
-                    summary,
-                )
-                .await;
-            } else {
-                telegram_output::post_text(client, bot_token, chat_id, &result.reply).await;
-            }
-        }
+        // When awaiting confirmation the keyboard message body IS the reply (M3):
+        // posted once, with the tool's concrete German summary.
+        Ok(result) => post_turn_result(pool, client, bot_token, chat_id, &result).await,
         Err(e) => {
             warn!(chat_id, "driver::process_turn error: {e}");
             telegram_output::post_text(
@@ -112,10 +96,12 @@ pub async fn handle_media_message(
     bot_token: &str,
     chat_id: i64,
     file_id: &str,
+    extra_file_ids: &[String],
     kind: &str,
     mime_type: Option<&str>,
     caption: Option<&str>,
     reply_to_text: Option<&str>,
+    reply_to_message_id: Option<i64>,
     llm: Arc<dyn AssistantLlmProvider>,
     registry: &ToolRegistry,
     soul: &Soul,
@@ -131,13 +117,25 @@ pub async fn handle_media_message(
     // rasterize + model).
     telegram_output::post_text(client, bot_token, chat_id, "🖼️ Einen Moment, ich schaue mir das an …").await;
 
-    let images = match super::media::prepare_images(client, bot_token, file_id, kind, mime_type).await {
+    let mut images = match super::media::prepare_images(client, bot_token, file_id, kind, mime_type).await {
         Ok(imgs) => imgs,
         Err(msg) => {
             telegram_output::post_text(client, bot_token, chat_id, &msg).await;
             return true;
         }
     };
+    // The rest of a photo album: one turn sees every photo.
+    for extra in extra_file_ids {
+        if images.len() >= super::media::MAX_IMAGES {
+            warn!(chat_id, dropped = extra_file_ids.len(), "album exceeds MAX_IMAGES — extra photos ignored");
+            break;
+        }
+        match super::media::prepare_images(client, bot_token, extra, "photo", None).await {
+            Ok(more) => images.extend(more),
+            Err(msg) => warn!(chat_id, "album photo skipped: {msg}"),
+        }
+    }
+    images.truncate(super::media::MAX_IMAGES);
 
     // Caption becomes the prompt; with no caption, a neutral default instruction.
     let text = caption
@@ -149,23 +147,13 @@ pub async fn handle_media_message(
                 .to_string()
         });
 
-    let input = Input { text, chat_id, images, quoted_text: reply_to_text.map(|s| s.to_string()) };
+    let input = Input { text, chat_id, images, quoted_text: reply_to_text.map(|s| s.to_string()),
+        quoted_refs: quoted_refs(pool, chat_id, reply_to_message_id).await,
+        prior_action: None,
+    };
 
     match driver::process_turn(pool, llm, registry, soul, services, input).await {
-        Ok(result) => {
-            if result.awaiting_confirmation {
-                let summary = result
-                    .pending_summary_de
-                    .as_deref()
-                    .unwrap_or(result.reply.as_str());
-                confirm_dispatcher::maybe_post_keyboard(
-                    pool, client, bot_token, chat_id, result.pending_action_id, summary,
-                )
-                .await;
-            } else {
-                telegram_output::post_text(client, bot_token, chat_id, &result.reply).await;
-            }
-        }
+        Ok(result) => post_turn_result(pool, client, bot_token, chat_id, &result).await,
         Err(e) => {
             warn!(chat_id, "driver::process_turn (media) error: {e}");
             telegram_output::post_text(
@@ -181,6 +169,90 @@ pub async fn handle_media_message(
     true
 }
 
+/// Handle a Telegram voice note: transcribe locally, show Alex what was heard,
+/// then run a normal assistant turn on the transcript.
+///
+/// The echo matters: a misheard name or date is visible before Josie acts on
+/// it, and the transcript in the chat doubles as the record of what was asked.
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_voice_message(
+    pool: &PgPool,
+    client: &Client,
+    bot_token: &str,
+    chat_id: i64,
+    file_id: &str,
+    duration_secs: u32,
+    max_duration_secs: u32,
+    reply_to_text: Option<&str>,
+    reply_to_message_id: Option<i64>,
+    transcriber: Arc<dyn aust_assistant::voice::VoiceTranscriber>,
+    llm: Arc<dyn AssistantLlmProvider>,
+    registry: &ToolRegistry,
+    soul: &Soul,
+    services: aust_core::services::ServiceBundle,
+) -> bool {
+    if bindings::resolve(pool, chat_id).await.is_err() {
+        return false;
+    }
+    if duration_secs > max_duration_secs {
+        telegram_output::post_text(
+            client,
+            bot_token,
+            chat_id,
+            &format!(
+                "🎤 Die Sprachnachricht ist {} min lang — ich verarbeite höchstens {} min. Bitte kürzer oder als Text.",
+                duration_secs.div_ceil(60),
+                max_duration_secs / 60
+            ),
+        )
+        .await;
+        return true;
+    }
+
+    info!(chat_id, duration_secs, "Agent handling voice message");
+    telegram_output::post_text(client, bot_token, chat_id, "🎤 Ich höre zu …").await;
+
+    let audio = match super::media::download_file(client, bot_token, file_id).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            warn!(chat_id, "voice download failed: {e}");
+            telegram_output::post_text(client, bot_token, chat_id, "Ich konnte die Sprachnachricht nicht von Telegram laden. Bitte versuche es erneut.").await;
+            return true;
+        }
+    };
+    let text = match transcriber.transcribe(&audio).await {
+        Ok(t) => t,
+        Err(aust_assistant::AssistantError::VoiceUnsupported) => {
+            telegram_output::post_text(client, bot_token, chat_id, "🎤 Sprachnachrichten sind auf diesem Server noch nicht eingerichtet — bitte als Text schicken.").await;
+            return true;
+        }
+        Err(e) => {
+            warn!(chat_id, "voice transcription failed: {e}");
+            telegram_output::post_text(client, bot_token, chat_id, &format!("🎤 Ich konnte die Sprachnachricht nicht verstehen ({e}). Bitte nochmal oder als Text.")).await;
+            return true;
+        }
+    };
+    telegram_output::post_text(client, bot_token, chat_id, &format!("🎤 „{text}“")).await;
+
+    let input = Input {
+        text: format!("[Sprachnachricht, automatisch transkribiert — Namen/Zahlen können verhört sein]\n{text}"),
+        chat_id,
+        images: Vec::new(),
+        quoted_text: reply_to_text.map(|s| s.to_string()),
+        quoted_refs: quoted_refs(pool, chat_id, reply_to_message_id).await,
+        prior_action: None,
+    };
+    telegram_output::send_typing(client, bot_token, chat_id).await;
+    match driver::process_turn(pool, llm, registry, soul, services, input).await {
+        Ok(result) => post_turn_result(pool, client, bot_token, chat_id, &result).await,
+        Err(e) => {
+            warn!(chat_id, "driver::process_turn (voice) error: {e}");
+            telegram_output::post_text(client, bot_token, chat_id, "⚠️ Es ist ein Fehler aufgetreten. Bitte versuche es erneut.").await;
+        }
+    }
+    true
+}
+
 /// Handle a `pa:<uuid>:<action>` callback query (inline button tap).
 ///
 /// Returns `true` if the callback was consumed. Returns `false` for unknown
@@ -191,11 +263,18 @@ pub async fn handle_callback_query(
     client: &Client,
     bot_token: &str,
     chat_id: i64,
+    message_id: i64,
     callback_data: &str,
     llm: Arc<dyn AssistantLlmProvider>,
     registry: &ToolRegistry,
+    soul: &Soul,
     services: aust_core::services::ServiceBundle,
 ) -> bool {
+    if let Some(rest) = callback_data.strip_prefix("mp:") {
+        handle_memory_proposal(pool, client, bot_token, chat_id, message_id, rest).await;
+        return true;
+    }
+
     // Parse `pa:<uuid>:<action>`
     let parts: Vec<&str> = callback_data.splitn(3, ':').collect();
     if parts.len() != 3 || parts[0] != "pa" {
@@ -236,7 +315,7 @@ pub async fn handle_callback_query(
         "confirm" => {
             handle_confirm(
                 pool, client, bot_token, chat_id, pending_id, &pending,
-                llm, registry, services, binding,
+                llm, registry, soul, services, binding,
             ).await;
         }
         "cancel" => {
@@ -266,6 +345,7 @@ async fn handle_confirm(
     pending: &aust_assistant::confirmation::PendingAction,
     llm: Arc<dyn AssistantLlmProvider>,
     registry: &ToolRegistry,
+    soul: &Soul,
     services: aust_core::services::ServiceBundle,
     binding: aust_assistant::bindings::ChatBinding,
 ) {
@@ -277,8 +357,9 @@ async fn handle_confirm(
         chat_id,
     };
 
-    match driver::resume_confirmed(pool, llm, registry, services, params).await {
+    match driver::resume_confirmed(pool, llm.clone(), registry, services.clone(), params).await {
         Ok(result) => {
+            let acted = result["ok"].as_bool() != Some(false);
             // A tool that could not do what was asked reports it in-band as
             // {"ok": false, "message": ...} rather than erroring — SMTP refused the
             // address, the reminder was already closed, the customer has no email.
@@ -306,6 +387,14 @@ async fn handle_confirm(
             } else {
                 telegram_output::post_text(client, bot_token, chat_id, &body).await;
             }
+
+            if acted {
+                continue_after_confirm(
+                    pool, client, bot_token, chat_id, &pending.tool_name, result,
+                    llm, registry, soul, services,
+                )
+                .await;
+            }
         }
         Err(e) => {
             warn!("resume_confirmed error: {e}");
@@ -313,6 +402,132 @@ async fn handle_confirm(
                 client, bot_token, chat_id,
                 &format!("⚠️ Fehler bei der Ausführung: {e}"),
             ).await;
+        }
+    }
+}
+
+/// The entity IDs recorded for the bot message Alex replied to, if any.
+async fn quoted_refs(pool: &PgPool, chat_id: i64, reply_to_message_id: Option<i64>) -> Option<serde_json::Value> {
+    aust_assistant::message_refs::lookup(pool, chat_id, reply_to_message_id?).await
+}
+
+/// ✅ Merken / ❌ Nein on a nightly lesson (`mp:<proposal_id>:ok|no`).
+///
+/// Only the owner may teach Josie: approval writes `agent_memory`, which shapes
+/// every later prompt.
+async fn handle_memory_proposal(
+    pool: &PgPool,
+    client: &Client,
+    bot_token: &str,
+    chat_id: i64,
+    message_id: i64,
+    rest: &str,
+) {
+    use aust_assistant::memory::proposals;
+    let Some((id, action)) = rest.split_once(':') else { return };
+    let Ok(id) = Uuid::parse_str(id) else { return };
+    let binding = match bindings::resolve(pool, chat_id).await {
+        Ok(b) if b.role == aust_assistant::Role::Owner => b,
+        _ => {
+            telegram_output::post_text(client, bot_token, chat_id, "Nur der Inhaber kann Josie etwas beibringen.").await;
+            return;
+        }
+    };
+    let (result, done) = match action {
+        "ok" => (proposals::approve(pool, id, binding.user_id).await, "✅ Gemerkt."),
+        "no" => (proposals::reject(pool, id, binding.user_id, Some("telegram")).await, "❌ Verworfen."),
+        _ => return,
+    };
+    let lesson = match proposals::get(pool, id).await {
+        Ok(Some(p)) => match p.value {
+            serde_json::Value::String(v) => v,
+            other => other.to_string(),
+        },
+        _ => String::new(),
+    };
+    let body = match result {
+        Ok(()) if lesson.is_empty() => done.to_string(),
+        Ok(()) => format!("{done}\n\n{lesson}"),
+        Err(aust_assistant::AssistantError::NotFound(_)) => "Dieser Vorschlag ist bereits erledigt.".to_string(),
+        Err(e) => {
+            warn!("memory proposal {id} ({action}) failed: {e}");
+            format!("⚠️ Fehler: {e}")
+        }
+    };
+    if message_id != 0 {
+        telegram_output::edit_message_remove_keyboard(client, bot_token, chat_id, message_id, &body).await;
+    } else {
+        telegram_output::post_text(client, bot_token, chat_id, &body).await;
+    }
+}
+
+/// Reply Josie gives on a continuation turn when nothing of the task is left.
+const NOTHING_LEFT: &str = "FERTIG";
+
+/// After a confirmed action, give Josie one turn to finish the original task.
+///
+/// A turn stops at the first action that needs confirmation, so "storniere den
+/// Termin und trag ihn am Freitag neu ein" used to end after the cancel: the
+/// tap ran it, and the re-booking was simply never attempted. The continuation
+/// sees the result, runs what is still open (which may queue the next
+/// confirmation), and stays silent when the confirmed action was the last step.
+#[allow(clippy::too_many_arguments)]
+async fn continue_after_confirm(
+    pool: &PgPool,
+    client: &Client,
+    bot_token: &str,
+    chat_id: i64,
+    tool_name: &str,
+    result: serde_json::Value,
+    llm: Arc<dyn AssistantLlmProvider>,
+    registry: &ToolRegistry,
+    soul: &Soul,
+    services: aust_core::services::ServiceBundle,
+) {
+    let text = format!(
+        "[System-Hinweis] Alex hat '{tool_name}' bestätigt, die Aktion ist ausgeführt. Ergebnis: {}\n\
+         Sind aus seinem ursprünglichen Auftrag noch Schritte offen, führe sie jetzt aus. \
+         Ist nichts mehr offen, antworte ausschließlich mit {NOTHING_LEFT}.",
+        aust_assistant::driver::cap_tool_result(&result.to_string()),
+    );
+    let input = Input {
+        text,
+        chat_id,
+        images: Vec::new(),
+        quoted_text: None,
+        quoted_refs: None,
+        prior_action: Some(driver::PriorAction { tool_name: tool_name.to_string(), result }),
+    };
+    match driver::process_turn(pool, llm, registry, soul, services, input).await {
+        Ok(r) if !r.awaiting_confirmation && is_nothing_left(&r.reply) => {}
+        Ok(r) => post_turn_result(pool, client, bot_token, chat_id, &r).await,
+        Err(e) => warn!(chat_id, "continuation after confirm failed: {e}"),
+    }
+}
+
+/// Whether a continuation reply is just the "nothing left" marker ("FERTIG", "Fertig.").
+fn is_nothing_left(reply: &str) -> bool {
+    reply.trim().trim_matches(|c: char| !c.is_alphanumeric()).eq_ignore_ascii_case(NOTHING_LEFT)
+}
+
+/// Post a finished turn: the confirmation keyboard if one is pending, else the reply.
+///
+/// The reply is split to Telegram's size limit, and every part records the IDs
+/// the turn's tools touched, so replying to it later resolves to those entities.
+async fn post_turn_result(
+    pool: &PgPool,
+    client: &Client,
+    bot_token: &str,
+    chat_id: i64,
+    result: &driver::TurnResult,
+) {
+    if result.awaiting_confirmation {
+        let summary = result.pending_summary_de.as_deref().unwrap_or(result.reply.as_str());
+        confirm_dispatcher::maybe_post_keyboard(pool, client, bot_token, chat_id, result.pending_action_id, summary).await;
+    } else {
+        let refs = aust_assistant::message_refs::from_ids(result.cited_ids.iter().cloned());
+        for message_id in telegram_output::post_long_text(client, bot_token, chat_id, &result.reply).await {
+            aust_assistant::message_refs::record(pool, chat_id, message_id, refs.clone()).await;
         }
     }
 }
@@ -332,6 +547,7 @@ async fn handle_cancel(
     {
         warn!("cancel pending_action {pending_id}: {e}");
     }
+    driver::record_resolution(pool, chat_id, &pending.tool_name, &pending.proposed_args, "von Alex abgebrochen — NICHT ausgeführt").await;
 
     let body = "❌ Abgebrochen.";
     if let Some(msg_id) = pending.telegram_message_id {
@@ -358,6 +574,10 @@ async fn handle_edit_request(
     if let Err(e) = confirmation::resolve(pool, pending_id, Resolution::Canceled).await {
         warn!("edit→cancel pending_action {pending_id}: {e}");
     }
+    driver::record_resolution(
+        pool, chat_id, &pending.tool_name, &pending.proposed_args,
+        "Alex will Änderungen — verworfen, NICHT ausgeführt; neuen Vorschlag nach seiner Beschreibung machen",
+    ).await;
 
     let body = "✏️ Was soll ich anders machen? Beschreib die Änderung \
                 (z. B. anderer Empfänger, Betrag oder Datum) und ich \
@@ -391,6 +611,13 @@ mod tests {
         }
         let id = uuid::Uuid::parse_str(parts[1]).ok()?;
         Some((id, parts[2]))
+    }
+
+    #[test]
+    fn nothing_left_marker_tolerates_case_and_punctuation() {
+        assert!(super::is_nothing_left("FERTIG"));
+        assert!(super::is_nothing_left(" Fertig. "));
+        assert!(!super::is_nothing_left("Fertig — ich habe außerdem den Termin verschoben."));
     }
 
     #[test]

@@ -22,6 +22,7 @@ use crate::routes::inquiry_actions::{
     retry_estimation, trigger_estimate, trigger_estimate_upload, trigger_video_upload,
     update_assignment, update_inquiry_items,
 };
+use crate::services::inquiry_update::{self, UpdateInquiryRequest};
 use crate::services::{inquiry_builder, route_plan};
 use crate::{ApiError, AppState};
 use aust_distance_calculator::{RouteCalculator, RouteRequest};
@@ -72,20 +73,7 @@ pub fn router() -> Router<Arc<AppState>> {
 // DTOs
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
-pub(crate) struct AddressInput {
-    pub(crate) street: Option<String>,
-    pub(crate) city: Option<String>,
-    pub(crate) postal_code: Option<String>,
-    pub(crate) floor: Option<String>,
-    pub(crate) elevator: Option<bool>,
-    /// @notice Legacy data (pre-2026-05) may have house numbers embedded in
-    ///         `street` (e.g. "Musterstr. 1") with `house_number` = NULL.
-    ///         The admin frontend (AddressEditor.svelte) extracts the number
-    ///         for display. See `split_street_house_number()` in submissions.rs.
-    pub(crate) house_number: Option<String>,
-    pub(crate) parking_ban: Option<bool>,
-}
+pub(crate) use crate::services::inquiry_update::AddressInput;
 
 #[derive(Debug, Deserialize)]
 struct CreateInquiryRequest {
@@ -131,42 +119,6 @@ struct InquiryListResponse {
     offset: i64,
 }
 
-#[derive(Debug, Deserialize)]
-struct UpdateInquiryRequest {
-    status: Option<String>,
-    notes: Option<String>,
-    services: Option<Services>,
-    estimated_volume_m3: Option<f64>,
-    distance_km: Option<f64>,
-    scheduled_date: Option<String>,
-    start_time: Option<NaiveTime>,
-    end_time: Option<NaiveTime>,
-    origin_address_id: Option<Uuid>,
-    destination_address_id: Option<Uuid>,
-    service_type: Option<String>,
-    submission_mode: Option<String>,
-    recipient_id: Option<Uuid>,
-    /// Inline billing address — if provided, creates an address record and sets billing_address_id.
-    /// If both billing_address and billing_address_id are provided, billing_address_id takes priority.
-    billing_address: Option<AddressInput>,
-    billing_address_id: Option<Uuid>,
-    /// Set to `null` explicitly to clear the billing address override.
-    clear_billing_address: Option<bool>,
-    custom_fields: Option<serde_json::Value>,
-    employee_notes: Option<String>,
-    /// Set end_date (YYYY-MM-DD) for multi-day inquiries. Set to `null` to clear (single-day).
-    end_date: Option<String>,
-    /// Set to true to explicitly clear end_date (single-day inquiry).
-    clear_end_date: Option<bool>,
-    /// Enable travel daily allowance (Verpflegungspauschale) for multi-day trips.
-    has_pauschale: Option<bool>,
-    /// Inline stop address — if provided, creates an address record and sets stop_address_id.
-    stop_address: Option<AddressInput>,
-    /// Link to an existing stop address by UUID.
-    stop_address_id: Option<Uuid>,
-    /// Set to `true` to explicitly clear the stop address.
-    clear_stop_address: Option<bool>,
-}
 
 // ---------------------------------------------------------------------------
 // Protected CRUD handlers
@@ -457,180 +409,7 @@ async fn update_inquiry(
     Path(id): Path<Uuid>,
     Json(request): Json<UpdateInquiryRequest>,
 ) -> Result<Json<InquiryResponseModel>, ApiError> {
-    let now = chrono::Utc::now();
-
-    // Fetch current inquiry for status checks
-    let current_inquiry = inquiry_repo::fetch_by_id(&state.db, id).await?;
-    let current_status: InquiryStatus = current_inquiry.status.parse()
-        .map_err(|_| ApiError::Internal(format!("Invalid status in DB: {}", current_inquiry.status)))?;
-
-// Validate status transition if status is being changed
-    if let Some(ref new_status) = request.status {
-        let target_status: InquiryStatus = new_status.parse()
-            .map_err(|e| ApiError::Validation(format!("Ungueltiger Status: {e}")))?;
-        if !current_status.can_transition_to(&target_status) {
-            return Err(ApiError::Validation(format!(
-                "Statuswechsel von '{current_status}' nach '{target_status}' ist nicht erlaubt"
-            )));
-        }
-    }
-
-    // Serialize services if provided
-    let services_json = request
-        .services
-        .as_ref()
-        .and_then(|s| serde_json::to_value(s).ok());
-
-    // Create billing address if provided inline
-    let resolved_billing_address_id = if let Some(ref addr) = request.billing_address {
-        let street = addr.street.as_deref().unwrap_or("").trim().to_string();
-        let city = addr.city.as_deref().unwrap_or("").trim().to_string();
-        if !street.is_empty() || !city.is_empty() {
-            let id = address_repo::create(
-                &state.db,
-                &street,
-                &city,
-                addr.postal_code.as_deref(),
-                addr.floor.as_deref(),
-                addr.elevator,
-                addr.house_number.as_deref(),
-                addr.parking_ban,
-            )
-            .await?;
-            Some(id)
-        } else {
-            request.billing_address_id
-        }
-    } else {
-        request.billing_address_id
-    };
-
-    // If clear_billing_address is true, set to None (fall back to resolution chain)
-    let billing_address_id = if request.clear_billing_address.unwrap_or(false) {
-        None
-    } else {
-        resolved_billing_address_id
-    };
-
-    // Resolve stop address.
-    // None = leave unchanged; Some(None) = clear; Some(Some(id)) = set.
-    let stop_address_id: Option<Option<Uuid>> = if request.clear_stop_address.unwrap_or(false) {
-        Some(None)
-    } else if let Some(ref addr) = request.stop_address {
-        let street = addr.street.as_deref().unwrap_or("").trim().to_string();
-        let city = addr.city.as_deref().unwrap_or("").trim().to_string();
-        if !street.is_empty() || !city.is_empty() {
-            let id = address_repo::create(
-                &state.db,
-                &street,
-                &city,
-                addr.postal_code.as_deref(),
-                addr.floor.as_deref(),
-                addr.elevator,
-                addr.house_number.as_deref(),
-                addr.parking_ban,
-            )
-            .await?;
-            Some(Some(id))
-        } else {
-            request.stop_address_id.map(Some)
-        }
-    } else {
-        request.stop_address_id.map(Some)
-    };
-
-    let scheduled_date = request.scheduled_date.as_deref().and_then(|s| {
-        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
-    });
-
-    let end_date: Option<Option<chrono::NaiveDate>> = if request.clear_end_date.unwrap_or(false) {
-        Some(None)
-    } else {
-        request.end_date.as_deref().and_then(|s| {
-            chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
-        }).map(Some)
-    };
-
-    inquiry_repo::update_fields(
-        &state.db,
-        id,
-        request.status.as_deref(),
-        request.notes.as_deref(),
-        services_json.as_ref(),
-        request.estimated_volume_m3,
-        request.distance_km,
-        request.start_time,
-        request.end_time,
-        request.origin_address_id,
-        scheduled_date,
-        request.destination_address_id,
-        stop_address_id,
-        request.service_type.as_deref(),
-        request.submission_mode.as_deref(),
-        request.recipient_id,
-        billing_address_id,
-        request.custom_fields.as_ref(),
-        request.employee_notes.as_deref(),
-        end_date,
-        request.has_pauschale,
-        now,
-    )
-    .await?;
-    // Overwrite the customer's billing address from the inquiry (feedback c7a8081e).
-    // Only sync when a billing address was explicitly provided in this request.
-    if billing_address_id.is_some() {
-        let _ = customer_repo::sync_billing_address(&state.db, current_inquiry.customer_id, billing_address_id).await;
-    }
-
-    // Auto-update billing address from origin → destination on completion, and
-    // mirror the new address onto the customer: post-move it is the current one
-    // (feedback c7a8081e). Best-effort — a failed sync must not fail the update.
-    if request.status.as_deref() == Some("completed") {
-        match inquiry_repo::auto_update_billing_on_completed(&state.db, id).await {
-            Ok(Some(new_billing_id)) => {
-                if let Err(e) = customer_repo::sync_billing_address(
-                    &state.db,
-                    current_inquiry.customer_id,
-                    Some(new_billing_id),
-                )
-                .await
-                {
-                    tracing::warn!(
-                        customer_id = %current_inquiry.customer_id,
-                        inquiry_id = %id,
-                        error = %e,
-                        "Post-completion billing address sync to customer failed"
-                    );
-                }
-            }
-            Ok(None) => {}
-            Err(e) => tracing::warn!(
-                inquiry_id = %id,
-                error = %e,
-                "Auto-update of billing address on completion failed"
-            ),
-        }
-    }
-
-    // Emit status.changed domain event when a status transition was requested (non-fatal).
-    if let Some(ref new_status) = request.status {
-        let emitter = state.events.clone();
-        let old_status = current_inquiry.status.clone();
-        let new_status = new_status.clone();
-        let payload = serde_json::json!({
-            "inquiry_id": id,
-            "old_status": old_status,
-            "new_status": new_status,
-        });
-        let aggregate = format!("inquiry:{id}");
-        aust_core::tenant::spawn(async move {
-            if let Err(e) = emitter.emit("status.changed", &aggregate, payload).await {
-                tracing::warn!("Failed to emit status.changed event: {e}");
-            }
-        });
-    }
-
-    let response = inquiry_builder::build_inquiry_response(&state.db, id).await?;
+    let response = inquiry_update::update_inquiry(&state.db, &state.events, id, request).await?;
     Ok(Json(response))
 }
 
