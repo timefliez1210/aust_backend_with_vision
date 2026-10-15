@@ -5,6 +5,7 @@ pub(crate) mod admin_emails;
 pub mod auth;
 pub mod calendar;
 pub mod calendar_items;
+pub mod conversion;
 pub mod customer;
 pub mod distance;
 pub mod employee;

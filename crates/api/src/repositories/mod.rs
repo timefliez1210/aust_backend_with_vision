@@ -10,6 +10,7 @@ pub(crate) mod admin_repo;
 pub(crate) mod auth_repo;
 pub(crate) mod calendar_item_repo;
 pub(crate) mod calendar_repo;
+pub(crate) mod conversion_repo;
 pub(crate) mod customer_address_repo;
 pub(crate) mod customer_auth_repo;
 pub(crate) mod customer_repo;
