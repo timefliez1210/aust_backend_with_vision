@@ -2386,6 +2386,7 @@ pub(crate) async fn kva_states(db: &sqlx::PgPool, today: NaiveDate) -> Result<Ve
 
 async fn load_register_items(db: &sqlx::PgPool) -> Result<Vec<RechnungsausgangItem>, ApiError> {
     let rows = invoice_repo::list_for_rechnungsausgangsbuch(db).await?;
+    let today = register_export::berlin_date(Utc::now());
 
     let mut items: Vec<RechnungsausgangItem> = rows
         .into_iter()
@@ -2423,6 +2424,13 @@ async fn load_register_items(db: &sqlx::PgPool) -> Result<Vec<RechnungsausgangIt
 
             let settled = r.paid_at.is_some();
             let offen = open_amount_cents(settled, brutto_cents, r.paid_amount_cents);
+            let issued_at = register_issued_at(
+                r.sent_at,
+                r.created_at,
+                &r.invoice_type,
+                r.end_date.or(r.scheduled_date),
+                today,
+            );
 
             RechnungsausgangItem {
                 id: r.id,
@@ -2435,7 +2443,7 @@ async fn load_register_items(db: &sqlx::PgPool) -> Result<Vec<RechnungsausgangIt
                 netto_cents,
                 mwst_cents,
                 brutto_cents,
-                sent_at: r.sent_at,
+                sent_at: issued_at,
                 created_at: r.created_at,
                 // `invoices.due_date` is readable but no code path ever writes it, so the
                 // Fälligkeit column was empty for every core invoice. Derive it from the
@@ -2445,7 +2453,7 @@ async fn load_register_items(db: &sqlx::PgPool) -> Result<Vec<RechnungsausgangIt
                 // still wins, so setting the column by hand keeps working.
                 due_date: r
                     .due_date
-                    .or_else(|| r.sent_at.map(|s| (s + chrono::Duration::days(7)).date_naive())),
+                    .or_else(|| issued_at.map(|s| (s + chrono::Duration::days(7)).date_naive())),
                 paid_at: r.paid_at,
                 offene_zahlungen_cents: offen,
                 is_settled: settled,
@@ -2512,6 +2520,36 @@ async fn load_register_items(db: &sqlx::PgPool) -> Result<Vec<RechnungsausgangIt
     });
 
     Ok(items)
+}
+
+/// The Rechnungsdatum the register shows for a core invoice.
+///
+/// Alex creates an invoice in the app and hands it over himself (PDF, paper, own
+/// mail), so `sent_at` — only stamped when the app emails it — was empty for most
+/// real invoices. Those rows counted as drafts and dropped out of every total:
+/// "Offen" showed 3.510,46 € with ~21.000 € of unpaid invoices on screen (report
+/// 473961dd). Rule agreed 2026-10-16: an invoice created on a job counts as sent.
+///
+/// The one exception is the Schlussrechnung of an Anzahlung pair: it is created
+/// together with the Anzahlung, before the move, and is not owed until the job is
+/// done. It counts from the day after the job's last day, dated that last day.
+fn register_issued_at(
+    sent_at: Option<DateTime<Utc>>,
+    created_at: DateTime<Utc>,
+    invoice_type: &str,
+    job_end: Option<NaiveDate>,
+    today: NaiveDate,
+) -> Option<DateTime<Utc>> {
+    if sent_at.is_some() {
+        return sent_at;
+    }
+    if invoice_type != "partial_final" {
+        return Some(created_at);
+    }
+    let end = job_end.filter(|d| *d < today)?;
+    // Noon UTC is the same calendar day in Berlin, whatever the season.
+    let end_ts = end.and_hms_opt(12, 0, 0)?.and_utc();
+    Some(end_ts.max(created_at))
 }
 
 /// Is this register row a reserved number rather than an issued invoice?
@@ -3320,6 +3358,35 @@ async fn update_number_settings(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Report 473961dd: a created invoice is issued even if the app never mailed it;
+    /// a Schlussrechnung only once its job is over.
+    #[test]
+    fn register_issue_date_follows_creation_except_for_a_pending_schlussrechnung() {
+        let ts = |y, m, d| NaiveDate::from_ymd_opt(y, m, d).unwrap().and_hms_opt(9, 0, 0).unwrap().and_utc();
+        let day = |y, m, d| NaiveDate::from_ymd_opt(y, m, d).unwrap();
+        let today = day(2026, 10, 16);
+        let created = ts(2026, 10, 1);
+
+        // Mailed by the app: the dispatch date stays authoritative.
+        let sent = Some(ts(2026, 10, 3));
+        assert_eq!(register_issued_at(sent, created, "full", None, today), sent);
+        assert_eq!(register_issued_at(sent, created, "partial_final", None, today), sent);
+
+        // Created but handed over outside the app: issued on its creation day.
+        assert_eq!(register_issued_at(None, created, "full", None, today), Some(created));
+        assert_eq!(register_issued_at(None, created, "partial_first", None, today), Some(created));
+
+        // Schlussrechnung: not before the job is over, then dated its last day.
+        assert_eq!(register_issued_at(None, created, "partial_final", Some(day(2026, 10, 20)), today), None);
+        assert_eq!(register_issued_at(None, created, "partial_final", Some(today), today), None);
+        assert_eq!(register_issued_at(None, created, "partial_final", None, today), None);
+        let issued = register_issued_at(None, created, "partial_final", Some(day(2026, 10, 8)), today).unwrap();
+        assert_eq!(register_export::berlin_date(issued), day(2026, 10, 8));
+        // A Schlussrechnung created after the job keeps its creation date.
+        let late = ts(2026, 10, 12);
+        assert_eq!(register_issued_at(None, late, "partial_final", Some(day(2026, 10, 8)), today), Some(late));
+    }
 
     /// The KVA badge must count exactly what the Nachfassliste shows: open,
     /// past the threshold, not muted, and the move still ahead.
