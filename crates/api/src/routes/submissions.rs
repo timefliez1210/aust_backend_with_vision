@@ -732,34 +732,45 @@ async fn fill_missing_labels(
     }
 
     // One representative frame per manifest item, in item order — index i of
-    // `frames` belongs to `items[i]`. Without that alignment we cannot tell
-    // which photo shows which unnamed item, so only the fallback is safe.
-    let aligned = representative_frame_per_item(images, manifest)
-        .filter(|frames| frames.len() == items.len());
-    let named: Vec<String> = if let Some(frames) = aligned {
-        let to_label: Vec<(Vec<u8>, String)> =
-            missing.iter().map(|&idx| frames[idx].clone()).collect();
-        match services::vision::build_vlm_estimator(state) {
-            Ok(estimator) => {
-                tracing::info!(
-                    n_items = to_label.len(),
-                    "Naming unlabelled AR items via VLM"
-                );
-                estimator.label_objects(&to_label).await
-            }
-            Err(e) => {
-                tracing::warn!("VLM naming unavailable, using fallback names: {e}");
-                vec![aust_volume_estimator::FALLBACK_LABEL.to_string(); to_label.len()]
-            }
+    // `frames` belongs to `items[i]`, and is `None` for an item sent without a
+    // photo. Without that alignment we cannot tell which photo shows which
+    // unnamed item, so only the fallback is safe.
+    let frames = representative_frame_per_item(images, manifest)
+        .filter(|frames| frames.len() == items.len())
+        .unwrap_or_else(|| {
+            tracing::warn!(
+                n_images = images.len(),
+                n_items = items.len(),
+                "AR manifest frame counts don't line up with the images — cannot map \
+                 photos to unnamed items, using fallback names"
+            );
+            vec![None; items.len()]
+        });
+
+    // Unnamed items with nothing to show keep the fallback name.
+    let (missing, unseen): (Vec<usize>, Vec<usize>) =
+        missing.into_iter().partition(|&idx| frames[idx].is_some());
+    for idx in unseen {
+        items[idx].german_name = Some(aust_volume_estimator::FALLBACK_LABEL.to_string());
+        items[idx].name = aust_volume_estimator::FALLBACK_LABEL.to_string();
+    }
+    if missing.is_empty() {
+        return;
+    }
+
+    let to_label: Vec<(Vec<u8>, String)> = missing
+        .iter()
+        .filter_map(|&idx| frames[idx].clone())
+        .collect();
+    let named: Vec<String> = match services::vision::build_vlm_estimator(state) {
+        Ok(estimator) => {
+            tracing::info!(n_items = to_label.len(), "Naming unlabelled AR items via VLM");
+            estimator.label_objects(&to_label).await
         }
-    } else {
-        tracing::warn!(
-            n_images = images.len(),
-            n_items = items.len(),
-            "AR manifest frame counts don't line up with the images — cannot map \
-             photos to unnamed items, using fallback names"
-        );
-        vec![aust_volume_estimator::FALLBACK_LABEL.to_string(); missing.len()]
+        Err(e) => {
+            tracing::warn!("VLM naming unavailable, using fallback names: {e}");
+            vec![aust_volume_estimator::FALLBACK_LABEL.to_string(); to_label.len()]
+        }
     };
 
     for (&idx, name) in missing.iter().zip(named) {
@@ -782,12 +793,14 @@ fn select_representative_frames(
     const MAX_FALLBACK_FRAMES: usize = 24;
 
     representative_frame_per_item(images, manifest)
+        .map(|frames| frames.into_iter().flatten().collect())
         .unwrap_or_else(|| images.iter().take(MAX_FALLBACK_FRAMES).cloned().collect())
 }
 
 /// The middle frame of each manifest item's sweep, index-aligned with the
-/// manifest — or `None` when the declared frame counts don't add up to the
-/// images actually uploaded.
+/// manifest (`None` at an item that came with no photos — a RoomPlan box) — or
+/// `None` overall when the declared frame counts don't add up to the images
+/// actually uploaded.
 ///
 /// **Caller**: `select_representative_frames` and `fill_missing_labels`.
 /// **Why**: Naming needs to know *which* photo shows which item; a length match
@@ -796,20 +809,20 @@ fn select_representative_frames(
 fn representative_frame_per_item(
     images: &[(Vec<u8>, String)],
     manifest: &serde_json::Value,
-) -> Option<Vec<(Vec<u8>, String)>> {
+) -> Option<Vec<Option<(Vec<u8>, String)>>> {
     let entries = manifest.as_array().filter(|a| !a.is_empty())?;
     let counts: Vec<usize> = entries
         .iter()
         .map(|e| e.get("frame_count").and_then(|c| c.as_u64()).unwrap_or(0) as usize)
         .collect();
-    if !counts.iter().all(|&c| c > 0) || counts.iter().sum::<usize>() != images.len() {
+    if images.is_empty() || counts.iter().sum::<usize>() != images.len() {
         return None;
     }
 
     let mut frames = Vec::with_capacity(counts.len());
     let mut offset = 0;
     for count in counts {
-        frames.push(images[offset + count / 2].clone());
+        frames.push((count > 0).then(|| images[offset + count / 2].clone()));
         offset += count;
     }
     Some(frames)
@@ -2798,6 +2811,25 @@ mod tests {
             {"frame_count": 4}, {"frame_count": 4}, {"frame_count": 4},
         ]);
         assert!(representative_frame_per_item(&images, &manifest).is_none());
+    }
+
+    #[test]
+    fn per_item_frames_skip_items_without_photos() {
+        // RoomPlan boxes come without photos; the leftovers measured next to
+        // them carry one each. The photographed ones still line up.
+        let images = dummy_frames(2);
+        let manifest = serde_json::json!([
+            {"label": "Sofa", "frame_count": 0},
+            {"label": "", "frame_count": 1},
+            {"label": "Tisch", "frame_count": 0},
+            {"label": "", "frame_count": 1},
+        ]);
+        let frames = representative_frame_per_item(&images, &manifest).unwrap();
+        assert_eq!(frames.len(), 4);
+        assert!(frames[0].is_none());
+        assert_eq!(frames[1].as_ref().unwrap().0, vec![0u8]);
+        assert!(frames[2].is_none());
+        assert_eq!(frames[3].as_ref().unwrap().0, vec![1u8]);
     }
 
     #[test]
