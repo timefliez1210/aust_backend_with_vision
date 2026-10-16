@@ -20,6 +20,6 @@ pub use traits::{
     EmployeeWorkloadEntry, EstimationService, EstimationSummary, FeedbackRecord, InquiryService,
     InvoiceDetail, InvoiceReminder, InvoiceService, InvoiceSummary, MetricsService, NewAddress,
     NewCustomer, NewInquiry, OfferComputation, OfferDraft, OfferOverrides, OfferPreview, OfferService,
-    OfferVersion, PipelineMetrics, PricingConfig, ReminderRecord, ReminderService, ReviewRecord,
+    OfferVersion, PipelineMetrics, PricingConfig, RegisterInvoice, ReminderRecord, ReminderService, ReviewRecord,
     ReviewService, RevisionStatus, SettingsService, TodoRecord, TodoService,
 };

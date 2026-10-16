@@ -15,19 +15,39 @@ pub struct ListInvoices;
 impl Tool for ListInvoices {
     fn name(&self) -> &'static str { "list_invoices" }
     fn description(&self) -> &'static str {
-        "Listet Rechnungen auf, optional gefiltert nach Status ('draft', 'sent', 'paid', 'overdue'). Nur für Inhaber."
+        "Listet Rechnungen aus dem Rechnungsausgangsbuch mit Kunde, Leistungsdatum, Netto/Brutto,          offenem Betrag und invoice_id (für get_invoice/send_invoice). Filter: status          (all|open|paid), customer (Name), from/to. Für Summen und Auswertungen invoice_stats          nehmen. Nur für Inhaber."
     }
     fn params_schema(&self) -> Value {
-        json!({ "type": "object", "properties": { "status": { "type": "string" } } })
+        json!({
+            "type": "object",
+            "properties": {
+                "status": { "type": "string", "enum": ["all", "open", "paid"] },
+                "customer": { "type": "string" },
+                "from": { "type": "string", "format": "date" },
+                "to": { "type": "string", "format": "date" }
+            }
+        })
     }
     fn safety(&self) -> Safety { Safety::Read }
     fn min_role(&self) -> Role { Role::Owner }
 
     async fn execute(&self, ctx: &ToolCtx, args: &Value) -> Result<Value> {
-        let status = args["status"].as_str();
-        let items = ctx.services.invoices.list(status).await?;
-        let count = items.len();
-        Ok(json!({ "invoices": items, "count": count }))
+        let mut args = args.clone();
+        // Older prompts and memories still say 'sent'/'overdue'.
+        if let Some(s) = args["status"].as_str() {
+            let mapped = match s {
+                "sent" | "overdue" | "offen" => "open",
+                "bezahlt" => "paid",
+                other => other,
+            };
+            args["status"] = json!(mapped);
+        }
+        let mut out = super::stats::InvoiceStats.execute(ctx, &args).await?;
+        let count = out["summe"]["anzahl"].clone();
+        if let Some(obj) = out.as_object_mut() {
+            obj.insert("count".into(), count);
+        }
+        Ok(out)
     }
 }
 

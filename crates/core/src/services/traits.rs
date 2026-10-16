@@ -409,6 +409,36 @@ pub struct PipelineMetrics {
     pub revenue_netto_cents: i64,
 }
 
+/// One row of the Rechnungsausgangsbuch, with the amounts the register computes.
+///
+/// The register is the single source for invoice money: the admin page, the
+/// Gewinn tab and Josie all read these rows, so their totals cannot disagree.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterInvoice {
+    /// `invoices.id` for an Umzug row (usable with get_invoice / send_invoice);
+    /// the storage invoice's id for a Lagerung row.
+    pub id: Uuid,
+    pub invoice_number: String,
+    pub inquiry_id: Option<Uuid>,
+    pub customer_name: Option<String>,
+    /// Leistungszeitraum (start / end). Storage invoices: the billed month.
+    pub service_start: Option<NaiveDate>,
+    pub service_end: Option<NaiveDate>,
+    /// Rechnungsdatum as the register shows it; `None` = reserved number, not issued.
+    pub issued_on: Option<NaiveDate>,
+    pub netto_cents: Option<i64>,
+    pub brutto_cents: Option<i64>,
+    /// Still owed, brutto. `None` when the amount is unknown.
+    pub open_cents: Option<i64>,
+    pub paid_on: Option<NaiveDate>,
+    /// `draft` | `ready` | `sent` | `paid` | `void` | `written_off` | `cancelled` …
+    pub status: String,
+    /// `full` | `partial_first` | `partial_final` | `lagerung`
+    pub invoice_type: String,
+    /// TRUE when the register counts the row in its totals (issued, not storniert).
+    pub counts: bool,
+}
+
 /// Single-day operational metrics (status transitions that happened on a date).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DailyMetrics {
@@ -1125,6 +1155,18 @@ pub trait MetricsService: Send + Sync {
 
     /// Return single-day metrics (status transitions that happened on `date`).
     async fn daily(&self, date: NaiveDate) -> Result<DailyMetrics, ServiceError>;
+
+    /// Every row of the Rechnungsausgangsbuch, amounts computed exactly as the
+    /// admin register does.
+    async fn invoice_register(&self) -> Result<Vec<RegisterInvoice>, ServiceError>;
+
+    /// The admin Conversion tab's report (channels, funnel, drop-offs) for leads
+    /// dated `from..=to`, as JSON.
+    async fn conversion_report(
+        &self,
+        from: Option<NaiveDate>,
+        to: Option<NaiveDate>,
+    ) -> Result<serde_json::Value, ServiceError>;
 }
 
 // ── Todos ─────────────────────────────────────────────────────────────────────

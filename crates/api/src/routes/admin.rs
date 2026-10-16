@@ -2350,6 +2350,40 @@ pub(crate) async fn issued_register(db: &sqlx::PgPool) -> Result<IssuedRegister,
     Ok(out)
 }
 
+/// The register's rows for Josie's statistics tools — same amounts, same "counts in
+/// the totals" rule as the page and the Gewinn tab.
+///
+/// **Caller**: `bridge::MetricsServiceImpl::invoice_register`
+pub(crate) async fn register_for_assistant(
+    db: &sqlx::PgPool,
+) -> Result<Vec<aust_core::services::RegisterInvoice>, ApiError> {
+    let berlin = |t: DateTime<Utc>| register_export::berlin_date(t);
+    Ok(load_register_items(db)
+        .await?
+        .into_iter()
+        .map(|r| {
+            let draft = register_is_draft(&r);
+            let storno = matches!(r.status.as_str(), "void" | "written_off" | "cancelled");
+            aust_core::services::RegisterInvoice {
+                counts: !draft && !storno,
+                id: r.id,
+                issued_on: if draft { None } else { r.sent_at.map(berlin) },
+                paid_on: r.paid_at.map(berlin),
+                invoice_number: r.invoice_number,
+                inquiry_id: r.inquiry_id,
+                customer_name: r.customer_name,
+                service_start: r.scheduled_date,
+                service_end: r.end_date,
+                netto_cents: r.netto_cents,
+                brutto_cents: r.brutto_cents,
+                open_cents: r.offene_zahlungen_cents,
+                status: r.status,
+                invoice_type: r.invoice_type,
+            }
+        })
+        .collect())
+}
+
 /// One KVA as the KVA-Buch judges it.
 pub(crate) struct KvaState {
     /// `gewonnen` | `verloren` | `offen` | `unbekannt`

@@ -21,6 +21,7 @@ pub mod offers;
 pub mod reminders;
 pub mod reviews;
 pub mod settings;
+pub mod stats;
 
 #[cfg(test)]
 pub mod testing;
@@ -231,6 +232,8 @@ impl ToolRegistry {
         registry.register(Box::new(meta::DailyBriefing));
         registry.register(Box::new(meta::WeeklyPipeline));
         registry.register(Box::new(meta::DailyMetrics));
+        registry.register(Box::new(stats::InvoiceStats));
+        registry.register(Box::new(stats::ConversionStats));
         registry.register(Box::new(meta::CreateTodo));
         registry.register(Box::new(meta::ListTodos));
         registry.register(Box::new(meta::ResolveTodo));

@@ -18,7 +18,7 @@ use aust_core::services::{
     EmployeeService, EmployeeWorkloadEntry, EstimationService, EstimationSummary, FeedbackRecord,
     InquiryService, InvoiceDetail, InvoiceReminder, InvoiceService, InvoiceSummary, MetricsService,
     NewInquiry, OfferComputation, OfferDraft, OfferOverrides as CoreOfferOverrides, OfferPreview,
-    OfferService, OfferVersion, PipelineMetrics, PricingConfig, ReminderRecord, ReminderService,
+    OfferService, OfferVersion, PipelineMetrics, PricingConfig, RegisterInvoice, ReminderRecord, ReminderService,
     ReviewRecord, ReviewService, RevisionStatus, ServiceBundle, ServiceError, SettingsService,
     TodoRecord, TodoService,
 };
@@ -1003,6 +1003,34 @@ impl MetricsService for MockMetricsService {
             invoices_created: 0,
             revenue_accepted_netto_cents: 100000,
         })
+    }
+
+    async fn invoice_register(&self) -> Result<Vec<RegisterInvoice>, ServiceError> {
+        let day = NaiveDate::from_ymd_opt(2026, 6, 30);
+        Ok(vec![RegisterInvoice {
+            id: Uuid::from_u128(7),
+            invoice_number: "2026-59".into(),
+            inquiry_id: None,
+            customer_name: Some("Sebastian Luttert".into()),
+            service_start: day,
+            service_end: day,
+            issued_on: day,
+            netto_cents: Some(473_450),
+            brutto_cents: Some(563_406),
+            open_cents: Some(563_406),
+            paid_on: None,
+            status: "sent".into(),
+            invoice_type: "full".into(),
+            counts: true,
+        }])
+    }
+
+    async fn conversion_report(
+        &self,
+        _from: Option<NaiveDate>,
+        _to: Option<NaiveDate>,
+    ) -> Result<serde_json::Value, ServiceError> {
+        Ok(serde_json::json!({ "total": { "leads": 3 }, "leads": [{}, {}, {}] }))
     }
 }
 

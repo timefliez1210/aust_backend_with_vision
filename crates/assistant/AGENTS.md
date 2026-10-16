@@ -30,7 +30,7 @@ into the `aust-email-agent` Telegram poller.
 | `memory/proposals.rs` | `pending_memory_proposals` — low-confidence memory proposals (reflection hook <0.7, nightly consolidation <0.8) queued for Alex's batch approval via Telegram; append-only, `approve` inserts into `agent_memory` |
 | `memory/session_mem.rs` | Session-scoped memory helpers backing `session.rs` |
 | `tools/mod.rs` | `Tool` trait, `Safety` enum, `ToolRegistry`, schema validation |
-| `tools/inquiries.rs`, `offers.rs`, `calendar.rs`, `customers.rs`, `emails.rs`, `invoices.rs`, `employees.rs`, `estimates.rs`, `addresses.rs`, `reminders.rs`, `reviews.rs`, `settings.rs`, `meta.rs` | 91 tools, 89 registered (see Tools below); one file per business domain, matching the `ServiceBundle` traits in `aust-core` |
+| `tools/inquiries.rs`, `offers.rs`, `calendar.rs`, `customers.rs`, `emails.rs`, `invoices.rs`, `employees.rs`, `estimates.rs`, `addresses.rs`, `reminders.rs`, `reviews.rs`, `settings.rs`, `meta.rs`, `stats.rs` | 93 tools, 91 registered (see Tools below); one file per business domain, matching the `ServiceBundle` traits in `aust-core` |
 | `tools/testing.rs` | `cfg(test)`-only mock implementation of every `aust_core::services` trait + `mock_bundle()` factory, used across the tool unit tests |
 | `hooks/reflection.rs` | Nightly learning (06:00 Berlin, slot `reflection`): reads last day's episodes + turns, proposes ≤3 lessons into `pending_memory_proposals`, posts each with ✅/❌ (`mp:<id>:ok\|no`); nothing stored without Alex's tap |
 | `hooks/briefing.rs` | Daily briefing assembler + schedulers. `run_briefing_tick` posts at 07:00 + 15:00 Europe/Berlin (today's appointments with route/m³/crew, tomorrow, open/overdue invoices, finished jobs without invoice, pipeline, unanswered mail, missing hours, vehicle deadlines); `run_evening_preview_tick` posts at 21:00 tomorrow's appointments starting before 09:00, only if any. Once per slot/day via the `agent_briefing_log` claim; driven by a 60s loop in `src/main.rs`. |
@@ -41,7 +41,7 @@ into the `aust-email-agent` Telegram poller.
 
 ## Tools
 
-91 tools across 13 domain files (counted via `impl Tool for`; 89 registered in `ToolRegistry::new`): `calendar.rs` (13),
+93 tools across 14 domain files (counted via `impl Tool for`; 91 registered in `ToolRegistry::new`): `stats.rs` (2: invoice_stats, conversion_stats — money always from the Rechnungsausgangsbuch rows via `MetricsService::invoice_register`), `calendar.rs` (13),
 `inquiries.rs`/`offers.rs`/`invoices.rs` (10 each), `meta.rs` (8), `customers.rs`/`emails.rs`/`reviews.rs`
 (7 each), `employees.rs` (5), `reminders.rs`/`estimates.rs`/`settings.rs` (3 each), `addresses.rs` (2).
 Every tool declares a `Safety` (Read/Write) and minimum `Role`; the `ToolRegistry` validates

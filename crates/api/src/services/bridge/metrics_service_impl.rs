@@ -4,7 +4,9 @@ use async_trait::async_trait;
 use chrono::NaiveDate;
 use sqlx::PgPool;
 
-use aust_core::services::{DailyMetrics, MetricsService, PipelineMetrics, ServiceError};
+use aust_core::services::{
+    DailyMetrics, MetricsService, PipelineMetrics, RegisterInvoice, ServiceError,
+};
 
 pub struct MetricsServiceImpl {
     pool: PgPool,
@@ -76,22 +78,16 @@ impl MetricsService for MetricsServiceImpl {
         .await
         .map_err(super::map_sqlx)?;
 
-        let revenue_brutto_cents: i64 = sqlx::query_scalar(
-            r#"
-            SELECT COALESCE(SUM(o.price_cents), 0)::bigint
-            FROM offers o
-            JOIN inquiries i ON o.inquiry_id = i.id
-            WHERE o.status = 'accepted'
-              AND i.updated_at::date BETWEEN $1 AND $2
-            "#,
-        )
-        .bind(from)
-        .bind(to)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(super::map_sqlx)?;
-
-        let revenue_netto_cents = (revenue_brutto_cents as f64 / 1.19).round() as i64;
+        // Billed netto by Leistungsdatum, from the register itself. The old figure
+        // summed offers with status 'accepted' — a status almost nothing sets — and
+        // divided a netto price by 1.19 again, so it reported ~0 €.
+        let revenue_netto_cents: i64 = crate::routes::admin::issued_revenue(&self.pool)
+            .await
+            .map_err(|e| ServiceError::Db(anyhow::anyhow!(e.to_string())))?
+            .into_iter()
+            .filter(|r| r.service_date.is_some_and(|d| d >= from && d <= to))
+            .map(|r| r.netto_cents)
+            .sum();
 
         Ok(PipelineMetrics {
             period_from: from,
@@ -162,7 +158,7 @@ impl MetricsService for MetricsServiceImpl {
             SELECT COALESCE(SUM(o.price_cents), 0)::bigint
             FROM offers o
             JOIN inquiries i ON o.inquiry_id = i.id
-            WHERE o.status = 'accepted'
+            WHERE o.status NOT IN ('rejected', 'cancelled', 'superseded')
               AND i.accepted_at::date = $1
             "#,
         )
@@ -171,7 +167,8 @@ impl MetricsService for MetricsServiceImpl {
         .await
         .map_err(super::map_sqlx)?;
 
-        let revenue_accepted_netto_cents = (revenue_brutto_cents as f64 / 1.19).round() as i64;
+        // `price_cents` is netto already (see conversion_repo / KVA-Buch).
+        let revenue_accepted_netto_cents = revenue_brutto_cents;
 
         Ok(DailyMetrics {
             date,
@@ -182,5 +179,22 @@ impl MetricsService for MetricsServiceImpl {
             invoices_created,
             revenue_accepted_netto_cents,
         })
+    }
+
+    async fn invoice_register(&self) -> Result<Vec<RegisterInvoice>, ServiceError> {
+        crate::routes::admin::register_for_assistant(&self.pool)
+            .await
+            .map_err(|e| ServiceError::Db(anyhow::anyhow!(e.to_string())))
+    }
+
+    async fn conversion_report(
+        &self,
+        from: Option<NaiveDate>,
+        to: Option<NaiveDate>,
+    ) -> Result<serde_json::Value, ServiceError> {
+        let report = crate::services::conversion_service::report(&self.pool, from, to)
+            .await
+            .map_err(|e| ServiceError::Db(anyhow::anyhow!(e.to_string())))?;
+        serde_json::to_value(report).map_err(|e| ServiceError::Db(anyhow::anyhow!(e.to_string())))
     }
 }
