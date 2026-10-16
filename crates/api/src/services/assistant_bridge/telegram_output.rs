@@ -64,13 +64,46 @@ pub fn split_message(body: &str) -> Vec<String> {
     chunks
 }
 
-/// Post a reply of any length (split as needed) and return every message ID.
+/// Post one of Josie's replies of any length (split as needed) and return every
+/// message ID. Markdown is rendered phone-friendly as Telegram HTML
+/// ([`super::telegram_format`]); a chunk Telegram rejects as HTML goes out as plain text.
 pub async fn post_long_text(client: &Client, bot_token: &str, chat_id: i64, body: &str) -> Vec<i64> {
     let mut ids = Vec::new();
     for chunk in split_message(body) {
-        ids.push(post_text(client, bot_token, chat_id, &chunk).await);
+        let html = super::telegram_format::to_telegram_html(&chunk);
+        let id = match post_html(client, bot_token, chat_id, &html).await {
+            Some(id) => id,
+            None => post_text(client, bot_token, chat_id, &chunk).await,
+        };
+        ids.push(id);
     }
     ids
+}
+
+/// Send `html` with `parse_mode: HTML`; `None` when Telegram refuses it.
+async fn post_html(client: &Client, bot_token: &str, chat_id: i64, html: &str) -> Option<i64> {
+    let url = format!("https://api.telegram.org/bot{bot_token}/sendMessage");
+    let payload = serde_json::json!({
+        "chat_id": chat_id,
+        "text": html,
+        "parse_mode": "HTML",
+        "link_preview_options": { "is_disabled": true },
+    });
+    match client.post(&url).json(&payload).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let json: serde_json::Value = resp.json().await.unwrap_or_default();
+            json["result"]["message_id"].as_i64()
+        }
+        Ok(resp) => {
+            error!("post_html rejected ({}), falling back to plain text: {}", resp.status(), resp.text().await.unwrap_or_default());
+            None
+        }
+        // Not retried as plain text: the message may have gone out anyway.
+        Err(e) => {
+            error!("post_html network error: {e}");
+            Some(0)
+        }
+    }
 }
 
 /// Show "schreibt …" while a turn runs (Telegram clears it after ~5 s or on reply).
