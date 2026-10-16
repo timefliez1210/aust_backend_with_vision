@@ -1042,7 +1042,8 @@ impl EmailProcessor {
                 | ApprovalDecision::StorageReject(_)
                 | ApprovalDecision::AssistantText { .. }
                 | ApprovalDecision::AssistantCallback { .. }
-                | ApprovalDecision::AssistantMedia { .. } => {
+                | ApprovalDecision::AssistantMedia { .. }
+                | ApprovalDecision::AssistantVoice { .. } => {
                     if let Some(tx) = &self.offer_tx {
                         let _ = tx.send(response.decision);
                     }
