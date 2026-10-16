@@ -125,7 +125,8 @@ mod tests {
         assert_eq!(to_pgvector(&[0.5, -1.0]), "[0.5,-1]");
     }
 
-    /// Runs the real model where it is cached: `AUST_TEST_EMBED_CACHE=<dir>`.
+    /// Runs the real model where it is cached: `AUST_TEST_EMBED_CACHE=<dir>`, plus
+    /// `ORT_DYLIB_PATH=<libonnxruntime.so>` (ONNX Runtime >= 1.24, loaded at runtime).
     #[test]
     fn local_model_ranks_the_related_episode_first() {
         let Ok(dir) = std::env::var("AUST_TEST_EMBED_CACHE") else { return };

@@ -31,6 +31,17 @@ RUN git clone --depth 1 --branch ${WHISPER_CPP_REF} https://github.com/ggml-org/
     && cmake --build /whisper/build -j"$(nproc)" --target whisper-cli \
     && cp /whisper/build/bin/whisper-cli /usr/local/bin/whisper-cli
 
+# ---- ONNX Runtime (Josie's local embeddings, loaded at runtime via ORT_DYLIB_PATH) ----
+# ort's prebuilt static library needs a newer libstdc++ than bookworm ships, so the
+# binary dlopens Microsoft's official build instead. Must be >= 1.24 (ort api-24).
+FROM debian:bookworm-slim AS onnxruntime
+ARG ORT_VERSION=1.24.4
+RUN apt-get update && apt-get install -y curl ca-certificates --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl -fsSL https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz \
+    | tar -xz -C /opt \
+    && cp -L /opt/onnxruntime-linux-x64-${ORT_VERSION}/lib/libonnxruntime.so /usr/local/lib/libonnxruntime.so
+
 # ---- Runtime stage ----
 FROM debian:bookworm-slim
 
@@ -57,6 +68,8 @@ COPY --from=builder /app/target/release/aust_backend ./aust_backend
 # The model is not baked in (~190–570 MB): it lives in /opt/aust/whisper on the
 # host, mounted at /app/whisper, and AUST__VOICE__MODEL_PATH points at it.
 COPY --from=whisper /usr/local/bin/whisper-cli /usr/local/bin/whisper-cli
+COPY --from=onnxruntime /usr/local/lib/libonnxruntime.so /usr/local/lib/libonnxruntime.so
+ENV ORT_DYLIB_PATH=/usr/local/lib/libonnxruntime.so
 COPY config ./config
 COPY migrations ./migrations
 # Assistant persona file — the binary loads SOUL.md from the working dir at startup.
