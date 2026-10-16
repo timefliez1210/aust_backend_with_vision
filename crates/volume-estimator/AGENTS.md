@@ -71,7 +71,7 @@ Response: `VisionServiceResponse { job_id, status, detected_items: Vec<VisionDet
 
 ## Configuration
 
-Uses `VisionServiceConfig` from core: `enabled` (default `false`), `base_url` (default `http://localhost:8090`), `video_base_url`/`ar_base_url` (both `Option<String>`, default `None` → fall back to `base_url`), `timeout_secs` (default 120), `max_retries` (default 1), `poll_interval_secs` (default 60 — Modal containers stay warm at least that long), `max_polls` (default 20, i.e. a 20-minute ceiling for photo jobs; video may need more), plus VLM backend selection: `backend` (`"modal"` default | `"vlm"`), `vlm_model` (default `"minimax-m3"`), `vlm_timeout_secs` (default 1800).
+Uses `VisionServiceConfig` from core: `enabled` (default `false`), `base_url` (default `http://localhost:8090`), `video_base_url`/`ar_base_url` (both `Option<String>`, default `None` → fall back to `base_url`), `timeout_secs` (default 120), `max_retries` (default 1), `poll_interval_secs` (default 60 — Modal containers stay warm at least that long), `max_polls` (default 20, i.e. a 20-minute ceiling for photo jobs; video may need more), plus VLM backend selection: `backend` (`"modal"` default | `"vlm"`), `vlm_model` (default `"gemma4:31b"`; minimax-m3 is paid-only since 2026-10), `vlm_timeout_secs` (default 1800).
 
 ## ⚠️ Connected Changes
 

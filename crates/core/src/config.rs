@@ -411,8 +411,9 @@ pub struct VisionServiceConfig {
     ///   connects through `llm.ollama.base_url`/`api_key`.
     #[serde(default = "default_vision_backend")]
     pub backend: String,
-    /// Ollama model tag for the `"vlm"` backend.
-    /// minimax-m3 benchmarked closest to ground truth on the 59-photo reference set.
+    /// Ollama model tag for the `"vlm"` backend. minimax-m3 benchmarked closest to
+    /// ground truth on the 59-photo reference set but left the free plan (402) in
+    /// 2026-10; `gemma4:31b` is the free vision model.
     #[serde(default = "default_vlm_model")]
     pub vlm_model: String,
     /// Wall-clock ceiling in seconds for a single VLM generation. Thinking
@@ -426,7 +427,7 @@ fn default_vision_backend() -> String {
 }
 
 fn default_vlm_model() -> String {
-    "minimax-m3".to_string()
+    "gemma4:31b".to_string()
 }
 
 fn default_vlm_timeout_secs() -> u64 {

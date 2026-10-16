@@ -12,7 +12,7 @@ default_provider = "ollama"
 
 [llm.ollama]
 base_url = "https://ollama.com"
-model = "qwen3.5:397b"
+model = "gpt-oss:120b"
 # Set via AUST__LLM__OLLAMA__API_KEY env var
 api_key = ""
 

@@ -85,9 +85,12 @@ directly (would create a circular dependency); `DraftOffer`/`CommitOfferDraft` g
   this — it does not; that field feeds a *different* generic Ollama provider elsewhere in the
   codebase (e.g. vision), not Josie.
 - **Ollama Cloud gates models by plan.** On the free plan `kimi-k2.6`, `deepseek-v4-flash`,
-  `glm-*`, `qwen3.5:397b`, `minimax-m*`, `mistral-large-3` and `deepseek-*` all answer
-  `402 "this model is not included in your free usage"`. Free-plan usable as of 2026-09:
-  `gpt-oss:120b`, `gpt-oss:20b`, `gemma4:31b`, `nemotron-3-super`, `nemotron-3-nano:30b`.
+  `glm-*`, `minimax-m*`, `mistral-large-3`, `kimi-k3` and `deepseek-*` all answer
+  `402 "this model is not included in your free usage"`; `qwen3.5:397b` was retired
+  (410) on 2026-09-25. Free-plan usable as of 2026-10-16: `gpt-oss:120b` (~1 s/call, best),
+  `gpt-oss:20b`, `gemma4:31b`, `nemotron-3-ultra` (7–13 s), `nemotron-3-super` (13–19 s),
+  `nemotron-3-nano:30b`. OpenRouter's free tier was checked too and is not better (50 req/day,
+  frequent upstream 429s).
 - **Only the vision model may see images.** `gpt-oss:*` and `nemotron-*` reject an
   image-bearing request outright (`"this model does not support image input"`), so
   `chat_core` routes any turn carrying `images` to `vision_model` regardless of tier.
