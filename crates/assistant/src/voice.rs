@@ -184,15 +184,26 @@ impl WhisperCppTranscriber {
     }
 }
 
-/// Collapse whisper's line-per-segment output into one paragraph and drop the
-/// bracketed non-speech markers it emits on silence ("[Musik]", "(Stille)").
+/// Collapse whisper's line-per-segment output into one paragraph, drop the
+/// bracketed non-speech markers it emits on silence ("[Musik]", "(Stille)") and
+/// the quotes it sometimes wraps a whole note in.
 pub(crate) fn clean_transcript(raw: &str) -> String {
-    raw.split_whitespace()
+    let text = raw
+        .split_whitespace()
         .filter(|w| {
             !((w.starts_with('[') && w.ends_with(']')) || (w.starts_with('(') && w.ends_with(')')))
         })
         .collect::<Vec<_>>()
-        .join(" ")
+        .join(" ");
+    for (open, close) in [('"', '"'), ('„', '“'), ('»', '«'), ('“', '”')] {
+        if let Some(inner) = text.strip_prefix(open).and_then(|t| t.strip_suffix(close))
+            && !inner.contains(open)
+            && !inner.contains(close)
+        {
+            return inner.trim().to_string();
+        }
+    }
+    text
 }
 
 #[cfg(test)]
@@ -213,6 +224,15 @@ mod tests {
             "Trag den Umzug von Frau Lange am Freitag ein."
         );
         assert_eq!(clean_transcript("[BLANK_AUDIO]\n"), "");
+        assert_eq!(
+            clean_transcript("\"Kannst du kurz herausfinden, wie viele Rechnungen offen sind?\""),
+            "Kannst du kurz herausfinden, wie viele Rechnungen offen sind?"
+        );
+        // A quote inside the note stays.
+        assert_eq!(
+            clean_transcript("\"Umzug\" ist eingetragen, schreib \"erledigt\""),
+            "\"Umzug\" ist eingetragen, schreib \"erledigt\""
+        );
     }
 
     /// Runs only where whisper.cpp and a model are installed:

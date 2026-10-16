@@ -91,8 +91,14 @@ impl Default for VoiceConfig {
             threads: 0,
             timeout_secs: 300,
             max_duration_secs: 300,
-            prompt: "Umzug, Besichtigung, Halteverbot, Kostenvoranschlag, KVA, Rechnung, Termin, \
-                     Crew, Möbellift, Einpackservice, Kubikmeter, Hildesheim."
+            // A short in-domain sentence works better than a word list: whisper
+            // treats the prompt as the preceding transcript. Words it misheard in
+            // real notes: Aufräumhelden ("Berghänden"), markiert ("man kehr"),
+            // Besichtigungstermine ("Besichtigungsterminal").
+            prompt: "Josie, zeig mir die Termine von heute. Aust Umzüge und Aufräumhelden \
+                     in Hildesheim: Umzug, Besichtigungstermine, Kostenvoranschlag (KVA), \
+                     Aufträge, Rechnungen als bezahlt markiert, Rechnungsausgangsbuch, Mahnung, \
+                     Halteverbot, Möbellift, Einpackservice, Crew, Kubikmeter, Bug."
                 .to_string(),
         }
     }
