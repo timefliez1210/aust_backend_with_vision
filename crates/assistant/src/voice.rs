@@ -161,6 +161,15 @@ impl WhisperCppTranscriber {
             .arg(&self.settings.model)
             .args(["-l", "de", "-bs", "1", "-bo", "1", "-fa", "-nt", "-np"])
             .args(["-t", &self.threads().to_string()]);
+        // Whisper always encodes a 30 s window; a short note padded to 30 s spends
+        // most of the time on silence. Shrinking the window to the note's length
+        // gave the same text ~2.4× faster on the 1-vCPU VPS (large-v3-turbo, 11 s
+        // clip: 77 s → 32 s).
+        if let Ok(meta) = tokio::fs::metadata(&wav).await
+            && let Some(ctx) = audio_ctx_for(meta.len())
+        {
+            cmd.args(["-ac", &ctx.to_string()]);
+        }
         if !self.settings.prompt.trim().is_empty() {
             cmd.args(["--prompt", self.settings.prompt.trim()]);
         }
@@ -182,6 +191,17 @@ impl WhisperCppTranscriber {
         }
         Ok(text)
     }
+}
+
+/// Encoder window (`-ac`) for a 16 kHz mono s16 WAV of `wav_bytes`: whisper's
+/// full window is 1500 frames for 30 s (50 per second). Two seconds of margin,
+/// never below 512 frames (at 384 turbo looped "Ask… Ask… Ask…" on a 4 s clip), `None`
+/// when the note fills the whole window anyway.
+pub(crate) fn audio_ctx_for(wav_bytes: u64) -> Option<u32> {
+    const BYTES_PER_SEC: u64 = 16_000 * 2;
+    let secs = wav_bytes.saturating_sub(44).div_ceil(BYTES_PER_SEC);
+    let ctx = ((secs + 2) * 50).max(512);
+    (ctx < 1500).then_some(ctx as u32)
 }
 
 /// Collapse whisper's line-per-segment output into one paragraph, drop the
@@ -215,6 +235,15 @@ mod tests {
         let t = NoopTranscriber;
         let err = t.transcribe(b"fake audio").await.unwrap_err();
         assert!(matches!(err, AssistantError::VoiceUnsupported));
+    }
+
+    #[test]
+    fn audio_ctx_follows_the_note_length() {
+        let wav = |secs: u64| 44 + secs * 32_000;
+        assert_eq!(audio_ctx_for(wav(11)), Some(650));
+        assert_eq!(audio_ctx_for(wav(1)), Some(512), "floor against repetition loops");
+        assert_eq!(audio_ctx_for(wav(28)), None, "full window");
+        assert_eq!(audio_ctx_for(wav(120)), None);
     }
 
     #[test]
