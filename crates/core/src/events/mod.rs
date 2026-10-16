@@ -157,7 +157,7 @@ mod tests {
         let event_id = emitter.emit("test.event", "inquiry:test-123", payload).await
             .expect("emit should succeed");
 
-        let pending = consumer.fetch_pending(10).await.expect("fetch_pending should succeed");
+        let pending = consumer.fetch_pending(100_000).await.expect("fetch_pending should succeed");
         assert!(
             pending.iter().any(|e| e.id == event_id),
             "emitted event should appear in pending list"
@@ -165,7 +165,7 @@ mod tests {
 
         consumer.mark_consumed(event_id).await.expect("mark_consumed should succeed");
 
-        let pending2 = consumer.fetch_pending(10).await.expect("second fetch_pending should succeed");
+        let pending2 = consumer.fetch_pending(100_000).await.expect("second fetch_pending should succeed");
         assert!(
             !pending2.iter().any(|e| e.id == event_id),
             "event should not appear in pending list after being consumed"
