@@ -25,8 +25,7 @@ use std::time::Duration;
 /// Regenerate this file when the catalogue changes.
 const RE_CATALOGUE: &str = include_str!("re_catalogue.txt");
 
-/// Maximum edge length for downscaled images sent to the model.
-/// 512 px matches the benchmarked configuration.
+/// Default maximum edge length for downscaled images sent to the model.
 const MAX_IMAGE_DIM: u32 = 512;
 
 /// Maximum number of keyframes extracted from a video.
@@ -49,17 +48,22 @@ CATALOGUE:
 {RE_CATALOGUE}
 
 TASK — using ALL the photos:
-- DEDUPLICATE across photos: the same physical object shown in several photos is ONE object. Use whole-room context to decide same-vs-different. Do NOT list the same object under two catalogue synonyms (e.g. a bed is ONE entry, not bed + mattress; a rug is rug OR carpet, not both).
-- For each distinct movable object: pick the best-matching catalogue key, take its volume (for "per seat/meter" estimate the count; for size-variants pick small/large by what you see). Count quantities per type carefully, room by room.
-- EXCLUDE NOT-MOVED items from the total; list them separately. Built-in kitchen units (Einbaukueche), built-in oven/dishwasher, radiators stay with the property.
-- For BOX items and loose contents (full wardrobes, kitchen contents, books, clothes), estimate how many Umzugskartons (a full wardrobe is typically 8-12 Kartons).
+1. WALK THE APARTMENT ROOM BY ROOM. Group the photos by room (kitchen, living room, bedroom, hallway, cellar, balcony …). For each room list EVERY object you can see, including ones that are only partly in frame or in the background: sofas, tables, chairs, stools, desks (also a small desk under a printer), PCs and monitors, printers, shelves, chests, cabinets, dressers, nightstands, beds, spare mattresses, wardrobes, fridges AND separate freezers or small under-counter fridges, washing machine, dryer, microwave, lamps, mirrors, rugs, plants, bikes, exercise equipment, balcony/garden furniture, suitcases, bags, buckets and storage boxes.
+2. DEDUPLICATE across photos: the same physical object shown in several photos is ONE object. Use whole-room context to decide same-vs-different. Do NOT list the same object under two catalogue synonyms (e.g. a bed is ONE entry, not bed + mattress; a rug is rug OR carpet, not both). But two DIFFERENT objects of the same type (two fridges, two dressers) are two.
+3. SIZE what is measured per unit: wardrobes/shelves/cupboards per metre of width — count the doors, one door ≈ 0.5 m; sofas per seat — count the seat cushions, a corner/L-sofa has 4-6 seats.
+4. For each distinct movable object pick the best-matching catalogue key and take its volume (size-variants: small/large by what you see). If you are unsure whether something is movable furniture, INCLUDE it — a forgotten item costs far more than an extra one.
+5. EXCLUDE NOT-MOVED items from the total; list them separately. Built-in kitchen units (Einbaukueche), built-in oven/dishwasher, radiators stay with the property. A freestanding fridge, washing machine or cabinet is NOT built-in.
+6. COUNT UMZUGSKARTONS from the contents you actually see, per room, not as a round guess: about 4 per metre of full wardrobe, about 3 per metre of filled shelf or bookcase, 10-15 for a kitchen with filled cupboards, 2-5 for loose items, decoration and small appliances in each other room, plus anything already packed or in bags/buckets.
 
-Respond ONLY with a single JSON object, no markdown, no explanation:
+Respond ONLY with a single JSON object, no markdown, no explanation. Fill "rooms" first — it is your working list — then derive the rest from it:
 {{
-  "movable_items": [
-    {{"key": "<english_key>", "german": "<German name>", "count": <int>, "volume_per_unit_m3": <float>, "volume_m3": <float line total>}}
+  "rooms": [
+    {{"room": "<room>", "objects": ["<every object seen, with size, e.g. 'Kleiderschrank 7 Türen ≈ 3,5 m'>"], "kartons": <int>}}
   ],
-  "boxes_estimate": <int total Umzugskartons>,
+  "movable_items": [
+    {{"key": "<english_key>", "german": "<German name>", "count": <number — pieces, seats, or metres for per-metre items>, "volume_per_unit_m3": <float>, "volume_m3": <float line total>}}
+  ],
+  "boxes_estimate": <int total Umzugskartons = sum of the rooms' kartons>,
   "not_moved": [{{"item": "<name>", "reason": "<short reason>"}}],
   "total_movable_m3": <float>
 }}"#
@@ -100,8 +104,9 @@ struct VlmLabelResponse {
 struct VlmResponse {
     #[serde(default)]
     movable_items: Vec<VlmItem>,
+    /// Models sometimes answer `12.5`; rounded when used.
     #[serde(default)]
-    boxes_estimate: u32,
+    boxes_estimate: f64,
     #[serde(default)]
     not_moved: Vec<VlmNotMoved>,
 }
@@ -112,16 +117,27 @@ struct VlmItem {
     key: String,
     #[serde(default)]
     german: Option<String>,
+    /// Fractional for per-metre items (`3.5` m of wardrobe).
     #[serde(default = "default_count")]
-    count: u32,
+    count: f64,
     #[serde(default)]
     volume_per_unit_m3: Option<f64>,
     #[serde(default)]
     volume_m3: Option<f64>,
 }
 
-fn default_count() -> u32 {
-    1
+fn default_count() -> f64 {
+    1.0
+}
+
+/// "3", "3,5" — German decimal comma, no trailing zeros.
+fn fmt_count(n: f64) -> String {
+    let rounded = (n * 10.0).round() / 10.0;
+    if rounded.fract() == 0.0 {
+        format!("{rounded:.0}")
+    } else {
+        format!("{rounded:.1}").replace('.', ",")
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -139,6 +155,7 @@ struct VlmNotMoved {
 pub struct VlmEstimator {
     provider: OllamaProvider,
     timeout: Duration,
+    max_image_dim: u32,
 }
 
 impl VlmEstimator {
@@ -163,7 +180,14 @@ impl VlmEstimator {
         Self {
             provider,
             timeout: Duration::from_secs(timeout_secs),
+            max_image_dim: MAX_IMAGE_DIM,
         }
+    }
+
+    /// Longest image edge sent to the model (default [`MAX_IMAGE_DIM`]).
+    pub fn with_max_image_dim(mut self, dim: u32) -> Self {
+        self.max_image_dim = dim;
+        self
     }
 
     /// Run the catalogue estimation over a set of photos.
@@ -191,7 +215,7 @@ impl VlmEstimator {
 
         let mut images_b64 = Vec::with_capacity(images.len());
         for (data, mime) in images {
-            match decode_and_downscale(data).await {
+            match decode_and_downscale(data, self.max_image_dim).await {
                 Ok(jpeg) => images_b64
                     .push(base64::engine::general_purpose::STANDARD.encode(jpeg)),
                 Err(e) => {
@@ -270,7 +294,7 @@ impl VlmEstimator {
 
         let mut images_b64 = Vec::with_capacity(chunk.len());
         for (data, mime) in chunk {
-            match decode_and_downscale(data).await {
+            match decode_and_downscale(data, self.max_image_dim).await {
                 Ok(jpeg) => images_b64
                     .push(base64::engine::general_purpose::STANDARD.encode(jpeg)),
                 Err(e) => {
@@ -338,11 +362,11 @@ fn parse_label_response(response: &str, expected: usize) -> Vec<String> {
 /// HEIC/HEIF/AVIF (iPhone default format — the `image` crate cannot decode it;
 /// the old Modal pipeline used pillow-heif). `heif-convert` comes from the
 /// `libheif-examples` package in `docker/Dockerfile.backend`.
-async fn decode_and_downscale(data: &[u8]) -> Result<Vec<u8>, VolumeError> {
-    match downscale_to_jpeg(data, MAX_IMAGE_DIM) {
+async fn decode_and_downscale(data: &[u8], max_dim: u32) -> Result<Vec<u8>, VolumeError> {
+    match downscale_to_jpeg(data, max_dim) {
         Ok(jpeg) => Ok(jpeg),
         Err(rust_err) => match heic_to_jpeg(data).await {
-            Ok(converted) => downscale_to_jpeg(&converted, MAX_IMAGE_DIM),
+            Ok(converted) => downscale_to_jpeg(&converted, max_dim),
             Err(heif_err) => Err(VolumeError::Vision(format!(
                 "{rust_err}; heif fallback: {heif_err}"
             ))),
@@ -421,10 +445,10 @@ fn parse_vlm_response(response: &str) -> Result<VisionAnalysisResult, VolumeErro
     let mut total = 0.0_f64;
 
     for item in &parsed.movable_items {
-        let count = item.count.max(1);
+        let count = if item.count > 0.0 { item.count } else { 1.0 };
         let line_volume = item
             .volume_m3
-            .or_else(|| item.volume_per_unit_m3.map(|v| v * count as f64))
+            .or_else(|| item.volume_per_unit_m3.map(|v| v * count))
             .unwrap_or(0.0);
         if line_volume <= 0.0 {
             tracing::warn!("VLM item without volume skipped: {:?}", item.key);
@@ -437,8 +461,8 @@ fn parse_vlm_response(response: &str) -> Result<VisionAnalysisResult, VolumeErro
             .clone()
             .filter(|g| !g.is_empty())
             .unwrap_or_else(|| item.key.clone());
-        let name = if count > 1 {
-            format!("{count}× {german}")
+        let name = if count != 1.0 {
+            format!("{}× {german}", fmt_count(count))
         } else {
             german.clone()
         };
@@ -458,17 +482,18 @@ fn parse_vlm_response(response: &str) -> Result<VisionAnalysisResult, VolumeErro
         });
     }
 
-    if parsed.boxes_estimate > 0 {
-        let karton_volume = parsed.boxes_estimate as f64 * KARTON_M3;
+    let boxes = parsed.boxes_estimate.max(0.0).round() as u32;
+    if boxes > 0 {
+        let karton_volume = boxes as f64 * KARTON_M3;
         total += karton_volume;
         detected_items.push(DetectedItem {
-            name: format!("{}× Umzugskarton", parsed.boxes_estimate),
+            name: format!("{boxes}× Umzugskarton"),
             volume_m3: round2(karton_volume),
             confidence: VLM_CONFIDENCE,
             dimensions: None,
             category: Some("boxes".to_string()),
             german_name: Some("Umzugskarton bis 80 l".to_string()),
-            re_value: Some(parsed.boxes_estimate as f64),
+            re_value: Some(boxes as f64),
             volume_source: Some("re_catalog".to_string()),
             bbox: None,
             bbox_image_index: None,
@@ -655,6 +680,17 @@ mod tests {
         let response = r#"{"movable_items":[{"key":"chair","count":3,"volume_per_unit_m3":0.2}],"boxes_estimate":0,"not_moved":[]}"#;
         let result = parse_vlm_response(response).unwrap();
         assert!((result.total_volume_m3 - 0.6).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_accepts_fractional_counts() {
+        // gemma writes wardrobe width in metres as the count; one such line must
+        // not throw away the whole estimate.
+        let response = r#"{"movable_items":[{"key":"wardrobe","german":"Schrank","count":3.5,"volume_per_unit_m3":0.8,"volume_m3":2.8}],"boxes_estimate":12.5,"not_moved":[]}"#;
+        let result = parse_vlm_response(response).unwrap();
+        assert_eq!(result.detected_items[0].name, "3,5× Schrank");
+        assert_eq!(result.detected_items[1].name, "13× Umzugskarton");
+        assert!((result.total_volume_m3 - 4.1).abs() < 1e-9);
     }
 
     #[test]

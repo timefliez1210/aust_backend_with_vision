@@ -3,6 +3,7 @@
 //! ```text
 //! cargo run -p aust-volume-estimator --example vlm_eval -- <model> <runs> <out_dir> <set_dir>...
 //! ```
+//! `VLM_MAX_DIM` overrides the image size (default 512 px).
 //! Reads `AUST__LLM__OLLAMA__API_KEY` from the environment or the repo `.env`.
 //! Writes `<out_dir>/<set>_<run>.raw.txt` (model answer) and `.json`
 //! (parsed `VisionAnalysisResult` + timing) per run.
@@ -27,7 +28,9 @@ async fn main() {
             l.strip_prefix("AUST__LLM__OLLAMA__API_KEY=").map(|k| k.trim().to_string())
         })
     });
-    let estimator = VlmEstimator::new("https://ollama.com".into(), api_key, model.clone(), 1800);
+    let max_dim: u32 = std::env::var("VLM_MAX_DIM").ok().and_then(|v| v.parse().ok()).unwrap_or(512);
+    let estimator = VlmEstimator::new("https://ollama.com".into(), api_key, model.clone(), 1800)
+        .with_max_image_dim(max_dim);
 
     for set in sets {
         let set_dir = Path::new(set);
