@@ -174,6 +174,17 @@ impl VlmEstimator {
         &self,
         images: &[(Vec<u8>, String)],
     ) -> Result<VisionAnalysisResult, VolumeError> {
+        let response = self.estimate_photos_raw(images).await?;
+        parse_vlm_response(&response)
+    }
+
+    /// The model's unparsed answer for [`Self::estimate_photos`] — for the
+    /// benchmark harness (`examples/vlm_eval.rs`), which checks the model's
+    /// keys, counts and per-unit volumes against the catalogue.
+    pub async fn estimate_photos_raw(
+        &self,
+        images: &[(Vec<u8>, String)],
+    ) -> Result<String, VolumeError> {
         if images.is_empty() {
             return Err(VolumeError::Vision("no images provided".into()));
         }
@@ -210,7 +221,12 @@ impl VlmEstimator {
             "VLM estimation: response received"
         );
 
-        parse_vlm_response(&response)
+        Ok(response)
+    }
+
+    /// Parse a raw answer from [`Self::estimate_photos_raw`].
+    pub fn parse_response(response: &str) -> Result<VisionAnalysisResult, VolumeError> {
+        parse_vlm_response(response)
     }
 
     /// Run the catalogue estimation over a video by extracting keyframes
